@@ -1,0 +1,9 @@
+node_modules/
+.env
+*.log
+wallets-db.json
+.codegraph/
+server.pid
+*.backup
+*.old
+ecosystem.config.cjs
