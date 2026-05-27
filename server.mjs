@@ -131,20 +131,23 @@ async function getOrCreateWallet(metamaskAddr) {
   return wallet
 }
 
-async function pollAttestation(domain, txHash, maxRetries = 20) {
+async function pollAttestation(domain, txHash, maxRetries = 40) {
   const url = `https://iris-api-sandbox.circle.com/v2/messages/${domain}?transactionHash=${txHash}`
-  console.log(`[iris] polling: ${url}`)
+  console.log(`[iris] polling: domain=${domain} tx=${txHash.slice(0,12)}...`)
+  // Fast early polls: 1s interval for first 10 attempts, then 1.5s
   for (let i = 0; i < maxRetries; i++) {
-    await new Promise(r => setTimeout(r, 3000))
+    const delay = i < 10 ? 1000 : 1500
+    await new Promise(r => setTimeout(r, delay))
     try {
       const r = await fetch(url, { headers: { Accept: 'application/json' } })
-      if (!r.ok) { console.log(`[iris] HTTP ${r.status}`); continue }
+      if (!r.ok) { console.log(`[iris] HTTP ${r.status} (retry ${i+1}/${maxRetries})`); continue }
       const ct = r.headers.get('content-type') || ''
       if (!ct.includes('json')) { console.log('[iris] non-JSON response'); continue }
       const data = await r.json()
       const msg = data?.messages?.[0]
-      console.log(`[iris] attempt ${i+1}/${maxRetries}: ${msg?.status}`)
+      if (i === 0 || msg?.status !== 'pending') console.log(`[iris] attempt ${i+1}/${maxRetries}: ${msg?.status || 'no message'}`)
       if (msg?.status === 'complete' && msg.attestation && msg.message) {
+        console.log(`[iris] ✓ attestation ready after ${(i+1)*delay/1000}s`)
         return { attestation: msg.attestation, message: msg.message }
       }
     } catch(e) { console.log(`[iris] error: ${e.message}`) }
