@@ -245,16 +245,15 @@ app.post('/api/mint-via-appkit', async (req, res) => {
     if (!burnTxHash || !fromChain || !toChain) return res.status(400).json({ error: 'Missing params' })
 
     const viemAdapter = createViemAdapterFromPrivateKey({ privateKey: process.env.OWNER_PRIVATE_KEY })
+    const { privateKeyToAccount } = await import('viem/accounts')
+    const ownerAddress = privateKeyToAccount(process.env.OWNER_PRIVATE_KEY).address
     
     // Reconstruct bridge result untuk retry
     const partialResult = {
       state: 'error',
       amount: '0',
       token: 'USDC',
-      source: { 
-        address: process.env.OWNER_PRIVATE_KEY ? (await import('viem/accounts')).then(m => m.privateKeyToAccount(process.env.OWNER_PRIVATE_KEY).address) : toAddress,
-        chain: fromChain 
-      },
+      source: { address: ownerAddress, chain: fromChain },
       destination: { address: toAddress, chain: toChain },
       steps: [
         { name: 'approve', state: 'success' },
