@@ -96,6 +96,17 @@ const RECEIVE_MESSAGE_ABI = [{
   stateMutability: 'nonpayable'
 }]
 
+// ── Chain-aware attestation polling retry config ──
+// Arc/Solana: ~detik finality → 30s polling  |  Arbitrum: ~1-5mnt → ~9mnt buffer
+// Sepolia/Base: ~12-19mnt finality → ~22mnt buffer
+const RETRY_CFG = {
+  Arc_Testnet: { maxRetries: 60, fastMode: true },
+  Solana_Devnet: { maxRetries: 60, fastMode: true },
+  Arbitrum_Sepolia: { maxRetries: 300, fastMode: false },
+  Ethereum_Sepolia: { maxRetries: 700, fastMode: false },
+  Base_Sepolia: { maxRetries: 700, fastMode: false },
+}
+
 const circleClient = initiateDeveloperControlledWalletsClient({
   apiKey: process.env.CIRCLE_API_KEY,
   entitySecret: process.env.CIRCLE_ENTITY_SECRET,
@@ -131,26 +142,41 @@ async function getOrCreateWallet(metamaskAddr) {
   return wallet
 }
 
-async function pollAttestation(domain, txHash, maxRetries = 40) {
+async function pollAttestation(domain, txHash, maxRetries = 60, fastMode = false) {
   const url = `https://iris-api-sandbox.circle.com/v2/messages/${domain}?transactionHash=${txHash}`
-  console.log(`[iris] polling: domain=${domain} tx=${txHash.slice(0,12)}...`)
-  // Fast early polls: 1s interval for first 10 attempts, then 1.5s
+  console.log(`[iris] polling: domain=${domain} tx=${txHash.slice(0,12)}... (fast=${fastMode})`)
+  let lastStatus = ''
   for (let i = 0; i < maxRetries; i++) {
-    const delay = i < 10 ? 1000 : 1500
+    // Adaptive delay: fast chains (instant finality) poll quicker
+    let delay
+    if (fastMode) {
+      delay = 500
+    } else if (i < 20) {
+      delay = 500  // First 10s: aggressive
+    } else if (i < 60) {
+      delay = 1000 // Next 40s: moderate
+    } else {
+      delay = 2000 // After 60s: slow/patient
+    }
     await new Promise(r => setTimeout(r, delay))
     try {
       const r = await fetch(url, { headers: { Accept: 'application/json' } })
-      if (!r.ok) { console.log(`[iris] HTTP ${r.status} (retry ${i+1}/${maxRetries})`); continue }
+      if (!r.ok) { if (i % 10 === 0) console.log(`[iris] HTTP ${r.status} (retry ${i+1}/${maxRetries})`); continue }
       const ct = r.headers.get('content-type') || ''
-      if (!ct.includes('json')) { console.log('[iris] non-JSON response'); continue }
+      if (!ct.includes('json')) { if (i % 10 === 0) console.log('[iris] non-JSON response'); continue }
       const data = await r.json()
       const msg = data?.messages?.[0]
-      if (i === 0 || msg?.status !== 'pending') console.log(`[iris] attempt ${i+1}/${maxRetries}: ${msg?.status || 'no message'}`)
+      const curStatus = msg?.status || 'no message'
+      if (curStatus !== lastStatus || i % 10 === 0) {
+        console.log(`[iris] attempt ${i+1}/${maxRetries}: ${curStatus}`)
+        lastStatus = curStatus
+      }
       if (msg?.status === 'complete' && msg.attestation && msg.message) {
-        console.log(`[iris] ✓ attestation ready after ${(i+1)*delay/1000}s`)
+        const elapsed = fastMode ? ((i+1)*0.5) : (i < 20 ? (i+1)*0.5 : i < 60 ? 10 + (i-20)*1 : 10 + 40 + (i-60)*2)
+        console.log(`[iris] ✓ attestation ready after ~${elapsed.toFixed(1)}s`)
         return { attestation: msg.attestation, message: msg.message }
       }
-    } catch(e) { console.log(`[iris] error: ${e.message}`) }
+    } catch(e) { if (i % 10 === 0) console.log(`[iris] error: ${e.message}`) }
   }
   return null
 }
@@ -198,6 +224,7 @@ app.post('/api/swap', async (req, res) => {
   try {
     const { metamaskAddress, tokenIn, tokenOut, amountIn } = req.body
     if (!metamaskAddress || !tokenIn || !tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
+    if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
     const wallet = await getOrCreateWallet(metamaskAddress)
     const result = await kit.swap({
       from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
@@ -230,10 +257,10 @@ app.post('/api/get-attestation', async (req, res) => {
     const domains = { Arc_Testnet: 26, Ethereum_Sepolia: 0, Base_Sepolia: 6, Arbitrum_Sepolia: 3, Solana_Devnet: 1 }
     const domain = domains[fromChain]
     if (domain === undefined) return res.status(400).json({ error: 'Unknown chain: ' + fromChain })
-    console.log(`[get-attestation] domain=${domain} tx=${txHash}`)
-    // Fast attestation - poll dengan interval lebih pendek
-    const att = await pollAttestation(domain, txHash, 60)
-    if (!att) return res.status(400).json({ error: 'Attestation timeout.' })
+    const retryCfg = RETRY_CFG[fromChain] || { maxRetries: 120, fastMode: false }
+    console.log(`[get-attestation] domain=${domain} tx=${txHash} retries=${retryCfg.maxRetries} fast=${retryCfg.fastMode}`)
+    const att = await pollAttestation(domain, txHash, retryCfg.maxRetries, retryCfg.fastMode)
+    if (!att) return res.status(400).json({ error: 'Attestation timeout. Chain: ' + fromChain + ' may need more time.' })
     res.json({ success: true, attestation: att.attestation, message: att.message, domain })
   } catch(e) { console.error('[get-attestation]', e.message); res.status(500).json({ error: e.message }) }
 })
@@ -241,17 +268,34 @@ app.post('/api/get-attestation', async (req, res) => {
 // ── Mint via App Kit (EVM chains) - lebih reliable dari manual receiveMessage ──
 app.post('/api/mint-via-appkit', async (req, res) => {
   try {
-    const { burnTxHash, fromChain, toChain, toAddress } = req.body
+    const { burnTxHash, fromChain, toChain, toAddress, amount: reqAmount } = req.body
     if (!burnTxHash || !fromChain || !toChain) return res.status(400).json({ error: 'Missing params' })
 
-    const viemAdapter = createViemAdapterFromPrivateKey({ privateKey: process.env.OWNER_PRIVATE_KEY })
+      // Build RPC mapping by chain ID from CCTP config
+      const RPC_BY_CHAIN_ID = {}
+      for (const [, cfg] of Object.entries(CCTP)) {
+        if (cfg.chain) {
+          RPC_BY_CHAIN_ID[cfg.chain.id] = cfg.chain.rpcUrls.default.http[0]
+        }
+      }
+      const viemAdapter = createViemAdapterFromPrivateKey({
+        privateKey: process.env.OWNER_PRIVATE_KEY,
+        getPublicClient: ({ chain }) => {
+          const rpcUrl = RPC_BY_CHAIN_ID[chain.id]
+          if (!rpcUrl) {
+            console.warn('[mint-via-appkit] No RPC for chain ID ' + chain.id + ', using default')
+            return createPublicClient({ chain, transport: http() })
+          }
+          return createPublicClient({ chain, transport: http(rpcUrl, { retryCount: 3, timeout: 10000 }) })
+        },
+      })
     const { privateKeyToAccount } = await import('viem/accounts')
     const ownerAddress = privateKeyToAccount(process.env.OWNER_PRIVATE_KEY).address
     
     // Reconstruct bridge result untuk retry
     const partialResult = {
       state: 'error',
-      amount: '0',
+        amount: reqAmount || '0',
       token: 'USDC',
       source: { address: ownerAddress, chain: fromChain },
       destination: { address: toAddress, chain: toChain },
@@ -262,7 +306,7 @@ app.post('/api/mint-via-appkit', async (req, res) => {
       ],
     }
 
-    console.log(`[mint-via-appkit] retrying from burn tx ${burnTxHash}`)
+      console.log(`[mint-via-appkit] retrying chain=${fromChain} -> ${toChain} tx=${burnTxHash}`)
     const retryResult = await kit.retry(partialResult, {
       from: viemAdapter,
       to: viemAdapter,
@@ -280,10 +324,14 @@ app.post('/api/mint-via-appkit', async (req, res) => {
 // ── Mint CCTP Solana (Arc → Solana) - return attestation untuk Solflare sign ──
 app.post('/api/mint-cctp-solana', async (req, res) => {
   try {
-    const { burnTxHash, toAddress } = req.body
+    const { burnTxHash, toAddress, fromChain } = req.body
     if (!burnTxHash || !toAddress) return res.status(400).json({ error: 'Missing params' })
-    const att = await pollAttestation(26, burnTxHash)
-    if (!att) return res.status(400).json({ error: 'Attestation timeout.' })
+      // Poll attestation dengan domain yang sesuai dengan source chain
+      const solDomain = CCTP[fromChain]?.domain ?? 26
+      console.log(`[mint-cctp-solana] fromChain=${fromChain || 'Arc_Testnet'} domain=${solDomain}`)
+      const solRetry = RETRY_CFG[fromChain || 'Arc_Testnet'] || { maxRetries: 60, fastMode: false }
+      const att = await pollAttestation(solDomain, burnTxHash, solRetry.maxRetries, solRetry.fastMode)
+    if (!att) return res.status(400).json({ error: 'Attestation timeout. Please retry.' })
     res.json({
       success: true,
       requiresSolanaSign: true,
@@ -291,7 +339,7 @@ app.post('/api/mint-cctp-solana', async (req, res) => {
       message: att.message,
       toAddress,
       solanaConfig: {
-        messageTransmitter: 'CCTPiPYPc6AsJuwueEnWgSgucamXDZwBd53dQ11YiKX3',
+        messageTransmitter: 'CCTPmbSD7gX1bxKPAmg77w8oFzNFpaQiQUWD43TKaecd',
         usdcMint: SOLANA_CCTP.usdcMint,
       },
     })
@@ -303,22 +351,85 @@ app.post('/api/mint-cctp-from-solana', async (req, res) => {
   try {
     const { burnTxHash, toAddress } = req.body
     if (!burnTxHash || !toAddress) return res.status(400).json({ error: 'Missing params' })
-    const att = await pollAttestation(1, burnTxHash)
-    if (!att) return res.status(400).json({ error: 'Attestation timeout.' })
+    const att = await pollAttestation(1, burnTxHash, 120, false)
+    if (!att) return res.status(400).json({ error: 'Attestation timeout from Solana. Please retry.' })
     const account = privateKeyToAccount(process.env.OWNER_PRIVATE_KEY)
     const wc = createWalletClient({ account, chain: arcTestnet, transport: http() })
     const pc = createPublicClient({ chain: arcTestnet, transport: http() })
-    const txHash = await wc.writeContract({
-      address: CCTP.Arc_Testnet.messageTransmitter,
-      abi: RECEIVE_MESSAGE_ABI,
-      functionName: 'receiveMessage',
-      args: [att.message, att.attestation],
-    })
-    await pc.waitForTransactionReceipt({ hash: txHash })
+    // Retry mint up to 3 times
+    let txHash
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        console.log(`[mint-from-solana] attempt ${attempt+1}/3`)
+        txHash = await wc.writeContract({
+          address: CCTP.Arc_Testnet.messageTransmitter,
+          abi: RECEIVE_MESSAGE_ABI,
+          functionName: 'receiveMessage',
+          args: [att.message, att.attestation],
+        })
+        await pc.waitForTransactionReceipt({ hash: txHash })
+        break
+      } catch(e) {
+        console.error(`[mint-from-solana] attempt ${attempt+1} failed:`, e.message)
+        if (attempt === 2) throw e
+        await new Promise(r => setTimeout(r, 3000))
+      }
+    }
     res.json({ success: true, txHash, explorerUrl: CCTP.Arc_Testnet.explorer + txHash })
   } catch(e) { console.error('[mint-from-solana]', e.message); res.status(500).json({ error: e.message }) }
 })
 
+
+// ── Mint Direct (fallback manual receiveMessage) - EVM → EVM tanpa AppKit ──
+app.post('/api/mint-direct', async (req, res) => {
+  try {
+    const { burnTxHash, fromChain, toChain, toAddress, amount: reqAmount } = req.body
+    if (!burnTxHash || !fromChain || !toChain) return res.status(400).json({ error: 'Missing params' })
+
+    const fromInfo = CCTP[fromChain]
+    if (!fromInfo) return res.status(400).json({ error: 'Unknown fromChain: ' + fromChain })
+    const toInfo = CCTP[toChain]
+    if (!toInfo) return res.status(400).json({ error: 'Unknown toChain: ' + toChain })
+
+    // 1. Poll attestation
+    const dirRetry = RETRY_CFG[fromChain] || { maxRetries: 120, fastMode: false }
+    console.log('[mint-direct] polling attestation domain=' + fromInfo.domain + ' from=' + fromChain + ' to=' + toChain + ' retries=' + dirRetry.maxRetries)
+    const att = await pollAttestation(fromInfo.domain, burnTxHash, dirRetry.maxRetries, dirRetry.fastMode)
+    if (!att) return res.status(400).json({ error: 'Attestation timeout. Please retry.' })
+
+    // 2. receiveMessage via backend viem wallet
+    const account = privateKeyToAccount(process.env.OWNER_PRIVATE_KEY)
+    const RPC_BY_CHAIN_ID = {}
+    for (const [, cfg] of Object.entries(CCTP)) {
+      if (cfg.chain) RPC_BY_CHAIN_ID[cfg.chain.id] = cfg.chain.rpcUrls.default.http[0]
+    }
+    const rpcUrl = RPC_BY_CHAIN_ID[toInfo.chain.id]
+    if (!rpcUrl) return res.status(500).json({ error: 'No RPC for destination chain ID: ' + toInfo.chain.id })
+    const wc = createWalletClient({ account, chain: toInfo.chain, transport: http(rpcUrl) })
+    const pc = createPublicClient({ chain: toInfo.chain, transport: http(rpcUrl) })
+
+    // 3. Send receiveMessage with retry
+    let txHash
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        console.log('[mint-direct] attempt ' + (attempt+1) + '/3')
+        txHash = await wc.writeContract({
+          address: toInfo.messageTransmitter,
+          abi: RECEIVE_MESSAGE_ABI,
+          functionName: 'receiveMessage',
+          args: [att.message, att.attestation],
+        })
+        await pc.waitForTransactionReceipt({ hash: txHash })
+        break
+      } catch(e) {
+        console.error('[mint-direct] attempt ' + (attempt+1) + ' failed:', e.message)
+        if (attempt === 2) throw e
+        await new Promise(r => setTimeout(r, 3000))
+      }
+    }
+    res.json({ success: true, txHash, explorerUrl: toInfo.explorer + txHash })
+  } catch(e) { console.error('[mint-direct]', e.message); res.status(500).json({ error: e.message }) }
+})
 // ── Send ──
 app.post('/api/send', async (req, res) => {
   try {
@@ -327,7 +438,24 @@ app.post('/api/send', async (req, res) => {
     const resolvedToken = SEND_TOKEN_MAP[token] || token
     let fromCtx
     if (source === 'eoa') {
-      const viemAdapter = createViemAdapterFromPrivateKey({ privateKey: process.env.OWNER_PRIVATE_KEY })
+      // Build RPC mapping by chain ID from CCTP config
+      const RPC_BY_CHAIN_ID = {}
+      for (const [, cfg] of Object.entries(CCTP)) {
+        if (cfg.chain) {
+          RPC_BY_CHAIN_ID[cfg.chain.id] = cfg.chain.rpcUrls.default.http[0]
+        }
+      }
+      const viemAdapter = createViemAdapterFromPrivateKey({
+        privateKey: process.env.OWNER_PRIVATE_KEY,
+        getPublicClient: ({ chain }) => {
+          const rpcUrl = RPC_BY_CHAIN_ID[chain.id]
+          if (!rpcUrl) {
+            console.warn('[mint-via-appkit] No RPC for chain ID ' + chain.id + ', using default')
+            return createPublicClient({ chain, transport: http() })
+          }
+          return createPublicClient({ chain, transport: http(rpcUrl, { retryCount: 3, timeout: 10000 }) })
+        },
+      })
       fromCtx = { adapter: viemAdapter, chain: SwapChain.Arc_Testnet }
     } else {
       const wallet = await getOrCreateWallet(metamaskAddress)
