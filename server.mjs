@@ -14,20 +14,25 @@ process.on('unhandledRejection', (reason) => console.error('[UnhandledRejection]
 BigInt.prototype.toJSON = function() { return this.toString() }
 
 const app = express()
+app.disable('x-powered-by')
 const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:5173',
   'http://localhost:4173',
   'https://43.163.98.128.nip.io',
   'https://43.163.98.128.nip.io/arc-dex',
+  'https://arc-dex-bice.vercel.app',
 ]
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(','))
   .split(',')
   .map(v => v.trim())
   .filter(Boolean)
-const VERCEL_ORIGIN_RE = /^https:\/\/[a-z0-9-]+\.vercel\.app$/i
 app.use((req, res, next) => {
   const origin = req.headers.origin
-  if (origin && (ALLOWED_ORIGINS.includes(origin) || VERCEL_ORIGIN_RE.test(origin))) {
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('X-Frame-Options', 'DENY')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin)
     res.setHeader('Vary', 'Origin')
   }
@@ -37,6 +42,27 @@ app.use((req, res, next) => {
   next()
 })
 app.use(express.json({ limit: '64kb' }))
+
+function rateLimit({ windowMs, max, keyPrefix }) {
+  const hits = new Map()
+  return (req, res, next) => {
+    const now = Date.now()
+    const ip = req.headers['x-forwarded-for']?.toString().split(',')[0].trim() || req.socket.remoteAddress || 'unknown'
+    const key = `${keyPrefix}:${ip}`
+    const current = hits.get(key)
+    if (!current || now > current.resetAt) {
+      hits.set(key, { count: 1, resetAt: now + windowMs })
+      return next()
+    }
+    current.count += 1
+    if (current.count > max) return res.status(429).json({ error: 'Too many requests. Please try again later.' })
+    next()
+  }
+}
+
+const authLimiter = rateLimit({ windowMs: 5 * 60 * 1000, max: 20, keyPrefix: 'auth' })
+const apiLimiter = rateLimit({ windowMs: 60 * 1000, max: 120, keyPrefix: 'api' })
+const attestationLimiter = rateLimit({ windowMs: 60 * 1000, max: 45, keyPrefix: 'attestation' })
 
 const KIT_KEY = process.env.KIT_KEY
 const PORT = process.env.PORT || 3001
@@ -173,15 +199,22 @@ function createAuthToken(address) {
 }
 
 function verifyAuthToken(token) {
-  if (!AUTH_SECRET || !token || !token.includes('.')) return null
-  const [payload, sig] = token.split('.')
-  const expected = signPayload(payload)
-  const sigBuf = Buffer.from(sig)
-  const expBuf = Buffer.from(expected)
-  if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) return null
-  const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
-  if (!data?.address || !data?.exp || Date.now() > data.exp) return null
-  return data.address
+  try {
+    if (!AUTH_SECRET || !token || !token.includes('.')) return null
+    const parts = token.split('.')
+    if (parts.length !== 2) return null
+    const [payload, sig] = parts
+    if (!/^[A-Za-z0-9_-]+$/.test(payload) || !/^[A-Za-z0-9_-]+$/.test(sig)) return null
+    const expected = signPayload(payload)
+    const sigBuf = Buffer.from(sig)
+    const expBuf = Buffer.from(expected)
+    if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) return null
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
+    if (!data?.address || !data?.exp || Date.now() > data.exp) return null
+    return data.address
+  } catch {
+    return null
+  }
 }
 
 function requireAuth(req, res, next) {
@@ -209,6 +242,21 @@ function normalizeAmount(value) {
   if (!Number.isFinite(num) || num <= 0) throw new Error('Invalid amount')
   if (num > 1_000_000) throw new Error('Amount exceeds safety limit')
   return raw
+}
+
+function normalizeTxHash(value, field = 'txHash') {
+  const raw = String(value || '')
+  if (!/^0x[0-9a-f]{64}$/i.test(raw) && !/^[1-9A-HJ-NP-Za-km-z]{32,128}$/.test(raw)) {
+    throw new Error(`Invalid ${field}`)
+  }
+  return raw
+}
+
+function requireServerSignedMintAuth(req, res, next) {
+  if (process.env.ENABLE_SERVER_SIGNED_MINT !== 'true') {
+    return res.status(403).json({ error: 'Server-signed mint disabled. Use wallet-signed mint.' })
+  }
+  requireAuth(req, res, next)
 }
 
 function isNoSwapRouteError(err) {
@@ -321,7 +369,7 @@ app.get('/api/config', (_, res) => {
   res.json({ kitKey: KIT_KEY || '' })
 })
 
-app.post('/api/auth/session', async (req, res) => {
+app.post('/api/auth/session', authLimiter, async (req, res) => {
   try {
     const { address, issuedAt, signature } = req.body || {}
     const normalized = normalizeAddress(address, 'address')
@@ -344,7 +392,7 @@ app.post('/api/auth/session', async (req, res) => {
 })
 
 // ── Wallet ──
-app.post('/api/wallet', requireAuth, async (req, res) => {
+app.post('/api/wallet', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress } = req.body
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
@@ -370,7 +418,7 @@ app.get('/api/balance/:address', async (req, res) => {
 })
 
 // ── Quote ──
-app.post('/api/quote', requireAuth, async (req, res) => {
+app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress, tokenIn, tokenOut, amountIn } = req.body
     if (!metamaskAddress || !tokenIn || !tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
@@ -404,7 +452,7 @@ app.post('/api/quote', requireAuth, async (req, res) => {
 })
 
 // ── Swap ──
-app.post('/api/swap', requireAuth, async (req, res) => {
+app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress, tokenIn, tokenOut, amountIn } = req.body
     if (!metamaskAddress || !tokenIn || !tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
@@ -437,7 +485,7 @@ app.post('/api/swap', requireAuth, async (req, res) => {
 })
 
 // ── Prepare Bridge (Circle → EOA) ──
-app.post('/api/prepare-bridge', requireAuth, async (req, res) => {
+app.post('/api/prepare-bridge', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress, amount, token } = req.body
     if (!metamaskAddress || !amount) return res.status(400).json({ error: 'Missing params' })
@@ -455,18 +503,20 @@ app.post('/api/prepare-bridge', requireAuth, async (req, res) => {
 })
 
 // ── Get Attestation - fast via App Kit ──
-app.post('/api/get-attestation', async (req, res) => {
+app.post('/api/get-attestation', attestationLimiter, async (req, res) => {
   try {
     const { txHash, fromChain, toChain, once } = req.body
     if (!txHash || !fromChain) return res.status(400).json({ error: 'Missing params' })
+    const safeTxHash = normalizeTxHash(txHash, 'txHash')
     const domains = { Arc_Testnet: 26, Ethereum_Sepolia: 0, Base_Sepolia: 6, Arbitrum_Sepolia: 3, HyperEVM_Testnet: 19, Solana_Devnet: 5 }
     const domain = domains[fromChain]
     if (domain === undefined) return res.status(400).json({ error: 'Unknown chain: ' + fromChain })
+    if (toChain && domains[toChain] === undefined) return res.status(400).json({ error: 'Unknown destination chain: ' + toChain })
     const retryCfg = RETRY_CFG[fromChain] || { maxRetries: 120, fastMode: false }
-    console.log(`[get-attestation] domain=${domain} tx=${txHash} retries=${retryCfg.maxRetries} fast=${retryCfg.fastMode}`)
+    console.log(`[get-attestation] domain=${domain} tx=${safeTxHash.slice(0,12)}... retries=${retryCfg.maxRetries} fast=${retryCfg.fastMode}`)
     const att = once
-      ? await checkAttestationOnce(domain, txHash).then(r => r.complete ? { attestation: r.attestation, message: r.message, status: r.status } : r)
-      : await pollAttestation(domain, txHash, retryCfg.maxRetries, retryCfg.fastMode)
+      ? await checkAttestationOnce(domain, safeTxHash).then(r => r.complete ? { attestation: r.attestation, message: r.message, status: r.status } : r)
+      : await pollAttestation(domain, safeTxHash, retryCfg.maxRetries, retryCfg.fastMode)
     if (once && !att?.attestation) return res.json({ success: false, pending: true, status: att?.status || 'pending' })
     if (!att) return res.status(400).json({ error: 'Attestation timeout. Chain: ' + fromChain + ' may need more time.' })
     // Include messageTransmitter address + chainId untuk client sign via MetaMask
@@ -476,17 +526,24 @@ app.post('/api/get-attestation', async (req, res) => {
       dstChainId = CCTP[toChain].chain.id
     }
     res.json({ success: true, attestation: att.attestation, message: att.message, domain, messageTransmitter: msgTx, chainId: dstChainId })
-  } catch(e) { console.error('[get-attestation]', e.message); res.status(500).json({ error: e.message }) }
+  } catch(e) {
+    console.error('[get-attestation]', e.message)
+    const status = /^Invalid |^Unknown /.test(e.message || '') ? 400 : 500
+    res.status(status).json({ error: e.message })
+  }
 })
 
 // ── Mint via App Kit (EVM chains) - lebih reliable dari manual receiveMessage ──
-app.post('/api/mint-via-appkit', async (req, res) => {
-  if (process.env.ENABLE_SERVER_SIGNED_MINT !== 'true') {
-    return res.status(403).json({ error: 'Server-signed mint disabled. Use wallet-signed retry mint.' })
-  }
+app.post('/api/mint-via-appkit', apiLimiter, requireServerSignedMintAuth, async (req, res) => {
   try {
     const { burnTxHash, fromChain, toChain, toAddress, amount: reqAmount } = req.body
     if (!burnTxHash || !fromChain || !toChain) return res.status(400).json({ error: 'Missing params' })
+    const safeBurnTxHash = normalizeTxHash(burnTxHash, 'burnTxHash')
+    if (toAddress) {
+      const safeToAddress = normalizeAddress(toAddress, 'toAddress')
+      if (safeToAddress.toLowerCase() !== req.authAddress) return res.status(403).json({ error: 'Authenticated wallet does not match mint recipient' })
+    }
+    if (!CCTP[fromChain] || !CCTP[toChain]) return res.status(400).json({ error: 'Unsupported bridge chain' })
 
       // Build RPC mapping by chain ID from CCTP config
       const RPC_BY_CHAIN_ID = {}
@@ -518,12 +575,12 @@ app.post('/api/mint-via-appkit', async (req, res) => {
       destination: { address: toAddress, chain: toChain },
       steps: [
         { name: 'approve', state: 'success' },
-        { name: 'burn', state: 'success', txHash: burnTxHash },
+        { name: 'burn', state: 'success', txHash: safeBurnTxHash },
         { name: 'fetchAttestation', state: 'error', error: 'Resuming from frontend burn' },
       ],
     }
 
-      console.log(`[mint-via-appkit] retrying chain=${fromChain} -> ${toChain} tx=${burnTxHash}`)
+      console.log(`[mint-via-appkit] retrying chain=${fromChain} -> ${toChain} tx=${safeBurnTxHash.slice(0,12)}...`)
     const retryResult = await kit.retry(partialResult, {
       from: viemAdapter,
       to: viemAdapter,
@@ -539,14 +596,17 @@ app.post('/api/mint-via-appkit', async (req, res) => {
 })
 
 // ── Mint CCTP Solana (Arc/EVM → Solana) - return attestation untuk Solflare sign ──
-app.post('/api/mint-cctp-solana', async (req, res) => {
+app.post('/api/mint-cctp-solana', attestationLimiter, async (req, res) => {
   try {
     const { burnTxHash, toAddress, fromChain } = req.body
     if (!burnTxHash || !toAddress) return res.status(400).json({ error: 'Missing params' })
+    const safeBurnTxHash = normalizeTxHash(burnTxHash, 'burnTxHash')
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,64}$/.test(String(toAddress))) return res.status(400).json({ error: 'Invalid Solana address' })
+    if (fromChain && !CCTP[fromChain]) return res.status(400).json({ error: 'Unknown fromChain: ' + fromChain })
     const solDomain = CCTP[fromChain]?.domain ?? 26
     console.log('[mint-cctp-solana] fromChain=' + (fromChain || 'Arc_Testnet') + ' domain=' + solDomain)
     const solRetry = RETRY_CFG[fromChain || 'Arc_Testnet'] || { maxRetries: 60, fastMode: false }
-    const att = await pollAttestation(solDomain, burnTxHash, solRetry.maxRetries, solRetry.fastMode)
+    const att = await pollAttestation(solDomain, safeBurnTxHash, solRetry.maxRetries, solRetry.fastMode)
     if (!att) return res.status(400).json({ error: 'Attestation timeout. Please retry.' })
 
     res.json({
@@ -564,14 +624,14 @@ app.post('/api/mint-cctp-solana', async (req, res) => {
 })
 
 // ── Mint CCTP dari Solana → Arc (backend sign di Arc) ──
-app.post('/api/mint-cctp-from-solana', async (req, res) => {
-  if (process.env.ENABLE_SERVER_SIGNED_MINT !== 'true') {
-    return res.status(403).json({ error: 'Server-signed Solana mint disabled.' })
-  }
+app.post('/api/mint-cctp-from-solana', apiLimiter, requireServerSignedMintAuth, async (req, res) => {
   try {
     const { burnTxHash, toAddress } = req.body
     if (!burnTxHash || !toAddress) return res.status(400).json({ error: 'Missing params' })
-    const att = await pollAttestation(SOLANA_CCTP.domain, burnTxHash, 120, false)
+    const safeBurnTxHash = normalizeTxHash(burnTxHash, 'burnTxHash')
+    const safeToAddress = normalizeAddress(toAddress, 'toAddress')
+    if (safeToAddress.toLowerCase() !== req.authAddress) return res.status(403).json({ error: 'Authenticated wallet does not match mint recipient' })
+    const att = await pollAttestation(SOLANA_CCTP.domain, safeBurnTxHash, 120, false)
     if (!att) return res.status(400).json({ error: 'Attestation timeout from Solana. Please retry.' })
     const account = privateKeyToAccount(process.env.OWNER_PRIVATE_KEY)
     const wc = createWalletClient({ account, chain: arcTestnet, transport: http() })
@@ -601,13 +661,15 @@ app.post('/api/mint-cctp-from-solana', async (req, res) => {
 
 
 // ── Mint Direct (fallback manual receiveMessage) - EVM → EVM tanpa AppKit ──
-app.post('/api/mint-direct', async (req, res) => {
-  if (process.env.ENABLE_SERVER_SIGNED_MINT !== 'true') {
-    return res.status(403).json({ error: 'Server-signed mint disabled. Use wallet-signed retry mint.' })
-  }
+app.post('/api/mint-direct', apiLimiter, requireServerSignedMintAuth, async (req, res) => {
   try {
     const { burnTxHash, fromChain, toChain, toAddress, amount: reqAmount } = req.body
     if (!burnTxHash || !fromChain || !toChain) return res.status(400).json({ error: 'Missing params' })
+    const safeBurnTxHash = normalizeTxHash(burnTxHash, 'burnTxHash')
+    if (toAddress) {
+      const safeToAddress = normalizeAddress(toAddress, 'toAddress')
+      if (safeToAddress.toLowerCase() !== req.authAddress) return res.status(403).json({ error: 'Authenticated wallet does not match mint recipient' })
+    }
 
     const fromInfo = CCTP[fromChain]
     if (!fromInfo) return res.status(400).json({ error: 'Unknown fromChain: ' + fromChain })
@@ -617,7 +679,7 @@ app.post('/api/mint-direct', async (req, res) => {
     // 1. Poll attestation
     const dirRetry = RETRY_CFG[fromChain] || { maxRetries: 120, fastMode: false }
     console.log('[mint-direct] polling attestation domain=' + fromInfo.domain + ' from=' + fromChain + ' to=' + toChain + ' retries=' + dirRetry.maxRetries)
-    const att = await pollAttestation(fromInfo.domain, burnTxHash, dirRetry.maxRetries, dirRetry.fastMode)
+    const att = await pollAttestation(fromInfo.domain, safeBurnTxHash, dirRetry.maxRetries, dirRetry.fastMode)
     if (!att) return res.status(400).json({ error: 'Attestation timeout. Please retry.' })
 
     // 2. receiveMessage via backend viem wallet
@@ -654,7 +716,7 @@ app.post('/api/mint-direct', async (req, res) => {
   } catch(e) { console.error('[mint-direct]', e.message); res.status(500).json({ error: e.message }) }
 })
 // ── Send ──
-app.post('/api/send-estimate', requireAuth, async (req, res) => {
+app.post('/api/send-estimate', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress, toAddress, amount, token, source } = req.body
     if (!metamaskAddress || !toAddress || !amount || !token) return res.status(400).json({ error: 'Missing params' })
@@ -662,6 +724,7 @@ app.post('/api/send-estimate', requireAuth, async (req, res) => {
     const destination = normalizeAddress(toAddress, 'toAddress')
     const safeAmount = normalizeAmount(amount)
     if (source === 'eoa') return res.status(400).json({ error: 'EOA estimate dihitung langsung dari wallet browser.' })
+    if (!SEND_TOKEN_MAP[token]) return res.status(400).json({ error: 'Unsupported token: ' + token })
     const resolvedToken = SEND_TOKEN_MAP[token] || token
     const wallet = await getOrCreateWallet(owner)
     const params = {
@@ -682,13 +745,14 @@ app.post('/api/send-estimate', requireAuth, async (req, res) => {
   } catch(e) { console.error('[send-estimate]', e.message); res.status(500).json({ error: e.message }) }
 })
 
-app.post('/api/send', requireAuth, async (req, res) => {
+app.post('/api/send', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress, toAddress, amount, token, source } = req.body
     if (!metamaskAddress || !toAddress || !amount || !token) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const destination = normalizeAddress(toAddress, 'toAddress')
     const safeAmount = normalizeAmount(amount)
+    if (!SEND_TOKEN_MAP[token]) return res.status(400).json({ error: 'Unsupported token: ' + token })
     const resolvedToken = SEND_TOKEN_MAP[token] || token
     if (source === 'eoa') {
       return res.status(400).json({ error: 'EOA send harus ditandatangani langsung dari wallet browser.' })
@@ -703,7 +767,8 @@ app.post('/api/send', requireAuth, async (req, res) => {
 // ── History ──
 app.get('/api/history/:address', async (req, res) => {
   try {
-    const r = await fetch(`https://testnet.arcscan.app/api/v2/addresses/${req.params.address}/transactions?filter=to%7Cfrom&limit=10`)
+    const target = normalizeAddress(req.params.address, 'address')
+    const r = await fetch(`https://testnet.arcscan.app/api/v2/addresses/${target}/transactions?filter=to%7Cfrom&limit=10`)
     const data = await r.json()
     const txs = (data.items || []).slice(0, 10).map(tx => ({ hash: tx.hash, method: tx.method || 'transfer', from: tx.from?.hash, to: tx.to?.hash, timestamp: tx.timestamp, status: tx.status }))
     res.json({ txs })
