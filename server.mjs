@@ -240,8 +240,14 @@ async function getOrCreateWallet(metamaskAddr) {
   const addr = metamaskAddr.toLowerCase()
   const db = loadWallets()
   if (db[addr]) {
-    const res = await circleClient.getWallet({ id: db[addr] })
-    return res.data?.wallet
+    const record = typeof db[addr] === 'string' ? { id: db[addr] } : db[addr]
+    const res = await circleClient.getWallet({ id: record.id })
+    const wallet = res.data?.wallet
+    if (wallet?.id && wallet?.address && (typeof db[addr] === 'string' || db[addr].address !== wallet.address)) {
+      db[addr] = { id: wallet.id, address: wallet.address }
+      saveWallets(db)
+    }
+    return wallet
   }
   const ws = await circleClient.createWalletSet({ name: `user-${addr.slice(0,8)}` })
   const wr = await circleClient.createWallets({
@@ -249,7 +255,7 @@ async function getOrCreateWallet(metamaskAddr) {
     walletSetId: ws.data?.walletSet?.id ?? '', accountType: 'SCA',
   })
   const wallet = wr.data?.wallets?.[0]
-  db[addr] = wallet.id
+  db[addr] = { id: wallet.id, address: wallet.address }
   saveWallets(db)
   console.log(`[wallet] new: ${addr} → ${wallet.address}`)
   return wallet
