@@ -369,6 +369,68 @@ app.get('/api/config', (_, res) => {
   res.json({ kitKey: KIT_KEY || '' })
 })
 
+function hashAgentText(text) {
+  let h1 = 0x811c9dc5
+  let h2 = 0x01000193
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i)
+    h1 ^= ch
+    h1 = Math.imul(h1, 0x01000193)
+    h2 ^= ch + i
+    h2 = Math.imul(h2, 0x811c9dc5)
+  }
+  return `0x${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0).toString(16).padStart(8, '0')}`.padEnd(66, '0')
+}
+
+function agentPlanResponse({ prompt, agentId, owner, requester }) {
+  const cleanPrompt = String(prompt || '').trim().slice(0, 1000)
+  const budgetMatch = cleanPrompt.match(/(\d+(?:\.\d+)?)\s*(?:USDC|usd)/i)
+  const suggestedBudget = budgetMatch?.[1] || '1'
+  const provider = isAddress(owner || '') ? getAddress(owner) : requester
+  const evaluator = isAddress(requester || '') ? getAddress(requester) : provider
+  const deliverable = [
+    'ARCOX hosted AI agent response',
+    `Prompt: ${cleanPrompt || 'No prompt provided'}`,
+    'Decision: accepted',
+    `Budget: ${suggestedBudget} USDC`,
+    `Provider: ${provider}`,
+    `Evaluator: ${evaluator}`,
+  ].join('\n')
+  return {
+    requestId: `hosted-agent-${Date.now()}`,
+    agentId: String(agentId || 'arcox-hosted-agent'),
+    status: 'accepted',
+    summary: cleanPrompt ? `ARCOX hosted agent accepted: ${cleanPrompt}` : 'ARCOX hosted agent is ready.',
+    suggestedProvider: provider,
+    suggestedEvaluator: evaluator,
+    suggestedBudget,
+    deliverable,
+    deliverableHash: hashAgentText(deliverable),
+    nextSteps: [
+      'Create the job in ARCOX DEX.',
+      'Set budget and fund escrow with user wallet approval.',
+      'Submit deliverable from provider wallet or terminal agent.',
+      'Complete job from evaluator wallet after validation.',
+    ],
+  }
+}
+
+app.post('/api/agent/ask', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const requester = normalizeAddress(req.body?.address || req.body?.requester || req.authAddress, 'requester')
+    const prompt = String(req.body?.prompt || '')
+    if (!prompt.trim()) return res.status(400).json({ error: 'Prompt is required' })
+    res.json(agentPlanResponse({
+      prompt,
+      agentId: req.body?.agentId,
+      owner: req.body?.owner,
+      requester,
+    }))
+  } catch (e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
 app.post('/api/auth/session', authLimiter, async (req, res) => {
   try {
     const { address, issuedAt, signature } = req.body || {}
