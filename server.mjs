@@ -93,6 +93,15 @@ const SEND_TOKEN_MAP = {
   USYC: '0xe9185F0c5F296Ed1797AaE4238D26CCaBEadb86C',
 }
 
+const TOKEN_DECIMALS = {
+  USDC: 6,
+  EURC: 6,
+  USYC: 6,
+  cirBTC: 8,
+}
+const PLATFORM_FEE_BPS = Number(process.env.ARCOX_ROUTER_FEE_BPS || 30)
+const PLATFORM_TREASURY = process.env.ARCOX_FEE_TREASURY || '0xE34FF1D2C925DDafB28C95C2396fC49A6f64569e'
+
 const CCTP = {
   Arc_Testnet: {
     domain: 26,
@@ -242,6 +251,40 @@ function normalizeAmount(value) {
   if (!Number.isFinite(num) || num <= 0) throw new Error('Invalid amount')
   if (num > 1_000_000) throw new Error('Amount exceeds safety limit')
   return raw
+}
+
+function decimalToUnits(value, decimals) {
+  const raw = normalizeAmount(value)
+  const [whole, frac = ''] = raw.split('.')
+  const padded = frac.padEnd(decimals, '0').slice(0, decimals)
+  return BigInt(whole) * (10n ** BigInt(decimals)) + BigInt(padded || '0')
+}
+
+function unitsToDecimal(units, decimals) {
+  const sign = units < 0n ? '-' : ''
+  const abs = units < 0n ? -units : units
+  const base = 10n ** BigInt(decimals)
+  const whole = abs / base
+  const frac = (abs % base).toString().padStart(decimals, '0').replace(/0+$/, '')
+  return `${sign}${whole.toString()}${frac ? `.${frac}` : ''}`
+}
+
+function splitPlatformFee(amount, token) {
+  const decimals = TOKEN_DECIMALS[token]
+  if (decimals === undefined) throw new Error('Unsupported token decimals: ' + token)
+  const amountUnits = decimalToUnits(amount, decimals)
+  const feeBps = Number.isFinite(PLATFORM_FEE_BPS) && PLATFORM_FEE_BPS > 0 ? Math.floor(PLATFORM_FEE_BPS) : 0
+  const feeUnits = (amountUnits * BigInt(feeBps)) / 10_000n
+  const netUnits = amountUnits - feeUnits
+  if (netUnits <= 0n) throw new Error('Amount too small after platform fee')
+  return {
+    feeBps,
+    amountUnits,
+    feeUnits,
+    netUnits,
+    feeAmount: unitsToDecimal(feeUnits, decimals),
+    netAmount: unitsToDecimal(netUnits, decimals),
+  }
 }
 
 function normalizeTxHash(value, field = 'txHash') {
@@ -489,13 +532,14 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
     if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
     if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
     if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
+    const platformFee = splitPlatformFee(safeAmount, tokenIn)
     try {
       const wallet = await getOrCreateWallet(owner)
       const estimate = await kit.estimateSwap({
         from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
         tokenIn,
         tokenOut,
-        amountIn: safeAmount,
+        amountIn: platformFee.netAmount,
         config: { kitKey: KIT_KEY, allowanceStrategy: 'approve' },
       })
       const fee = (estimate.fees || []).reduce((sum, f) => sum + Number(f.amount || 0), 0)
@@ -503,6 +547,13 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
         available: true,
         amountOut: estimate.estimatedOutput?.amount || '0',
         fee: fee.toFixed(6),
+        platformFee: {
+          bps: platformFee.feeBps,
+          amount: platformFee.feeAmount,
+          token: tokenIn,
+          treasury: PLATFORM_TREASURY,
+          swapAmountIn: platformFee.netAmount,
+        },
         rate: Number(estimate.estimatedOutput?.amount || 0) / Number(safeAmount || 1),
       })
     } catch(e) {
@@ -523,12 +574,13 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
     if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
     if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
     if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
+    const platformFee = splitPlatformFee(safeAmount, tokenIn)
     const wallet = await getOrCreateWallet(owner)
     const params = {
       from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
       tokenIn,
       tokenOut,
-      amountIn: safeAmount,
+      amountIn: platformFee.netAmount,
       config: { kitKey: KIT_KEY, allowanceStrategy: 'approve' },
     }
     try {
@@ -537,8 +589,33 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
       if (isNoSwapRouteError(e)) return noSwapRouteResponse(res, e)
       console.warn('[swap] estimate precheck failed, continuing:', e.message)
     }
+    let feeResult = null
+    const treasury = normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY')
+    if (platformFee.feeUnits > 0n) {
+      feeResult = await kit.send({
+        from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
+        to: treasury,
+        amount: platformFee.feeAmount,
+        token: SEND_TOKEN_MAP[tokenIn] || TOKENS[tokenIn] || tokenIn,
+      })
+    }
     const result = await kit.swap(params)
-    res.json({ success: true, result })
+    res.json({
+      success: true,
+      result: {
+        ...result,
+        grossAmountIn: safeAmount,
+        amountIn: platformFee.netAmount,
+        platformFee: {
+          bps: platformFee.feeBps,
+          amount: platformFee.feeAmount,
+          token: tokenIn,
+          treasury,
+          txHash: feeResult?.txHash,
+          explorerUrl: feeResult?.explorerUrl,
+        },
+      },
+    })
   } catch(e) {
     if (isNoSwapRouteError(e)) return noSwapRouteResponse(res, e)
     console.error('[swap]', e.message)
