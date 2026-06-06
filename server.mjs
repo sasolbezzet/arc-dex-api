@@ -67,6 +67,7 @@ const attestationLimiter = rateLimit({ windowMs: 60 * 1000, max: 45, keyPrefix: 
 const KIT_KEY = process.env.KIT_KEY
 const PORT = process.env.PORT || 3001
 const WALLET_DB = './wallets-db.json'
+const TX_HISTORY_DB = './tx-history-db.json'
 const AUTH_SECRET = process.env.AUTH_SECRET || process.env.CIRCLE_ENTITY_SECRET || process.env.CIRCLE_API_KEY || ''
 const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS || 24 * 60 * 60 * 1000)
 const LOGIN_WINDOW_MS = 5 * 60 * 1000
@@ -91,6 +92,7 @@ const SEND_TOKEN_MAP = {
   USDC: 'USDC',
   EURC: '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
   USYC: '0xe9185F0c5F296Ed1797AaE4238D26CCaBEadb86C',
+  cirBTC: '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF',
 }
 
 const TOKEN_DECIMALS = {
@@ -253,6 +255,12 @@ function normalizeAmount(value) {
   return raw
 }
 
+function normalizeArcToken(value) {
+  const raw = String(value || 'USDC')
+  if (raw.toUpperCase() === 'CIRBTC') return 'cirBTC'
+  return raw.toUpperCase()
+}
+
 function decimalToUnits(value, decimals) {
   const raw = normalizeAmount(value)
   const [whole, frac = ''] = raw.split('.')
@@ -270,6 +278,7 @@ function unitsToDecimal(units, decimals) {
 }
 
 function splitPlatformFee(amount, token) {
+  token = normalizeArcToken(token)
   const decimals = TOKEN_DECIMALS[token]
   if (decimals === undefined) throw new Error('Unsupported token decimals: ' + token)
   const amountUnits = decimalToUnits(amount, decimals)
@@ -326,6 +335,55 @@ function loadWallets() {
   catch { return {} }
 }
 function saveWallets(db) { writeFileSync(WALLET_DB, JSON.stringify(db, null, 2)) }
+function loadTxHistory() {
+  try {
+    if (!existsSync(TX_HISTORY_DB)) return {}
+    const db = JSON.parse(readFileSync(TX_HISTORY_DB, 'utf8'))
+    return db && typeof db === 'object' ? db : {}
+  } catch { return {} }
+}
+function saveTxHistory(db) { writeFileSync(TX_HISTORY_DB, JSON.stringify(db, null, 2)) }
+function sanitizeHistoryRecord(input, owner) {
+  const action = String(input?.action || input?.kind || '').toLowerCase()
+  if (!['bridge', 'swap', 'send'].includes(action)) throw new Error('Invalid history action')
+  const status = ['pending', 'success', 'error'].includes(String(input?.status)) ? String(input.status) : 'success'
+  const rec = {
+    id: String(input?.id || `${action}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`).slice(0, 96),
+    ts: Number(input?.ts || Date.now()),
+    owner,
+    action,
+    source: String(input?.source || 'web-ui').slice(0, 32),
+    walletSource: String(input?.walletSource || input?.fundingSource || '').slice(0, 32),
+    from: String(input?.from || '').slice(0, 64),
+    to: String(input?.to || '').slice(0, 128),
+    amount: String(input?.amount || '').slice(0, 64),
+    token: String(input?.token || 'USDC').slice(0, 32),
+    status,
+    tx: String(input?.tx || input?.txHash || '').slice(0, 96),
+    explorer: String(input?.explorer || input?.explorerUrl || '').slice(0, 220),
+    approveTx: String(input?.approveTx || '').slice(0, 96),
+    burnTx: String(input?.burnTx || '').slice(0, 96),
+    burnExplorerUrl: String(input?.burnExplorerUrl || input?.burnExplorer || '').slice(0, 220),
+    mintTx: String(input?.mintTx || '').slice(0, 128),
+    mintExplorerUrl: String(input?.mintExplorerUrl || input?.mintExplorer || '').slice(0, 240),
+    srcDomain: Number.isFinite(Number(input?.srcDomain)) ? Number(input.srcDomain) : undefined,
+    dstDomain: Number.isFinite(Number(input?.dstDomain)) ? Number(input.dstDomain) : undefined,
+    note: String(input?.note || '').slice(0, 500),
+    error: String(input?.error || '').slice(0, 500),
+  }
+  return rec
+}
+function appendTxHistory(owner, input) {
+  const normalized = normalizeAddress(owner, 'owner')
+  const db = loadTxHistory()
+  const key = normalized.toLowerCase()
+  const rec = sanitizeHistoryRecord(input, normalized)
+  const items = Array.isArray(db[key]) ? db[key] : []
+  const withoutExisting = items.filter(item => item?.id !== rec.id)
+  db[key] = [rec, ...withoutExisting].sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0)).slice(0, 100)
+  saveTxHistory(db)
+  return rec
+}
 
 async function getOrCreateWallet(metamaskAddr) {
   const addr = metamaskAddr.toLowerCase()
@@ -515,7 +573,7 @@ app.get('/api/balance/:address', async (req, res) => {
     for (const [sym, addr] of Object.entries(TOKENS)) {
       try {
         const bal = await client.readContract({ address: addr, abi: erc20Abi, functionName: 'balanceOf', args: [target] })
-        result[sym] = formatUnits(bal, 6)
+        result[sym] = formatUnits(bal, TOKEN_DECIMALS[sym] || 6)
       } catch { result[sym] = '0' }
     }
     res.json(result)
@@ -630,7 +688,7 @@ app.post('/api/prepare-bridge', apiLimiter, requireAuth, async (req, res) => {
     if (!metamaskAddress || !amount) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amount)
-    const bridgeToken = token || 'USDC'
+    const bridgeToken = normalizeArcToken(token || 'USDC')
     if (!TOKENS[bridgeToken]) return res.status(400).json({ error: 'Unsupported token: ' + bridgeToken })
     const wallet = await getOrCreateWallet(owner)
     const result = await kit.send({
@@ -857,7 +915,8 @@ app.post('/api/mint-direct', apiLimiter, requireServerSignedMintAuth, async (req
 // ── Send ──
 app.post('/api/send-estimate', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { metamaskAddress, toAddress, amount, token, source } = req.body
+    const { metamaskAddress, toAddress, amount, source } = req.body
+    const token = normalizeArcToken(req.body.token)
     if (!metamaskAddress || !toAddress || !amount || !token) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const destination = normalizeAddress(toAddress, 'toAddress')
@@ -866,10 +925,11 @@ app.post('/api/send-estimate', apiLimiter, requireAuth, async (req, res) => {
     if (!SEND_TOKEN_MAP[token]) return res.status(400).json({ error: 'Unsupported token: ' + token })
     const resolvedToken = SEND_TOKEN_MAP[token] || token
     const wallet = await getOrCreateWallet(owner)
+    const platformFee = splitPlatformFee(safeAmount, token)
     const params = {
       from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
       to: destination,
-      amount: safeAmount,
+      amount: platformFee.netAmount,
       token: resolvedToken,
     }
     const estimate = await kit.estimateSend(params)
@@ -879,6 +939,14 @@ app.post('/api/send-estimate', apiLimiter, requireAuth, async (req, res) => {
       fee: typeof fee === 'object' ? fee.amount : String(fee || '-'),
       token: typeof fee === 'object' ? (fee.token || 'USDC') : 'USDC',
       detail: estimate?.gas ? `${estimate.gas} gas` : 'App Kit estimate',
+      platformFee: {
+        bps: platformFee.feeBps,
+        amount: platformFee.feeAmount,
+        token,
+        treasury: normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY'),
+      },
+      grossAmount: safeAmount,
+      recipientReceives: platformFee.netAmount,
       estimate,
     })
   } catch(e) { console.error('[send-estimate]', e.message); res.status(500).json({ error: e.message }) }
@@ -886,7 +954,8 @@ app.post('/api/send-estimate', apiLimiter, requireAuth, async (req, res) => {
 
 app.post('/api/send', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { metamaskAddress, toAddress, amount, token, source } = req.body
+    const { metamaskAddress, toAddress, amount, source } = req.body
+    const token = normalizeArcToken(req.body.token)
     if (!metamaskAddress || !toAddress || !amount || !token) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const destination = normalizeAddress(toAddress, 'toAddress')
@@ -898,9 +967,46 @@ app.post('/api/send', apiLimiter, requireAuth, async (req, res) => {
     }
     const wallet = await getOrCreateWallet(owner)
     const fromCtx = { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address }
-    const result = await kit.send({ from: fromCtx, to: destination, amount: safeAmount, token: resolvedToken })
-    res.json({ success: true, result })
+    const platformFee = splitPlatformFee(safeAmount, token)
+    const treasury = normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY')
+    let feeResult = null
+    if (platformFee.feeUnits > 0n) {
+      feeResult = await kit.send({ from: fromCtx, to: treasury, amount: platformFee.feeAmount, token: resolvedToken })
+    }
+    const result = await kit.send({ from: fromCtx, to: destination, amount: platformFee.netAmount, token: resolvedToken })
+    res.json({
+      success: true,
+      result: {
+        ...result,
+        grossAmount: safeAmount,
+        amount: platformFee.netAmount,
+        platformFee: {
+          bps: platformFee.feeBps,
+          amount: platformFee.feeAmount,
+          token,
+          treasury,
+          txHash: feeResult?.txHash,
+          explorerUrl: feeResult?.explorerUrl,
+        },
+      },
+    })
   } catch(e) { console.error('[send]', e.message); res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/tx-history', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const db = loadTxHistory()
+    const items = Array.isArray(db[req.authAddress]) ? db[req.authAddress] : []
+    res.json({ success: true, history: items.slice(0, 100) })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/tx-history', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const owner = req.body?.metamaskAddress || req.body?.owner || req.authAddress
+    const rec = appendTxHistory(owner, req.body?.record || req.body)
+    res.json({ success: true, record: rec })
+  } catch(e) { console.error('[tx-history]', e.message); res.status(400).json({ error: e.message }) }
 })
 
 // ── History ──
