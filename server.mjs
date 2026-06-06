@@ -101,6 +101,12 @@ const TOKEN_DECIMALS = {
   USYC: 6,
   cirBTC: 8,
 }
+
+function swapTokenParam(token) {
+  if (token === 'USYC' || token === 'cirBTC') return TOKENS[token]
+  return token
+}
+
 const PLATFORM_FEE_BPS = Number(process.env.ARCOX_ROUTER_FEE_BPS || 30)
 const PLATFORM_TREASURY = process.env.ARCOX_FEE_TREASURY || '0xE34FF1D2C925DDafB28C95C2396fC49A6f64569e'
 
@@ -583,8 +589,10 @@ app.get('/api/balance/:address', async (req, res) => {
 // ── Quote ──
 app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { metamaskAddress, tokenIn, tokenOut, amountIn } = req.body
-    if (!metamaskAddress || !tokenIn || !tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
+    const { metamaskAddress, amountIn } = req.body
+    const tokenIn = normalizeArcToken(req.body.tokenIn)
+    const tokenOut = normalizeArcToken(req.body.tokenOut)
+    if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
     if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
@@ -595,8 +603,8 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
       const wallet = await getOrCreateWallet(owner)
       const estimate = await kit.estimateSwap({
         from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
-        tokenIn,
-        tokenOut,
+        tokenIn: swapTokenParam(tokenIn),
+        tokenOut: swapTokenParam(tokenOut),
         amountIn: platformFee.netAmount,
         config: { kitKey: KIT_KEY, allowanceStrategy: 'approve' },
       })
@@ -625,8 +633,10 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
 // ── Swap ──
 app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { metamaskAddress, tokenIn, tokenOut, amountIn } = req.body
-    if (!metamaskAddress || !tokenIn || !tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
+    const { metamaskAddress, amountIn } = req.body
+    const tokenIn = normalizeArcToken(req.body.tokenIn)
+    const tokenOut = normalizeArcToken(req.body.tokenOut)
+    if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
     if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
@@ -636,8 +646,8 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
     const wallet = await getOrCreateWallet(owner)
     const params = {
       from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
-      tokenIn,
-      tokenOut,
+      tokenIn: swapTokenParam(tokenIn),
+      tokenOut: swapTokenParam(tokenOut),
       amountIn: platformFee.netAmount,
       config: { kitKey: KIT_KEY, allowanceStrategy: 'approve' },
     }
