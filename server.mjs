@@ -116,6 +116,8 @@ function swapTokenParam(token) {
 
 const PLATFORM_FEE_BPS = Number(process.env.ARCOX_ROUTER_FEE_BPS || 30)
 const PLATFORM_TREASURY = process.env.ARCOX_FEE_TREASURY || '0xE34FF1D2C925DDafB28C95C2396fC49A6f64569e'
+const ARC_APPKIT_ADAPTER = '0xBBD70b01a1CAbc96d5b7b129Ae1AAabdf50dd40b'
+const STABLECOIN_SERVICE_BASE_URL = 'https://api.circle.com'
 
 const CCTP = {
   Arc_Testnet: {
@@ -341,6 +343,65 @@ function noSwapRouteResponse(res, err) {
     error: 'Route swap belum tersedia dari Circle Stablecoin Service untuk pasangan/jumlah ini. Coba jumlah lebih besar, atau ulangi beberapa menit lagi.',
     details: err?.message || String(err || ''),
   })
+}
+
+function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount }) {
+  if (!KIT_KEY) throw new Error('KIT_KEY belum dikonfigurasi')
+  if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) throw new Error('Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut))
+  if (tokenIn === tokenOut) throw new Error('Token swap harus berbeda')
+  return {
+    tokenInAddress: TOKENS[tokenIn],
+    tokenInChain: 'Arc_Testnet',
+    tokenOutAddress: TOKENS[tokenOut],
+    tokenOutChain: 'Arc_Testnet',
+    fromAddress: owner,
+    toAddress: owner,
+    amount: decimalToUnits(amount, TOKEN_DECIMALS[tokenIn]).toString(),
+    slippageBps: 300,
+  }
+}
+
+function stablecoinErrorMessage(payload, fallback) {
+  if (!payload || typeof payload !== 'object') return fallback
+  return payload.message || payload.error || payload.detail || fallback
+}
+
+async function stablecoinRequest(path, { method = 'GET', query, body } = {}) {
+  const url = new URL(path, STABLECOIN_SERVICE_BASE_URL)
+  if (query) {
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== null) url.searchParams.set(key, String(value))
+    }
+  }
+  const controller = new AbortController()
+  const id = setTimeout(() => controller.abort(), 20000)
+  try {
+    const response = await fetch(url, {
+      method,
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${KIT_KEY}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'arcox-api/1.0',
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    })
+    const text = await response.text()
+    const data = text ? JSON.parse(text) : {}
+    if (!response.ok) {
+      const msg = stablecoinErrorMessage(data, `Stablecoin Service HTTP ${response.status}`)
+      const err = new Error(msg)
+      err.responseBody = data
+      err.status = response.status
+      throw err
+    }
+    return data
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error('Stablecoin Service timeout. Coba ulang beberapa detik lagi.')
+    throw error
+  } finally {
+    clearTimeout(id)
+  }
 }
 
 function readJsonObject(path) {
@@ -860,6 +921,91 @@ app.get('/api/balance/:address', async (req, res) => {
 })
 
 // ── Quote ──
+app.post('/api/eoa-swap-quote', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { metamaskAddress, amountIn } = req.body
+    const tokenIn = normalizeArcToken(req.body.tokenIn)
+    const tokenOut = normalizeArcToken(req.body.tokenOut)
+    if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
+    const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
+    const safeAmount = normalizeAmount(amountIn)
+    const platformFee = splitPlatformFee(safeAmount, tokenIn)
+    const params = buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
+    const quote = await stablecoinRequest('/v1/stablecoinKits/quote', { query: params })
+    const estimatedUnits = BigInt(quote?.quote?.estimatedAmount || '0')
+    const minUnits = BigInt(quote?.quote?.minAmount || '0')
+    const amountOut = unitsToDecimal(estimatedUnits, TOKEN_DECIMALS[tokenOut])
+    const minAmountOut = unitsToDecimal(minUnits, TOKEN_DECIMALS[tokenOut])
+    return res.json({
+      available: true,
+      source: 'stablecoin-service',
+      provider: quote?.quote?.route?.provider || 'circle',
+      amountOut,
+      minAmountOut,
+      fee: '0.000000',
+      platformFee: {
+        bps: platformFee.feeBps,
+        amount: platformFee.feeAmount,
+        token: tokenIn,
+        treasury: PLATFORM_TREASURY,
+        swapAmountIn: platformFee.netAmount,
+      },
+      rate: Number(amountOut || 0) / Number(safeAmount || 1),
+    })
+  } catch(e) {
+    if (isNoSwapRouteError(e)) return noSwapRouteResponse(res, e)
+    console.error('[eoa-swap-quote]', e.message)
+    res.status(e.status || 500).json({ error: e.message })
+  }
+})
+
+app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { metamaskAddress, amountIn } = req.body
+    const tokenIn = normalizeArcToken(req.body.tokenIn)
+    const tokenOut = normalizeArcToken(req.body.tokenOut)
+    if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
+    const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
+    const safeAmount = normalizeAmount(amountIn)
+    const platformFee = splitPlatformFee(safeAmount, tokenIn)
+    const params = buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
+    const prepared = await stablecoinRequest('/v1/stablecoinKits/swap', { method: 'POST', body: params })
+    if (!prepared?.transaction?.executionParams || !prepared?.transaction?.signature) {
+      throw new Error('Stablecoin Service tidak mengembalikan payload EVM swap yang valid.')
+    }
+    const amountOut = unitsToDecimal(BigInt(prepared.estimatedAmount || '0'), TOKEN_DECIMALS[tokenOut])
+    return res.json({
+      success: true,
+      source: 'stablecoin-service',
+      route: 'eoa-appkit-adapter',
+      adapterContract: ARC_APPKIT_ADAPTER,
+      tokenIn,
+      tokenOut,
+      tokenInAddress: prepared.tokenInAddress,
+      tokenOutAddress: prepared.tokenOutAddress,
+      grossAmountIn: safeAmount,
+      amountIn: platformFee.netAmount,
+      amountBaseUnits: params.amount,
+      amountOut,
+      stopLimit: prepared.stopLimit,
+      estimatedAmount: prepared.estimatedAmount,
+      gasLimit: prepared.transaction.gasLimit,
+      executionParams: prepared.transaction.executionParams,
+      signature: prepared.transaction.signature,
+      platformFee: {
+        bps: platformFee.feeBps,
+        amount: platformFee.feeAmount,
+        token: tokenIn,
+        treasury: normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY'),
+      },
+    })
+  } catch(e) {
+    if (isNoSwapRouteError(e)) return noSwapRouteResponse(res, e)
+    console.error('[eoa-swap-prepare]', e.message)
+    res.status(e.status || 500).json({ error: e.message })
+  }
+})
+
 app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress, amountIn } = req.body
