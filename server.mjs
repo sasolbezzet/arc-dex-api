@@ -1381,6 +1381,34 @@ app.post('/api/dev/simulate-webhook', apiLimiter, async (req, res) => {
   }
 })
 
+app.get('/api/nanopayments/capabilities', apiLimiter, async (_req, res) => {
+  res.json({
+    provider: 'circle-gateway',
+    protocol: 'x402',
+    paymentRail: 'circle-gateway-nanopayments',
+    token: 'USDC',
+    currentMode: 'readiness',
+    live: false,
+    enabled: String(process.env.X402_ENABLED || 'false').toLowerCase() === 'true',
+    freeEndpoints: ['/api/invoices', '/api/invoices/:invoiceId', '/api/invoices/:invoiceId/status'],
+    protectedEndpointExamples: ['/api/eco/route-preview'],
+    expectedFlow: [
+      'Buyer deposits USDC into a Gateway Wallet contract outside ARCOX Pay invoice flow.',
+      'Buyer requests a premium ARCOX API resource.',
+      'ARCOX API returns HTTP 402 with request-bound amount, token, network, recipient, resource, and requestId.',
+      'Buyer signs an offchain EIP-3009 authorization.',
+      'Buyer retries the request with the payment proof.',
+      'ARCOX verifies proof binding and prevents replay before serving the premium response.',
+      'Circle Gateway settlement is future work and must be wired before live nanopayments are claimed.',
+    ],
+    safety: {
+      invoicePayments: 'Public ARCOX Pay invoices remain normal USDC payments and are not secretly charged by x402.',
+      privateKeys: 'Never store user private keys in the API or Web UI.',
+      replayProtection: 'x402 proof/requestId reuse is rejected by middleware.',
+    },
+  })
+})
+
 app.post('/api/eco/route-preview', apiLimiter, withX402PaymentRequired(async (req, res) => {
   try {
     res.json(await quoteEcoRoutePayment(req.body || {}))

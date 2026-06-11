@@ -50,6 +50,15 @@ export function withX402PaymentRequired(handler, config = {}) {
       recipient: String(config.recipient || process.env.X402_FEE_WALLET || ''),
       resource,
       requestId: req.headers['x-arcox-payment-request-id'] || randomUUID(),
+      protocol: 'x402',
+      paymentRail: 'circle-gateway-nanopayments',
+      authorizationType: 'EIP-3009',
+      settlement: {
+        mode: 'batched',
+        provider: 'circle-gateway',
+        live: false,
+        note: 'ARCOX exposes x402-ready requirements, but Circle Gateway Nanopayments settlement is not enabled unless a production verifier/settler is wired.',
+      },
     }
 
     if (!requirement.recipient) {
@@ -71,6 +80,7 @@ export function withX402PaymentRequired(handler, config = {}) {
       network: requirement.network,
       recipient: requirement.recipient,
       resource: requirement.resource,
+      protocol: requirement.protocol,
     }
     for (const [key, value] of Object.entries(expected)) {
       if (String(proof[key] || '') !== String(value)) {

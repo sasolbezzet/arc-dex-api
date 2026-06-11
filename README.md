@@ -10,6 +10,7 @@ Backend retail proxy untuk ARCOX DEX.
 - Circle Gateway webhook foundation dan dev simulator.
 - Eco route preview mock mode untuk future cross-chain stablecoin invoice.
 - x402-ready middleware untuk premium API endpoint, disabled by default.
+- Circle Gateway Nanopayments readiness metadata untuk future gas-free x402 payments.
 - `wallets-db.json` sebagai mapping owner ke Circle wallet proxy.
 - `tx-history-db.json` sebagai history transaksi web UI dan agent.
 - `invoices-db.json` sebagai invoice/payment request runtime storage.
@@ -72,10 +73,17 @@ ARCOX Pay adalah USDC payment request dan invoice layer untuk Arc. Fitur yang di
 - Eco adapter mock mode.
 - MCP compatibility.
 - Future x402 monetization.
+- Future Circle Gateway Nanopayments readiness.
 
 Yang real sekarang: public USDC invoice/payment link di Arc Testnet.
 
 Yang mock/future: production Eco routing, x402 berbayar aktif, dan privacy/private payment.
+
+Circle Gateway Nanopayments belum live. ARCOX hanya menyiapkan response `402 Payment Required`, proof binding, replay protection, dan endpoint readiness:
+
+```text
+GET /api/nanopayments/capabilities
+```
 
 ## Env Tambahan
 
