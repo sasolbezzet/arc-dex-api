@@ -14,6 +14,7 @@ Backend retail proxy untuk ARCOX DEX.
 - `tx-history-db.json` sebagai history transaksi web UI dan agent.
 - `invoices-db.json` sebagai invoice/payment request runtime storage.
 - `webhook-events-db.json` sebagai webhook raw event/idempotency storage.
+- Atomic JSON writes dengan `.bak` dan `runtime-backups/` untuk mengurangi risiko corrupt file saat crash.
 
 ## Bukan Tanggung Jawab
 
@@ -27,9 +28,38 @@ Backend retail proxy untuk ARCOX DEX.
 .env
 wallets-db.json
 tx-history-db.json
+invoices-db.json
+webhook-events-db.json
+runtime-backups/
 ```
 
-File DB JSON adalah state runtime lokal. Backup sebelum migrasi atau reset server.
+File DB JSON adalah state runtime lokal. Backup sebelum migrasi atau reset server. Untuk production serius, migrasi berikutnya tetap disarankan ke PostgreSQL/SQLite managed migration; atomic JSON backup ini adalah mitigasi VPS testnet.
+
+## VPS Deployment
+
+PM2:
+
+```bash
+cd /home/ubuntu/arc-dex-api
+npm install
+mkdir -p logs runtime-backups
+pm2 start ecosystem.config.cjs
+pm2 save
+```
+
+Restart setelah update:
+
+```bash
+cd /home/ubuntu/arc-dex-api
+git pull
+pm2 restart arc-dex-api
+```
+
+Direct fallback:
+
+```bash
+node --env-file=.env server.mjs
+```
 
 ## ARCOX Pay
 

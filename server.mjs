@@ -1,6 +1,6 @@
 import 'dotenv/config'
 import express from 'express'
-import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto'
 import { AppKit, SwapChain } from '@circle-fin/app-kit'
 import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
@@ -72,6 +72,7 @@ const WALLET_DB = './wallets-db.json'
 const TX_HISTORY_DB = './tx-history-db.json'
 const INVOICE_DB = './invoices-db.json'
 const WEBHOOK_DB = './webhook-events-db.json'
+const JSON_BACKUP_DIR = './runtime-backups'
 const AUTH_SECRET = process.env.AUTH_SECRET || process.env.CIRCLE_ENTITY_SECRET || process.env.CIRCLE_API_KEY || ''
 const ARCOX_PAY_BASE_URL = (process.env.ARCOX_PAY_BASE_URL || process.env.ARCOX_WEB_URL || 'https://arc-dex-bice.vercel.app').replace(/\/$/, '')
 const ENABLE_DEV_TOOLS = String(process.env.ENABLE_DEV_TOOLS || 'false').toLowerCase() === 'true'
@@ -342,19 +343,39 @@ function noSwapRouteResponse(res, err) {
   })
 }
 
-function loadWallets() {
-  try { return existsSync(WALLET_DB) ? JSON.parse(readFileSync(WALLET_DB, 'utf-8')) : {} }
-  catch { return {} }
-}
-function saveWallets(db) { writeFileSync(WALLET_DB, JSON.stringify(db, null, 2)) }
-function loadTxHistory() {
+function readJsonObject(path) {
   try {
-    if (!existsSync(TX_HISTORY_DB)) return {}
-    const db = JSON.parse(readFileSync(TX_HISTORY_DB, 'utf8'))
+    if (!existsSync(path)) return {}
+    const db = JSON.parse(readFileSync(path, 'utf8'))
     return db && typeof db === 'object' ? db : {}
-  } catch { return {} }
+  } catch {
+    const backup = `${path}.bak`
+    try {
+      if (!existsSync(backup)) return {}
+      const db = JSON.parse(readFileSync(backup, 'utf8'))
+      return db && typeof db === 'object' ? db : {}
+    } catch {
+      return {}
+    }
+  }
 }
-function saveTxHistory(db) { writeFileSync(TX_HISTORY_DB, JSON.stringify(db, null, 2)) }
+
+function atomicWriteJson(path, db) {
+  mkdirSync(JSON_BACKUP_DIR, { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  const data = JSON.stringify(db, null, 2)
+  if (existsSync(path)) {
+    copyFileSync(path, `${path}.bak`)
+    copyFileSync(path, `${JSON_BACKUP_DIR}/${path.replace(/[^a-zA-Z0-9_.-]/g, '_')}.${Date.now()}.bak`)
+  }
+  writeFileSync(tmp, data)
+  renameSync(tmp, path)
+}
+
+function loadWallets() { return readJsonObject(WALLET_DB) }
+function saveWallets(db) { atomicWriteJson(WALLET_DB, db) }
+function loadTxHistory() { return readJsonObject(TX_HISTORY_DB) }
+function saveTxHistory(db) { atomicWriteJson(TX_HISTORY_DB, db) }
 function sanitizeHistoryRecord(input, owner) {
   const action = String(input?.action || input?.kind || '').toLowerCase()
   if (!['bridge', 'swap', 'send'].includes(action)) throw new Error('Invalid history action')
@@ -397,24 +418,10 @@ function appendTxHistory(owner, input) {
   return rec
 }
 
-function readObjectDb(path) {
-  try {
-    if (!existsSync(path)) return {}
-    const db = JSON.parse(readFileSync(path, 'utf8'))
-    return db && typeof db === 'object' && !Array.isArray(db) ? db : {}
-  } catch {
-    return {}
-  }
-}
-
-function writeObjectDb(path, db) {
-  writeFileSync(path, JSON.stringify(db, null, 2))
-}
-
-function loadInvoices() { return readObjectDb(INVOICE_DB) }
-function saveInvoices(db) { writeObjectDb(INVOICE_DB, db) }
-function loadWebhookEvents() { return readObjectDb(WEBHOOK_DB) }
-function saveWebhookEvents(db) { writeObjectDb(WEBHOOK_DB, db) }
+function loadInvoices() { return readJsonObject(INVOICE_DB) }
+function saveInvoices(db) { atomicWriteJson(INVOICE_DB, db) }
+function loadWebhookEvents() { return readJsonObject(WEBHOOK_DB) }
+function saveWebhookEvents(db) { atomicWriteJson(WEBHOOK_DB, db) }
 
 function nowIso() { return new Date().toISOString() }
 
@@ -1069,7 +1076,7 @@ app.post('/api/mint-via-appkit', apiLimiter, requireServerSignedMintAuth, async 
 })
 
 // ── Mint CCTP Solana (Arc/EVM → Solana) - return attestation untuk Solflare sign ──
-app.post('/api/mint-cctp-solana', attestationLimiter, async (req, res) => {
+app.post('/api/mint-cctp-solana', attestationLimiter, requireAuth, async (req, res) => {
   try {
     const { burnTxHash, toAddress, fromChain } = req.body
     if (!burnTxHash || !toAddress) return res.status(400).json({ error: 'Missing params' })

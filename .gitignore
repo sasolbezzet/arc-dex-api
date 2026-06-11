@@ -3,8 +3,11 @@ node_modules/
 *.log
 wallets-db.json
 tx-history-db.json
+invoices-db.json
+webhook-events-db.json
+runtime-backups/
+logs/
 .codegraph/
 server.pid
 *.backup
 *.old
-ecosystem.config.cjs
