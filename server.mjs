@@ -1,13 +1,15 @@
 import 'dotenv/config'
 import express from 'express'
 import { readFileSync, writeFileSync, existsSync } from 'fs'
-import { createHmac, timingSafeEqual } from 'crypto'
+import { createHmac, randomUUID, timingSafeEqual } from 'crypto'
 import { AppKit, SwapChain } from '@circle-fin/app-kit'
 import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
 import { createPublicClient, createWalletClient, http, erc20Abi, formatUnits, defineChain, getAddress, isAddress, verifyMessage } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { initiateDeveloperControlledWalletsClient } from '@circle-fin/developer-controlled-wallets'
+import { quoteEcoRoutePayment } from './services/ecoAdapter.mjs'
+import { withX402PaymentRequired } from './middleware/x402.mjs'
 
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
 process.on('unhandledRejection', (reason) => console.error('[UnhandledRejection]', reason?.message || reason))
@@ -36,8 +38,8 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', origin)
     res.setHeader('Vary', 'Origin')
   }
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Arcox-Payment-Proof, X-Arcox-Payment-Request-Id')
   if (req.method === 'OPTIONS') return res.status(204).end()
   next()
 })
@@ -68,7 +70,11 @@ const KIT_KEY = process.env.KIT_KEY
 const PORT = process.env.PORT || 3001
 const WALLET_DB = './wallets-db.json'
 const TX_HISTORY_DB = './tx-history-db.json'
+const INVOICE_DB = './invoices-db.json'
+const WEBHOOK_DB = './webhook-events-db.json'
 const AUTH_SECRET = process.env.AUTH_SECRET || process.env.CIRCLE_ENTITY_SECRET || process.env.CIRCLE_API_KEY || ''
+const ARCOX_PAY_BASE_URL = (process.env.ARCOX_PAY_BASE_URL || process.env.ARCOX_WEB_URL || 'https://arc-dex-bice.vercel.app').replace(/\/$/, '')
+const ENABLE_DEV_TOOLS = String(process.env.ENABLE_DEV_TOOLS || 'false').toLowerCase() === 'true'
 const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS || 24 * 60 * 60 * 1000)
 const LOGIN_WINDOW_MS = 5 * 60 * 1000
 if (!process.env.AUTH_SECRET) console.warn('[security] AUTH_SECRET not set. Set a dedicated random AUTH_SECRET before production.')
@@ -389,6 +395,266 @@ function appendTxHistory(owner, input) {
   db[key] = [rec, ...withoutExisting].sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0)).slice(0, 100)
   saveTxHistory(db)
   return rec
+}
+
+function readObjectDb(path) {
+  try {
+    if (!existsSync(path)) return {}
+    const db = JSON.parse(readFileSync(path, 'utf8'))
+    return db && typeof db === 'object' && !Array.isArray(db) ? db : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeObjectDb(path, db) {
+  writeFileSync(path, JSON.stringify(db, null, 2))
+}
+
+function loadInvoices() { return readObjectDb(INVOICE_DB) }
+function saveInvoices(db) { writeObjectDb(INVOICE_DB, db) }
+function loadWebhookEvents() { return readObjectDb(WEBHOOK_DB) }
+function saveWebhookEvents(db) { writeObjectDb(WEBHOOK_DB, db) }
+
+function nowIso() { return new Date().toISOString() }
+
+function timelineEvent(type, message, txHash = '') {
+  return {
+    type,
+    message,
+    ...(txHash ? { txHash } : {}),
+    createdAt: nowIso(),
+  }
+}
+
+function paymentUrlFor(invoiceId) {
+  return `${ARCOX_PAY_BASE_URL}/pay?invoice=${encodeURIComponent(invoiceId)}`
+}
+
+function normalizeInvoiceToken(value) {
+  const token = String(value || 'USDC').toUpperCase()
+  if (token !== 'USDC') throw new Error('Unsupported token')
+  return 'USDC'
+}
+
+function normalizeInvoiceNetwork(value) {
+  const network = String(value || 'arc-testnet').toLowerCase()
+  if (network !== 'arc-testnet') throw new Error('Unsupported network')
+  return 'arc-testnet'
+}
+
+function invoiceIsExpired(invoice) {
+  return Date.now() > new Date(invoice.expiresAt).getTime()
+}
+
+function refreshInvoiceStatus(invoice) {
+  if (!invoice) return invoice
+  if (['paid', 'failed', 'cancelled', 'expired'].includes(invoice.status)) return invoice
+  if (invoiceIsExpired(invoice)) {
+    invoice.status = 'expired'
+    invoice.timeline = [...(invoice.timeline || []), timelineEvent('expired', 'Invoice expired before payment was completed.')]
+  }
+  return invoice
+}
+
+function getInvoiceOrThrow(invoiceId) {
+  const db = loadInvoices()
+  const invoice = db[String(invoiceId || '')]
+  if (!invoice) throw new Error('Invoice not found')
+  const refreshed = refreshInvoiceStatus(invoice)
+  db[refreshed.invoiceId] = refreshed
+  saveInvoices(db)
+  return refreshed
+}
+
+function createInvoice(input = {}) {
+  const amount = normalizeAmount(input.amount)
+  const token = normalizeInvoiceToken(input.token)
+  const network = normalizeInvoiceNetwork(input.network)
+  const merchantAddress = normalizeAddress(input.merchantAddress, 'merchantAddress')
+  const minutesRaw = Number(input.expiresInMinutes || 15)
+  const expiresInMinutes = Number.isFinite(minutesRaw) && minutesRaw > 0 ? Math.min(minutesRaw, 60 * 24 * 30) : 15
+  const invoiceId = `inv_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`
+  const createdAt = nowIso()
+  const invoice = {
+    invoiceId,
+    ...(input.orderId ? { orderId: String(input.orderId).slice(0, 96) } : {}),
+    merchantAddress,
+    amount,
+    token,
+    network,
+    ...(input.memo ? { memo: String(input.memo).slice(0, 500) } : {}),
+    status: 'unpaid',
+    paymentUrl: paymentUrlFor(invoiceId),
+    createdAt,
+    expiresAt: new Date(Date.now() + expiresInMinutes * 60 * 1000).toISOString(),
+    timeline: [timelineEvent('created', 'Invoice created.')],
+  }
+  const db = loadInvoices()
+  db[invoiceId] = invoice
+  saveInvoices(db)
+  return invoice
+}
+
+function patchInvoice(invoiceId, patch = {}) {
+  const db = loadInvoices()
+  const invoice = refreshInvoiceStatus(db[String(invoiceId || '')])
+  if (!invoice) throw new Error('Invoice not found')
+  if (patch.amount !== undefined && String(patch.amount) !== String(invoice.amount)) throw new Error('Invoice amount cannot be changed')
+  if (patch.token !== undefined && normalizeInvoiceToken(patch.token) !== invoice.token) throw new Error('Invoice token cannot be changed')
+  if (patch.network !== undefined && normalizeInvoiceNetwork(patch.network) !== invoice.network) throw new Error('Invoice network cannot be changed')
+  if (patch.merchantAddress !== undefined && normalizeAddress(patch.merchantAddress, 'merchantAddress') !== invoice.merchantAddress) throw new Error('Invoice merchantAddress cannot be changed')
+  if (patch.orderId !== undefined) invoice.orderId = String(patch.orderId).slice(0, 96)
+  if (patch.memo !== undefined) invoice.memo = String(patch.memo).slice(0, 500)
+  if (patch.txHash !== undefined && patch.txHash) invoice.txHash = normalizeTxHash(patch.txHash)
+  if (patch.payerAddress !== undefined && patch.payerAddress) invoice.payerAddress = normalizeAddress(patch.payerAddress, 'payerAddress')
+  if (patch.status !== undefined) {
+    const nextStatus = String(patch.status)
+    if (!['unpaid', 'pending', 'paid', 'expired', 'failed', 'cancelled'].includes(nextStatus)) throw new Error('Invalid invoice status')
+    if (invoice.status === 'paid' && nextStatus !== 'paid') throw new Error('Paid invoice cannot be changed')
+    if (invoice.status === 'expired' && nextStatus !== 'expired') throw new Error('Expired invoice cannot be changed')
+    if (invoiceIsExpired(invoice) && !['expired', 'failed', 'cancelled'].includes(nextStatus)) throw new Error('Invoice expired')
+    invoice.status = nextStatus
+    if (nextStatus === 'paid') invoice.paidAt = invoice.paidAt || nowIso()
+    invoice.timeline = [...(invoice.timeline || []), timelineEvent(`status_${nextStatus}`, `Invoice status updated to ${nextStatus}.`, invoice.txHash)]
+  }
+  db[invoice.invoiceId] = invoice
+  saveInvoices(db)
+  return invoice
+}
+
+function markInvoicePaid(invoiceId, input = {}) {
+  const db = loadInvoices()
+  const invoice = refreshInvoiceStatus(db[String(invoiceId || '')])
+  if (!invoice) throw new Error('Invoice not found')
+  if (invoice.status === 'paid') throw new Error('Invoice already paid')
+  if (invoice.status === 'expired' || invoiceIsExpired(invoice)) throw new Error('Invoice expired')
+  if (input.txHash) invoice.txHash = normalizeTxHash(input.txHash)
+  if (input.payerAddress) invoice.payerAddress = normalizeAddress(input.payerAddress, 'payerAddress')
+  invoice.status = 'paid'
+  invoice.paidAt = nowIso()
+  invoice.timeline = [...(invoice.timeline || []), timelineEvent('manual_mark_paid', 'Invoice marked paid by payment confirmation or sandbox tool.', invoice.txHash)]
+  db[invoice.invoiceId] = invoice
+  saveInvoices(db)
+  return invoice
+}
+
+async function verifyInvoicePaymentTx(invoice, input = {}) {
+  const txHash = normalizeTxHash(input.txHash, 'txHash')
+  const payerAddress = input.payerAddress ? normalizeAddress(input.payerAddress, 'payerAddress') : ''
+  const receipt = await publicClient.getTransactionReceipt({ hash: txHash }).catch(() => null)
+  if (!receipt) throw new Error('Payment transaction receipt not found')
+  if (receipt.status !== 'success') throw new Error('Payment transaction failed on-chain')
+  const expectedAmount = decimalToUnits(invoice.amount, 6)
+  const merchant = getAddress(invoice.merchantAddress).toLowerCase()
+  const payer = payerAddress ? payerAddress.toLowerCase() : ''
+  const matched = receipt.logs.some((log) => {
+    if (String(log.address).toLowerCase() !== TOKENS.USDC.toLowerCase()) return false
+    try {
+      const decoded = decodeEventLog({ abi: erc20Abi, data: log.data, topics: log.topics })
+      if (decoded.eventName !== 'Transfer') return false
+      const from = String(decoded.args?.from || '').toLowerCase()
+      const to = String(decoded.args?.to || '').toLowerCase()
+      const value = BigInt(decoded.args?.value || 0n)
+      return to === merchant && value === expectedAmount && (!payer || from === payer)
+    } catch {
+      return false
+    }
+  })
+  if (!matched) throw new Error('Payment transaction does not match invoice amount/token/recipient')
+  return true
+}
+
+function pickWebhookValue(payload, keys) {
+  for (const key of keys) {
+    const parts = key.split('.')
+    let current = payload
+    for (const part of parts) current = current?.[part]
+    if (current !== undefined && current !== null && String(current).trim()) return current
+  }
+  return ''
+}
+
+function extractWebhookFields(payload = {}) {
+  const eventType = String(pickWebhookValue(payload, ['eventType', 'type', 'event.type']) || '')
+  const notificationId = String(pickWebhookValue(payload, ['notificationId', 'id', 'eventId', 'event.id']) || `local_${randomUUID()}`)
+  const txHash = String(pickWebhookValue(payload, [
+    'txHash', 'transactionHash', 'data.txHash', 'data.transactionHash', 'event.data.txHash', 'event.data.transactionHash',
+  ]) || '')
+  const invoiceId = String(pickWebhookValue(payload, [
+    'invoiceId', 'reference', 'memo', 'metadata.invoiceId', 'data.invoiceId', 'data.reference', 'data.memo',
+    'data.metadata.invoiceId', 'event.data.invoiceId', 'event.data.metadata.invoiceId',
+  ]) || '')
+  return { eventType, notificationId, txHash, invoiceId }
+}
+
+function findInvoiceForWebhook(payload) {
+  const fields = extractWebhookFields(payload)
+  const db = loadInvoices()
+  if (fields.invoiceId && db[fields.invoiceId]) return { invoice: db[fields.invoiceId], fields }
+  for (const invoice of Object.values(db)) {
+    if (fields.txHash && String(invoice.txHash || '').toLowerCase() === fields.txHash.toLowerCase()) return { invoice, fields }
+    if (fields.invoiceId && String(invoice.memo || '').includes(fields.invoiceId)) return { invoice, fields }
+  }
+  return { invoice: null, fields }
+}
+
+async function processCircleGatewayWebhook(payload = {}) {
+  if (!payload || typeof payload !== 'object') throw new Error('Invalid webhook payload')
+  const fields = extractWebhookFields(payload)
+  if (!fields.eventType) throw new Error('Missing webhook event type')
+  const eventDb = loadWebhookEvents()
+  if (eventDb[fields.notificationId]) {
+    return { duplicate: true, event: eventDb[fields.notificationId] }
+  }
+  const event = {
+    id: `wh_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`,
+    provider: 'circle-gateway',
+    notificationId: fields.notificationId,
+    eventType: fields.eventType,
+    rawPayload: payload,
+    processed: false,
+    matched: false,
+    ...(fields.txHash ? { relatedTxHash: fields.txHash } : {}),
+    createdAt: nowIso(),
+  }
+  eventDb[fields.notificationId] = event
+  saveWebhookEvents(eventDb)
+
+  const { invoice } = findInvoiceForWebhook(payload)
+  if (!invoice) {
+    event.processed = true
+    event.matched = false
+    event.processedAt = nowIso()
+    eventDb[fields.notificationId] = event
+    saveWebhookEvents(eventDb)
+    return { duplicate: false, matched: false, event }
+  }
+
+  const invoiceDb = loadInvoices()
+  const target = refreshInvoiceStatus(invoiceDb[invoice.invoiceId])
+  const statusMap = {
+    'gateway.deposit.finalized': { status: 'pending', type: 'deposit_finalized', message: 'Circle Gateway deposit finalized.' },
+    'gateway.mint.forwarded': { status: 'pending', type: 'mint_forwarded', message: 'Circle Gateway mint forwarded.' },
+    'gateway.mint.finalized': { status: 'paid', type: 'mint_finalized', message: 'Circle Gateway mint finalized.' },
+  }
+  const mapped = statusMap[fields.eventType]
+  if (mapped && target.status !== 'paid') {
+    target.status = mapped.status
+    if (fields.txHash) target.txHash = fields.txHash
+    if (mapped.status === 'paid') target.paidAt = target.paidAt || nowIso()
+    target.timeline = [...(target.timeline || []), timelineEvent(mapped.type, mapped.message, fields.txHash)]
+    invoiceDb[target.invoiceId] = target
+    saveInvoices(invoiceDb)
+  }
+  event.processed = true
+  event.matched = true
+  event.relatedInvoiceId = target.invoiceId
+  event.relatedTxHash = fields.txHash || target.txHash
+  event.processedAt = nowIso()
+  eventDb[fields.notificationId] = event
+  saveWebhookEvents(eventDb)
+  return { duplicate: false, matched: true, event, invoice: target }
 }
 
 async function getOrCreateWallet(metamaskAddr) {
@@ -1019,6 +1285,110 @@ app.post('/api/tx-history', apiLimiter, requireAuth, async (req, res) => {
   } catch(e) { console.error('[tx-history]', e.message); res.status(400).json({ error: e.message }) }
 })
 
+// ── ARCOX Pay invoices ──
+app.post('/api/invoices', apiLimiter, async (req, res) => {
+  try {
+    res.json(createInvoice(req.body || {}))
+  } catch(e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/invoices/:invoiceId', apiLimiter, async (req, res) => {
+  try {
+    res.json(getInvoiceOrThrow(req.params.invoiceId))
+  } catch(e) {
+    res.status(404).json({ error: e.message })
+  }
+})
+
+app.patch('/api/invoices/:invoiceId', apiLimiter, async (req, res) => {
+  try {
+    res.json(patchInvoice(req.params.invoiceId, req.body || {}))
+  } catch(e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/invoices/:invoiceId/status', apiLimiter, async (req, res) => {
+  try {
+    const invoice = getInvoiceOrThrow(req.params.invoiceId)
+    res.json({
+      invoiceId: invoice.invoiceId,
+      orderId: invoice.orderId,
+      amount: invoice.amount,
+      token: invoice.token,
+      network: invoice.network,
+      status: invoice.status,
+      merchantAddress: invoice.merchantAddress,
+      txHash: invoice.txHash,
+      payerAddress: invoice.payerAddress,
+      paidAt: invoice.paidAt,
+      expiresAt: invoice.expiresAt,
+      timeline: invoice.timeline || [],
+    })
+  } catch(e) {
+    res.status(404).json({ error: e.message })
+  }
+})
+
+app.post('/api/invoices/:invoiceId/mark-paid', apiLimiter, async (req, res) => {
+  try {
+    if (!ENABLE_DEV_TOOLS) {
+      const invoice = getInvoiceOrThrow(req.params.invoiceId)
+      await verifyInvoicePaymentTx(invoice, req.body || {})
+    }
+    res.json(markInvoicePaid(req.params.invoiceId, req.body || {}))
+  } catch(e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.post('/api/webhooks/circle-gateway', apiLimiter, async (req, res) => {
+  try {
+    // TODO: verify Circle Gateway webhook signature once Circle webhook secret/header format is configured.
+    const result = await processCircleGatewayWebhook(req.body || {})
+    res.json({ ok: true, ...result })
+  } catch(e) {
+    res.status(400).json({ ok: false, error: e.message })
+  }
+})
+
+app.post('/api/dev/simulate-webhook', apiLimiter, async (req, res) => {
+  try {
+    if (!ENABLE_DEV_TOOLS) return res.status(404).json({ error: 'Dev tools disabled' })
+    const invoiceId = String(req.body?.invoiceId || '')
+    const eventType = String(req.body?.eventType || 'gateway.mint.finalized')
+    const txHash = String(req.body?.txHash || '')
+    const payload = {
+      notificationId: `sim_${invoiceId}_${eventType}_${txHash || Date.now()}`,
+      eventType,
+      invoiceId,
+      data: { invoiceId, txHash, metadata: { invoiceId } },
+    }
+    const result = await processCircleGatewayWebhook(payload)
+    const invoice = invoiceId ? getInvoiceOrThrow(invoiceId) : undefined
+    res.json({ ok: true, ...result, invoice })
+  } catch(e) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.post('/api/eco/route-preview', apiLimiter, withX402PaymentRequired(async (req, res) => {
+  try {
+    res.json(await quoteEcoRoutePayment(req.body || {}))
+  } catch(e) {
+    res.status(400).json({ error: e.message })
+  }
+}, {
+  enabled: String(process.env.X402_ENABLED || 'false').toLowerCase() === 'true',
+  price: '0.01',
+  token: process.env.X402_DEFAULT_TOKEN || 'USDC',
+  network: process.env.X402_DEFAULT_NETWORK || 'arc-testnet',
+  recipient: process.env.X402_FEE_WALLET || '',
+  resource: '/api/eco/route-preview',
+}))
+
 // ── History ──
 app.get('/api/history/:address', async (req, res) => {
   try {
@@ -1037,4 +1407,5 @@ app.listen(PORT, () => {
   console.log(`╚════════════════════════════════╝\n`)
   console.log('Routes: health, wallet, balance, quote, swap, prepare-bridge,')
   console.log('        get-attestation, mint-cctp-solana, mint-cctp-from-solana, send, history')
+  console.log('        invoices, circle-gateway webhook, eco route-preview')
 })
