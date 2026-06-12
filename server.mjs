@@ -38,11 +38,12 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', origin)
     res.setHeader('Vary', 'Origin')
   }
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PATCH, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Arcox-Payment-Proof, X-Arcox-Payment-Request-Id')
   if (req.method === 'OPTIONS') return res.status(204).end()
   next()
 })
+app.use(['/api/webhooks/nowpayments', '/api/webhooks/circle'], express.raw({ type: '*/*', limit: '256kb' }))
 app.use(express.json({ limit: '64kb' }))
 
 function rateLimit({ windowMs, max, keyPrefix }) {
@@ -643,6 +644,50 @@ function pickWebhookValue(payload, keys) {
   return ''
 }
 
+function rawWebhookBody(req) {
+  if (Buffer.isBuffer(req.body)) return req.body.toString('utf8')
+  if (typeof req.body === 'string') return req.body
+  if (req.body && typeof req.body === 'object') return JSON.stringify(req.body)
+  return ''
+}
+
+function parseWebhookJson(rawBody) {
+  if (!rawBody) return {}
+  try {
+    const payload = JSON.parse(rawBody)
+    return payload && typeof payload === 'object' ? payload : {}
+  } catch(e) {
+    return { _parseError: e.message || 'Invalid JSON' }
+  }
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function safeEqualHex(left, right) {
+  const a = String(left || '').trim().toLowerCase()
+  const b = String(right || '').trim().toLowerCase()
+  if (!a || !b || a.length !== b.length) return false
+  try {
+    return timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'))
+  } catch {
+    return false
+  }
+}
+
+function firstWebhookString(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === '') continue
+    return String(value)
+  }
+  return ''
+}
+
 function extractWebhookFields(payload = {}) {
   const eventType = String(pickWebhookValue(payload, ['eventType', 'type', 'event.type']) || '')
   const notificationId = String(pickWebhookValue(payload, ['notificationId', 'id', 'eventId', 'event.id']) || `local_${randomUUID()}`)
@@ -654,6 +699,60 @@ function extractWebhookFields(payload = {}) {
     'data.metadata.invoiceId', 'event.data.invoiceId', 'event.data.metadata.invoiceId',
   ]) || '')
   return { eventType, notificationId, txHash, invoiceId }
+}
+
+function extractCircleGatewayFields(payload = {}) {
+  const data = payload.data && typeof payload.data === 'object' ? payload.data : {}
+  const eventId = firstWebhookString(payload.notificationId, payload.id, payload.eventId, data.notificationId, data.id)
+  const eventType = firstWebhookString(payload.type, payload.eventType, payload.notificationType, data.type, data.eventType)
+  const status = firstWebhookString(payload.status, data.status, eventType)
+  return {
+    eventId,
+    eventType,
+    status,
+    subscriptionId: firstWebhookString(payload.subscriptionId, data.subscriptionId),
+    walletAddress: firstWebhookString(payload.walletAddress, data.walletAddress, data.address),
+    blockchain: firstWebhookString(payload.blockchain, payload.domain, data.blockchain, data.domain),
+    txHash: firstWebhookString(payload.txHash, payload.transactionHash, data.txHash, data.transactionHash),
+    sourceChain: firstWebhookString(payload.sourceChain, data.sourceChain),
+    destinationChain: firstWebhookString(payload.destinationChain, data.destinationChain),
+    amount: firstWebhookString(payload.amount, data.amount),
+    token: firstWebhookString(payload.token, payload.currency, data.token, data.currency),
+    createdAt: firstWebhookString(payload.createdAt, data.createdAt),
+    rawPayload: payload,
+  }
+}
+
+function verifyNowpaymentsIpn(req, rawBody, payload) {
+  const verifyIpn = String(process.env.NOWPAYMENTS_VERIFY_IPN || 'false').toLowerCase() === 'true'
+  if (!verifyIpn) return { ok: true }
+  const secret = process.env.NOWPAYMENTS_IPN_SECRET || ''
+  const signature = String(req.headers['x-nowpayments-sig'] || '')
+  if (!secret || !signature) return { ok: false, error: 'NOWPayments IPN signature required' }
+  const signedPayload = payload?._parseError ? rawBody : stableStringify(payload)
+  const expected = createHmac('sha512', secret).update(signedPayload).digest('hex')
+  if (!safeEqualHex(expected, signature)) return { ok: false, error: 'Invalid NOWPayments IPN signature' }
+  return { ok: true }
+}
+
+function saveGenericWebhookEvent(provider, notificationId, eventType, rawPayload, extra = {}) {
+  const eventDb = loadWebhookEvents()
+  const id = String(notificationId || `${provider}_${Date.now()}_${randomUUID().slice(0, 8)}`)
+  if (eventDb[id]) return { duplicate: true, event: eventDb[id] }
+  const event = {
+    id: `wh_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`,
+    provider,
+    notificationId: id,
+    eventType: String(eventType || ''),
+    rawPayload,
+    processed: false,
+    matched: false,
+    createdAt: nowIso(),
+    ...extra,
+  }
+  eventDb[id] = event
+  saveWebhookEvents(eventDb)
+  return { duplicate: false, event }
 }
 
 function findInvoiceForWebhook(payload) {
@@ -1495,6 +1594,111 @@ app.post('/api/invoices/:invoiceId/mark-paid', apiLimiter, async (req, res) => {
   } catch(e) {
     res.status(400).json({ error: e.message })
   }
+})
+
+app.get('/api/webhooks/nowpayments', (_req, res) => {
+  res.json({
+    ok: true,
+    provider: 'nowpayments',
+    message: 'NOWPayments webhook endpoint is alive. Use POST for callbacks.',
+  })
+})
+
+app.post('/api/webhooks/nowpayments', apiLimiter, async (req, res) => {
+  const rawBody = rawWebhookBody(req)
+  console.log('[webhook:nowpayments] raw payload', rawBody)
+  const payload = parseWebhookJson(rawBody)
+  const verification = verifyNowpaymentsIpn(req, rawBody, payload)
+  if (!verification.ok) return res.status(401).json({ ok: false, provider: 'nowpayments', error: verification.error })
+
+  const event = {
+    payment_id: payload.payment_id,
+    payment_status: payload.payment_status,
+    order_id: payload.order_id,
+    price_amount: payload.price_amount,
+    price_currency: payload.price_currency,
+    pay_amount: payload.pay_amount,
+    pay_currency: payload.pay_currency,
+    actually_paid: payload.actually_paid,
+    pay_address: payload.pay_address,
+    purchase_id: payload.purchase_id,
+    outcome_amount: payload.outcome_amount,
+    outcome_currency: payload.outcome_currency,
+  }
+  console.log('[webhook:nowpayments] parsed event', event)
+
+  saveGenericWebhookEvent('nowpayments', event.payment_id || event.purchase_id || `nowpayments_${Date.now()}`, event.payment_status || 'ipn', payload, {
+    relatedInvoiceId: event.order_id || undefined,
+    processed: true,
+    processedAt: nowIso(),
+  })
+
+  // TODO: save NOWPayments webhook payload into payment_events/webhook_events table.
+  // TODO: update ARCOX payment status by payment_id/order_id.
+  // TODO: if payment_status is finished/confirmed, mark order as paid and unlock ARCOX service.
+
+  res.json({
+    ok: true,
+    received: true,
+    provider: 'nowpayments',
+    payment_id: event.payment_id || null,
+    payment_status: event.payment_status || null,
+    order_id: event.order_id || null,
+  })
+})
+
+app.head('/api/webhooks/circle', (_req, res) => res.status(200).end())
+
+app.get('/api/webhooks/circle', (_req, res) => {
+  res.json({
+    ok: true,
+    provider: 'circle',
+    product: 'gateway',
+    message: 'Circle Gateway webhook endpoint is alive. Use POST for callbacks.',
+  })
+})
+
+app.post('/api/webhooks/circle', apiLimiter, async (req, res) => {
+  const rawBody = rawWebhookBody(req)
+  console.log('[webhook:circle-gateway] raw payload', rawBody)
+  const payload = parseWebhookJson(rawBody)
+
+  const verifyWebhook = String(process.env.CIRCLE_VERIFY_WEBHOOK || 'false').toLowerCase() === 'true'
+  if (verifyWebhook) {
+    const signature = String(req.headers['circle-signature'] || req.headers['x-circle-signature'] || '')
+    // TODO: implement Circle Gateway webhook signature verification when Circle publishes/assigns the exact signing header and secret for this subscription.
+    if (!signature) return res.status(401).json({ ok: false, provider: 'circle', product: 'gateway', error: 'Circle webhook signature required' })
+    return res.status(401).json({ ok: false, provider: 'circle', product: 'gateway', error: 'Circle webhook signature verification is not configured yet' })
+  }
+
+  const fields = extractCircleGatewayFields(payload)
+  const saved = saveGenericWebhookEvent('circle-gateway', fields.eventId || `circle_${Date.now()}`, fields.eventType || 'gateway.unknown', payload, {
+    relatedTxHash: fields.txHash || undefined,
+  })
+
+  if (!saved.duplicate) {
+    if (fields.eventType === 'gateway.deposit.finalized') {
+      // TODO: mark source-chain USDC deposit as finalized.
+    } else if (fields.eventType === 'gateway.mint.forwarded') {
+      // TODO: mark Gateway mint relay as forwarded/confirmed.
+    } else if (fields.eventType === 'gateway.mint.finalized') {
+      // TODO: mark destination-chain USDC mint as finalized and usable by ARCOX treasury.
+    } else if (fields.eventType?.startsWith('gateway.')) {
+      // TODO: store unhandled Circle Gateway lifecycle event for reconciliation.
+    }
+  }
+  // TODO: store Circle notification ID to prevent duplicate processing.
+
+  console.log('[webhook:circle-gateway] parsed event', { ...fields, rawPayload: undefined, duplicate: saved.duplicate })
+  res.json({
+    ok: true,
+    received: true,
+    provider: 'circle',
+    product: 'gateway',
+    eventId: fields.eventId || null,
+    eventType: fields.eventType || null,
+    status: fields.status || null,
+  })
 })
 
 app.post('/api/webhooks/circle-gateway', apiLimiter, async (req, res) => {
