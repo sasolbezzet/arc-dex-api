@@ -6,7 +6,7 @@ const router = Router()
 const arkham = new ArkhamService()
 
 function paid(priceEnv, fallback, handler) {
-  return withArcoxX402(handler, { amount: priceFromEnv(priceEnv, fallback), service: 'arcox_intel' })
+  return withArcoxX402(handler, { amount: priceFromEnv(priceEnv, fallback), priceEnv, service: 'arcox_intel' })
 }
 
 function sendArkham(pathBuilder, priceEnv, fallback) {

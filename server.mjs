@@ -13,6 +13,7 @@ import { withX402PaymentRequired } from './middleware/x402.mjs'
 import arkhamRoutes from './src/routes/arkhamRoutes.mjs'
 import nowpaymentsRoutes from './src/routes/nowpaymentsRoutes.mjs'
 import treasuryRoutes from './src/routes/treasuryRoutes.mjs'
+import x402Routes from './src/routes/x402Routes.mjs'
 
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
 process.on('unhandledRejection', (reason) => console.error('[UnhandledRejection]', reason?.message || reason))
@@ -42,7 +43,7 @@ app.use((req, res, next) => {
     res.setHeader('Vary', 'Origin')
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PATCH, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Arcox-Payment-Proof, X-Arcox-Payment-Request-Id, X-Payment, X-Payment-Proof')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Arcox-Payment-Proof, X-Arcox-Payment-Request-Id, X-Arcox-Payment-Tx, X-Payment, X-Payment-Proof, X-Payment-ID, X-Payment-TX')
   if (req.method === 'OPTIONS') return res.status(204).end()
   next()
 })
@@ -72,6 +73,7 @@ const attestationLimiter = rateLimit({ windowMs: 60 * 1000, max: 45, keyPrefix: 
 app.use('/api/intel', apiLimiter, arkhamRoutes)
 app.use('/api/nowpayments', apiLimiter, nowpaymentsRoutes)
 app.use('/api/treasury', apiLimiter, treasuryRoutes)
+app.use('/api/x402', apiLimiter, x402Routes)
 
 const KIT_KEY = process.env.KIT_KEY
 const PORT = process.env.PORT || 3001
