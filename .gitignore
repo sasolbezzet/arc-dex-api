@@ -1,5 +1,13 @@
 node_modules/
 .env
+.env.local
+.env.*.local
+*.pem
+*.key
+private-key*
+seed*
+mnemonic*
+.vercel
 *.log
 wallets-db.json
 tx-history-db.json

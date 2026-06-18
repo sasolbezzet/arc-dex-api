@@ -73,11 +73,19 @@ ARCOX Pay adalah USDC payment request dan invoice layer untuk Arc. Fitur yang di
 - Eco adapter mock mode.
 - MCP compatibility.
 - Future x402 monetization.
+- ARCOX Intel API: selected Arkham-backed intelligence endpoints protected by x402.
 - Future Circle Gateway Nanopayments readiness.
 
 Yang real sekarang: public USDC invoice/payment link di Arc Testnet.
 
 Yang mock/future: production Eco routing, x402 berbayar aktif, dan privacy/private payment.
+
+ARCOX Intel:
+
+- Backend only: `ARKHAM_API_KEY` belongs in `arc-dex-api` env.
+- Frontend and MCP call `/api/intel/*`; they never call Arkham directly.
+- Development/testnet can use `X-PAYMENT: mock-paid` when `X402_VERIFY_PAYMENT=false`.
+- See `docs/arcox-intel.md`.
 
 Circle Gateway Nanopayments belum live. ARCOX hanya menyiapkan response `402 Payment Required`, proof binding, replay protection, dan endpoint readiness:
 

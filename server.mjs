@@ -10,6 +10,9 @@ import { privateKeyToAccount } from 'viem/accounts'
 import { initiateDeveloperControlledWalletsClient } from '@circle-fin/developer-controlled-wallets'
 import { quoteEcoRoutePayment } from './services/ecoAdapter.mjs'
 import { withX402PaymentRequired } from './middleware/x402.mjs'
+import arkhamRoutes from './src/routes/arkhamRoutes.mjs'
+import nowpaymentsRoutes from './src/routes/nowpaymentsRoutes.mjs'
+import treasuryRoutes from './src/routes/treasuryRoutes.mjs'
 
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
 process.on('unhandledRejection', (reason) => console.error('[UnhandledRejection]', reason?.message || reason))
@@ -39,7 +42,7 @@ app.use((req, res, next) => {
     res.setHeader('Vary', 'Origin')
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PATCH, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Arcox-Payment-Proof, X-Arcox-Payment-Request-Id')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Arcox-Payment-Proof, X-Arcox-Payment-Request-Id, X-Payment, X-Payment-Proof')
   if (req.method === 'OPTIONS') return res.status(204).end()
   next()
 })
@@ -66,6 +69,9 @@ function rateLimit({ windowMs, max, keyPrefix }) {
 const authLimiter = rateLimit({ windowMs: 5 * 60 * 1000, max: 20, keyPrefix: 'auth' })
 const apiLimiter = rateLimit({ windowMs: 60 * 1000, max: 120, keyPrefix: 'api' })
 const attestationLimiter = rateLimit({ windowMs: 60 * 1000, max: 45, keyPrefix: 'attestation' })
+app.use('/api/intel', apiLimiter, arkhamRoutes)
+app.use('/api/nowpayments', apiLimiter, nowpaymentsRoutes)
+app.use('/api/treasury', apiLimiter, treasuryRoutes)
 
 const KIT_KEY = process.env.KIT_KEY
 const PORT = process.env.PORT || 3001
