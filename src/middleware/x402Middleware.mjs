@@ -1,11 +1,15 @@
-import { randomUUID } from 'crypto'
-import { createPublicClient, decodeEventLog, defineChain, erc20Abi, getAddress, http, parseUnits } from 'viem'
+import { randomUUID, createHmac, timingSafeEqual } from 'crypto'
 
-const payments = globalThis.__arcoxX402Payments || new Map()
-globalThis.__arcoxX402Payments = payments
+const invoices = globalThis.__arcoxX402Invoices || new Map()
+globalThis.__arcoxX402Invoices = invoices
 
-const usedTxHashes = globalThis.__arcoxX402UsedTxHashes || new Set()
-globalThis.__arcoxX402UsedTxHashes = usedTxHashes
+const webhookEvents = globalThis.__arcoxX402WebhookEvents || new Map()
+globalThis.__arcoxX402WebhookEvents = webhookEvents
+
+const unmatchedInboundEvents = globalThis.__arcoxX402UnmatchedInboundEvents || []
+globalThis.__arcoxX402UnmatchedInboundEvents = unmatchedInboundEvents
+
+let uniqueCounter = globalThis.__arcoxX402UniqueCounter || 0
 
 export function priceFromEnv(name, fallback) {
   return String(process.env[name] || fallback)
@@ -14,114 +18,239 @@ export function priceFromEnv(name, fallback) {
 export function x402Config() {
   return {
     enabled: String(process.env.X402_ENABLED || 'true').toLowerCase() === 'true',
-    verifyPayment: String(process.env.X402_VERIFY_PAYMENT || 'false').toLowerCase() === 'true',
-    network: process.env.X402_NETWORK || 'arc-testnet',
-    chainId: Number(process.env.X402_CHAIN_ID || process.env.ARC_CHAIN_ID || 5042002),
+    mode: process.env.X402_MODE || 'circle_webhook_testnet',
+    baseAmount: String(process.env.X402_BASE_AMOUNT || process.env.X402_DEFAULT_PRICE_USDC || '0.005'),
+    ttlSeconds: Number(process.env.X402_PAYMENT_TTL_SECONDS || process.env.X402_PAYMENT_EXPIRY_SECONDS || 300),
     asset: process.env.X402_ASSET || 'USDC',
-    tokenAddress: process.env.X402_USDC_ADDRESS || '0x3600000000000000000000000000000000000000',
-    recipient: process.env.X402_RECIPIENT_ADDRESS || '',
-    rpcUrl: process.env.ARC_RPC_URL || process.env.RPC || 'https://rpc.testnet.arc.network/',
-    expiresInSeconds: Number(process.env.X402_PAYMENT_EXPIRY_SECONDS || 300),
+    network: process.env.CIRCLE_X402_NETWORK || process.env.X402_NETWORK || 'circle-sandbox-testnet',
+    circleEnvironment: process.env.CIRCLE_ENV || 'sandbox',
+    circleBaseUrl: process.env.CIRCLE_BASE_URL || 'https://api-sandbox.circle.com',
+    circleTreasuryWalletId: process.env.CIRCLE_X402_TREASURY_WALLET_ID || '',
+    circleTreasuryAddress: process.env.CIRCLE_X402_TREASURY_ADDRESS || process.env.X402_RECIPIENT_ADDRESS || '',
   }
 }
 
-export function createX402PaymentRequest(input = {}) {
+function normalizeAmount(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) throw new Error('Invalid x402 amount')
+  return n.toFixed(6)
+}
+
+function nextUniqueAmount(baseAmount) {
+  uniqueCounter = (uniqueCounter % 999) + 1
+  globalThis.__arcoxX402UniqueCounter = uniqueCounter
+  const base = Number(normalizeAmount(baseAmount))
+  return (base + uniqueCounter / 1_000_000).toFixed(6)
+}
+
+export function createX402Invoice(input = {}) {
   const cfg = x402Config()
-  const amount = String(input.amount || process.env.X402_DEFAULT_PRICE_USDC || '0.01')
-  const resource = String(input.resource || '/api/intel')
-  const paymentId = input.paymentId || `x402_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`
   const now = Date.now()
-  const request = {
-    service: input.service || 'arcox_intel',
+  const invoiceId = input.invoiceId || `arcox_x402_${randomUUID().replaceAll('-', '').slice(0, 16)}`
+  const paymentId = input.paymentId || `x402_${randomUUID().replaceAll('-', '').slice(0, 16)}`
+  const baseAmount = normalizeAmount(input.amount || cfg.baseAmount)
+  const uniqueAmount = normalizeAmount(input.uniqueAmount || nextUniqueAmount(baseAmount))
+  const invoice = {
+    invoiceId,
     paymentId,
-    nonce: paymentId,
-    amount,
+    service: input.service || 'arcox_intel',
+    resource: String(input.resource || '/api/intel'),
+    status: 'pending',
     asset: cfg.asset,
     network: cfg.network,
-    chainId: cfg.chainId,
-    tokenAddress: cfg.tokenAddress,
-    recipient: cfg.recipient,
-    resource,
-    status: 'pending',
+    circleEnvironment: cfg.circleEnvironment,
+    circleTreasuryWalletId: cfg.circleTreasuryWalletId,
+    recipient: cfg.circleTreasuryAddress,
+    baseAmount,
+    uniqueAmount,
+    amount: uniqueAmount,
     createdAt: new Date(now).toISOString(),
-    expiresAt: new Date(now + cfg.expiresInSeconds * 1000).toISOString(),
-    expiresInSeconds: cfg.expiresInSeconds,
-    verifyPayment: cfg.verifyPayment,
-    mockMode: !cfg.verifyPayment,
+    expiresAt: new Date(now + cfg.ttlSeconds * 1000).toISOString(),
+    expiresInSeconds: cfg.ttlSeconds,
+    mockMode: false,
   }
-  payments.set(paymentId, request)
-  return request
+  invoices.set(invoiceId, invoice)
+  invoices.set(paymentId, invoice)
+  return invoice
 }
 
-export function getX402PaymentRequest(paymentId) {
-  const item = payments.get(String(paymentId || ''))
-  if (!item) return null
-  if (item.status === 'pending' && Date.now() > Date.parse(item.expiresAt)) {
-    item.status = 'expired'
-    item.updatedAt = new Date().toISOString()
-    payments.set(item.paymentId, item)
+export function getX402Invoice(id) {
+  const invoice = invoices.get(String(id || ''))
+  if (!invoice) return null
+  if (invoice.status === 'pending' && Date.now() > Date.parse(invoice.expiresAt)) {
+    invoice.status = 'expired'
+    invoice.updatedAt = new Date().toISOString()
+    invoices.set(invoice.invoiceId, invoice)
+    invoices.set(invoice.paymentId, invoice)
   }
-  return item
+  return invoice
 }
 
-export async function verifyX402Payment({ paymentId, txHash, payerAddress }) {
-  const request = getX402PaymentRequest(paymentId)
-  if (!request) return { ok: false, error: 'Unknown x402 paymentId' }
-  if (request.status === 'expired') return { ok: false, error: 'x402 payment expired', payment: request }
-  if (request.status === 'used') return { ok: false, error: 'x402 payment already used', payment: request }
-  if (!/^0x[0-9a-fA-F]{64}$/.test(String(txHash || ''))) return { ok: false, error: 'Invalid x402 txHash', payment: request }
-  const hash = String(txHash).toLowerCase()
-  if (usedTxHashes.has(hash)) return { ok: false, error: 'x402 txHash already used', payment: request }
+export function publicInvoice(invoice) {
+  if (!invoice) return null
+  return {
+    invoiceId: invoice.invoiceId,
+    paymentId: invoice.paymentId,
+    service: invoice.service,
+    resource: invoice.resource,
+    status: invoice.status,
+    asset: invoice.asset,
+    network: invoice.network,
+    circleEnvironment: invoice.circleEnvironment,
+    circleTreasuryWalletId: invoice.circleTreasuryWalletId,
+    recipient: invoice.recipient,
+    baseAmount: invoice.baseAmount,
+    uniqueAmount: invoice.uniqueAmount,
+    amount: invoice.uniqueAmount,
+    createdAt: invoice.createdAt,
+    expiresAt: invoice.expiresAt,
+    expiresInSeconds: invoice.expiresInSeconds,
+    txHash: invoice.txHash,
+    paidAt: invoice.paidAt,
+    mockMode: false,
+  }
+}
+
+function normalizeAddress(value) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function normalizeAsset(value) {
+  return String(value || '').trim().toUpperCase()
+}
+
+function normalizeNetwork(value) {
+  return String(value || '').trim().toLowerCase().replace(/[\s_-]+/g, '-')
+}
+
+function eventIdFromCircle(payload) {
+  return String(payload?.notificationId || payload?.id || payload?.eventId || payload?.data?.id || payload?.data?.transactionId || payload?.data?.transferId || '')
+}
+
+function eventTypeFromCircle(payload) {
+  return String(payload?.type || payload?.notificationType || payload?.eventType || payload?.event || '')
+}
+
+function dataFromCircle(payload) {
+  return payload?.data && typeof payload.data === 'object' ? payload.data : payload || {}
+}
+
+function amountFromCircle(data) {
+  const amount = data.amount?.amount ?? data.amount ?? data.amounts?.[0]?.amount
+  return normalizeAmount(amount)
+}
+
+function assetFromCircle(data) {
+  return normalizeAsset(data.currency || data.asset || data.token || data.amount?.currency || data.amounts?.[0]?.currency)
+}
+
+function networkFromCircle(data, fallback) {
+  return normalizeNetwork(data.network || data.chain || data.blockchain || data.blockchainName || data.destinationChain || fallback)
+}
+
+function destinationFromCircle(data) {
+  return data.destinationAddress || data.toAddress || data.walletAddress || data.address || data.destination?.address || data.to
+}
+
+function txHashFromCircle(data) {
+  return data.txHash || data.transactionHash || data.transaction?.txHash || data.hash
+}
+
+function statusFromCircle(data) {
+  return String(data.status || data.state || data.transactionStatus || '').toLowerCase()
+}
+
+function isFinalCircleStatus(status) {
+  return ['final', 'finalized', 'confirmed', 'complete', 'completed', 'success', 'succeeded'].includes(status)
+}
+
+export function verifyCircleWebhookSignature(req, rawBody) {
+  const secret = process.env.CIRCLE_WEBHOOK_SECRET || ''
+  if (!secret) return { ok: true, skipped: true }
+  const signature = String(req.headers['circle-signature'] || req.headers['x-circle-signature'] || req.headers['circle-signature-sha256'] || '')
+  if (!signature) return { ok: false, error: 'Circle webhook signature required' }
+  const expected = createHmac('sha256', secret).update(rawBody).digest('hex')
+  const normalized = signature.replace(/^sha256=/i, '')
+  try {
+    const a = Buffer.from(expected, 'hex')
+    const b = Buffer.from(normalized, 'hex')
+    if (a.length !== b.length || !timingSafeEqual(a, b)) return { ok: false, error: 'Invalid Circle webhook signature' }
+    return { ok: true }
+  } catch {
+    return { ok: false, error: 'Invalid Circle webhook signature format' }
+  }
+}
+
+export function processCircleX402Webhook(payload = {}) {
+  const eventId = eventIdFromCircle(payload) || `circle_${Date.now()}_${randomUUID().slice(0, 8)}`
+  const eventType = eventTypeFromCircle(payload)
+  if (webhookEvents.has(eventId)) return { duplicate: true, event: webhookEvents.get(eventId) }
+
+  const data = dataFromCircle(payload)
+  const event = {
+    id: eventId,
+    provider: 'circle',
+    eventType,
+    rawPayload: payload,
+    processed: false,
+    matched: false,
+    createdAt: new Date().toISOString(),
+  }
+  webhookEvents.set(eventId, event)
+
+  if (eventType !== 'transactions.inbound') {
+    event.processed = true
+    event.processedAt = new Date().toISOString()
+    return { duplicate: false, event, ignored: true, reason: 'unsupported_event_type' }
+  }
 
   const cfg = x402Config()
-  if (Number(request.chainId) !== Number(cfg.chainId)) return { ok: false, error: 'Invalid x402 chain', payment: request }
-  if (getAddress(request.tokenAddress) !== getAddress(cfg.tokenAddress)) return { ok: false, error: 'Invalid x402 asset', payment: request }
-  if (getAddress(request.recipient) !== getAddress(cfg.recipient)) return { ok: false, error: 'Invalid x402 recipient', payment: request }
-
-  const chain = defineChain({
-    id: cfg.chainId,
-    name: 'Arc Testnet',
-    nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-    rpcUrls: { default: { http: [cfg.rpcUrl] } },
-  })
-  const client = createPublicClient({ chain, transport: http(cfg.rpcUrl, { retryCount: 2, timeout: 12000 }) })
-  const chainId = await client.getChainId()
-  if (Number(chainId) !== Number(cfg.chainId)) return { ok: false, error: 'Invalid RPC chain', payment: request }
-
-  const receipt = await client.getTransactionReceipt({ hash: txHash })
-  if (!receipt) return { ok: false, error: 'Transaction not found', payment: request }
-  if (receipt.status !== 'success') return { ok: false, error: 'x402 transaction reverted', payment: request }
-
-  const required = parseUnits(request.amount, 6)
-  let matched = null
-  for (const log of receipt.logs || []) {
-    if (String(log.address).toLowerCase() !== String(request.tokenAddress).toLowerCase()) continue
-    try {
-      const decoded = decodeEventLog({ abi: erc20Abi, data: log.data, topics: log.topics })
-      if (decoded.eventName !== 'Transfer') continue
-      const from = getAddress(decoded.args.from)
-      const to = getAddress(decoded.args.to)
-      const value = BigInt(decoded.args.value)
-      if (to !== getAddress(request.recipient)) continue
-      if (payerAddress && from !== getAddress(payerAddress)) continue
-      if (value < required) return { ok: false, error: 'Insufficient x402 payment amount', payment: request }
-      matched = { from, to, value: value.toString() }
-      break
-    } catch {}
+  const extracted = {
+    walletId: String(data.walletId || data.wallet?.id || ''),
+    destinationAddress: normalizeAddress(destinationFromCircle(data)),
+    asset: assetFromCircle(data),
+    amount: amountFromCircle(data),
+    network: networkFromCircle(data, cfg.network),
+    txHash: txHashFromCircle(data),
+    status: statusFromCircle(data),
   }
-  if (!matched) return { ok: false, error: 'No matching USDC Transfer event found', payment: request }
+  event.extracted = extracted
 
-  const paid = {
-    ...request,
-    status: 'paid',
-    txHash,
-    payerAddress: matched.from,
-    paidAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+  if (!isFinalCircleStatus(extracted.status)) {
+    event.processed = true
+    event.processedAt = new Date().toISOString()
+    return { duplicate: false, event, ignored: true, reason: 'non_final_status' }
   }
-  payments.set(request.paymentId, paid)
-  usedTxHashes.add(hash)
-  return { ok: true, payment: paid }
+
+  const targetNetwork = normalizeNetwork(cfg.network)
+  for (const invoice of invoices.values()) {
+    if (!invoice || invoice.invoiceId !== invoices.get(invoice.invoiceId)?.invoiceId) continue
+    const latest = getX402Invoice(invoice.invoiceId)
+    if (!latest || latest.status !== 'pending') continue
+    if (normalizeAddress(latest.recipient) !== extracted.destinationAddress) continue
+    if (normalizeAsset(latest.asset) !== extracted.asset) continue
+    if (normalizeAmount(latest.uniqueAmount) !== extracted.amount) continue
+    if (normalizeNetwork(latest.network || targetNetwork) !== extracted.network && targetNetwork !== extracted.network) continue
+    latest.status = 'paid'
+    latest.txHash = extracted.txHash || ''
+    latest.paidAt = new Date().toISOString()
+    latest.updatedAt = latest.paidAt
+    latest.rawWebhookEvent = payload
+    event.processed = true
+    event.matched = true
+    event.relatedInvoiceId = latest.invoiceId
+    event.relatedPaymentId = latest.paymentId
+    event.relatedTxHash = latest.txHash
+    event.processedAt = new Date().toISOString()
+    invoices.set(latest.invoiceId, latest)
+    invoices.set(latest.paymentId, latest)
+    return { duplicate: false, event, invoice: latest }
+  }
+
+  event.processed = true
+  event.processedAt = new Date().toISOString()
+  unmatchedInboundEvents.push(event)
+  return { duplicate: false, event, unmatched: true }
 }
 
 export function withArcoxX402(handler, config = {}) {
@@ -134,34 +263,30 @@ export function withArcoxX402(handler, config = {}) {
 
     const resource = String(config.resource || req.originalUrl || req.path)
     const paymentId = String(req.headers['x-payment-id'] || req.headers['x-arcox-payment-request-id'] || req.query?.paymentId || '')
-    const txHash = String(req.headers['x-payment-tx'] || req.headers['x-arcox-payment-tx'] || req.query?.paymentTx || '')
-    const mockPaid = String(req.headers['x-payment'] || '').toLowerCase() === 'mock-paid'
-
-    if (mockPaid && !cfg.verifyPayment) {
-      req.arcoxX402 = { mode: 'mock-paid' }
-      return handler(req, res, next)
-    }
-
-    if (paymentId && txHash) {
-      const payment = getX402PaymentRequest(paymentId)
-      if (payment?.status === 'paid' && String(payment.txHash).toLowerCase() === txHash.toLowerCase() && payment.resource === resource) {
-        payments.set(paymentId, { ...payment, status: 'used', usedAt: new Date().toISOString() })
-        req.arcoxX402 = { mode: 'real-testnet', payment }
+    if (paymentId) {
+      const invoice = getX402Invoice(paymentId)
+      if (invoice?.status === 'paid' && invoice.resource === resource) {
+        req.arcoxX402 = { mode: 'circle_webhook_testnet', invoice }
         return handler(req, res, next)
       }
-      if (payment && payment.resource !== resource) {
-        return res.status(402).json({ error: 'x402 payment resource mismatch', x402: createX402PaymentRequest({ ...config, resource }) })
+      if (invoice && invoice.resource !== resource) {
+        const nextInvoice = createX402Invoice({ ...config, resource, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
+        return res.status(402).json({ error: 'x402 payment resource mismatch', x402: publicInvoice(nextInvoice) })
+      }
+      if (invoice?.status === 'expired') {
+        const nextInvoice = createX402Invoice({ ...config, resource, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
+        return res.status(402).json({ error: 'x402 invoice expired', x402: publicInvoice(nextInvoice) })
       }
     }
 
-    const request = createX402PaymentRequest({
+    const invoice = createX402Invoice({
       service: config.service || 'arcox_intel',
-      amount: priceFromEnv(config.priceEnv || '', config.amount || process.env.X402_DEFAULT_PRICE_USDC || '0.01'),
+      amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount),
       resource,
     })
-    if (!request.recipient || !/^0x[0-9a-fA-F]{40}$/.test(request.recipient)) {
-      request.recipient = 'configure_X402_RECIPIENT_ADDRESS'
+    if (!invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) {
+      invoice.recipient = 'configure_CIRCLE_X402_TREASURY_ADDRESS'
     }
-    return res.status(402).json({ error: 'Payment Required', x402: request })
+    return res.status(402).json({ error: 'Payment Required', x402: publicInvoice(invoice) })
   }
 }

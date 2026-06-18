@@ -14,6 +14,7 @@ import arkhamRoutes from './src/routes/arkhamRoutes.mjs'
 import nowpaymentsRoutes from './src/routes/nowpaymentsRoutes.mjs'
 import treasuryRoutes from './src/routes/treasuryRoutes.mjs'
 import x402Routes from './src/routes/x402Routes.mjs'
+import { processCircleX402Webhook, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
 
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
 process.on('unhandledRejection', (reason) => console.error('[UnhandledRejection]', reason?.message || reason))
@@ -47,7 +48,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.status(204).end()
   next()
 })
-app.use(['/api/webhooks/nowpayments', '/api/webhooks/circle'], express.raw({ type: '*/*', limit: '256kb' }))
+app.use(['/api/webhooks/nowpayments', '/api/webhooks/circle', '/api/circle/webhook'], express.raw({ type: '*/*', limit: '256kb' }))
 app.use(express.json({ limit: '64kb' }))
 
 function rateLimit({ windowMs, max, keyPrefix }) {
@@ -1663,6 +1664,42 @@ app.get('/api/webhooks/circle', (_req, res) => {
     provider: 'circle',
     product: 'gateway',
     message: 'Circle Gateway webhook endpoint is alive. Use POST for callbacks.',
+  })
+})
+
+app.head('/api/circle/webhook', (_req, res) => res.status(200).end())
+
+app.get('/api/circle/webhook', (_req, res) => {
+  res.json({
+    ok: true,
+    provider: 'circle',
+    product: 'x402-invoice-webhook',
+    message: 'Circle x402 invoice webhook endpoint is alive. Use POST for transactions.inbound callbacks.',
+  })
+})
+
+app.post('/api/circle/webhook', apiLimiter, async (req, res) => {
+  const rawBody = rawWebhookBody(req)
+  const payload = parseWebhookJson(rawBody)
+  const verification = verifyCircleWebhookSignature(req, rawBody)
+  if (!verification.ok) return res.status(401).json({ ok: false, provider: 'circle', error: verification.error })
+  const result = processCircleX402Webhook(payload)
+  res.json({
+    ok: true,
+    received: true,
+    provider: 'circle',
+    product: 'x402-invoice-webhook',
+    duplicate: Boolean(result.duplicate),
+    matched: Boolean(result.invoice),
+    invoice: result.invoice ? {
+      invoiceId: result.invoice.invoiceId,
+      paymentId: result.invoice.paymentId,
+      status: result.invoice.status,
+      txHash: result.invoice.txHash,
+      paidAt: result.invoice.paidAt,
+    } : null,
+    eventId: result.event?.id || null,
+    eventType: result.event?.eventType || null,
   })
 })
 
