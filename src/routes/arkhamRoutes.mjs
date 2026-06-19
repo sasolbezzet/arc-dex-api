@@ -9,10 +9,30 @@ function paid(priceEnv, fallback, handler) {
   return withArcoxX402(handler, { amount: priceFromEnv(priceEnv, fallback), priceEnv, service: 'arcox_intel' })
 }
 
+function withPaymentMeta(req, payload) {
+  const invoice = req.arcoxX402?.invoice
+  if (!invoice || !payload || typeof payload !== 'object' || Array.isArray(payload)) return payload
+  return {
+    ...payload,
+    x402Payment: {
+      invoiceId: invoice.invoiceId,
+      paymentId: invoice.paymentId,
+      status: invoice.status,
+      amount: invoice.uniqueAmount,
+      asset: invoice.asset,
+      network: invoice.network,
+      recipient: invoice.recipient,
+      txHash: invoice.txHash,
+      paidAt: invoice.paidAt,
+      reconciledBy: invoice.reconciledBy,
+    },
+  }
+}
+
 function sendArkham(pathBuilder, priceEnv, fallback) {
   return paid(priceEnv, fallback, async (req, res) => {
     try {
-      res.json(await arkham.get(pathBuilder(req), req.query || {}))
+      res.json(withPaymentMeta(req, await arkham.get(pathBuilder(req), req.query || {})))
     } catch (error) {
       res.status(error.status || 502).json({ ok: false, mode: 'arkham', error: error.message, disclaimer: 'Informational only. Not financial advice.' })
     }
@@ -47,7 +67,7 @@ router.get('/token/:chain/:address/holders', sendArkham(req => `/token/holders/$
 
 router.get('/report/address/:address', paid('ARCOX_INTEL_PRICE_REPORT_ADDRESS', '0.05', async (req, res) => {
   try {
-    res.json(await arkham.reportAddress(req.params.address))
+    res.json(withPaymentMeta(req, await arkham.reportAddress(req.params.address)))
   } catch (error) {
     res.status(502).json({ ok: false, error: error.message, disclaimer: 'Informational only. Not financial advice.' })
   }
