@@ -144,7 +144,20 @@ export async function reconcileX402Invoice(id) {
       fromBlock,
       toBlock: current,
     })
-    const match = logs.find(log => formatUnits(log.args.value || 0n, 6) === normalizeAmount(invoice.uniqueAmount))
+    const invoiceCreatedAt = Date.parse(invoice.createdAt || '')
+    const amountMatches = logs
+      .filter(log => formatUnits(log.args.value || 0n, 6) === normalizeAmount(invoice.uniqueAmount))
+      .sort((a, b) => Number((b.blockNumber || 0n) - (a.blockNumber || 0n)))
+    let match = null
+    for (const log of amountMatches) {
+      if (Number.isFinite(invoiceCreatedAt) && log.blockNumber) {
+        const block = await client.getBlock({ blockNumber: log.blockNumber }).catch(() => null)
+        const blockTimeMs = block?.timestamp ? Number(block.timestamp) * 1000 : 0
+        if (blockTimeMs && blockTimeMs + 30_000 < invoiceCreatedAt) continue
+      }
+      match = log
+      break
+    }
     if (!match) return invoice
     invoice.status = 'paid'
     invoice.txHash = match.transactionHash
