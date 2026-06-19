@@ -1,4 +1,6 @@
 import { randomUUID, createHmac, timingSafeEqual } from 'crypto'
+import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { createPublicClient, http, parseAbiItem, formatUnits } from 'viem'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
@@ -10,6 +12,41 @@ const unmatchedInboundEvents = globalThis.__arcoxX402UnmatchedInboundEvents || [
 globalThis.__arcoxX402UnmatchedInboundEvents = unmatchedInboundEvents
 
 let uniqueCounter = globalThis.__arcoxX402UniqueCounter || 0
+const X402_INVOICE_DB = process.env.X402_INVOICE_DB || './x402-invoices-db.json'
+const ARC_USDC = process.env.X402_USDC_ADDRESS || '0x3600000000000000000000000000000000000000'
+let loadedPersistentInvoices = false
+
+function loadPersistentInvoices() {
+  if (loadedPersistentInvoices) return
+  loadedPersistentInvoices = true
+  try {
+    if (!existsSync(X402_INVOICE_DB)) return
+    const parsed = JSON.parse(readFileSync(X402_INVOICE_DB, 'utf8') || '[]')
+    const list = Array.isArray(parsed) ? parsed : Object.values(parsed || {})
+    for (const invoice of list) {
+      if (!invoice?.invoiceId || !invoice?.paymentId) continue
+      invoices.set(invoice.invoiceId, invoice)
+      invoices.set(invoice.paymentId, invoice)
+    }
+  } catch (error) {
+    console.error('[x402] failed to load invoice db', error?.message || error)
+  }
+}
+
+function persistInvoices() {
+  try {
+    const unique = []
+    const seen = new Set()
+    for (const invoice of invoices.values()) {
+      if (!invoice?.invoiceId || seen.has(invoice.invoiceId)) continue
+      seen.add(invoice.invoiceId)
+      unique.push(invoice)
+    }
+    writeFileSync(X402_INVOICE_DB, JSON.stringify(unique, null, 2))
+  } catch (error) {
+    console.error('[x402] failed to persist invoice db', error?.message || error)
+  }
+}
 
 export function priceFromEnv(name, fallback) {
   return String(process.env[name] || fallback)
@@ -44,6 +81,7 @@ function nextUniqueAmount(baseAmount) {
 }
 
 export function createX402Invoice(input = {}) {
+  loadPersistentInvoices()
   const cfg = x402Config()
   const now = Date.now()
   const invoiceId = input.invoiceId || `arcox_x402_${randomUUID().replaceAll('-', '').slice(0, 16)}`
@@ -71,10 +109,12 @@ export function createX402Invoice(input = {}) {
   }
   invoices.set(invoiceId, invoice)
   invoices.set(paymentId, invoice)
+  persistInvoices()
   return invoice
 }
 
 export function getX402Invoice(id) {
+  loadPersistentInvoices()
   const invoice = invoices.get(String(id || ''))
   if (!invoice) return null
   if (invoice.status === 'pending' && Date.now() > Date.parse(invoice.expiresAt)) {
@@ -82,8 +122,43 @@ export function getX402Invoice(id) {
     invoice.updatedAt = new Date().toISOString()
     invoices.set(invoice.invoiceId, invoice)
     invoices.set(invoice.paymentId, invoice)
+    persistInvoices()
   }
   return invoice
+}
+
+export async function reconcileX402Invoice(id) {
+  const invoice = getX402Invoice(id)
+  if (!invoice || invoice.status !== 'pending') return invoice
+  if (!invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) return invoice
+  try {
+    const rpc = process.env.ARC_RPC_URL || process.env.RPC || 'https://rpc.testnet.arc.network/'
+    const client = createPublicClient({ transport: http(rpc, { timeout: 10_000, retryCount: 1 }) })
+    const current = await client.getBlockNumber()
+    const lookback = BigInt(Number(process.env.X402_RECONCILE_LOOKBACK_BLOCKS || '25000'))
+    const fromBlock = current > lookback ? current - lookback : 0n
+    const logs = await client.getLogs({
+      address: ARC_USDC,
+      event: parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 value)'),
+      args: { to: invoice.recipient },
+      fromBlock,
+      toBlock: current,
+    })
+    const match = logs.find(log => formatUnits(log.args.value || 0n, 6) === normalizeAmount(invoice.uniqueAmount))
+    if (!match) return invoice
+    invoice.status = 'paid'
+    invoice.txHash = match.transactionHash
+    invoice.paidAt = new Date().toISOString()
+    invoice.updatedAt = invoice.paidAt
+    invoice.reconciledBy = 'arc-usdc-transfer-log'
+    invoices.set(invoice.invoiceId, invoice)
+    invoices.set(invoice.paymentId, invoice)
+    persistInvoices()
+    return invoice
+  } catch (error) {
+    console.error('[x402] reconcile failed', error?.message || error)
+    return invoice
+  }
 }
 
 export function publicInvoice(invoice) {
@@ -182,6 +257,7 @@ export function verifyCircleWebhookSignature(req, rawBody) {
 }
 
 export function processCircleX402Webhook(payload = {}) {
+  loadPersistentInvoices()
   const eventId = eventIdFromCircle(payload) || `circle_${Date.now()}_${randomUUID().slice(0, 8)}`
   const eventType = eventTypeFromCircle(payload)
   if (webhookEvents.has(eventId)) return { duplicate: true, event: webhookEvents.get(eventId) }
@@ -244,6 +320,7 @@ export function processCircleX402Webhook(payload = {}) {
     event.processedAt = new Date().toISOString()
     invoices.set(latest.invoiceId, latest)
     invoices.set(latest.paymentId, latest)
+    persistInvoices()
     return { duplicate: false, event, invoice: latest }
   }
 
@@ -264,7 +341,7 @@ export function withArcoxX402(handler, config = {}) {
     const resource = String(config.resource || req.originalUrl || req.path)
     const paymentId = String(req.headers['x-payment-id'] || req.headers['x-arcox-payment-request-id'] || req.query?.paymentId || '')
     if (paymentId) {
-      const invoice = getX402Invoice(paymentId)
+      const invoice = await reconcileX402Invoice(paymentId)
       if (invoice?.status === 'paid' && invoice.resource === resource) {
         req.arcoxX402 = { mode: 'circle_webhook_testnet', invoice }
         return handler(req, res, next)

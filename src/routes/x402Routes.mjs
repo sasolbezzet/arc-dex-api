@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { createX402Invoice, getX402Invoice, publicInvoice, x402Config } from '../middleware/x402Middleware.mjs'
+import { createX402Invoice, getX402Invoice, publicInvoice, reconcileX402Invoice, x402Config } from '../middleware/x402Middleware.mjs'
 
 const router = Router()
 
@@ -15,8 +15,8 @@ router.post('/invoices/create', (req, res) => {
   res.json({ ok: true, x402: publicInvoice(invoice), invoice: publicInvoice(invoice), config: publicConfig() })
 })
 
-router.get('/invoices/:invoiceId/status', (req, res) => {
-  const invoice = getX402Invoice(req.params.invoiceId)
+router.get('/invoices/:invoiceId/status', async (req, res) => {
+  const invoice = await reconcileX402Invoice(req.params.invoiceId)
   if (!invoice) return res.status(404).json({ error: 'x402 invoice not found' })
   res.json({ ok: true, x402: publicInvoice(invoice), invoice: publicInvoice(invoice) })
 })
@@ -33,8 +33,8 @@ router.post('/payment-request', (req, res) => {
   res.json({ ok: true, x402: publicInvoice(invoice), invoice: publicInvoice(invoice), config: publicConfig() })
 })
 
-router.get('/payment-request/:paymentId', (req, res) => {
-  const invoice = getX402Invoice(req.params.paymentId)
+router.get('/payment-request/:paymentId', async (req, res) => {
+  const invoice = await reconcileX402Invoice(req.params.paymentId)
   if (!invoice) return res.status(404).json({ error: 'x402 payment request not found' })
   res.json({ ok: true, x402: publicInvoice(invoice), invoice: publicInvoice(invoice) })
 })
