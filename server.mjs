@@ -11,7 +11,6 @@ import { initiateDeveloperControlledWalletsClient } from '@circle-fin/developer-
 import { quoteEcoRoutePayment } from './services/ecoAdapter.mjs'
 import { withX402PaymentRequired } from './middleware/x402.mjs'
 import arkhamRoutes from './src/routes/arkhamRoutes.mjs'
-import nowpaymentsRoutes from './src/routes/nowpaymentsRoutes.mjs'
 import treasuryRoutes from './src/routes/treasuryRoutes.mjs'
 import x402Routes from './src/routes/x402Routes.mjs'
 import { processCircleX402Webhook, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
@@ -48,7 +47,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.status(204).end()
   next()
 })
-app.use(['/api/webhooks/nowpayments', '/api/webhooks/circle', '/api/circle/webhook'], express.raw({ type: '*/*', limit: '256kb' }))
+app.use(['/api/webhooks/circle', '/api/circle/webhook'], express.raw({ type: '*/*', limit: '256kb' }))
 app.use(express.json({ limit: '64kb' }))
 
 function rateLimit({ windowMs, max, keyPrefix }) {
@@ -72,7 +71,6 @@ const authLimiter = rateLimit({ windowMs: 5 * 60 * 1000, max: 20, keyPrefix: 'au
 const apiLimiter = rateLimit({ windowMs: 60 * 1000, max: 120, keyPrefix: 'api' })
 const attestationLimiter = rateLimit({ windowMs: 60 * 1000, max: 45, keyPrefix: 'attestation' })
 app.use('/api/intel', apiLimiter, arkhamRoutes)
-app.use('/api/nowpayments', apiLimiter, nowpaymentsRoutes)
 app.use('/api/treasury', apiLimiter, treasuryRoutes)
 app.use('/api/x402', apiLimiter, x402Routes)
 
@@ -670,25 +668,6 @@ function parseWebhookJson(rawBody) {
   }
 }
 
-function stableStringify(value) {
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`
-  }
-  return JSON.stringify(value)
-}
-
-function safeEqualHex(left, right) {
-  const a = String(left || '').trim().toLowerCase()
-  const b = String(right || '').trim().toLowerCase()
-  if (!a || !b || a.length !== b.length) return false
-  try {
-    return timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'))
-  } catch {
-    return false
-  }
-}
-
 function firstWebhookString(...values) {
   for (const value of values) {
     if (value === undefined || value === null || value === '') continue
@@ -730,18 +709,6 @@ function extractCircleGatewayFields(payload = {}) {
     createdAt: firstWebhookString(payload.createdAt, data.createdAt),
     rawPayload: payload,
   }
-}
-
-function verifyNowpaymentsIpn(req, rawBody, payload) {
-  const verifyIpn = String(process.env.NOWPAYMENTS_VERIFY_IPN || 'false').toLowerCase() === 'true'
-  if (!verifyIpn) return { ok: true }
-  const secret = process.env.NOWPAYMENTS_IPN_SECRET || ''
-  const signature = String(req.headers['x-nowpayments-sig'] || '')
-  if (!secret || !signature) return { ok: false, error: 'NOWPayments IPN signature required' }
-  const signedPayload = payload?._parseError ? rawBody : stableStringify(payload)
-  const expected = createHmac('sha512', secret).update(signedPayload).digest('hex')
-  if (!safeEqualHex(expected, signature)) return { ok: false, error: 'Invalid NOWPayments IPN signature' }
-  return { ok: true }
 }
 
 function saveGenericWebhookEvent(provider, notificationId, eventType, rawPayload, extra = {}) {
@@ -1603,57 +1570,6 @@ app.post('/api/invoices/:invoiceId/mark-paid', apiLimiter, async (req, res) => {
   } catch(e) {
     res.status(400).json({ error: e.message })
   }
-})
-
-app.get('/api/webhooks/nowpayments', (_req, res) => {
-  res.json({
-    ok: true,
-    provider: 'nowpayments',
-    message: 'NOWPayments webhook endpoint is alive. Use POST for callbacks.',
-  })
-})
-
-app.post('/api/webhooks/nowpayments', apiLimiter, async (req, res) => {
-  const rawBody = rawWebhookBody(req)
-  console.log('[webhook:nowpayments] raw payload', rawBody)
-  const payload = parseWebhookJson(rawBody)
-  const verification = verifyNowpaymentsIpn(req, rawBody, payload)
-  if (!verification.ok) return res.status(401).json({ ok: false, provider: 'nowpayments', error: verification.error })
-
-  const event = {
-    payment_id: payload.payment_id,
-    payment_status: payload.payment_status,
-    order_id: payload.order_id,
-    price_amount: payload.price_amount,
-    price_currency: payload.price_currency,
-    pay_amount: payload.pay_amount,
-    pay_currency: payload.pay_currency,
-    actually_paid: payload.actually_paid,
-    pay_address: payload.pay_address,
-    purchase_id: payload.purchase_id,
-    outcome_amount: payload.outcome_amount,
-    outcome_currency: payload.outcome_currency,
-  }
-  console.log('[webhook:nowpayments] parsed event', event)
-
-  saveGenericWebhookEvent('nowpayments', event.payment_id || event.purchase_id || `nowpayments_${Date.now()}`, event.payment_status || 'ipn', payload, {
-    relatedInvoiceId: event.order_id || undefined,
-    processed: true,
-    processedAt: nowIso(),
-  })
-
-  // TODO: save NOWPayments webhook payload into payment_events/webhook_events table.
-  // TODO: update ARCOX payment status by payment_id/order_id.
-  // TODO: if payment_status is finished/confirmed, mark order as paid and unlock ARCOX service.
-
-  res.json({
-    ok: true,
-    received: true,
-    provider: 'nowpayments',
-    payment_id: event.payment_id || null,
-    payment_status: event.payment_status || null,
-    order_id: event.order_id || null,
-  })
 })
 
 app.head('/api/webhooks/circle', (_req, res) => res.status(200).end())
