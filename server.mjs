@@ -353,6 +353,20 @@ function noSwapRouteResponse(res, err) {
   })
 }
 
+function isBlockedCircleSwapRoute(tokenIn, tokenOut) {
+  return tokenIn === 'EURC' && tokenOut === 'USDC'
+}
+
+function blockedCircleSwapResponse(res, tokenIn, tokenOut) {
+  return res.json({
+    success: false,
+    available: false,
+    code: 'CIRCLE_SCA_ROUTE_UNAVAILABLE',
+    error: `Circle wallet route ${tokenIn} → ${tokenOut} belum aman untuk dieksekusi. Gunakan EOA wallet untuk pasangan ini.`,
+    details: 'Circle developer/proxy wallet rejects this route during Arc Testnet execution estimation, while the EOA prepared-adapter route works.',
+  })
+}
+
 function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount }) {
   if (!KIT_KEY) throw new Error('KIT_KEY belum dikonfigurasi')
   if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) throw new Error('Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut))
@@ -1092,6 +1106,7 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
     if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
     if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
     if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
+    if (isBlockedCircleSwapRoute(tokenIn, tokenOut)) return blockedCircleSwapResponse(res, tokenIn, tokenOut)
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
     try {
       const wallet = await getOrCreateWallet(owner)
@@ -1136,6 +1151,7 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
     if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
     if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
     if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
+    if (isBlockedCircleSwapRoute(tokenIn, tokenOut)) return blockedCircleSwapResponse(res, tokenIn, tokenOut)
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
     const wallet = await getOrCreateWallet(owner)
     const params = {
@@ -1151,17 +1167,23 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
       if (isNoSwapRouteError(e)) return noSwapRouteResponse(res, e)
       console.warn('[swap] estimate precheck failed, continuing:', e.message)
     }
+    const result = await kit.swap(params)
     let feeResult = null
+    let feeError = ''
     const treasury = normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY')
     if (platformFee.feeUnits > 0n) {
-      feeResult = await kit.send({
-        from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
-        to: treasury,
-        amount: platformFee.feeAmount,
-        token: SEND_TOKEN_MAP[tokenIn] || TOKENS[tokenIn] || tokenIn,
-      })
+      try {
+        feeResult = await kit.send({
+          from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
+          to: treasury,
+          amount: platformFee.feeAmount,
+          token: SEND_TOKEN_MAP[tokenIn] || TOKENS[tokenIn] || tokenIn,
+        })
+      } catch (error) {
+        feeError = error?.message || String(error)
+        console.warn('[swap] post-swap platform fee failed:', feeError)
+      }
     }
-    const result = await kit.swap(params)
     res.json({
       success: true,
       result: {
@@ -1175,6 +1197,7 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
           treasury,
           txHash: feeResult?.txHash,
           explorerUrl: feeResult?.explorerUrl,
+          error: feeError || undefined,
         },
       },
     })
