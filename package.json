@@ -11,9 +11,9 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@circle-fin/adapter-circle-wallets": "^1.3.1",
-    "@circle-fin/adapter-viem-v2": "^1.11.1",
-    "@circle-fin/app-kit": "^1.6.1",
+    "@circle-fin/adapter-circle-wallets": "^1.3.2",
+    "@circle-fin/adapter-viem-v2": "^1.11.2",
+    "@circle-fin/app-kit": "^1.7.0",
     "@circle-fin/developer-controlled-wallets": "^10.3.1",
     "@solana/spl-token": "^0.4.14",
     "@solana/web3.js": "^1.98.4",
