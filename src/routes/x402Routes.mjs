@@ -61,6 +61,8 @@ function publicConfig() {
     circleBaseUrl: cfg.circleBaseUrl,
     circleTreasuryWalletId: cfg.circleTreasuryWalletId,
     recipient: cfg.circleTreasuryAddress,
+    memoContract: cfg.memoContract,
+    paymentMethod: 'arc-transaction-memo',
     baseAmount: cfg.baseAmount,
     expiresInSeconds: cfg.ttlSeconds,
     mockMode: false,

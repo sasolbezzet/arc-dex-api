@@ -1,6 +1,6 @@
 import { randomUUID, createHmac, timingSafeEqual } from 'crypto'
 import { existsSync, readFileSync, writeFileSync } from 'fs'
-import { createPublicClient, http, parseAbiItem, formatUnits } from 'viem'
+import { createPublicClient, http, parseAbiItem, formatUnits, keccak256, toHex, decodeEventLog } from 'viem'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
@@ -14,6 +14,9 @@ globalThis.__arcoxX402UnmatchedInboundEvents = unmatchedInboundEvents
 let uniqueCounter = globalThis.__arcoxX402UniqueCounter || 0
 const X402_INVOICE_DB = process.env.X402_INVOICE_DB || './x402-invoices-db.json'
 const ARC_USDC = process.env.X402_USDC_ADDRESS || '0x3600000000000000000000000000000000000000'
+const ARC_MEMO_CONTRACT = process.env.ARC_MEMO_CONTRACT || '0x5294E9927c3306DcBaDb03fe70b92e01cCede505'
+const TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 value)')
+const MEMO_EVENT = parseAbiItem('event Memo(address indexed sender,address indexed target,bytes32 callDataHash,bytes32 indexed memoId,bytes memo,uint256 memoIndex)')
 let loadedPersistentInvoices = false
 
 function loadPersistentInvoices() {
@@ -64,6 +67,7 @@ export function x402Config() {
     circleBaseUrl: process.env.CIRCLE_BASE_URL || 'https://api-sandbox.circle.com',
     circleTreasuryWalletId: process.env.CIRCLE_X402_TREASURY_WALLET_ID || '',
     circleTreasuryAddress: process.env.CIRCLE_X402_TREASURY_ADDRESS || process.env.X402_RECIPIENT_ADDRESS || '',
+    memoContract: ARC_MEMO_CONTRACT,
   }
 }
 
@@ -88,6 +92,14 @@ export function createX402Invoice(input = {}) {
   const paymentId = input.paymentId || `x402_${randomUUID().replaceAll('-', '').slice(0, 16)}`
   const baseAmount = normalizeAmount(input.amount || cfg.baseAmount)
   const uniqueAmount = normalizeAmount(input.uniqueAmount || nextUniqueAmount(baseAmount))
+  const memoId = input.memoId || keccak256(toHex(paymentId))
+  const memoData = input.memoData || toHex(JSON.stringify({
+    app: 'arcox',
+    type: 'x402',
+    invoiceId,
+    paymentId,
+    resource: String(input.resource || '/api/intel'),
+  }))
   const invoice = {
     invoiceId,
     paymentId,
@@ -102,6 +114,10 @@ export function createX402Invoice(input = {}) {
     baseAmount,
     uniqueAmount,
     amount: uniqueAmount,
+    memoContract: ARC_MEMO_CONTRACT,
+    memoId,
+    memoData,
+    paymentMethod: 'arc-transaction-memo',
     createdAt: new Date(now).toISOString(),
     expiresAt: new Date(now + cfg.ttlSeconds * 1000).toISOString(),
     expiresInSeconds: cfg.ttlSeconds,
@@ -137,9 +153,23 @@ export async function reconcileX402Invoice(id) {
     const current = await client.getBlockNumber()
     const lookback = BigInt(Number(process.env.X402_RECONCILE_LOOKBACK_BLOCKS || '25000'))
     const fromBlock = current > lookback ? current - lookback : 0n
+    const memoMatch = await findMemoPayment(client, invoice, fromBlock, current)
+    if (memoMatch) {
+      invoice.status = 'paid'
+      invoice.txHash = memoMatch.transactionHash
+      invoice.paidAt = new Date().toISOString()
+      invoice.updatedAt = invoice.paidAt
+      invoice.reconciledBy = 'arc-transaction-memo'
+      invoice.memoIndex = memoMatch.memoIndex
+      invoice.memoSender = memoMatch.sender
+      invoices.set(invoice.invoiceId, invoice)
+      invoices.set(invoice.paymentId, invoice)
+      persistInvoices()
+      return invoice
+    }
     const logs = await client.getLogs({
       address: ARC_USDC,
-      event: parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 value)'),
+      event: TRANSFER_EVENT,
       args: { to: invoice.recipient },
       fromBlock,
       toBlock: current,
@@ -190,13 +220,55 @@ export function publicInvoice(invoice) {
     baseAmount: invoice.baseAmount,
     uniqueAmount: invoice.uniqueAmount,
     amount: invoice.uniqueAmount,
+    memoContract: invoice.memoContract || ARC_MEMO_CONTRACT,
+    memoId: invoice.memoId,
+    memoData: invoice.memoData,
+    paymentMethod: invoice.paymentMethod || 'arc-transaction-memo',
     createdAt: invoice.createdAt,
     expiresAt: invoice.expiresAt,
     expiresInSeconds: invoice.expiresInSeconds,
     txHash: invoice.txHash,
     paidAt: invoice.paidAt,
+    reconciledBy: invoice.reconciledBy,
+    memoIndex: invoice.memoIndex,
+    memoSender: invoice.memoSender,
     mockMode: false,
   }
+}
+
+async function findMemoPayment(client, invoice, fromBlock, toBlock) {
+  if (!invoice.memoId || !/^0x[0-9a-fA-F]{64}$/.test(invoice.memoId)) return null
+  const memoLogs = await client.getLogs({
+    address: invoice.memoContract || ARC_MEMO_CONTRACT,
+    event: MEMO_EVENT,
+    args: { memoId: invoice.memoId },
+    fromBlock,
+    toBlock,
+  }).catch(() => [])
+  const expectedAmount = normalizeAmount(invoice.uniqueAmount)
+  const expectedTo = normalizeAddress(invoice.recipient)
+  for (const memoLog of memoLogs.sort((a, b) => Number((b.blockNumber || 0n) - (a.blockNumber || 0n)))) {
+    if (normalizeAddress(memoLog.args?.target) !== normalizeAddress(ARC_USDC)) continue
+    const receipt = await client.getTransactionReceipt({ hash: memoLog.transactionHash }).catch(() => null)
+    if (!receipt || receipt.status !== 'success') continue
+    const transfer = receipt.logs.find(log => {
+      if (normalizeAddress(log.address) !== normalizeAddress(ARC_USDC)) return false
+      try {
+        const decoded = decodeEventLog({ abi: [TRANSFER_EVENT], data: log.data, topics: log.topics })
+        return normalizeAddress(decoded.args?.to) === expectedTo && formatUnits(decoded.args?.value || 0n, 6) === expectedAmount
+      } catch {
+        return false
+      }
+    })
+    if (transfer) {
+      return {
+        transactionHash: memoLog.transactionHash,
+        memoIndex: String(memoLog.args?.memoIndex ?? ''),
+        sender: memoLog.args?.sender || '',
+      }
+    }
+  }
+  return null
 }
 
 function normalizeAddress(value) {
