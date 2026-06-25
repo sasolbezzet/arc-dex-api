@@ -75,12 +75,13 @@ router.get('/token/top', sendArkham(() => '/token/top', 'ARCOX_INTEL_PRICE_TOKEN
   orderByPercent: 'false',
   size: '10',
 })))
+router.get('/token/:chain/:address/holders', sendArkham(req => `/token/holders/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_HOLDERS', '0.03'))
+router.get('/token/:chain/:address/top-flow', sendArkham(req => `/token/top_flow/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_HOLDERS', '0.03', { timeLast: '24h' }))
+router.get('/token/:chain/:address', sendArkham(req => `/intelligence/token/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005'))
 router.get('/token/:id', sendArkham(req => `/intelligence/token/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005'))
 router.get('/token/:id/market', sendArkham(req => `/token/market/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005'))
 router.get('/token/:id/holders', sendArkham(req => `/token/holders/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_HOLDERS', '0.03'))
 router.get('/token/:id/top-flow', sendArkham(req => `/token/top_flow/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_HOLDERS', '0.03', { timeLast: '24h' }))
-router.get('/token/:chain/:address', sendArkham(req => `/intelligence/token/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005'))
-router.get('/token/:chain/:address/holders', sendArkham(req => `/token/holders/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_HOLDERS', '0.03'))
 
 router.get('/report/address/:address', paid('ARCOX_INTEL_PRICE_REPORT_ADDRESS', '0.05', async (req, res) => {
   try {
