@@ -8,9 +8,9 @@ Backend retail proxy untuk ARCOX DEX.
 - Quote/swap/send/bridge preparation untuk web UI dan agent.
 - ARCOX Pay invoice/payment request API untuk public USDC payment link di Arc Testnet.
 - Circle Gateway webhook foundation dan dev simulator.
-- Eco route preview mock mode untuk future cross-chain stablecoin invoice.
-- x402-ready middleware untuk premium API endpoint, disabled by default.
-- Circle Gateway Nanopayments readiness metadata untuk future gas-free x402 payments.
+- Eco route preview untuk future cross-chain stablecoin invoice.
+- x402 middleware untuk premium API endpoint memakai real Arc Testnet USDC invoice.
+- Arc Transaction Memo reconciliation untuk x402 payment.
 - `wallets-db.json` sebagai mapping owner ke Circle wallet proxy.
 - `tx-history-db.json` sebagai history transaksi web UI dan agent.
 - `invoices-db.json` sebagai invoice/payment request runtime storage.
@@ -69,25 +69,25 @@ ARCOX Pay adalah USDC payment request dan invoice layer untuk Arc. Fitur yang di
 - Payment links dan checkout page.
 - Invoice status/timeline.
 - Circle Gateway webhook foundation.
-- Sandbox/API viewer di `/pay/sandbox`.
-- Eco adapter mock mode.
+- Pay status console di `/pay/status`.
+- Unified Balance / Circle Gateway payment readiness.
 - MCP compatibility.
-- Future x402 monetization.
+- x402 monetization memakai Arc Testnet USDC.
 - ARCOX Intel API: selected Arkham-backed intelligence endpoints protected by x402.
 - Future Circle Gateway Nanopayments readiness.
 
 Yang real sekarang: public USDC invoice/payment link di Arc Testnet.
 
-Yang mock/future: production Eco routing, x402 berbayar aktif, dan privacy/private payment.
+Yang future: production Eco routing penuh, gas-free nanopayments batch settlement, dan privacy/private payment.
 
 ARCOX Intel:
 
 - Backend only: `ARKHAM_API_KEY` belongs in `arc-dex-api` env.
 - Frontend and MCP call `/api/intel/*`; they never call Arkham directly.
-- Development/testnet can use `X-PAYMENT: mock-paid` when `X402_VERIFY_PAYMENT=false`.
+- x402 payment memakai exact USDC amount, 6 decimals, Arc Transaction Memo, dan on-chain reconciliation.
 - See `docs/arcox-intel.md`.
 
-Circle Gateway Nanopayments belum live. ARCOX hanya menyiapkan response `402 Payment Required`, proof binding, replay protection, dan endpoint readiness:
+Circle Gateway Nanopayments gas-free belum live. ARCOX memakai response `402 Payment Required`, invoice internal, dan Arc USDC memo payment:
 
 ```text
 GET /api/nanopayments/capabilities
@@ -109,24 +109,23 @@ ECO_LIVE_ROUTES=false
 ECO_DAPP_ID=arcox-pay
 ECO_QUOTES_API_URL=https://quotes.eco.com/api/v3/quotes/single
 X402_ENABLED=true
-X402_MODE=circle_webhook_testnet
+X402_MODE=arc_real_testnet
 X402_ASSET=USDC
+X402_CHAIN_ID=5042002
+X402_USDC_ADDRESS=0x3600000000000000000000000000000000000000
+X402_RECIPIENT_ADDRESS=
 X402_BASE_AMOUNT=0.005
 X402_PAYMENT_TTL_SECONDS=300
 CIRCLE_X402_TREASURY_WALLET_ID=
-CIRCLE_X402_TREASURY_ADDRESS=
 CIRCLE_X402_NETWORK=arc-testnet
+ARC_MEMO_CONTRACT=0x5294E9927c3306DcBaDb03fe70b92e01cCede505
 ```
 
 ## Testing Singkat
 
 1. Start API dan DEX.
-2. Buka `/pay/sandbox`.
+2. Buka `/pay/status`.
 3. Create invoice.
-4. Buka payment link.
-5. Cek invoice status.
-6. Simulate `gateway.deposit.finalized`.
-7. Simulate `gateway.mint.forwarded`.
-8. Simulate `gateway.mint.finalized`.
-9. Pastikan invoice menjadi `paid`.
-10. Kirim webhook duplikat dan pastikan tidak double-process.
+4. Bayar exact Arc USDC via wallet memo.
+5. Cek invoice status sampai `paid`.
+6. Retry Intel request memakai `X-PAYMENT-ID`.

@@ -1,5 +1,13 @@
 import { Router } from 'express'
-import { createX402Invoice, getX402Invoice, publicInvoice, reconcileX402Invoice, x402Config } from '../middleware/x402Middleware.mjs'
+import {
+  createX402Invoice,
+  estimateUnifiedBalanceX402,
+  getX402Invoice,
+  markUnifiedBalanceSpendSubmitted,
+  publicInvoice,
+  reconcileX402Invoice,
+  x402Config,
+} from '../middleware/x402Middleware.mjs'
 
 const router = Router()
 
@@ -42,8 +50,24 @@ router.get('/payment-request/:paymentId', async (req, res) => {
 router.post('/verify', (_req, res) => {
   res.status(410).json({
     ok: false,
-    error: 'Manual x402 txHash verification is disabled. Pay the exact invoice amount to the Circle treasury wallet and wait for Circle transactions.inbound webhook.',
+    error: 'Manual x402 txHash verification is disabled. Pay with Arc USDC memo or Unified Balance and wait for on-chain/webhook reconciliation.',
   })
+})
+
+router.post('/invoices/:invoiceId/estimate-unified-balance', (req, res) => {
+  try {
+    const invoice = estimateUnifiedBalanceX402(req.params.invoiceId, req.body || {})
+    if (!invoice) return res.status(404).json({ error: 'x402 invoice not found' })
+    res.json({ ok: true, x402: publicInvoice(invoice), invoice: publicInvoice(invoice) })
+  } catch (error) {
+    res.status(400).json({ error: error?.message || 'Unified Balance estimate failed' })
+  }
+})
+
+router.post('/invoices/:invoiceId/spend-submitted', (req, res) => {
+  const invoice = markUnifiedBalanceSpendSubmitted(req.params.invoiceId, req.body || {})
+  if (!invoice) return res.status(404).json({ error: 'x402 invoice not found' })
+  res.json({ ok: true, x402: publicInvoice(invoice), invoice: publicInvoice(invoice) })
 })
 
 router.get('/config', (_req, res) => {
@@ -57,15 +81,17 @@ function publicConfig() {
     mode: cfg.mode,
     asset: cfg.asset,
     network: cfg.network,
+    chainId: cfg.chainId,
+    usdcAddress: cfg.usdcAddress,
     circleEnvironment: cfg.circleEnvironment,
     circleBaseUrl: cfg.circleBaseUrl,
     circleTreasuryWalletId: cfg.circleTreasuryWalletId,
     recipient: cfg.circleTreasuryAddress,
     memoContract: cfg.memoContract,
-    paymentMethod: 'arc-transaction-memo',
+    paymentMethod: 'arc-usdc-memo',
+    paymentMethods: ['arc-usdc-memo', 'unified-balance-gateway'],
     baseAmount: cfg.baseAmount,
     expiresInSeconds: cfg.ttlSeconds,
-    mockMode: false,
   }
 }
 

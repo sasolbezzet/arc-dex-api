@@ -17,6 +17,7 @@ const ARC_USDC = process.env.X402_USDC_ADDRESS || '0x360000000000000000000000000
 const ARC_MEMO_CONTRACT = process.env.ARC_MEMO_CONTRACT || '0x5294E9927c3306DcBaDb03fe70b92e01cCede505'
 const TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 value)')
 const MEMO_EVENT = parseAbiItem('event Memo(address indexed sender,address indexed target,bytes32 callDataHash,bytes32 indexed memoId,bytes memo,uint256 memoIndex)')
+const OPEN_STATUSES = new Set(['created', 'payment_required', 'estimate_ready', 'awaiting_signature', 'spend_submitted', 'settlement_pending', 'recovery_required', 'pending'])
 let loadedPersistentInvoices = false
 
 function loadPersistentInvoices() {
@@ -58,15 +59,17 @@ export function priceFromEnv(name, fallback) {
 export function x402Config() {
   return {
     enabled: String(process.env.X402_ENABLED || 'true').toLowerCase() === 'true',
-    mode: process.env.X402_MODE || 'circle_webhook_testnet',
+    mode: process.env.X402_MODE || 'arc_real_testnet',
     baseAmount: String(process.env.X402_BASE_AMOUNT || process.env.X402_DEFAULT_PRICE_USDC || '0.005'),
     ttlSeconds: Number(process.env.X402_PAYMENT_TTL_SECONDS || process.env.X402_PAYMENT_EXPIRY_SECONDS || 300),
     asset: process.env.X402_ASSET || 'USDC',
-    network: process.env.CIRCLE_X402_NETWORK || process.env.X402_NETWORK || 'circle-sandbox-testnet',
-    circleEnvironment: process.env.CIRCLE_ENV || 'sandbox',
+    network: process.env.CIRCLE_X402_NETWORK || process.env.X402_NETWORK || 'arc-testnet',
+    chainId: Number(process.env.X402_CHAIN_ID || process.env.ARC_CHAIN_ID || 5042002),
+    usdcAddress: ARC_USDC,
+    circleEnvironment: process.env.CIRCLE_ENV || 'testnet',
     circleBaseUrl: process.env.CIRCLE_BASE_URL || 'https://api-sandbox.circle.com',
     circleTreasuryWalletId: process.env.CIRCLE_X402_TREASURY_WALLET_ID || '',
-    circleTreasuryAddress: process.env.CIRCLE_X402_TREASURY_ADDRESS || process.env.X402_RECIPIENT_ADDRESS || '',
+    circleTreasuryAddress: process.env.X402_RECIPIENT_ADDRESS || process.env.CIRCLE_X402_TREASURY_ADDRESS || process.env.ARCOX_TREASURY_WALLET_ADDRESS || '',
     memoContract: ARC_MEMO_CONTRACT,
   }
 }
@@ -82,6 +85,16 @@ function nextUniqueAmount(baseAmount) {
   globalThis.__arcoxX402UniqueCounter = uniqueCounter
   const base = Number(normalizeAmount(baseAmount))
   return (base + uniqueCounter / 1_000_000).toFixed(6)
+}
+
+function amountToBaseUnits(value) {
+  const normalized = normalizeAmount(value)
+  const [whole, fraction = ''] = normalized.split('.')
+  return `${BigInt(whole || '0') * 1_000_000n + BigInt((fraction + '000000').slice(0, 6))}`
+}
+
+function isOpenStatus(status) {
+  return OPEN_STATUSES.has(String(status || ''))
 }
 
 export function createX402Invoice(input = {}) {
@@ -105,23 +118,39 @@ export function createX402Invoice(input = {}) {
     paymentId,
     service: input.service || 'arcox_intel',
     resource: String(input.resource || '/api/intel'),
-    status: 'pending',
+    status: 'payment_required',
     asset: cfg.asset,
     network: cfg.network,
+    chainId: cfg.chainId,
+    usdcAddress: cfg.usdcAddress,
     circleEnvironment: cfg.circleEnvironment,
     circleTreasuryWalletId: cfg.circleTreasuryWalletId,
     recipient: cfg.circleTreasuryAddress,
     baseAmount,
     uniqueAmount,
     amount: uniqueAmount,
+    amountBaseUnits: amountToBaseUnits(uniqueAmount),
+    decimals: 6,
     memoContract: ARC_MEMO_CONTRACT,
     memoId,
     memoData,
-    paymentMethod: 'arc-transaction-memo',
+    paymentMethod: 'arc-usdc-memo',
+    paymentMethods: ['arc-usdc-memo', 'unified-balance-gateway'],
+    settlementStatus: 'payment_required',
+    route: {
+      destination: 'Arc_Testnet',
+      asset: 'USDC',
+      directArc: true,
+      unifiedBalance: true,
+    },
+    fee: {
+      asset: 'USDC',
+      amount: '0',
+      note: 'No ARCOX x402 platform fee added to the invoice amount.',
+    },
     createdAt: new Date(now).toISOString(),
     expiresAt: new Date(now + cfg.ttlSeconds * 1000).toISOString(),
     expiresInSeconds: cfg.ttlSeconds,
-    mockMode: false,
   }
   invoices.set(invoiceId, invoice)
   invoices.set(paymentId, invoice)
@@ -133,8 +162,9 @@ export function getX402Invoice(id) {
   loadPersistentInvoices()
   const invoice = invoices.get(String(id || ''))
   if (!invoice) return null
-  if (invoice.status === 'pending' && Date.now() > Date.parse(invoice.expiresAt)) {
+  if (isOpenStatus(invoice.status) && Date.now() > Date.parse(invoice.expiresAt)) {
     invoice.status = 'expired'
+    invoice.settlementStatus = invoice.settlementStatus === 'settlement_pending' ? 'recovery_required' : 'expired'
     invoice.updatedAt = new Date().toISOString()
     invoices.set(invoice.invoiceId, invoice)
     invoices.set(invoice.paymentId, invoice)
@@ -145,7 +175,7 @@ export function getX402Invoice(id) {
 
 export async function reconcileX402Invoice(id) {
   const invoice = getX402Invoice(id)
-  if (!invoice || invoice.status !== 'pending') return invoice
+  if (!invoice || !isOpenStatus(invoice.status)) return invoice
   if (!invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) return invoice
   try {
     const rpc = process.env.ARC_RPC_URL || process.env.RPC || 'https://rpc.testnet.arc.network/'
@@ -156,6 +186,7 @@ export async function reconcileX402Invoice(id) {
     const memoMatch = await findMemoPayment(client, invoice, fromBlock, current)
     if (memoMatch) {
       invoice.status = 'paid'
+      invoice.settlementStatus = 'paid'
       invoice.txHash = memoMatch.transactionHash
       invoice.paidAt = new Date().toISOString()
       invoice.updatedAt = invoice.paidAt
@@ -190,6 +221,7 @@ export async function reconcileX402Invoice(id) {
     }
     if (!match) return invoice
     invoice.status = 'paid'
+    invoice.settlementStatus = 'paid'
     invoice.txHash = match.transactionHash
     invoice.paidAt = new Date().toISOString()
     invoice.updatedAt = invoice.paidAt
@@ -214,25 +246,37 @@ export function publicInvoice(invoice) {
     status: invoice.status,
     asset: invoice.asset,
     network: invoice.network,
+    chainId: invoice.chainId || x402Config().chainId,
+    usdcAddress: invoice.usdcAddress || ARC_USDC,
     circleEnvironment: invoice.circleEnvironment,
     circleTreasuryWalletId: invoice.circleTreasuryWalletId,
     recipient: invoice.recipient,
     baseAmount: invoice.baseAmount,
     uniqueAmount: invoice.uniqueAmount,
     amount: invoice.uniqueAmount,
+    amountBaseUnits: invoice.amountBaseUnits || amountToBaseUnits(invoice.uniqueAmount),
+    decimals: 6,
     memoContract: invoice.memoContract || ARC_MEMO_CONTRACT,
     memoId: invoice.memoId,
     memoData: invoice.memoData,
-    paymentMethod: invoice.paymentMethod || 'arc-transaction-memo',
+    paymentMethod: invoice.paymentMethod || 'arc-usdc-memo',
+    paymentMethods: invoice.paymentMethods || ['arc-usdc-memo', 'unified-balance-gateway'],
+    settlementStatus: invoice.settlementStatus || invoice.status,
+    route: invoice.route,
+    fee: invoice.fee,
+    unifiedBalanceEstimate: invoice.unifiedBalanceEstimate,
+    spendTxHash: invoice.spendTxHash,
+    transferId: invoice.transferId,
     createdAt: invoice.createdAt,
     expiresAt: invoice.expiresAt,
     expiresInSeconds: invoice.expiresInSeconds,
     txHash: invoice.txHash,
     paidAt: invoice.paidAt,
     reconciledBy: invoice.reconciledBy,
+    serviceStatus: invoice.serviceStatus,
+    serviceUnlockedAt: invoice.serviceUnlockedAt,
     memoIndex: invoice.memoIndex,
     memoSender: invoice.memoSender,
-    mockMode: false,
   }
 }
 
@@ -326,7 +370,7 @@ function isFinalCircleStatus(status) {
 
 export function verifyCircleWebhookSignature(req, rawBody) {
   const secret = process.env.CIRCLE_WEBHOOK_SECRET || ''
-  if (!secret) return { ok: true, skipped: true }
+  if (!secret) return { ok: false, error: 'CIRCLE_WEBHOOK_SECRET is required' }
   const signature = String(req.headers['circle-signature'] || req.headers['x-circle-signature'] || req.headers['circle-signature-sha256'] || '')
   if (!signature) return { ok: false, error: 'Circle webhook signature required' }
   const expected = createHmac('sha256', secret).update(rawBody).digest('hex')
@@ -387,12 +431,13 @@ export function processCircleX402Webhook(payload = {}) {
   for (const invoice of invoices.values()) {
     if (!invoice || invoice.invoiceId !== invoices.get(invoice.invoiceId)?.invoiceId) continue
     const latest = getX402Invoice(invoice.invoiceId)
-    if (!latest || latest.status !== 'pending') continue
+    if (!latest || !isOpenStatus(latest.status)) continue
     if (normalizeAddress(latest.recipient) !== extracted.destinationAddress) continue
     if (normalizeAsset(latest.asset) !== extracted.asset) continue
     if (normalizeAmount(latest.uniqueAmount) !== extracted.amount) continue
     if (normalizeNetwork(latest.network || targetNetwork) !== extracted.network && targetNetwork !== extracted.network) continue
     latest.status = 'paid'
+    latest.settlementStatus = 'paid'
     latest.txHash = extracted.txHash || ''
     latest.paidAt = new Date().toISOString()
     latest.updatedAt = latest.paidAt
@@ -415,6 +460,55 @@ export function processCircleX402Webhook(payload = {}) {
   return { duplicate: false, event, unmatched: true }
 }
 
+export function estimateUnifiedBalanceX402(invoiceId, input = {}) {
+  const invoice = getX402Invoice(invoiceId)
+  if (!invoice) return null
+  if (!isOpenStatus(invoice.status)) return invoice
+  if (!invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) {
+    throw new Error('x402 recipient is not configured')
+  }
+  const now = new Date().toISOString()
+  const estimate = {
+    method: 'unified-balance-gateway',
+    asset: 'USDC',
+    amount: invoice.uniqueAmount,
+    amountBaseUnits: invoice.amountBaseUnits || amountToBaseUnits(invoice.uniqueAmount),
+    destinationChain: 'Arc_Testnet',
+    recipient: invoice.recipient,
+    route: input.route || 'Circle Gateway Unified Balance -> Arc Testnet USDC',
+    fees: input.fees || [],
+    delegateStatus: input.delegateStatus || 'must_be_ready_before_spend',
+    settlement: 'not_paid_until_onchain_transfer_or_gateway_webhook',
+    estimatedAt: now,
+  }
+  invoice.status = 'estimate_ready'
+  invoice.settlementStatus = 'estimate_ready'
+  invoice.unifiedBalanceEstimate = estimate
+  invoice.updatedAt = now
+  invoices.set(invoice.invoiceId, invoice)
+  invoices.set(invoice.paymentId, invoice)
+  persistInvoices()
+  return invoice
+}
+
+export function markUnifiedBalanceSpendSubmitted(invoiceId, input = {}) {
+  const invoice = getX402Invoice(invoiceId)
+  if (!invoice) return null
+  if (!isOpenStatus(invoice.status)) return invoice
+  const now = new Date().toISOString()
+  invoice.status = 'settlement_pending'
+  invoice.settlementStatus = 'settlement_pending'
+  invoice.paymentMethod = 'unified-balance-gateway'
+  invoice.spendTxHash = input.txHash || input.spendTxHash || ''
+  invoice.transferId = input.transferId || ''
+  invoice.spendResult = input.spendResult || null
+  invoice.updatedAt = now
+  invoices.set(invoice.invoiceId, invoice)
+  invoices.set(invoice.paymentId, invoice)
+  persistInvoices()
+  return invoice
+}
+
 export function withArcoxX402(handler, config = {}) {
   return async (req, res, next) => {
     if (String(process.env.ARCOX_INTEL_ENABLED || 'true').toLowerCase() === 'false') {
@@ -428,7 +522,12 @@ export function withArcoxX402(handler, config = {}) {
     if (paymentId) {
       const invoice = await reconcileX402Invoice(paymentId)
       if (invoice?.status === 'paid' && invoice.resource === resource) {
-        req.arcoxX402 = { mode: 'circle_webhook_testnet', invoice }
+        invoice.serviceStatus = 'service_unlocked'
+        invoice.serviceUnlockedAt = new Date().toISOString()
+        invoices.set(invoice.invoiceId, invoice)
+        invoices.set(invoice.paymentId, invoice)
+        persistInvoices()
+        req.arcoxX402 = { mode: 'arc_real_testnet', invoice }
         return handler(req, res, next)
       }
       if (invoice && invoice.resource !== resource) {
