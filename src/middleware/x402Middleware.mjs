@@ -188,6 +188,7 @@ export async function reconcileX402Invoice(id) {
       invoice.status = 'paid'
       invoice.settlementStatus = 'paid'
       invoice.txHash = memoMatch.transactionHash
+      invoice.blockNumber = memoMatch.blockNumber
       invoice.paidAt = new Date().toISOString()
       invoice.updatedAt = invoice.paidAt
       invoice.reconciledBy = 'arc-transaction-memo'
@@ -223,6 +224,7 @@ export async function reconcileX402Invoice(id) {
     invoice.status = 'paid'
     invoice.settlementStatus = 'paid'
     invoice.txHash = match.transactionHash
+    invoice.blockNumber = String(match.blockNumber || '')
     invoice.paidAt = new Date().toISOString()
     invoice.updatedAt = invoice.paidAt
     invoice.reconciledBy = 'arc-usdc-transfer-log'
@@ -271,6 +273,7 @@ export function publicInvoice(invoice) {
     expiresAt: invoice.expiresAt,
     expiresInSeconds: invoice.expiresInSeconds,
     txHash: invoice.txHash,
+    blockNumber: invoice.blockNumber,
     paidAt: invoice.paidAt,
     reconciledBy: invoice.reconciledBy,
     serviceStatus: invoice.serviceStatus,
@@ -307,6 +310,7 @@ async function findMemoPayment(client, invoice, fromBlock, toBlock) {
     if (transfer) {
       return {
         transactionHash: memoLog.transactionHash,
+        blockNumber: String(memoLog.blockNumber || ''),
         memoIndex: String(memoLog.args?.memoIndex ?? ''),
         sender: memoLog.args?.sender || '',
       }
