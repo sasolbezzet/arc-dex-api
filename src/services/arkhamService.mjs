@@ -56,13 +56,13 @@ export class ArkhamService {
       balances: `/balances/address/${encodeURIComponent(address)}`,
       counterparties: `/counterparties/address/${encodeURIComponent(address)}`,
       flows: `/flow/address/${encodeURIComponent(address)}`,
-      volume: `/volume/address/${encodeURIComponent(address)}`,
+      volume: { path: `/volume/address/${encodeURIComponent(address)}`, query: { timeLast: '24h' } },
     }
     const report = {}
     const errors = []
     for (const [section, path] of Object.entries(sections)) {
       try {
-        report[section] = await this.get(path)
+        report[section] = typeof path === 'string' ? await this.get(path) : await this.get(path.path, path.query)
       } catch (error) {
         errors.push({ section, message: error.message || `Arkham ${section} endpoint failed` })
       }
