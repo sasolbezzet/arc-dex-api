@@ -121,8 +121,9 @@ export function getPolicy(ownerAddress) {
   const current = { ...fallback, ...(state.autoPayPolicy[owner] || {}) }
   current.delegateAddress = current.delegateAddress || delegateAddress()
   current.delegateStatus = current.delegateStatus || 'not_configured'
+  if (current.delegateStatus === 'none') current.delegateStatus = 'not_configured'
   current.status = current.enabled
-    ? current.delegateStatus === 'ready' ? 'ready' : 'delegate_required'
+    ? current.delegateStatus === 'ready' ? 'ready' : 'auto_pay_required'
     : current.status === 'off' ? 'off' : 'deposit_required'
   delete current.dailyLimit
   return current
