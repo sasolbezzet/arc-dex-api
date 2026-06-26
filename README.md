@@ -89,10 +89,10 @@ ARCOX Intel:
 
 ## ARCOX AI Router
 
-ARCOX AI Router adalah OpenAI-compatible API layer yang dibayar dari saldo yang sudah difund melalui Unified Balance. Flow retail:
+ARCOX AI Router adalah OpenAI-compatible API layer yang dibayar per request dari Unified Balance user melalui Auto Pay delegate. Flow retail:
 
 ```text
-Connect wallet -> Deposit USDC to Unified Balance -> Fund AI Router -> Auto Pay ON -> Create API Key -> Use /v1/chat/completions
+Connect wallet -> Deposit USDC to Unified Balance -> Auto Pay ON -> Create API Key -> Use /v1/chat/completions
 ```
 
 Endpoint:
@@ -105,8 +105,6 @@ POST /api/ai-router/api-keys/:id/revoke
 POST /api/ai-router/api-keys/:id/rotate
 GET  /api/ai-router/models
 GET  /api/ai-router/usage?ownerAddress=0x...
-POST /api/ai-router/payments/prepare
-POST /api/ai-router/payments/:id/settle
 GET  /v1/models
 POST /v1/chat/completions
 ```
@@ -124,8 +122,10 @@ Security:
 - API key format `arx_sk_...`.
 - Backend stores only SHA-256 hash, never plain API key.
 - Provider API keys stay only in backend env.
-- AI Router charges only prepaid ARCOX credit funded from Unified Balance settlement to ARCOX treasury.
-- If credit is insufficient, `/v1/chat/completions` returns HTTP 402 with “Please deposit more USDC to Unified Balance”.
+- AI Router charges only at request time through delegated Unified Balance spend.
+- User funds stay in user Unified Balance until each AI request is paid.
+- If Unified Balance is insufficient, `/v1/chat/completions` returns HTTP 402 with “Please deposit more USDC to Unified Balance”.
+- If delegate is not ready, `/v1/chat/completions` returns HTTP 402 with “Enable Auto Pay first”.
 
 Provider env example:
 
@@ -173,6 +173,7 @@ CIRCLE_X402_TREASURY_WALLET_ID=
 CIRCLE_X402_NETWORK=arc-testnet
 ARC_MEMO_CONTRACT=0x5294E9927c3306DcBaDb03fe70b92e01cCede505
 AI_ROUTER_TREASURY_ADDRESS=
+AI_ROUTER_DELEGATE_ADDRESS=
 AI_ROUTER_DEFAULT_COST_USDC=0.001
 AI_ROUTER_DEFAULT_MAX_PER_REQUEST_USDC=0.02
 AI_ROUTER_DEFAULT_DAILY_LIMIT_USDC=0.20

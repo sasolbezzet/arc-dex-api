@@ -99,7 +99,6 @@ export function ensureUser(ownerAddress) {
   if (!state.users[owner]) {
     state.users[owner] = {
       ownerAddress: owner,
-      creditBalance: '0.000000',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     }
@@ -109,15 +108,24 @@ export function ensureUser(ownerAddress) {
 
 export function getPolicy(ownerAddress) {
   const owner = normalizeOwner(ownerAddress)
-  return state.autoPayPolicy[owner] || {
+  const fallback = {
     ownerAddress: owner,
     enabled: false,
     maxPerRequest: process.env.AI_ROUTER_DEFAULT_MAX_PER_REQUEST_USDC || '0.02',
     dailyLimit: process.env.AI_ROUTER_DEFAULT_DAILY_LIMIT_USDC || '0.20',
     monthlyLimit: process.env.AI_ROUTER_DEFAULT_MONTHLY_LIMIT_USDC || '2.00',
     source: 'unified_balance',
+    delegateStatus: 'not_configured',
+    delegateAddress: delegateAddress(),
     status: 'deposit_required',
   }
+  const current = { ...fallback, ...(state.autoPayPolicy[owner] || {}) }
+  current.delegateAddress = current.delegateAddress || delegateAddress()
+  current.delegateStatus = current.delegateStatus || 'not_configured'
+  current.status = current.enabled
+    ? current.delegateStatus === 'ready' ? 'ready' : 'delegate_required'
+    : current.status === 'off' ? 'off' : 'deposit_required'
+  return current
 }
 
 export function setPolicy(ownerAddress, input = {}) {
@@ -131,6 +139,8 @@ export function setPolicy(ownerAddress, input = {}) {
     dailyLimit: normalizeUsdc(input.dailyLimit || current.dailyLimit),
     monthlyLimit: normalizeUsdc(input.monthlyLimit || current.monthlyLimit),
     source: 'unified_balance',
+    delegateStatus: input.delegateStatus || current.delegateStatus || (input.enabled ? 'ready' : 'not_configured'),
+    delegateAddress: input.delegateAddress || current.delegateAddress || delegateAddress(),
     status: input.enabled ? 'ready' : 'off',
     updatedAt: new Date().toISOString(),
   }
@@ -138,10 +148,10 @@ export function setPolicy(ownerAddress, input = {}) {
   return state.autoPayPolicy[owner]
 }
 
-export function createPaymentIntent({ ownerAddress, amount }) {
+export function createPaymentIntent({ ownerAddress, amount, requestId, model }) {
   const owner = normalizeOwner(ownerAddress)
   ensureUser(owner)
-  const id = `air_pay_${randomUUID().replaceAll('-', '').slice(0, 14)}`
+  const id = requestId || `air_pay_${randomUUID().replaceAll('-', '').slice(0, 14)}`
   const now = new Date().toISOString()
   const payment = {
     id,
@@ -150,8 +160,12 @@ export function createPaymentIntent({ ownerAddress, amount }) {
     asset: 'USDC',
     network: 'arc-testnet',
     status: 'created',
-    paymentMethod: 'unified_balance',
+    paymentStatus: 'created',
+    paymentMethod: 'delegated_unified_balance',
     recipient: treasuryAddress(),
+    sourceAccount: owner,
+    delegateAddress: delegateAddress(),
+    model: model || '',
     createdAt: now,
     updatedAt: now,
   }
@@ -164,32 +178,25 @@ export function markPaymentSettled(id, patch = {}) {
   const payment = state.payments[id]
   if (!payment) return null
   payment.status = 'paid'
+  payment.paymentStatus = 'paid'
   payment.txHash = patch.txHash || payment.txHash || ''
+  payment.transferId = patch.transferId || payment.transferId || ''
+  payment.estimate = patch.estimate || payment.estimate || null
   payment.settledAt = new Date().toISOString()
   payment.updatedAt = payment.settledAt
-  const user = ensureUser(payment.ownerAddress)
-  user.creditBalance = addUsdc(user.creditBalance, payment.amount)
-  user.updatedAt = payment.updatedAt
   saveAiRouterStore()
   return payment
 }
 
-export function reserveCredit(ownerAddress, amount) {
-  const owner = normalizeOwner(ownerAddress)
-  const user = ensureUser(owner)
-  const cost = normalizeUsdc(amount)
-  if (compareUsdc(user.creditBalance, cost) < 0) return null
-  user.creditBalance = subUsdc(user.creditBalance, cost)
-  user.updatedAt = new Date().toISOString()
+export function markPaymentStatus(id, status, patch = {}) {
+  const payment = state.payments[id]
+  if (!payment) return null
+  payment.status = status
+  payment.paymentStatus = status
+  Object.assign(payment, patch)
+  payment.updatedAt = new Date().toISOString()
   saveAiRouterStore()
-  return { ownerAddress: owner, amount: cost, remaining: user.creditBalance }
-}
-
-export function refundCredit(ownerAddress, amount) {
-  const user = ensureUser(ownerAddress)
-  user.creditBalance = addUsdc(user.creditBalance, amount)
-  user.updatedAt = new Date().toISOString()
-  saveAiRouterStore()
+  return payment
 }
 
 export function addUsageLog(entry) {
@@ -227,19 +234,25 @@ export function spendToday(ownerAddress) {
   start.setUTCHours(0, 0, 0, 0)
   return state.usageLogs
     .filter(log => log.ownerAddress === owner && log.status === 'success' && Date.parse(log.createdAt) >= start.getTime())
-    .reduce((sum, log) => addUsdc(sum, log.cost), '0.000000')
+    .reduce((sum, log) => sumUsdc(sum, log.cost), '0.000000')
 }
 
 export function getAiRouterStatus(ownerAddress) {
   const owner = normalizeOwner(ownerAddress)
-  const user = ensureUser(owner)
+  ensureUser(owner)
+  const policy = getPolicy(owner)
   return {
     ownerAddress: owner,
     unifiedBalance: {
-      available: user?.creditBalance || '0.000000',
-      source: 'confirmed Unified Balance spends to ARCOX treasury',
+      available: 'read_with_circle_appkit_getBalances',
+      source: 'user-owned Unified Balance',
     },
-    autoPay: getPolicy(owner),
+    autoPay: policy,
+    delegate: {
+      status: policy.delegateStatus || 'not_configured',
+      address: policy.delegateAddress || delegateAddress(),
+      sourceAccount: owner,
+    },
     apiKeys: listApiKeys(owner),
     usageLogs: usageForOwner(owner, 10),
     modelList: Object.values(state.modelRegistry),
@@ -254,6 +267,10 @@ export function treasuryAddress() {
   return process.env.AI_ROUTER_TREASURY_ADDRESS || process.env.ARCOX_TREASURY_WALLET_ADDRESS || process.env.X402_RECIPIENT_ADDRESS || process.env.CIRCLE_X402_TREASURY_ADDRESS || ''
 }
 
+export function delegateAddress() {
+  return process.env.AI_ROUTER_DELEGATE_ADDRESS || process.env.CIRCLE_DELEGATE_ADDRESS || process.env.CIRCLE_X402_TREASURY_ADDRESS || ''
+}
+
 export function normalizeUsdc(value) {
   const n = Number(value)
   if (!Number.isFinite(n) || n < 0) throw new Error('Invalid USDC amount')
@@ -266,13 +283,8 @@ export function compareUsdc(a, b) {
   return ai === bi ? 0 : ai > bi ? 1 : -1
 }
 
-function addUsdc(a, b) {
+function sumUsdc(a, b) {
   return fromUnits(BigInt(toUnits(a)) + BigInt(toUnits(b)))
-}
-
-function subUsdc(a, b) {
-  const result = BigInt(toUnits(a)) - BigInt(toUnits(b))
-  return fromUnits(result > 0n ? result : 0n)
 }
 
 export function toUnits(value) {

@@ -1,6 +1,5 @@
 import { Router } from 'express'
 import { createHmac, timingSafeEqual } from 'crypto'
-import { createPublicClient, decodeEventLog, getAddress, http, parseAbiItem } from 'viem'
 import {
   addUsageLog,
   compareUsdc,
@@ -11,24 +10,20 @@ import {
   issueApiKey,
   listApiKeys,
   markPaymentSettled,
+  markPaymentStatus,
   normalizeOwner,
   normalizeUsdc,
   publicApiKey,
-  refundCredit,
-  reserveCredit,
   revokeApiKey,
   setPolicy,
   spendToday,
-  toUnits,
   treasuryAddress,
   usageForOwner,
-  aiRouterState,
 } from '../services/aiRouterStore.mjs'
 import { callChatCompletionWithFallback, publicModels } from '../services/aiProviderService.mjs'
+import { delegateConfig, spendDelegatedAiPayment } from '../services/aiRouterSpendService.mjs'
 
 const router = Router()
-const transferEvent = parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 value)')
-const ARC_USDC = process.env.X402_USDC_ADDRESS || '0x3600000000000000000000000000000000000000'
 
 router.get('/status', (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
@@ -90,38 +85,6 @@ router.get('/usage', (req, res) => {
   res.json({ ok: true, usageLogs: usageForOwner(ownerAddress, limit) })
 })
 
-router.post('/payments/prepare', requireOwnerAuth, (req, res) => {
-  const ownerAddress = normalizeOwner(req.body?.ownerAddress)
-  const amount = normalizeUsdc(req.body?.amount || process.env.AI_ROUTER_TOPUP_AMOUNT_USDC || '0.10')
-  if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
-  const recipient = treasuryAddress()
-  if (!/^0x[0-9a-fA-F]{40}$/.test(recipient)) return res.status(500).json({ error: 'AI Router treasury address is not configured' })
-  const payment = createPaymentIntent({ ownerAddress, amount })
-  res.json({
-    ok: true,
-    payment,
-    instruction: 'Spend this exact amount from Unified Balance to the ARCOX treasury, then submit the txHash automatically from the UI.',
-  })
-})
-
-router.post('/payments/:id/settle', requireOwnerAuth, async (req, res) => {
-  const payment = aiRouterState.payments[req.params.id]
-  if (!payment) return res.status(404).json({ error: 'payment not found' })
-  const txHash = String(req.body?.txHash || req.body?.spendTxHash || '').trim()
-  if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) return res.status(400).json({ error: 'valid txHash is required' })
-  try {
-    await verifyArcUsdcTransfer({ txHash, amount: payment.amount, recipient: payment.recipient })
-    const settled = markPaymentSettled(payment.id, { txHash })
-    const policy = setPolicy(payment.ownerAddress, { enabled: true, ...getPolicy(payment.ownerAddress) })
-    res.json({ ok: true, payment: settled, autoPay: policy, status: getAiRouterStatus(payment.ownerAddress) })
-  } catch (error) {
-    payment.status = 'failed'
-    payment.error = error?.message || 'payment verification failed'
-    payment.updatedAt = new Date().toISOString()
-    res.status(400).json({ error: payment.error, payment })
-  }
-})
-
 router.get('/docs', (_req, res) => {
   res.json({ ok: true, docs: docs() })
 })
@@ -140,14 +103,18 @@ export async function openAiChatCompletions(req, res) {
   const owner = apiKey.ownerAddress
   const policy = getPolicy(owner)
   const cost = normalizeUsdc(req.body?.metadata?.arcox_cost || process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001')
-  if (!policy.enabled) return paymentRequired(res, 'Auto Pay is off', 'Turn Auto Pay ON and fund AI Router from Unified Balance.')
+  if (!policy.enabled) return paymentRequired(res, 'Enable Auto Pay first', 'Enable Auto Pay before calling AI models.')
+  if ((policy.delegateStatus || 'not_configured') !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', 'Delegate is not ready for Unified Balance spend.')
+  if (!delegateConfig().enabled || !delegateConfig().delegateAddress) return paymentRequired(res, 'Enable Auto Pay first', 'Backend delegate wallet is not configured.')
   if (compareUsdc(cost, policy.maxPerRequest) > 0) return paymentRequired(res, 'Auto Pay limit reached', 'Request cost exceeds max per request limit.')
   if (compareUsdc(spendToday(owner), policy.dailyLimit) >= 0) return paymentRequired(res, 'Auto Pay limit reached', 'Daily Auto Pay limit reached.')
-  const reserve = reserveCredit(owner, cost)
-  if (!reserve) return paymentRequired(res, 'Please deposit more USDC to Unified Balance', 'Fund AI Router from Unified Balance before calling models.')
 
   const started = Date.now()
+  const payment = createPaymentIntent({ ownerAddress: owner, amount: cost, requestId, model: req.body?.model || 'arcox/auto' })
   try {
+    markPaymentStatus(payment.id, 'estimate_ready')
+    const spend = await spendDelegatedAiPayment({ sourceAccount: owner, amount: cost })
+    markPaymentSettled(payment.id, { txHash: spend.txHash, transferId: spend.transferId, estimate: spend.estimate })
     const { data, meta } = await callChatCompletionWithFallback(req.body || {})
     const usage = data.usage || {}
     const log = addUsageLog({
@@ -160,6 +127,7 @@ export async function openAiChatCompletions(req, res) {
       outputTokens: usage.completion_tokens || 0,
       cost,
       paymentId: requestId,
+      txHash: spend.txHash,
       fallbackCount: meta.fallbackCount,
       status: 'success',
       latency: meta.latency || Date.now() - started,
@@ -167,17 +135,24 @@ export async function openAiChatCompletions(req, res) {
     res.json({
       ...data,
       arcox: {
-        paidFrom: 'unified_balance_credit',
+        paidFrom: 'delegated_unified_balance',
         cost,
         requestId,
+        paymentId: payment.id,
+        paymentStatus: 'paid',
+        txHash: spend.txHash,
+        transferId: spend.transferId,
         usageLog: log,
         providerUsed: meta.providerUsed,
         fallbackCount: meta.fallbackCount,
       },
     })
   } catch (error) {
-    refundCredit(owner, cost)
     const meta = error?.providerMeta || {}
+    const message = error?.message || 'provider failed'
+    if (/insufficient/i.test(message)) return paymentRequired(res, 'Please deposit more USDC to Unified Balance', message)
+    if (/delegate|auto pay/i.test(message)) return paymentRequired(res, 'Enable Auto Pay first', message)
+    markPaymentStatus(payment.id, 'failed', { error: message })
     addUsageLog({
       requestId,
       apiKeyId: apiKey.id,
@@ -188,9 +163,9 @@ export async function openAiChatCompletions(req, res) {
       fallbackCount: meta.fallbackCount || 0,
       status: 'failed',
       latency: meta.latency || Date.now() - started,
-      error: error?.message || 'provider failed',
+      error: message,
     })
-    res.status(error?.status || 502).json({ error: { message: error?.message || 'AI provider failed', type: 'provider_error' } })
+    res.status(error?.status || 502).json({ error: { message, type: 'provider_error' } })
   }
 }
 
@@ -244,27 +219,9 @@ function paymentRequired(res, message, detail) {
       method: 'unified_balance',
       asset: 'USDC',
       network: 'arc-testnet',
-      action: 'Deposit USDC to Unified Balance, then fund AI Router credit from Unified Balance.',
+      action: 'Deposit USDC to Unified Balance and enable Auto Pay.',
     },
   })
-}
-
-async function verifyArcUsdcTransfer({ txHash, amount, recipient }) {
-  const client = createPublicClient({ transport: http(process.env.ARC_RPC_URL || process.env.RPC || 'https://rpc.testnet.arc.network/', { timeout: 15_000, retryCount: 1 }) })
-  const receipt = await client.getTransactionReceipt({ hash: txHash })
-  if (!receipt || receipt.status !== 'success') throw new Error('AI Router top-up transaction is not successful on Arc')
-  const expectedRecipient = getAddress(recipient)
-  const expectedAmount = BigInt(toUnits(amount))
-  const found = receipt.logs.some(log => {
-    if (String(log.address).toLowerCase() !== ARC_USDC.toLowerCase()) return false
-    try {
-      const decoded = decodeEventLog({ abi: [transferEvent], data: log.data, topics: log.topics })
-      return getAddress(decoded.args?.to) === expectedRecipient && BigInt(decoded.args?.value || 0n) >= expectedAmount
-    } catch {
-      return false
-    }
-  })
-  if (!found) throw new Error('No matching Arc ERC-20 USDC Transfer to ARCOX treasury found in tx receipt')
 }
 
 function docs() {
@@ -275,7 +232,6 @@ function docs() {
     setup: [
       'Connect wallet in ARCOX DEX.',
       'Deposit USDC to Unified Balance.',
-      'Fund AI Router from Unified Balance.',
       'Turn Auto Pay ON.',
       'Create API Key.',
       'Use the key in Hermes/OpenClaw/OpenAI-compatible clients.',
