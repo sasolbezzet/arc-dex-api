@@ -20,7 +20,7 @@ import {
   usageForOwner,
 } from '../services/aiRouterStore.mjs'
 import { callChatCompletionWithFallback, publicModels, validateChatCompletionRoute } from '../services/aiProviderService.mjs'
-import { delegateConfig, spendDelegatedAiPayment } from '../services/aiRouterSpendService.mjs'
+import { delegateConfig, estimateDelegatedAiSpend, spendDelegatedAiPayment } from '../services/aiRouterSpendService.mjs'
 
 const router = Router()
 
@@ -80,7 +80,7 @@ router.get('/models', (_req, res) => {
 router.get('/usage', (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
-  const limit = Number(req.query.limit || 25)
+  const limit = Number(req.query.limit || 5)
   res.json({ ok: true, usageLogs: usageForOwner(ownerAddress, limit) })
 })
 
@@ -121,9 +121,10 @@ export async function openAiChatCompletions(req, res) {
   const payment = createPaymentIntent({ ownerAddress: owner, amount: cost, requestId, model: req.body?.model || 'arcox/auto' })
   try {
     markPaymentStatus(payment.id, 'estimate_ready')
-    const spend = await spendDelegatedAiPayment({ sourceAccount: owner, amount: cost })
-    markPaymentSettled(payment.id, { txHash: spend.txHash, transferId: spend.transferId, estimate: spend.estimate })
+    const estimate = await estimateDelegatedAiSpend({ sourceAccount: owner, amount: cost })
     const { data, meta } = await callChatCompletionWithFallback(req.body || {})
+    const spend = await spendDelegatedAiPayment({ sourceAccount: owner, amount: cost, estimate })
+    markPaymentSettled(payment.id, { txHash: spend.txHash, transferId: spend.transferId, estimate: spend.estimate || estimate })
     const usage = data.usage || {}
     const log = addUsageLog({
       requestId,
@@ -140,7 +141,7 @@ export async function openAiChatCompletions(req, res) {
       status: 'success',
       latency: meta.latency || Date.now() - started,
     })
-    res.json({
+    const body = {
       ...data,
       arcox: {
         paidFrom: 'delegated_unified_balance',
@@ -154,7 +155,9 @@ export async function openAiChatCompletions(req, res) {
         providerUsed: meta.providerUsed,
         fallbackCount: meta.fallbackCount,
       },
-    })
+    }
+    if (req.body?.stream) return sendChatCompletionStream(res, body)
+    res.json(body)
   } catch (error) {
     const meta = error?.providerMeta || {}
     const message = error?.message || 'provider failed'
@@ -175,6 +178,54 @@ export async function openAiChatCompletions(req, res) {
     })
     res.status(error?.status || 502).json({ error: { message, type: 'provider_error' } })
   }
+}
+
+function sendChatCompletionStream(res, data) {
+  const id = data.id || `chatcmpl_${Date.now().toString(36)}`
+  const created = data.created || Math.floor(Date.now() / 1000)
+  const model = data.model || 'arcox/auto'
+  const content = extractAssistantText(data)
+  res.status(200)
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.flushHeaders?.()
+  writeSse(res, {
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+  })
+  if (content) {
+    writeSse(res, {
+      id,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    })
+  }
+  writeSse(res, {
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: data.choices?.[0]?.finish_reason || 'stop' }],
+    usage: data.usage,
+    arcox: data.arcox,
+  })
+  res.write('data: [DONE]\n\n')
+  res.end()
+}
+
+function writeSse(res, payload) {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`)
+}
+
+function extractAssistantText(data) {
+  const message = data?.choices?.[0]?.message || {}
+  return String(message.content || message.reasoning_content || message.reasoning || data?.output_text || '')
 }
 
 function authenticateAiKey(req, scope) {

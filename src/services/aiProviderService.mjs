@@ -81,7 +81,7 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
           ...(process.env.AI_ROUTER_HTTP_REFERER ? { 'HTTP-Referer': process.env.AI_ROUTER_HTTP_REFERER } : {}),
           ...(process.env.AI_ROUTER_APP_TITLE ? { 'X-OpenRouter-Title': process.env.AI_ROUTER_APP_TITLE } : {}),
         },
-        body: JSON.stringify({ ...payload, model: provider.model }),
+        body: JSON.stringify({ ...payload, model: provider.model, stream: false }),
       }).finally(() => clearTimeout(timeout))
       const text = await response.text()
       let data
@@ -97,6 +97,7 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
         }
         throw err
       }
+      validateProviderChatData(data, provider)
       return {
         data,
         meta: {
@@ -122,6 +123,14 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
   const err = new Error('All AI providers failed temporarily')
   err.status = 503
   err.providerMeta = { providerUsed: '', fallbackCount, latency: Date.now() - started, errors }
+  throw err
+}
+
+function validateProviderChatData(data, provider) {
+  if (Array.isArray(data?.choices) && data.choices.length) return
+  const err = new Error(`Provider ${provider.name} returned malformed chat completion`)
+  err.status = 502
+  err.provider = provider.name
   throw err
 }
 

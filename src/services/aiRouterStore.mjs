@@ -262,7 +262,7 @@ export function getAiRouterStatus(ownerAddress) {
       sourceAccount: owner,
     },
     apiKeys: listApiKeys(owner),
-    usageLogs: usageForOwner(owner, 10),
+    usageLogs: usageForOwner(owner, 5),
     modelList: Object.values(state.modelRegistry),
   }
 }

@@ -65,11 +65,11 @@ export async function estimateDelegatedAiSpend({ sourceAccount, amount }) {
   })
 }
 
-export async function spendDelegatedAiPayment({ sourceAccount, amount }) {
+export async function spendDelegatedAiPayment({ sourceAccount, amount, estimate: preparedEstimate }) {
   const cfg = delegateConfig()
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!cfg.recipient) throw new Error('ARCOX treasury recipient is not configured')
-  const estimate = await estimateDelegatedAiSpend({ sourceAccount, amount })
+  const estimate = preparedEstimate || await estimateDelegatedAiSpend({ sourceAccount, amount })
   const result = await getKit().unifiedBalance.spend({
     from: {
       adapter: getAdapter(),
