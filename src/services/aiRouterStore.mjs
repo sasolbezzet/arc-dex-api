@@ -133,15 +133,16 @@ export function setPolicy(ownerAddress, input = {}) {
   const owner = normalizeOwner(ownerAddress)
   ensureUser(owner)
   const current = getPolicy(owner)
+  const delegateStatus = normalizeAutoPayStatus(input.delegateStatus || current.delegateStatus || (input.enabled ? 'ready' : 'not_configured'), Boolean(input.enabled))
   state.autoPayPolicy[owner] = {
     ...current,
     enabled: Boolean(input.enabled),
     maxPerRequest: normalizeUsdc(input.maxPerRequest || current.maxPerRequest),
     monthlyLimit: normalizeUsdc(input.monthlyLimit || current.monthlyLimit),
     source: 'unified_balance',
-    delegateStatus: input.delegateStatus || current.delegateStatus || (input.enabled ? 'ready' : 'not_configured'),
+    delegateStatus,
     delegateAddress: input.delegateAddress || current.delegateAddress || delegateAddress(),
-    status: input.enabled ? 'ready' : 'off',
+    status: input.enabled && delegateStatus === 'ready' ? 'ready' : input.enabled ? 'auto_pay_required' : 'off',
     updatedAt: new Date().toISOString(),
   }
   saveAiRouterStore()
@@ -261,6 +262,18 @@ export function getAiRouterStatus(ownerAddress) {
 
 export function normalizeOwner(ownerAddress) {
   return String(ownerAddress || '').trim().toLowerCase()
+}
+
+function normalizeAutoPayStatus(value, setupEnabled = false) {
+  if (value === true) return 'ready'
+  if (value === false || value === null) return setupEnabled ? 'ready' : 'not_configured'
+  const raw = typeof value === 'string' ? value : value?.status || value?.state || value?.delegateStatus || value?.readiness || ''
+  const normalized = String(raw || '').toLowerCase().replaceAll('_', ' ').trim()
+  if (['ready', 'enabled', 'active', 'approved', 'allowed', 'complete', 'completed', 'success', 'delegated'].includes(normalized)) return 'ready'
+  if (['none', 'missing', 'disabled', 'not configured', 'not ready'].includes(normalized)) return setupEnabled ? 'ready' : 'not_configured'
+  if (normalized.includes('ready') || normalized.includes('enabled') || normalized.includes('active')) return 'ready'
+  if (normalized.includes('pending') || normalized.includes('processing')) return 'pending'
+  return setupEnabled ? 'ready' : normalized || 'not_configured'
 }
 
 export function treasuryAddress() {
