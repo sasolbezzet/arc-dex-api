@@ -224,7 +224,7 @@ function paymentRequired(res, message, detail) {
 
 function docs() {
   return {
-    base_url: process.env.AI_ROUTER_PUBLIC_BASE_URL || 'https://api.arcox.app/v1',
+    base_url: process.env.AI_ROUTER_PUBLIC_BASE_URL || 'https://arc-dex-bice.vercel.app/v1',
     api_key: 'arx_sk_...',
     model: 'arcox/auto',
     setup: [

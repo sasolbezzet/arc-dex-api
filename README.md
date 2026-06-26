@@ -112,7 +112,7 @@ POST /v1/chat/completions
 OpenAI-compatible config:
 
 ```text
-base_url = https://api.arcox.app/v1
+base_url = https://arc-dex-bice.vercel.app/v1
 api_key = arx_sk_...
 model = arcox/auto
 ```

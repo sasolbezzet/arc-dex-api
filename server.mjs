@@ -49,7 +49,8 @@ app.use((req, res, next) => {
   next()
 })
 app.use(['/api/webhooks/circle', '/api/circle/webhook'], express.raw({ type: '*/*', limit: '256kb' }))
-app.use(express.json({ limit: '64kb' }))
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || process.env.AI_ROUTER_JSON_BODY_LIMIT || '8mb'
+app.use(express.json({ limit: JSON_BODY_LIMIT }))
 
 function rateLimit({ windowMs, max, keyPrefix }) {
   const hits = new Map()
