@@ -1,5 +1,6 @@
 import { AppKit } from '@circle-fin/app-kit'
-import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
+import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
+import { privateKeyToAccount } from 'viem/accounts'
 
 let kit
 let adapter
@@ -11,24 +12,36 @@ function getKit() {
 
 function getAdapter() {
   if (!adapter) {
-    adapter = createCircleWalletsAdapter({
-      apiKey: process.env.CIRCLE_API_KEY,
-      entitySecret: process.env.CIRCLE_ENTITY_SECRET,
-    })
+    adapter = createViemAdapterFromPrivateKey({ privateKey: delegatePrivateKey() })
   }
   return adapter
 }
 
 export function delegateConfig() {
+  const signer = delegateSignerAddress()
   return {
-    delegateAddress: firstValidAddress(process.env.AI_ROUTER_DELEGATE_ADDRESS, process.env.CIRCLE_DELEGATE_ADDRESS, process.env.CIRCLE_X402_TREASURY_ADDRESS),
+    delegateAddress: firstValidAddress(process.env.AI_ROUTER_DELEGATE_ADDRESS, signer, process.env.CIRCLE_DELEGATE_ADDRESS),
     recipient: firstValidAddress(process.env.AI_ROUTER_TREASURY_ADDRESS, process.env.ARCOX_TREASURY_WALLET_ADDRESS, process.env.X402_RECIPIENT_ADDRESS, process.env.CIRCLE_X402_TREASURY_ADDRESS),
-    enabled: Boolean(process.env.CIRCLE_API_KEY && process.env.CIRCLE_ENTITY_SECRET),
+    enabled: Boolean(delegatePrivateKey()),
   }
 }
 
 function firstValidAddress(...values) {
   return values.find(value => /^0x[a-fA-F0-9]{40}$/.test(String(value || '').trim())) || ''
+}
+
+function delegatePrivateKey() {
+  const key = process.env.AI_ROUTER_DELEGATE_PRIVATE_KEY || process.env.EOA_PRIVATE_KEY || process.env.AGENT_PRIVATE_KEY || process.env.OWNER_PRIVATE_KEY || ''
+  return key ? key.startsWith('0x') ? key : `0x${key}` : ''
+}
+
+function delegateSignerAddress() {
+  try {
+    const privateKey = delegatePrivateKey()
+    return privateKey ? privateKeyToAccount(privateKey).address : ''
+  } catch {
+    return ''
+  }
 }
 
 export async function estimateDelegatedAiSpend({ sourceAccount, amount }) {

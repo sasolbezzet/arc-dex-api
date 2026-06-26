@@ -19,7 +19,7 @@ import {
   treasuryAddress,
   usageForOwner,
 } from '../services/aiRouterStore.mjs'
-import { callChatCompletionWithFallback, publicModels } from '../services/aiProviderService.mjs'
+import { callChatCompletionWithFallback, publicModels, validateChatCompletionRoute } from '../services/aiProviderService.mjs'
 import { delegateConfig, spendDelegatedAiPayment } from '../services/aiRouterSpendService.mjs'
 
 const router = Router()
@@ -106,6 +106,16 @@ export async function openAiChatCompletions(req, res) {
   if ((policy.delegateStatus || 'not_configured') !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', `Auto Pay is not ready for API key owner ${shortAddress(owner)}.`)
   if (!delegateConfig().enabled || !delegateConfig().delegateAddress) return paymentRequired(res, 'Enable Auto Pay first', 'Backend Auto Pay wallet is not configured.')
   if (compareUsdc(cost, policy.maxPerRequest) > 0) return paymentRequired(res, 'Auto Pay limit reached', 'Request cost exceeds max per request limit.')
+  try {
+    await validateChatCompletionRoute(req.body || {})
+  } catch (error) {
+    return res.status(error?.status || 503).json({
+      error: {
+        message: error?.message || 'AI provider route is not available',
+        type: error?.type || 'provider_config_error',
+      },
+    })
+  }
 
   const started = Date.now()
   const payment = createPaymentIntent({ ownerAddress: owner, amount: cost, requestId, model: req.body?.model || 'arcox/auto' })

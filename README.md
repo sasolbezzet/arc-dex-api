@@ -130,14 +130,14 @@ Security:
 Provider env example:
 
 ```text
-AI_PROVIDER_1_NAME=openrouter
-AI_PROVIDER_1_BASE_URL=https://openrouter.ai/api/v1
+AI_PROVIDER_1_NAME=NVIDIA
+AI_PROVIDER_1_BASE_URL=https://integrate.api.nvidia.com/v1
 AI_PROVIDER_1_API_KEY=
-AI_PROVIDER_1_MODEL=openai/gpt-4o-mini
-AI_PROVIDER_2_NAME=
-AI_PROVIDER_2_BASE_URL=
+AI_PROVIDER_1_MODEL=openai/gpt-oss-120b
+AI_PROVIDER_2_NAME=NVIDIA
+AI_PROVIDER_2_BASE_URL=https://integrate.api.nvidia.com/v1
 AI_PROVIDER_2_API_KEY=
-AI_PROVIDER_2_MODEL=
+AI_PROVIDER_2_MODEL=nvidia/nemotron-3-super-120b-a12b
 ```
 
 Circle Gateway Nanopayments gas-free belum live. ARCOX memakai response `402 Payment Required`, invoice internal, dan Arc USDC memo payment:
@@ -176,7 +176,7 @@ AI_ROUTER_TREASURY_ADDRESS=
 AI_ROUTER_DELEGATE_ADDRESS=
 AI_ROUTER_DEFAULT_COST_USDC=0.001
 AI_ROUTER_DEFAULT_MAX_PER_REQUEST_USDC=0.02
-AI_ROUTER_DEFAULT_DAILY_LIMIT_USDC=0.20
+AI_PROVIDER_VALIDATE_MODELS=true
 AI_PROVIDER_1_NAME=
 AI_PROVIDER_1_BASE_URL=
 AI_PROVIDER_1_API_KEY=

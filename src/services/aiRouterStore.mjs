@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { createHash, randomBytes, randomUUID } from 'crypto'
+import { privateKeyToAccount } from 'viem/accounts'
 
 const DB_FILE = process.env.AI_ROUTER_DB || './ai-router-db.json'
 const state = globalThis.__arcoxAiRouterStore || load()
@@ -119,7 +120,12 @@ export function getPolicy(ownerAddress) {
     status: 'deposit_required',
   }
   const current = { ...fallback, ...(state.autoPayPolicy[owner] || {}) }
-  current.delegateAddress = validEvmAddress(current.delegateAddress) ? current.delegateAddress : delegateAddress()
+  const configuredDelegate = delegateAddress()
+  if (!validEvmAddress(current.delegateAddress) || (configuredDelegate && current.delegateAddress.toLowerCase() !== configuredDelegate.toLowerCase())) {
+    current.delegateAddress = configuredDelegate
+    current.delegateStatus = 'not_configured'
+    current.enabled = false
+  }
   current.delegateStatus = current.delegateStatus || 'not_configured'
   if (current.delegateStatus === 'none') current.delegateStatus = 'not_configured'
   current.status = current.enabled
@@ -288,9 +294,20 @@ export function treasuryAddress() {
 export function delegateAddress() {
   return [
     process.env.AI_ROUTER_DELEGATE_ADDRESS,
+    privateKeyAddress(),
     process.env.CIRCLE_DELEGATE_ADDRESS,
-    process.env.CIRCLE_X402_TREASURY_ADDRESS,
   ].find(validEvmAddress) || ''
+}
+
+function privateKeyAddress() {
+  const key = process.env.AI_ROUTER_DELEGATE_PRIVATE_KEY || process.env.EOA_PRIVATE_KEY || process.env.AGENT_PRIVATE_KEY || process.env.OWNER_PRIVATE_KEY || ''
+  if (!key) return ''
+  try {
+    const privateKey = key.startsWith('0x') ? key : `0x${key}`
+    return privateKeyToAccount(privateKey).address
+  } catch {
+    return ''
+  }
 }
 
 export function normalizeUsdc(value) {

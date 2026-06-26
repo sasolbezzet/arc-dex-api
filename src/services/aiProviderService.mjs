@@ -29,12 +29,9 @@ export function publicModels() {
   const providers = configuredProviders()
   const models = new Map()
   for (const provider of providers) {
-    models.set(provider.model, {
-      id: provider.model,
-      object: 'model',
-      created: 0,
-      owned_by: provider.name,
-    })
+    addPublicModel(models, provider.model, provider.name)
+    const alias = modelAlias(provider.model)
+    if (alias !== provider.model) addPublicModel(models, alias, provider.name)
   }
   if (!models.has('arcox/auto')) {
     models.set('arcox/auto', { id: 'arcox/auto', object: 'model', created: 0, owned_by: 'arcox' })
@@ -42,16 +39,31 @@ export function publicModels() {
   return [...models.values()]
 }
 
-export async function callChatCompletionWithFallback(payload, options = {}) {
-  const providers = configuredProviders()
-  if (!providers.length) {
-    const err = new Error('No AI providers configured')
-    err.status = 503
-    throw err
+export async function validateChatCompletionRoute(payload = {}) {
+  const queue = selectProviders(payload)
+  const validationMode = String(process.env.AI_PROVIDER_VALIDATE_MODELS || 'true').toLowerCase()
+  if (validationMode === 'false' || validationMode === '0') return { ok: true, providers: queue }
+
+  const errors = []
+  for (const provider of queue) {
+    try {
+      const models = await providerModels(provider)
+      if (!models.length || models.includes(provider.model)) return { ok: true, providers: queue }
+      errors.push(`${provider.name}: model ${provider.model} not listed by provider`)
+    } catch (error) {
+      errors.push(`${provider.name}: ${error?.message || 'model validation failed'}`)
+    }
   }
+
+  const err = new Error(`AI provider model is not available. ${errors.join('; ')}`)
+  err.status = 503
+  err.type = 'provider_config_error'
+  throw err
+}
+
+export async function callChatCompletionWithFallback(payload, options = {}) {
   const requestedModel = payload.model || 'arcox/auto'
-  const candidates = providers.filter(p => requestedModel === 'arcox/auto' || p.model === requestedModel)
-  const queue = candidates.length ? candidates : providers
+  const queue = selectProviders(payload)
   const started = Date.now()
   const errors = []
   let fallbackCount = 0
@@ -69,7 +81,7 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
           ...(process.env.AI_ROUTER_HTTP_REFERER ? { 'HTTP-Referer': process.env.AI_ROUTER_HTTP_REFERER } : {}),
           ...(process.env.AI_ROUTER_APP_TITLE ? { 'X-OpenRouter-Title': process.env.AI_ROUTER_APP_TITLE } : {}),
         },
-        body: JSON.stringify({ ...payload, model: requestedModel === 'arcox/auto' ? provider.model : requestedModel }),
+        body: JSON.stringify({ ...payload, model: provider.model }),
       }).finally(() => clearTimeout(timeout))
       const text = await response.text()
       let data
@@ -111,6 +123,71 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
   err.status = 503
   err.providerMeta = { providerUsed: '', fallbackCount, latency: Date.now() - started, errors }
   throw err
+}
+
+function selectProviders(payload = {}) {
+  const providers = configuredProviders()
+  if (!providers.length) {
+    const err = new Error('No AI providers configured')
+    err.status = 503
+    err.type = 'provider_config_error'
+    throw err
+  }
+  const requestedModel = payload.model || 'arcox/auto'
+  if (requestedModel === 'arcox/auto') return providers
+  const candidates = providers.filter(provider => modelMatches(provider.model, requestedModel))
+  if (candidates.length) return candidates
+  const err = new Error(`Model ${requestedModel} is not configured in ARCOX AI Router`)
+  err.status = 400
+  err.type = 'model_not_found'
+  throw err
+}
+
+function modelMatches(providerModel, requestedModel) {
+  return providerModel === requestedModel || modelAlias(providerModel) === requestedModel || modelAlias(requestedModel) === providerModel
+}
+
+function modelAlias(model) {
+  const value = String(model || '').trim()
+  return value.includes('/') ? value.split('/').pop() : value
+}
+
+function addPublicModel(models, id, owner) {
+  if (!id || models.has(id)) return
+  models.set(id, {
+    id,
+    object: 'model',
+    created: 0,
+    owned_by: owner,
+  })
+}
+
+const modelCache = new Map()
+
+async function providerModels(provider) {
+  const cacheKey = `${provider.baseUrl}|${provider.apiKey.slice(-8)}`
+  const cached = modelCache.get(cacheKey)
+  if (cached && Date.now() - cached.time < Number(process.env.AI_PROVIDER_MODEL_CACHE_MS || 600_000)) return cached.models
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), Number(process.env.AI_PROVIDER_MODEL_TIMEOUT_MS || 10_000))
+  const response = await fetch(`${provider.baseUrl}/models`, {
+    signal: controller.signal,
+    headers: {
+      Authorization: `Bearer ${provider.apiKey}`,
+      ...(process.env.AI_ROUTER_HTTP_REFERER ? { 'HTTP-Referer': process.env.AI_ROUTER_HTTP_REFERER } : {}),
+      ...(process.env.AI_ROUTER_APP_TITLE ? { 'X-OpenRouter-Title': process.env.AI_ROUTER_APP_TITLE } : {}),
+    },
+  }).finally(() => clearTimeout(timeout))
+  if (!response.ok) {
+    const err = new Error(`models endpoint HTTP ${response.status}`)
+    err.status = response.status
+    throw err
+  }
+  const data = await response.json()
+  const list = Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : []
+  const models = list.map(item => typeof item === 'string' ? item : item?.id || item?.name).filter(Boolean)
+  modelCache.set(cacheKey, { time: Date.now(), models })
+  return models
 }
 
 function shouldFallback(status) {
