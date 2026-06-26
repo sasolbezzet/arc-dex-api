@@ -21,10 +21,14 @@ function getAdapter() {
 
 export function delegateConfig() {
   return {
-    delegateAddress: process.env.AI_ROUTER_DELEGATE_ADDRESS || process.env.CIRCLE_DELEGATE_ADDRESS || process.env.CIRCLE_X402_TREASURY_ADDRESS || '',
-    recipient: process.env.AI_ROUTER_TREASURY_ADDRESS || process.env.ARCOX_TREASURY_WALLET_ADDRESS || process.env.X402_RECIPIENT_ADDRESS || process.env.CIRCLE_X402_TREASURY_ADDRESS || '',
+    delegateAddress: firstValidAddress(process.env.AI_ROUTER_DELEGATE_ADDRESS, process.env.CIRCLE_DELEGATE_ADDRESS, process.env.CIRCLE_X402_TREASURY_ADDRESS),
+    recipient: firstValidAddress(process.env.AI_ROUTER_TREASURY_ADDRESS, process.env.ARCOX_TREASURY_WALLET_ADDRESS, process.env.X402_RECIPIENT_ADDRESS, process.env.CIRCLE_X402_TREASURY_ADDRESS),
     enabled: Boolean(process.env.CIRCLE_API_KEY && process.env.CIRCLE_ENTITY_SECRET),
   }
+}
+
+function firstValidAddress(...values) {
+  return values.find(value => /^0x[a-fA-F0-9]{40}$/.test(String(value || '').trim())) || ''
 }
 
 export async function estimateDelegatedAiSpend({ sourceAccount, amount }) {

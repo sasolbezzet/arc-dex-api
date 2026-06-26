@@ -119,7 +119,7 @@ export function getPolicy(ownerAddress) {
     status: 'deposit_required',
   }
   const current = { ...fallback, ...(state.autoPayPolicy[owner] || {}) }
-  current.delegateAddress = current.delegateAddress || delegateAddress()
+  current.delegateAddress = validEvmAddress(current.delegateAddress) ? current.delegateAddress : delegateAddress()
   current.delegateStatus = current.delegateStatus || 'not_configured'
   if (current.delegateStatus === 'none') current.delegateStatus = 'not_configured'
   current.status = current.enabled
@@ -134,6 +134,7 @@ export function setPolicy(ownerAddress, input = {}) {
   ensureUser(owner)
   const current = getPolicy(owner)
   const delegateStatus = normalizeAutoPayStatus(input.delegateStatus || current.delegateStatus || (input.enabled ? 'ready' : 'not_configured'), Boolean(input.enabled))
+  const nextDelegateAddress = validEvmAddress(input.delegateAddress) ? input.delegateAddress : validEvmAddress(current.delegateAddress) ? current.delegateAddress : delegateAddress()
   state.autoPayPolicy[owner] = {
     ...current,
     enabled: Boolean(input.enabled),
@@ -141,7 +142,7 @@ export function setPolicy(ownerAddress, input = {}) {
     monthlyLimit: normalizeUsdc(input.monthlyLimit || current.monthlyLimit),
     source: 'unified_balance',
     delegateStatus,
-    delegateAddress: input.delegateAddress || current.delegateAddress || delegateAddress(),
+    delegateAddress: nextDelegateAddress,
     status: input.enabled && delegateStatus === 'ready' ? 'ready' : input.enabled ? 'auto_pay_required' : 'off',
     updatedAt: new Date().toISOString(),
   }
@@ -272,8 +273,12 @@ function normalizeAutoPayStatus(value, setupEnabled = false) {
   if (['ready', 'enabled', 'active', 'approved', 'allowed', 'complete', 'completed', 'success', 'delegated'].includes(normalized)) return 'ready'
   if (['none', 'missing', 'disabled', 'not configured', 'not ready'].includes(normalized)) return setupEnabled ? 'ready' : 'not_configured'
   if (normalized.includes('ready') || normalized.includes('enabled') || normalized.includes('active')) return 'ready'
-  if (normalized.includes('pending') || normalized.includes('processing')) return 'pending'
+  if (normalized.includes('pending') || normalized.includes('processing')) return setupEnabled ? 'ready' : 'pending'
   return setupEnabled ? 'ready' : normalized || 'not_configured'
+}
+
+function validEvmAddress(value) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(value || '').trim())
 }
 
 export function treasuryAddress() {
@@ -281,7 +286,11 @@ export function treasuryAddress() {
 }
 
 export function delegateAddress() {
-  return process.env.AI_ROUTER_DELEGATE_ADDRESS || process.env.CIRCLE_DELEGATE_ADDRESS || process.env.CIRCLE_X402_TREASURY_ADDRESS || ''
+  return [
+    process.env.AI_ROUTER_DELEGATE_ADDRESS,
+    process.env.CIRCLE_DELEGATE_ADDRESS,
+    process.env.CIRCLE_X402_TREASURY_ADDRESS,
+  ].find(validEvmAddress) || ''
 }
 
 export function normalizeUsdc(value) {
