@@ -89,7 +89,7 @@ ARCOX Intel:
 
 ## ARCOX AI Router
 
-ARCOX AI Router adalah OpenAI-compatible API layer yang dibayar per request dari Unified Balance user melalui Auto Pay delegate. Flow retail:
+ARCOX AI Router adalah OpenAI-compatible API layer yang dibayar per request dari Unified Balance user melalui Auto Pay. Flow retail:
 
 ```text
 Connect wallet -> Deposit USDC to Unified Balance -> Auto Pay ON -> Create API Key -> Use /v1/chat/completions
@@ -122,10 +122,10 @@ Security:
 - API key format `arx_sk_...`.
 - Backend stores only SHA-256 hash, never plain API key.
 - Provider API keys stay only in backend env.
-- AI Router charges only at request time through delegated Unified Balance spend.
+- AI Router charges only at request time through Auto Pay Unified Balance spend.
 - User funds stay in user Unified Balance until each AI request is paid.
 - If Unified Balance is insufficient, `/v1/chat/completions` returns HTTP 402 with “Please deposit more USDC to Unified Balance”.
-- If delegate is not ready, `/v1/chat/completions` returns HTTP 402 with “Enable Auto Pay first”.
+- If Auto Pay is not ready, `/v1/chat/completions` returns HTTP 402 with “Enable Auto Pay first”.
 
 Provider env example:
 

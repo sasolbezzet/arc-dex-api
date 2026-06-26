@@ -16,7 +16,6 @@ import {
   publicApiKey,
   revokeApiKey,
   setPolicy,
-  spendToday,
   treasuryAddress,
   usageForOwner,
 } from '../services/aiRouterStore.mjs'
@@ -104,10 +103,9 @@ export async function openAiChatCompletions(req, res) {
   const policy = getPolicy(owner)
   const cost = normalizeUsdc(req.body?.metadata?.arcox_cost || process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001')
   if (!policy.enabled) return paymentRequired(res, 'Enable Auto Pay first', 'Enable Auto Pay before calling AI models.')
-  if ((policy.delegateStatus || 'not_configured') !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', 'Delegate is not ready for Unified Balance spend.')
-  if (!delegateConfig().enabled || !delegateConfig().delegateAddress) return paymentRequired(res, 'Enable Auto Pay first', 'Backend delegate wallet is not configured.')
+  if ((policy.delegateStatus || 'not_configured') !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', 'Auto Pay is not ready for Unified Balance spend.')
+  if (!delegateConfig().enabled || !delegateConfig().delegateAddress) return paymentRequired(res, 'Enable Auto Pay first', 'Backend Auto Pay wallet is not configured.')
   if (compareUsdc(cost, policy.maxPerRequest) > 0) return paymentRequired(res, 'Auto Pay limit reached', 'Request cost exceeds max per request limit.')
-  if (compareUsdc(spendToday(owner), policy.dailyLimit) >= 0) return paymentRequired(res, 'Auto Pay limit reached', 'Daily Auto Pay limit reached.')
 
   const started = Date.now()
   const payment = createPaymentIntent({ ownerAddress: owner, amount: cost, requestId, model: req.body?.model || 'arcox/auto' })
@@ -151,7 +149,7 @@ export async function openAiChatCompletions(req, res) {
     const meta = error?.providerMeta || {}
     const message = error?.message || 'provider failed'
     if (/insufficient/i.test(message)) return paymentRequired(res, 'Please deposit more USDC to Unified Balance', message)
-    if (/delegate|auto pay/i.test(message)) return paymentRequired(res, 'Enable Auto Pay first', message)
+    if (/delegate|auto pay/i.test(message)) return paymentRequired(res, 'Enable Auto Pay first', message.replace(/delegate/gi, 'Auto Pay'))
     markPaymentStatus(payment.id, 'failed', { error: message })
     addUsageLog({
       requestId,

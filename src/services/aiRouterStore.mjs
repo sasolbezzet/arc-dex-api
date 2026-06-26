@@ -112,7 +112,6 @@ export function getPolicy(ownerAddress) {
     ownerAddress: owner,
     enabled: false,
     maxPerRequest: process.env.AI_ROUTER_DEFAULT_MAX_PER_REQUEST_USDC || '0.02',
-    dailyLimit: process.env.AI_ROUTER_DEFAULT_DAILY_LIMIT_USDC || '0.20',
     monthlyLimit: process.env.AI_ROUTER_DEFAULT_MONTHLY_LIMIT_USDC || '2.00',
     source: 'unified_balance',
     delegateStatus: 'not_configured',
@@ -125,6 +124,7 @@ export function getPolicy(ownerAddress) {
   current.status = current.enabled
     ? current.delegateStatus === 'ready' ? 'ready' : 'delegate_required'
     : current.status === 'off' ? 'off' : 'deposit_required'
+  delete current.dailyLimit
   return current
 }
 
@@ -136,7 +136,6 @@ export function setPolicy(ownerAddress, input = {}) {
     ...current,
     enabled: Boolean(input.enabled),
     maxPerRequest: normalizeUsdc(input.maxPerRequest || current.maxPerRequest),
-    dailyLimit: normalizeUsdc(input.dailyLimit || current.dailyLimit),
     monthlyLimit: normalizeUsdc(input.monthlyLimit || current.monthlyLimit),
     source: 'unified_balance',
     delegateStatus: input.delegateStatus || current.delegateStatus || (input.enabled ? 'ready' : 'not_configured'),
