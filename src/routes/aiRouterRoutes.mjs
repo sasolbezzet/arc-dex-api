@@ -102,8 +102,8 @@ export async function openAiChatCompletions(req, res) {
   const owner = apiKey.ownerAddress
   const policy = getPolicy(owner)
   const cost = normalizeUsdc(req.body?.metadata?.arcox_cost || process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001')
-  if (!policy.enabled) return paymentRequired(res, 'Enable Auto Pay first', 'Enable Auto Pay before calling AI models.')
-  if ((policy.delegateStatus || 'not_configured') !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', 'Auto Pay is not ready for Unified Balance spend.')
+  if (!policy.enabled) return paymentRequired(res, 'Enable Auto Pay first', `Enable Auto Pay for API key owner ${shortAddress(owner)} before calling AI models. If the web UI is already ready, create/copy a fresh API key from that same connected wallet.`)
+  if ((policy.delegateStatus || 'not_configured') !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', `Auto Pay is not ready for API key owner ${shortAddress(owner)}.`)
   if (!delegateConfig().enabled || !delegateConfig().delegateAddress) return paymentRequired(res, 'Enable Auto Pay first', 'Backend Auto Pay wallet is not configured.')
   if (compareUsdc(cost, policy.maxPerRequest) > 0) return paymentRequired(res, 'Auto Pay limit reached', 'Request cost exceeds max per request limit.')
 
@@ -175,6 +175,11 @@ function authenticateAiKey(req, scope) {
   if (!apiKey) return { ok: false, status: 401, body: { error: { message: 'Invalid ARCOX API key', type: 'authentication_error' } } }
   if (!apiKey.scopes?.includes(scope)) return { ok: false, status: 403, body: { error: { message: `Missing scope ${scope}`, type: 'permission_error' } } }
   return { ok: true, apiKey: publicApiKey(apiKey) }
+}
+
+function shortAddress(address) {
+  const value = String(address || '')
+  return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value || 'unknown'
 }
 
 function requireOwnerAuth(req, res, next) {
