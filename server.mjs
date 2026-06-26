@@ -13,6 +13,7 @@ import { withX402PaymentRequired } from './middleware/x402.mjs'
 import arkhamRoutes from './src/routes/arkhamRoutes.mjs'
 import treasuryRoutes from './src/routes/treasuryRoutes.mjs'
 import x402Routes from './src/routes/x402Routes.mjs'
+import aiRouterRoutes, { openAiChatCompletions, openAiModels } from './src/routes/aiRouterRoutes.mjs'
 import { processCircleX402Webhook, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
 
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -73,6 +74,9 @@ const attestationLimiter = rateLimit({ windowMs: 60 * 1000, max: 45, keyPrefix: 
 app.use('/api/intel', apiLimiter, arkhamRoutes)
 app.use('/api/treasury', apiLimiter, treasuryRoutes)
 app.use('/api/x402', apiLimiter, x402Routes)
+app.use('/api/ai-router', apiLimiter, aiRouterRoutes)
+app.get('/v1/models', apiLimiter, openAiModels)
+app.post('/v1/chat/completions', apiLimiter, openAiChatCompletions)
 
 const KIT_KEY = process.env.KIT_KEY
 const PORT = process.env.PORT || 3001

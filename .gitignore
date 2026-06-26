@@ -16,6 +16,7 @@ tx-history-db.json
 invoices-db.json
 webhook-events-db.json
 x402-invoices-db.json
+ai-router-db.json
 runtime-backups/
 logs/
 .codegraph/

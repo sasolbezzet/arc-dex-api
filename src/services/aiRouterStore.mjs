@@ -1,0 +1,291 @@
+import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { createHash, randomBytes, randomUUID } from 'crypto'
+
+const DB_FILE = process.env.AI_ROUTER_DB || './ai-router-db.json'
+const state = globalThis.__arcoxAiRouterStore || load()
+globalThis.__arcoxAiRouterStore = state
+
+function load() {
+  try {
+    if (existsSync(DB_FILE)) {
+      const parsed = JSON.parse(readFileSync(DB_FILE, 'utf8') || '{}')
+      return normalize(parsed)
+    }
+  } catch (error) {
+    console.error('[ai-router] failed to load db', error?.message || error)
+  }
+  return normalize({})
+}
+
+function normalize(input) {
+  return {
+    users: input.users || {},
+    apiKeys: input.apiKeys || {},
+    autoPayPolicy: input.autoPayPolicy || {},
+    payments: input.payments || {},
+    usageLogs: input.usageLogs || [],
+    modelRegistry: input.modelRegistry || {},
+    providerHealth: input.providerHealth || {},
+  }
+}
+
+export function saveAiRouterStore() {
+  writeFileSync(DB_FILE, JSON.stringify(state, null, 2))
+}
+
+export function hashApiKey(key) {
+  return createHash('sha256').update(String(key)).digest('hex')
+}
+
+export function issueApiKey({ ownerAddress, label = 'ARCOX AI Router', scopes = ['ai:chat', 'ai:models'] }) {
+  const key = `arx_sk_${randomBytes(24).toString('base64url')}`
+  const now = new Date().toISOString()
+  const id = `key_${randomUUID().replaceAll('-', '').slice(0, 12)}`
+  const rec = {
+    id,
+    ownerAddress: normalizeOwner(ownerAddress),
+    label,
+    keyHash: hashApiKey(key),
+    keyPreview: `${key.slice(0, 10)}...${key.slice(-4)}`,
+    scopes,
+    status: 'active',
+    createdAt: now,
+    rotatedAt: null,
+    revokedAt: null,
+  }
+  state.apiKeys[id] = rec
+  ensureUser(ownerAddress)
+  saveAiRouterStore()
+  return { apiKey: key, record: publicApiKey(rec) }
+}
+
+export function findApiKey(secret) {
+  const keyHash = hashApiKey(secret || '')
+  return Object.values(state.apiKeys).find(key => key.keyHash === keyHash && key.status === 'active') || null
+}
+
+export function listApiKeys(ownerAddress) {
+  const owner = normalizeOwner(ownerAddress)
+  return Object.values(state.apiKeys).filter(key => key.ownerAddress === owner).map(publicApiKey)
+}
+
+export function revokeApiKey(id, ownerAddress) {
+  const key = state.apiKeys[id]
+  if (!key || key.ownerAddress !== normalizeOwner(ownerAddress)) return null
+  key.status = 'revoked'
+  key.revokedAt = new Date().toISOString()
+  saveAiRouterStore()
+  return publicApiKey(key)
+}
+
+export function publicApiKey(key) {
+  if (!key) return null
+  return {
+    id: key.id,
+    ownerAddress: key.ownerAddress,
+    label: key.label,
+    keyPreview: key.keyPreview,
+    scopes: key.scopes,
+    status: key.status,
+    createdAt: key.createdAt,
+    rotatedAt: key.rotatedAt,
+    revokedAt: key.revokedAt,
+  }
+}
+
+export function ensureUser(ownerAddress) {
+  const owner = normalizeOwner(ownerAddress)
+  if (!owner) return null
+  if (!state.users[owner]) {
+    state.users[owner] = {
+      ownerAddress: owner,
+      creditBalance: '0.000000',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }
+  }
+  return state.users[owner]
+}
+
+export function getPolicy(ownerAddress) {
+  const owner = normalizeOwner(ownerAddress)
+  return state.autoPayPolicy[owner] || {
+    ownerAddress: owner,
+    enabled: false,
+    maxPerRequest: process.env.AI_ROUTER_DEFAULT_MAX_PER_REQUEST_USDC || '0.02',
+    dailyLimit: process.env.AI_ROUTER_DEFAULT_DAILY_LIMIT_USDC || '0.20',
+    monthlyLimit: process.env.AI_ROUTER_DEFAULT_MONTHLY_LIMIT_USDC || '2.00',
+    source: 'unified_balance',
+    status: 'deposit_required',
+  }
+}
+
+export function setPolicy(ownerAddress, input = {}) {
+  const owner = normalizeOwner(ownerAddress)
+  ensureUser(owner)
+  const current = getPolicy(owner)
+  state.autoPayPolicy[owner] = {
+    ...current,
+    enabled: Boolean(input.enabled),
+    maxPerRequest: normalizeUsdc(input.maxPerRequest || current.maxPerRequest),
+    dailyLimit: normalizeUsdc(input.dailyLimit || current.dailyLimit),
+    monthlyLimit: normalizeUsdc(input.monthlyLimit || current.monthlyLimit),
+    source: 'unified_balance',
+    status: input.enabled ? 'ready' : 'off',
+    updatedAt: new Date().toISOString(),
+  }
+  saveAiRouterStore()
+  return state.autoPayPolicy[owner]
+}
+
+export function createPaymentIntent({ ownerAddress, amount }) {
+  const owner = normalizeOwner(ownerAddress)
+  ensureUser(owner)
+  const id = `air_pay_${randomUUID().replaceAll('-', '').slice(0, 14)}`
+  const now = new Date().toISOString()
+  const payment = {
+    id,
+    ownerAddress: owner,
+    amount: normalizeUsdc(amount),
+    asset: 'USDC',
+    network: 'arc-testnet',
+    status: 'created',
+    paymentMethod: 'unified_balance',
+    recipient: treasuryAddress(),
+    createdAt: now,
+    updatedAt: now,
+  }
+  state.payments[id] = payment
+  saveAiRouterStore()
+  return payment
+}
+
+export function markPaymentSettled(id, patch = {}) {
+  const payment = state.payments[id]
+  if (!payment) return null
+  payment.status = 'paid'
+  payment.txHash = patch.txHash || payment.txHash || ''
+  payment.settledAt = new Date().toISOString()
+  payment.updatedAt = payment.settledAt
+  const user = ensureUser(payment.ownerAddress)
+  user.creditBalance = addUsdc(user.creditBalance, payment.amount)
+  user.updatedAt = payment.updatedAt
+  saveAiRouterStore()
+  return payment
+}
+
+export function reserveCredit(ownerAddress, amount) {
+  const owner = normalizeOwner(ownerAddress)
+  const user = ensureUser(owner)
+  const cost = normalizeUsdc(amount)
+  if (compareUsdc(user.creditBalance, cost) < 0) return null
+  user.creditBalance = subUsdc(user.creditBalance, cost)
+  user.updatedAt = new Date().toISOString()
+  saveAiRouterStore()
+  return { ownerAddress: owner, amount: cost, remaining: user.creditBalance }
+}
+
+export function refundCredit(ownerAddress, amount) {
+  const user = ensureUser(ownerAddress)
+  user.creditBalance = addUsdc(user.creditBalance, amount)
+  user.updatedAt = new Date().toISOString()
+  saveAiRouterStore()
+}
+
+export function addUsageLog(entry) {
+  const log = {
+    requestId: entry.requestId || `air_req_${randomUUID().replaceAll('-', '').slice(0, 12)}`,
+    apiKeyId: entry.apiKeyId || '',
+    ownerAddress: normalizeOwner(entry.ownerAddress),
+    model: entry.model || '',
+    providerUsed: entry.providerUsed || '',
+    inputTokens: Number(entry.inputTokens || 0),
+    outputTokens: Number(entry.outputTokens || 0),
+    cost: normalizeUsdc(entry.cost || '0'),
+    paymentId: entry.paymentId || '',
+    txHash: entry.txHash || '',
+    fallbackCount: Number(entry.fallbackCount || 0),
+    status: entry.status || 'created',
+    latency: Number(entry.latency || 0),
+    error: entry.error || '',
+    createdAt: entry.createdAt || new Date().toISOString(),
+  }
+  state.usageLogs.unshift(log)
+  state.usageLogs = state.usageLogs.slice(0, 1000)
+  saveAiRouterStore()
+  return log
+}
+
+export function usageForOwner(ownerAddress, limit = 25) {
+  const owner = normalizeOwner(ownerAddress)
+  return state.usageLogs.filter(log => log.ownerAddress === owner).slice(0, Number(limit) || 25)
+}
+
+export function spendToday(ownerAddress) {
+  const owner = normalizeOwner(ownerAddress)
+  const start = new Date()
+  start.setUTCHours(0, 0, 0, 0)
+  return state.usageLogs
+    .filter(log => log.ownerAddress === owner && log.status === 'success' && Date.parse(log.createdAt) >= start.getTime())
+    .reduce((sum, log) => addUsdc(sum, log.cost), '0.000000')
+}
+
+export function getAiRouterStatus(ownerAddress) {
+  const owner = normalizeOwner(ownerAddress)
+  const user = ensureUser(owner)
+  return {
+    ownerAddress: owner,
+    unifiedBalance: {
+      available: user?.creditBalance || '0.000000',
+      source: 'confirmed Unified Balance spends to ARCOX treasury',
+    },
+    autoPay: getPolicy(owner),
+    apiKeys: listApiKeys(owner),
+    usageLogs: usageForOwner(owner, 10),
+    modelList: Object.values(state.modelRegistry),
+  }
+}
+
+export function normalizeOwner(ownerAddress) {
+  return String(ownerAddress || '').trim().toLowerCase()
+}
+
+export function treasuryAddress() {
+  return process.env.AI_ROUTER_TREASURY_ADDRESS || process.env.ARCOX_TREASURY_WALLET_ADDRESS || process.env.X402_RECIPIENT_ADDRESS || process.env.CIRCLE_X402_TREASURY_ADDRESS || ''
+}
+
+export function normalizeUsdc(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) throw new Error('Invalid USDC amount')
+  return n.toFixed(6)
+}
+
+export function compareUsdc(a, b) {
+  const ai = BigInt(toUnits(a))
+  const bi = BigInt(toUnits(b))
+  return ai === bi ? 0 : ai > bi ? 1 : -1
+}
+
+function addUsdc(a, b) {
+  return fromUnits(BigInt(toUnits(a)) + BigInt(toUnits(b)))
+}
+
+function subUsdc(a, b) {
+  const result = BigInt(toUnits(a)) - BigInt(toUnits(b))
+  return fromUnits(result > 0n ? result : 0n)
+}
+
+export function toUnits(value) {
+  const normalized = normalizeUsdc(value)
+  const [whole, fraction = ''] = normalized.split('.')
+  return String(BigInt(whole || '0') * 1_000_000n + BigInt((fraction + '000000').slice(0, 6)))
+}
+
+function fromUnits(value) {
+  const n = BigInt(value)
+  const whole = n / 1_000_000n
+  const fraction = `${n % 1_000_000n}`.padStart(6, '0')
+  return `${whole}.${fraction}`
+}
+
+export { state as aiRouterState }

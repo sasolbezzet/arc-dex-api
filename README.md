@@ -87,6 +87,59 @@ ARCOX Intel:
 - x402 payment memakai exact USDC amount, 6 decimals, Arc Transaction Memo, dan on-chain reconciliation.
 - See `docs/arcox-intel.md`.
 
+## ARCOX AI Router
+
+ARCOX AI Router adalah OpenAI-compatible API layer yang dibayar dari saldo yang sudah difund melalui Unified Balance. Flow retail:
+
+```text
+Connect wallet -> Deposit USDC to Unified Balance -> Fund AI Router -> Auto Pay ON -> Create API Key -> Use /v1/chat/completions
+```
+
+Endpoint:
+
+```text
+GET  /api/ai-router/status?ownerAddress=0x...
+POST /api/ai-router/auto-pay
+POST /api/ai-router/api-keys
+POST /api/ai-router/api-keys/:id/revoke
+POST /api/ai-router/api-keys/:id/rotate
+GET  /api/ai-router/models
+GET  /api/ai-router/usage?ownerAddress=0x...
+POST /api/ai-router/payments/prepare
+POST /api/ai-router/payments/:id/settle
+GET  /v1/models
+POST /v1/chat/completions
+```
+
+OpenAI-compatible config:
+
+```text
+base_url = https://api.arcox.app/v1
+api_key = arx_sk_...
+model = arcox/auto
+```
+
+Security:
+
+- API key format `arx_sk_...`.
+- Backend stores only SHA-256 hash, never plain API key.
+- Provider API keys stay only in backend env.
+- AI Router charges only prepaid ARCOX credit funded from Unified Balance settlement to ARCOX treasury.
+- If credit is insufficient, `/v1/chat/completions` returns HTTP 402 with “Please deposit more USDC to Unified Balance”.
+
+Provider env example:
+
+```text
+AI_PROVIDER_1_NAME=openrouter
+AI_PROVIDER_1_BASE_URL=https://openrouter.ai/api/v1
+AI_PROVIDER_1_API_KEY=
+AI_PROVIDER_1_MODEL=openai/gpt-4o-mini
+AI_PROVIDER_2_NAME=
+AI_PROVIDER_2_BASE_URL=
+AI_PROVIDER_2_API_KEY=
+AI_PROVIDER_2_MODEL=
+```
+
 Circle Gateway Nanopayments gas-free belum live. ARCOX memakai response `402 Payment Required`, invoice internal, dan Arc USDC memo payment:
 
 ```text
@@ -119,6 +172,14 @@ X402_PAYMENT_TTL_SECONDS=300
 CIRCLE_X402_TREASURY_WALLET_ID=
 CIRCLE_X402_NETWORK=arc-testnet
 ARC_MEMO_CONTRACT=0x5294E9927c3306DcBaDb03fe70b92e01cCede505
+AI_ROUTER_TREASURY_ADDRESS=
+AI_ROUTER_DEFAULT_COST_USDC=0.001
+AI_ROUTER_DEFAULT_MAX_PER_REQUEST_USDC=0.02
+AI_ROUTER_DEFAULT_DAILY_LIMIT_USDC=0.20
+AI_PROVIDER_1_NAME=
+AI_PROVIDER_1_BASE_URL=
+AI_PROVIDER_1_API_KEY=
+AI_PROVIDER_1_MODEL=
 ```
 
 ## Testing Singkat
