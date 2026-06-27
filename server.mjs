@@ -358,20 +358,6 @@ function noSwapRouteResponse(res, err) {
   })
 }
 
-function isBlockedCircleSwapRoute(tokenIn, tokenOut) {
-  return tokenIn === 'EURC' && tokenOut === 'USDC'
-}
-
-function blockedCircleSwapResponse(res, tokenIn, tokenOut) {
-  return res.json({
-    success: false,
-    available: false,
-    code: 'CIRCLE_SCA_ROUTE_UNAVAILABLE',
-    error: `Circle wallet route ${tokenIn} → ${tokenOut} belum aman untuk dieksekusi. Gunakan EOA wallet untuk pasangan ini.`,
-    details: 'Circle developer/proxy wallet rejects this route during Arc Testnet execution estimation, while the EOA prepared-adapter route works.',
-  })
-}
-
 function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount }) {
   if (!KIT_KEY) throw new Error('KIT_KEY belum dikonfigurasi')
   if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) throw new Error('Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut))
@@ -385,6 +371,50 @@ function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount }) {
     toAddress: owner,
     amount: decimalToUnits(amount, TOKEN_DECIMALS[tokenIn]).toString(),
     slippageBps: 300,
+  }
+}
+
+function isEurcToCirBtc(tokenIn, tokenOut) {
+  return tokenIn === 'EURC' && tokenOut === 'cirBTC'
+}
+
+async function estimateCircleSwapRoute({ from, tokenIn, tokenOut, amountIn, config }) {
+  if (!isEurcToCirBtc(tokenIn, tokenOut)) {
+    return kit.estimateSwap({ from, tokenIn: swapTokenParam(tokenIn), tokenOut: swapTokenParam(tokenOut), amountIn, config })
+  }
+  const first = await kit.estimateSwap({ from, tokenIn: 'EURC', tokenOut: 'USDC', amountIn, config })
+  const intermediateAmount = first?.estimatedOutput?.amount
+  if (!intermediateAmount || Number(intermediateAmount) <= 0) throw new Error('Route EURC → USDC tidak menghasilkan estimasi.')
+  const second = await kit.estimateSwap({ from, tokenIn: 'USDC', tokenOut: swapTokenParam('cirBTC'), amountIn: intermediateAmount, config })
+  return {
+    ...second,
+    tokenIn: 'EURC',
+    tokenOut: 'cirBTC',
+    amountIn,
+    fees: [...(first?.fees || []), ...(second?.fees || [])],
+    route: 'EURC → USDC → cirBTC',
+    legs: [first, second],
+  }
+}
+
+async function executeCircleSwapRoute({ from, tokenIn, tokenOut, amountIn, config }) {
+  if (!isEurcToCirBtc(tokenIn, tokenOut)) {
+    return kit.swap({ from, tokenIn: swapTokenParam(tokenIn), tokenOut: swapTokenParam(tokenOut), amountIn, config })
+  }
+  const first = await kit.swap({ from, tokenIn: 'EURC', tokenOut: 'USDC', amountIn, config })
+  const intermediateAmount = first?.amountOut
+  if (!intermediateAmount || Number(intermediateAmount) <= 0) throw new Error('Swap EURC → USDC tidak menghasilkan output untuk route cirBTC.')
+  const second = await kit.swap({ from, tokenIn: 'USDC', tokenOut: swapTokenParam('cirBTC'), amountIn: intermediateAmount, config })
+  return {
+    ...second,
+    tokenIn: 'EURC',
+    tokenOut: 'cirBTC',
+    amountIn,
+    route: 'EURC → USDC → cirBTC',
+    steps: [
+      { name: 'EURC → USDC', state: 'success', txHash: first?.txHash, explorerUrl: first?.explorerUrl, amountOut: first?.amountOut },
+      { name: 'USDC → cirBTC', state: 'success', txHash: second?.txHash, explorerUrl: second?.explorerUrl, amountOut: second?.amountOut },
+    ],
   }
 }
 
@@ -1014,6 +1044,119 @@ app.get('/api/balance/:address', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+const GATEWAY_TESTNET_API = 'https://gateway-api-testnet.circle.com'
+const GATEWAY_TESTNET_CHAINS = [
+  { domain: 26, chain: 'Arc_Testnet' },
+  { domain: 6, chain: 'Base_Sepolia' },
+  { domain: 0, chain: 'Ethereum_Sepolia' },
+  { domain: 3, chain: 'Arbitrum_Sepolia' },
+]
+
+app.post('/api/unified-balance/balances', apiLimiter, async (req, res) => {
+  try {
+    const address = normalizeAddress(req.body?.address, 'address')
+    const sources = GATEWAY_TESTNET_CHAINS.map(({ domain }) => ({ depositor: address, domain }))
+    const requestBody = { token: 'USDC', sources }
+    const [confirmed, pendingResult] = await Promise.all([
+      gatewayBalanceRequest('/v1/balances', requestBody),
+      gatewayBalanceRequest('/v1/deposits', requestBody).catch(error => {
+        console.warn('[unified-balance] pending lookup failed:', error.message)
+        return { token: 'USDC', deposits: [] }
+      }),
+    ])
+    res.json(formatGatewayBalances(address, confirmed, pendingResult))
+  } catch (error) {
+    console.error('[unified-balance]', error.message)
+    res.status(error?.status || 502).json({ error: error.message || 'Unified Balance lookup failed' })
+  }
+})
+
+async function gatewayBalanceRequest(path, body) {
+  let lastError
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 8_000)
+    try {
+      const response = await fetch(`${GATEWAY_TESTNET_API}${path}`, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'arcox-api/2.0' },
+        body: JSON.stringify(body),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok || data?.success === false) {
+        const error = new Error(data?.message || `Circle Gateway HTTP ${response.status}`)
+        error.status = response.status >= 400 && response.status < 500 ? response.status : 502
+        throw error
+      }
+      return data
+    } catch (error) {
+      lastError = error
+      if (attempt < 3) await new Promise(resolve => setTimeout(resolve, attempt * 350))
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+  const error = new Error(lastError?.name === 'AbortError' ? 'Circle Gateway balance request timed out' : (lastError?.message || 'Circle Gateway request failed'))
+  error.status = lastError?.status || 502
+  throw error
+}
+
+function formatGatewayBalances(address, confirmed, pending) {
+  const confirmedByDomain = new Map((confirmed?.balances || []).map(item => [Number(item.domain), String(item.balance || '0')]))
+  const pendingByDomain = new Map()
+  const pendingTxByDomain = new Map()
+  for (const deposit of pending?.deposits || []) {
+    const domain = Number(deposit.domain)
+    const amount = String(deposit.amount || '0')
+    pendingByDomain.set(domain, addDecimalAmounts(pendingByDomain.get(domain) || '0', amount))
+    const list = pendingTxByDomain.get(domain) || []
+    list.push({
+      transactionHash: deposit.transactionHash,
+      amount,
+      status: deposit.status,
+      blockTimestamp: deposit.blockTimestamp,
+    })
+    pendingTxByDomain.set(domain, list)
+  }
+  const chains = GATEWAY_TESTNET_CHAINS.map(({ domain, chain }) => ({
+    chain,
+    confirmedBalance: fixedUsdc(confirmedByDomain.get(domain) || '0'),
+    pendingBalance: fixedUsdc(pendingByDomain.get(domain) || '0'),
+    pendingTransactions: pendingTxByDomain.get(domain) || [],
+  }))
+  const totalConfirmed = chains.reduce((total, item) => addDecimalAmounts(total, item.confirmedBalance), '0')
+  const totalPending = chains.reduce((total, item) => addDecimalAmounts(total, item.pendingBalance), '0')
+  return {
+    token: 'USDC',
+    totalConfirmedBalance: fixedUsdc(totalConfirmed),
+    totalPendingBalance: fixedUsdc(totalPending),
+    breakdown: [{
+      depositor: address,
+      totalConfirmed: fixedUsdc(totalConfirmed),
+      totalPending: fixedUsdc(totalPending),
+      breakdown: chains,
+    }],
+    source: 'circle-gateway-server',
+  }
+}
+
+function addDecimalAmounts(left, right) {
+  return unitsToDecimal(balanceUsdcUnits(left) + balanceUsdcUnits(right), 6)
+}
+
+function balanceUsdcUnits(value) {
+  const normalized = String(value || '0').trim()
+  if (!/^\d+(\.\d+)?$/.test(normalized)) return 0n
+  const [whole, fraction = ''] = normalized.split('.')
+  return BigInt(whole) * 1_000_000n + BigInt(fraction.padEnd(6, '0').slice(0, 6) || '0')
+}
+
+function fixedUsdc(value) {
+  const [whole = '0', fraction = ''] = String(value || '0').split('.')
+  return `${whole}.${fraction.padEnd(6, '0').slice(0, 6)}`
+}
+
 // ── Quote ──
 app.post('/api/eoa-swap-quote', apiLimiter, requireAuth, async (req, res) => {
   try {
@@ -1111,14 +1254,13 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
     if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
     if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
     if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
-    if (isBlockedCircleSwapRoute(tokenIn, tokenOut)) return blockedCircleSwapResponse(res, tokenIn, tokenOut)
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
     try {
       const wallet = await getOrCreateWallet(owner)
-      const estimate = await kit.estimateSwap({
+      const estimate = await estimateCircleSwapRoute({
         from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
-        tokenIn: swapTokenParam(tokenIn),
-        tokenOut: swapTokenParam(tokenOut),
+        tokenIn,
+        tokenOut,
         amountIn: platformFee.netAmount,
         config: { kitKey: KIT_KEY, allowanceStrategy: 'approve' },
       })
@@ -1156,7 +1298,6 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
     if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
     if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
     if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
-    if (isBlockedCircleSwapRoute(tokenIn, tokenOut)) return blockedCircleSwapResponse(res, tokenIn, tokenOut)
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
     const wallet = await getOrCreateWallet(owner)
     const params = {
@@ -1167,12 +1308,24 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
       config: { kitKey: KIT_KEY, allowanceStrategy: 'approve' },
     }
     try {
-      await kit.estimateSwap(params)
+      await estimateCircleSwapRoute({
+        from: params.from,
+        tokenIn,
+        tokenOut,
+        amountIn: platformFee.netAmount,
+        config: params.config,
+      })
     } catch(e) {
       if (isNoSwapRouteError(e)) return noSwapRouteResponse(res, e)
       console.warn('[swap] estimate precheck failed, continuing:', e.message)
     }
-    const result = await kit.swap(params)
+    const result = await executeCircleSwapRoute({
+      from: params.from,
+      tokenIn,
+      tokenOut,
+      amountIn: platformFee.netAmount,
+      config: params.config,
+    })
     let feeResult = null
     let feeError = ''
     const treasury = normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY')
