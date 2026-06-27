@@ -423,6 +423,68 @@ function stablecoinErrorMessage(payload, fallback) {
   return payload.message || payload.error || payload.detail || fallback
 }
 
+async function quotePreparedEoaRoute({ owner, tokenIn, tokenOut, amount }) {
+  const firstParams = buildStablecoinSwapParams({
+    owner,
+    tokenIn,
+    tokenOut: isEurcToCirBtc(tokenIn, tokenOut) ? 'USDC' : tokenOut,
+    amount,
+  })
+  const first = await stablecoinRequest('/v1/stablecoinKits/quote', { query: firstParams })
+  if (!isEurcToCirBtc(tokenIn, tokenOut)) return { quote: first, legs: [{ params: firstParams, quote: first }] }
+  const intermediateUnits = String(first?.quote?.minAmount || '0')
+  if (BigInt(intermediateUnits) <= 0n) throw new Error('Route EURC → USDC tidak menghasilkan minimum output.')
+  const secondParams = buildStablecoinSwapParams({
+    owner,
+    tokenIn: 'USDC',
+    tokenOut: 'cirBTC',
+    amount: unitsToDecimal(BigInt(intermediateUnits), TOKEN_DECIMALS.USDC),
+  })
+  const second = await stablecoinRequest('/v1/stablecoinKits/quote', { query: secondParams })
+  return { quote: second, legs: [{ params: firstParams, quote: first }, { params: secondParams, quote: second }] }
+}
+
+async function prepareEoaSwapLeg(params, tokenIn, tokenOut) {
+  const prepared = await stablecoinRequest('/v1/stablecoinKits/swap', { method: 'POST', body: params })
+  if (!prepared?.transaction?.executionParams || !prepared?.transaction?.signature) {
+    throw new Error('Stablecoin Service tidak mengembalikan payload EVM swap yang valid.')
+  }
+  return {
+    tokenIn,
+    tokenOut,
+    tokenInAddress: prepared.tokenInAddress,
+    tokenOutAddress: prepared.tokenOutAddress,
+    amountBaseUnits: params.amount,
+    amountIn: unitsToDecimal(BigInt(params.amount), TOKEN_DECIMALS[tokenIn]),
+    amountOut: unitsToDecimal(BigInt(prepared.estimatedAmount || '0'), TOKEN_DECIMALS[tokenOut]),
+    stopLimit: prepared.stopLimit,
+    estimatedAmount: prepared.estimatedAmount,
+    gasLimit: prepared.transaction.gasLimit,
+    executionParams: prepared.transaction.executionParams,
+    signature: prepared.transaction.signature,
+  }
+}
+
+async function prepareEoaSwapRoute({ owner, tokenIn, tokenOut, amount }) {
+  if (!isEurcToCirBtc(tokenIn, tokenOut)) {
+    const params = buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount })
+    const leg = await prepareEoaSwapLeg(params, tokenIn, tokenOut)
+    return { amountOut: leg.amountOut, route: `${tokenIn} → ${tokenOut}`, legs: [leg] }
+  }
+  const firstParams = buildStablecoinSwapParams({ owner, tokenIn: 'EURC', tokenOut: 'USDC', amount })
+  const first = await prepareEoaSwapLeg(firstParams, 'EURC', 'USDC')
+  const intermediateUnits = String(first.stopLimit || '0')
+  if (BigInt(intermediateUnits) <= 0n) throw new Error('Route EURC → USDC tidak menghasilkan minimum output.')
+  const secondParams = buildStablecoinSwapParams({
+    owner,
+    tokenIn: 'USDC',
+    tokenOut: 'cirBTC',
+    amount: unitsToDecimal(BigInt(intermediateUnits), TOKEN_DECIMALS.USDC),
+  })
+  const second = await prepareEoaSwapLeg(secondParams, 'USDC', 'cirBTC')
+  return { amountOut: second.amountOut, route: 'EURC → USDC → cirBTC', legs: [first, second] }
+}
+
 async function stablecoinRequest(path, { method = 'GET', query, body } = {}) {
   const url = new URL(path, STABLECOIN_SERVICE_BASE_URL)
   if (query) {
@@ -1167,8 +1229,8 @@ app.post('/api/eoa-swap-quote', apiLimiter, requireAuth, async (req, res) => {
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
-    const params = buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
-    const quote = await stablecoinRequest('/v1/stablecoinKits/quote', { query: params })
+    const routeQuote = await quotePreparedEoaRoute({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
+    const quote = routeQuote.quote
     const estimatedUnits = BigInt(quote?.quote?.estimatedAmount || '0')
     const minUnits = BigInt(quote?.quote?.minAmount || '0')
     const amountOut = unitsToDecimal(estimatedUnits, TOKEN_DECIMALS[tokenOut])
@@ -1176,6 +1238,7 @@ app.post('/api/eoa-swap-quote', apiLimiter, requireAuth, async (req, res) => {
     return res.json({
       available: true,
       source: 'stablecoin-service',
+      route: routeQuote.legs.length > 1 ? 'EURC → USDC → cirBTC' : `${tokenIn} → ${tokenOut}`,
       provider: quote?.quote?.route?.provider || 'circle',
       amountOut,
       minAmountOut,
@@ -1205,12 +1268,7 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
-    const params = buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
-    const prepared = await stablecoinRequest('/v1/stablecoinKits/swap', { method: 'POST', body: params })
-    if (!prepared?.transaction?.executionParams || !prepared?.transaction?.signature) {
-      throw new Error('Stablecoin Service tidak mengembalikan payload EVM swap yang valid.')
-    }
-    const amountOut = unitsToDecimal(BigInt(prepared.estimatedAmount || '0'), TOKEN_DECIMALS[tokenOut])
+    const prepared = await prepareEoaSwapRoute({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
     return res.json({
       success: true,
       source: 'stablecoin-service',
@@ -1218,17 +1276,11 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
       adapterContract: ARC_APPKIT_ADAPTER,
       tokenIn,
       tokenOut,
-      tokenInAddress: prepared.tokenInAddress,
-      tokenOutAddress: prepared.tokenOutAddress,
+      route: prepared.route,
       grossAmountIn: safeAmount,
       amountIn: platformFee.netAmount,
-      amountBaseUnits: params.amount,
-      amountOut,
-      stopLimit: prepared.stopLimit,
-      estimatedAmount: prepared.estimatedAmount,
-      gasLimit: prepared.transaction.gasLimit,
-      executionParams: prepared.transaction.executionParams,
-      signature: prepared.transaction.signature,
+      amountOut: prepared.amountOut,
+      legs: prepared.legs,
       platformFee: {
         bps: platformFee.feeBps,
         amount: platformFee.feeAmount,

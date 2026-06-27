@@ -1,4 +1,11 @@
+import { readFileSync, statSync } from 'node:fs'
+import { parse as parseDotenv } from 'dotenv'
+
+let providerEnvMtime = 0
+let providerEnvKeys = new Set()
+
 export function configuredProviders() {
+  refreshProviderEnvironment()
   const providers = []
   for (let i = 1; i <= 8; i += 1) {
     const name = process.env[`AI_PROVIDER_${i}_NAME`]
@@ -23,6 +30,25 @@ export function configuredProviders() {
     }
   }
   return providers
+}
+
+function refreshProviderEnvironment() {
+  try {
+    const path = process.env.ARCOX_ENV_FILE || '.env'
+    const mtime = statSync(path).mtimeMs
+    if (mtime === providerEnvMtime) return
+    const parsed = parseDotenv(readFileSync(path))
+    const nextKeys = new Set(Object.keys(parsed).filter(key => key.startsWith('AI_PROVIDER_')))
+    for (const key of providerEnvKeys) {
+      if (!nextKeys.has(key)) delete process.env[key]
+    }
+    for (const key of nextKeys) process.env[key] = parsed[key]
+    providerEnvKeys = nextKeys
+    providerEnvMtime = mtime
+    modelCache.clear()
+  } catch {
+    // Keep process env when no local env file is available.
+  }
 }
 
 export function publicModels() {

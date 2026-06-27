@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { AppKit, SwapChain } from '@circle-fin/app-kit'
+import { ArcTestnet } from '@circle-fin/app-kit/chains'
 import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
 import { privateKeyToAccount } from 'viem/accounts'
@@ -36,8 +37,9 @@ const pairs = [
   .map(([tokenIn, tokenOut, amountIn]) => [tokenIn, tokenOut, requestedAmount || amountIn])
 
 if (throughApi) {
-  if (requestedWallet !== 'circle') throw new Error('--api currently supports --wallet=circle')
-  await testCircleApiSwaps()
+  if (requestedWallet === 'circle') await testCircleApiSwaps()
+  else if (requestedWallet === 'eoa') await testEoaApiSwaps()
+  else throw new Error('--api supports --wallet=eoa or --wallet=circle')
   process.exit(0)
 }
 
@@ -141,30 +143,15 @@ function circleWalletForOwner(address) {
 }
 
 async function testCircleApiSwaps() {
-  const issuedAt = new Date().toISOString()
-  const message = [
-    'ARCOX DEX login',
-    'Only sign this message on the official ARCOX DEX website.',
-    `Address: ${owner}`,
-    `Issued At: ${issuedAt}`,
-    'Network: Arc Testnet',
-  ].join('\n')
-  const signature = await privateKeyToAccount(privateKey).signMessage({ message })
-  const authResponse = await fetch('http://127.0.0.1:3001/api/auth/session', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ address: owner, issuedAt, signature }),
-  })
-  const auth = await authResponse.json()
-  if (!authResponse.ok || !auth.token) throw new Error(auth.error || 'ARCOX API login failed')
+  const token = await authenticateApi()
   for (const [tokenIn, tokenOut, amountIn] of pairs) {
     const payload = { metamaskAddress: owner, tokenIn, tokenOut, amountIn }
     try {
-      const quote = await apiPost('/api/quote', payload, auth.token)
+      const quote = await apiPost('/api/quote', payload, token)
       if (quote.available === false) throw new Error(quote.error || 'Route unavailable')
       const row = { wallet: 'circle-api', pair: `${tokenIn}-${tokenOut}`, amountIn, amountOut: quote.amountOut, executable: true }
       if (execute) {
-        const swap = await apiPost('/api/swap', payload, auth.token)
+        const swap = await apiPost('/api/swap', payload, token)
         if (swap.available === false) throw new Error(swap.error || 'Route unavailable')
         row.txHash = swap.result?.txHash || swap.result?.transactionHash
         row.feeTxHash = swap.result?.platformFee?.txHash
@@ -175,6 +162,97 @@ async function testCircleApiSwaps() {
     } catch (error) {
       console.log(JSON.stringify({ wallet: 'circle-api', pair: `${tokenIn}-${tokenOut}`, amountIn, executable: false, error: error.message }))
     }
+  }
+}
+
+async function testEoaApiSwaps() {
+  const token = await authenticateApi()
+  for (const [tokenIn, tokenOut, amountIn] of pairs) {
+    const payload = { metamaskAddress: owner, tokenIn, tokenOut, amountIn }
+    try {
+      const quote = await apiPost('/api/eoa-swap-quote', payload, token)
+      const row = { wallet: 'eoa-api', pair: `${tokenIn}-${tokenOut}`, amountIn, amountOut: quote.amountOut, executable: true }
+      if (execute) {
+        const prepared = await apiPost('/api/eoa-swap-prepare', payload, token)
+        const stepTxHashes = []
+        for (const leg of prepared.legs || []) {
+          const context = { chain: ArcTestnet, address: owner }
+          const approval = await eoaAdapter.prepareAction('token.approve', {
+            tokenAddress: leg.tokenInAddress,
+            delegate: prepared.adapterContract,
+            amount: BigInt(leg.amountBaseUnits),
+          }, context)
+          const approvalTx = await approval.execute()
+          await eoaAdapter.waitForTransaction(approvalTx, undefined, ArcTestnet)
+          stepTxHashes.push(approvalTx)
+          const swapRequest = await eoaAdapter.prepareAction('swap.execute', {
+            executeParams: normalizePreparedExecution(leg.executionParams),
+            tokenInputs: [{
+              permitType: 0,
+              token: leg.tokenInAddress,
+              amount: BigInt(leg.amountBaseUnits),
+              permitCalldata: '0x',
+            }],
+            signature: leg.signature,
+            inputAmount: BigInt(leg.amountBaseUnits),
+            tokenInAddress: leg.tokenInAddress,
+          }, context)
+          const localEstimate = await swapRequest.estimate()
+          const localGas = Number(localEstimate?.gas || 0)
+          const proxyGas = Number(leg.gasLimit || 0)
+          const gasLimit = Math.max(proxyGas, Math.ceil(localGas * 1.3))
+          const swapTx = await swapRequest.execute({ gasLimit })
+          let receipt
+          try {
+            receipt = await eoaAdapter.waitForTransaction(swapTx, undefined, ArcTestnet)
+          } catch (error) {
+            throw new Error(`${error.message}; txHash=${swapTx}; localGas=${localGas}; proxyGas=${proxyGas}; gasLimit=${gasLimit}`)
+          }
+          if (receipt.status === 'reverted') throw new Error(`Prepared swap reverted: ${swapTx}; gasUsed=${String(receipt.gasUsed || '')}; gasLimit=${gasLimit}`)
+          stepTxHashes.push(swapTx)
+        }
+        row.txHash = stepTxHashes.at(-1)
+        row.stepTxHashes = stepTxHashes
+      }
+      console.log(JSON.stringify(row))
+    } catch (error) {
+      console.log(JSON.stringify({ wallet: 'eoa-api', pair: `${tokenIn}-${tokenOut}`, amountIn, executable: false, error: error.message }))
+    }
+  }
+}
+
+async function authenticateApi() {
+  const issuedAt = new Date().toISOString()
+  const message = [
+    'ARCOX DEX login',
+    'Only sign this message on the official ARCOX DEX website.',
+    `Address: ${owner}`,
+    `Issued At: ${issuedAt}`,
+    'Network: Arc Testnet',
+  ].join('\n')
+  const signature = await privateKeyToAccount(privateKey).signMessage({ message })
+  const response = await fetch('http://127.0.0.1:3001/api/auth/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ address: owner, issuedAt, signature }),
+  })
+  const auth = await response.json()
+  if (!response.ok || !auth.token) throw new Error(auth.error || 'ARCOX API login failed')
+  return auth.token
+}
+
+function normalizePreparedExecution(params) {
+  return {
+    instructions: (params?.instructions || []).map(instruction => ({
+      ...instruction,
+      value: BigInt(instruction.value),
+      amountToApprove: BigInt(instruction.amountToApprove),
+      minTokenOut: BigInt(instruction.minTokenOut),
+    })),
+    tokens: params?.tokens || [],
+    execId: BigInt(params.execId),
+    deadline: BigInt(params.deadline),
+    metadata: params.metadata,
   }
 }
 

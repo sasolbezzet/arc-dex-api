@@ -206,6 +206,8 @@ function sendChatCompletionStream(res, data) {
   const created = data.created || Math.floor(Date.now() / 1000)
   const model = data.model || 'arcox/auto'
   const content = extractAssistantText(data)
+  const message = data?.choices?.[0]?.message || {}
+  const toolCalls = normalizeToolCalls(message.tool_calls)
   res.status(200)
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
   res.setHeader('Cache-Control', 'no-cache, no-transform')
@@ -227,17 +229,50 @@ function sendChatCompletionStream(res, data) {
       choices: [{ index: 0, delta: { content }, finish_reason: null }],
     })
   }
+  if (toolCalls.length) {
+    writeSse(res, {
+      id,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
+    })
+  }
+  if (message.function_call) {
+    writeSse(res, {
+      id,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [{ index: 0, delta: { function_call: message.function_call }, finish_reason: null }],
+    })
+  }
   writeSse(res, {
     id,
     object: 'chat.completion.chunk',
     created,
     model,
-    choices: [{ index: 0, delta: {}, finish_reason: data.choices?.[0]?.finish_reason || 'stop' }],
+    choices: [{ index: 0, delta: {}, finish_reason: data.choices?.[0]?.finish_reason || (toolCalls.length ? 'tool_calls' : 'stop') }],
     usage: data.usage,
     arcox: data.arcox,
   })
   res.write('data: [DONE]\n\n')
   res.end()
+}
+
+function normalizeToolCalls(toolCalls) {
+  if (!Array.isArray(toolCalls)) return []
+  return toolCalls.map((toolCall, index) => ({
+    index,
+    id: toolCall?.id,
+    type: toolCall?.type || 'function',
+    function: {
+      name: toolCall?.function?.name || '',
+      arguments: typeof toolCall?.function?.arguments === 'string'
+        ? toolCall.function.arguments
+        : JSON.stringify(toolCall?.function?.arguments || {}),
+    },
+  }))
 }
 
 function writeSse(res, payload) {
