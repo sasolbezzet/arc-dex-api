@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { ArkhamService } from '../services/arkhamService.mjs'
 import { priceFromEnv, withArcoxX402 } from '../middleware/x402Middleware.mjs'
+import { buildIntelPresentation } from '../services/intelPresentation.mjs'
 
 const router = Router()
 const arkham = new ArkhamService()
@@ -9,12 +10,13 @@ function paid(priceEnv, fallback, handler) {
   return withArcoxX402(handler, { amount: priceFromEnv(priceEnv, fallback), priceEnv, service: 'arcox_intel' })
 }
 
-function withPaymentMeta(req, payload) {
+function withPaymentMeta(req, payload, context = {}) {
   const invoice = req.arcoxX402?.invoice
-  if (!invoice || !payload || typeof payload !== 'object' || Array.isArray(payload)) return payload
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload
   return {
     ...payload,
-    x402Payment: {
+    intelPresentation: buildIntelPresentation(payload, context),
+    ...(invoice ? { x402Payment: {
       invoiceId: invoice.invoiceId,
       paymentId: invoice.paymentId,
       status: invoice.status,
@@ -25,7 +27,7 @@ function withPaymentMeta(req, payload) {
       txHash: invoice.txHash,
       paidAt: invoice.paidAt,
       reconciledBy: invoice.reconciledBy,
-    },
+    } } : {}),
   }
 }
 
@@ -42,11 +44,31 @@ function last24hWindow() {
 function sendArkham(pathBuilder, priceEnv, fallback, defaults = {}) {
   return paid(priceEnv, fallback, async (req, res) => {
     try {
-      res.json(withPaymentMeta(req, await arkham.get(pathBuilder(req), queryWithDefaults(req, defaults))))
+      const providerPath = pathBuilder(req)
+      const query = queryWithDefaults(req, defaults)
+      const payload = await arkham.get(providerPath, query)
+      const service = serviceName(req.route?.path || req.path)
+      res.json(withPaymentMeta(req, payload, {
+        service,
+        serviceLabel: service,
+        resource: req.originalUrl,
+        providerPath,
+        query,
+      }))
     } catch (error) {
       res.status(error.status || 502).json({ ok: false, mode: 'arkham', error: error.message, disclaimer: 'Informational only. Not financial advice.' })
     }
   })
+}
+
+function serviceName(routePath) {
+  const label = String(routePath || 'ARCOX Intel')
+    .replace(/:[^/]+/g, '')
+    .replace(/\//g, ' ')
+    .replace(/[-_]+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, char => char.toUpperCase())
+  return label ? `${label} Intel` : 'ARCOX Intel'
 }
 
 router.get('/address/:address', sendArkham(req => `/intelligence/address/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_ADDRESS', '0.005'))
@@ -85,7 +107,14 @@ router.get('/token/:id/top-flow', sendArkham(req => `/token/top_flow/${encodeURI
 
 router.get('/report/address/:address', paid('ARCOX_INTEL_PRICE_REPORT_ADDRESS', '0.05', async (req, res) => {
   try {
-    res.json(withPaymentMeta(req, await arkham.reportAddress(req.params.address)))
+    const payload = await arkham.reportAddress(req.params.address)
+    res.json(withPaymentMeta(req, payload, {
+      service: 'full_wallet_report',
+      serviceLabel: 'Full Wallet Report',
+      resource: req.originalUrl,
+      providerPath: '/report/address',
+      query: { address: req.params.address },
+    }))
   } catch (error) {
     res.status(502).json({ ok: false, error: error.message, disclaimer: 'Informational only. Not financial advice.' })
   }
