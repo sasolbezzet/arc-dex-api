@@ -119,65 +119,86 @@ export async function openAiChatCompletions(req, res) {
 
   const started = Date.now()
   const payment = createPaymentIntent({ ownerAddress: owner, amount: cost, requestId, model: req.body?.model || 'arcox/auto' })
+  markPaymentStatus(payment.id, 'estimate_ready')
+  let estimate
   try {
-    markPaymentStatus(payment.id, 'estimate_ready')
-    const estimate = await estimateDelegatedAiSpend({ sourceAccount: owner, amount: cost })
-    const { data, meta } = await callChatCompletionWithFallback(req.body || {})
-    const spend = await spendDelegatedAiPayment({ sourceAccount: owner, amount: cost, estimate })
-    markPaymentSettled(payment.id, { txHash: spend.txHash, transferId: spend.transferId, estimate: spend.estimate || estimate })
-    const usage = data.usage || {}
-    const log = addUsageLog({
-      requestId,
-      apiKeyId: apiKey.id,
-      ownerAddress: owner,
-      model: req.body?.model || 'arcox/auto',
-      providerUsed: meta.providerUsed,
-      inputTokens: usage.prompt_tokens || 0,
-      outputTokens: usage.completion_tokens || 0,
-      cost,
-      paymentId: requestId,
-      txHash: spend.txHash,
-      fallbackCount: meta.fallbackCount,
-      status: 'success',
-      latency: meta.latency || Date.now() - started,
-    })
-    const body = {
-      ...data,
-      arcox: {
-        paidFrom: 'delegated_unified_balance',
-        cost,
-        requestId,
-        paymentId: payment.id,
-        paymentStatus: 'paid',
-        txHash: spend.txHash,
-        transferId: spend.transferId,
-        usageLog: log,
-        providerUsed: meta.providerUsed,
-        fallbackCount: meta.fallbackCount,
-      },
-    }
-    if (req.body?.stream) return sendChatCompletionStream(res, body)
-    res.json(body)
+    estimate = await estimateDelegatedAiSpend({ sourceAccount: owner, amount: cost })
+  } catch (error) {
+    return handlePaymentFailure({ res, paymentId: payment.id, error })
+  }
+
+  let providerResult
+  try {
+    providerResult = await callChatCompletionWithFallback(req.body || {})
   } catch (error) {
     const meta = error?.providerMeta || {}
     const message = error?.message || 'provider failed'
-    if (/insufficient/i.test(message)) return paymentRequired(res, 'Please deposit more USDC to Unified Balance', message)
-    if (/delegate|auto pay/i.test(message)) return paymentRequired(res, 'Enable Auto Pay first', message.replace(/delegate/gi, 'Auto Pay'))
-    markPaymentStatus(payment.id, 'failed', { error: message })
+    markPaymentStatus(payment.id, 'failed', { error: message, charged: false })
     addUsageLog({
       requestId,
       apiKeyId: apiKey.id,
       ownerAddress: owner,
       model: req.body?.model || 'arcox/auto',
       providerUsed: meta.providerUsed || '',
-      cost,
+      cost: '0',
       fallbackCount: meta.fallbackCount || 0,
       status: 'failed',
       latency: meta.latency || Date.now() - started,
       error: message,
     })
-    res.status(error?.status || 502).json({ error: { message, type: 'provider_error' } })
+    return res.status(error?.status || 502).json({ error: { message, type: error?.type || 'provider_error', charged: false } })
   }
+
+  let spend
+  try {
+    spend = await spendDelegatedAiPayment({ sourceAccount: owner, amount: cost, estimate })
+    markPaymentSettled(payment.id, { txHash: spend.txHash, transferId: spend.transferId, estimate: spend.estimate || estimate })
+  } catch (error) {
+    return handlePaymentFailure({ res, paymentId: payment.id, error })
+  }
+
+  const { data, meta } = providerResult
+  const usage = data.usage || {}
+  const log = addUsageLog({
+    requestId,
+    apiKeyId: apiKey.id,
+    ownerAddress: owner,
+    model: req.body?.model || 'arcox/auto',
+    providerUsed: meta.providerUsed,
+    inputTokens: usage.prompt_tokens || 0,
+    outputTokens: usage.completion_tokens || 0,
+    cost,
+    paymentId: requestId,
+    txHash: spend.txHash,
+    fallbackCount: meta.fallbackCount,
+    status: 'success',
+    latency: meta.latency || Date.now() - started,
+  })
+  const body = {
+    ...data,
+    arcox: {
+      paidFrom: 'delegated_unified_balance',
+      cost,
+      requestId,
+      paymentId: payment.id,
+      paymentStatus: 'paid',
+      txHash: spend.txHash,
+      transferId: spend.transferId,
+      usageLog: log,
+      providerUsed: meta.providerUsed,
+      fallbackCount: meta.fallbackCount,
+    },
+  }
+  if (req.body?.stream) return sendChatCompletionStream(res, body)
+  res.json(body)
+}
+
+function handlePaymentFailure({ res, paymentId, error }) {
+  const message = error?.message || 'payment failed'
+  markPaymentStatus(paymentId, 'failed', { error: message, charged: false })
+  if (/insufficient/i.test(message)) return paymentRequired(res, 'Please deposit more USDC to Unified Balance', message)
+  if (/delegate|auto pay/i.test(message)) return paymentRequired(res, 'Enable Auto Pay first', message.replace(/delegate/gi, 'Auto Pay'))
+  return res.status(error?.status || 502).json({ error: { message, type: 'payment_error', charged: false } })
 }
 
 function sendChatCompletionStream(res, data) {

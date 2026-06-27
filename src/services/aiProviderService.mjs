@@ -81,7 +81,7 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
           ...(process.env.AI_ROUTER_HTTP_REFERER ? { 'HTTP-Referer': process.env.AI_ROUTER_HTTP_REFERER } : {}),
           ...(process.env.AI_ROUTER_APP_TITLE ? { 'X-OpenRouter-Title': process.env.AI_ROUTER_APP_TITLE } : {}),
         },
-        body: JSON.stringify({ ...payload, model: provider.model, stream: false }),
+        body: JSON.stringify(providerPayload(payload, provider.model)),
       }).finally(() => clearTimeout(timeout))
       const text = await response.text()
       let data
@@ -132,6 +132,13 @@ function validateProviderChatData(data, provider) {
   err.status = 502
   err.provider = provider.name
   throw err
+}
+
+function providerPayload(payload, model) {
+  const body = { ...(payload || {}), model, stream: false }
+  delete body.stream_options
+  delete body.streamOptions
+  return body
 }
 
 function selectProviders(payload = {}) {
