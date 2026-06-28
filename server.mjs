@@ -1145,9 +1145,10 @@ app.post('/api/unified-balance/balances', apiLimiter, async (req, res) => {
 
 async function gatewayBalanceRequest(path, body) {
   let lastError
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  const attempts = 2
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 8_000)
+    const timeout = setTimeout(() => controller.abort(), Number(process.env.GATEWAY_BALANCE_TIMEOUT_MS || 7_000))
     try {
       const response = await fetch(`${GATEWAY_TESTNET_API}${path}`, {
         method: 'POST',
@@ -1164,7 +1165,7 @@ async function gatewayBalanceRequest(path, body) {
       return data
     } catch (error) {
       lastError = error
-      if (attempt < 3) await new Promise(resolve => setTimeout(resolve, attempt * 350))
+      if (attempt < attempts) await new Promise(resolve => setTimeout(resolve, attempt * 350))
     } finally {
       clearTimeout(timeout)
     }

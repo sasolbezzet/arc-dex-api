@@ -126,6 +126,7 @@ export function getPolicy(ownerAddress) {
     source: 'unified_balance',
     delegateStatus: 'not_configured',
     delegateAddress: delegateAddress(),
+    delegateChains: [],
     status: 'deposit_required',
   }
   const current = { ...fallback, ...(state.autoPayPolicy[owner] || {}) }
@@ -133,6 +134,7 @@ export function getPolicy(ownerAddress) {
   if (!validEvmAddress(current.delegateAddress) || (configuredDelegate && current.delegateAddress.toLowerCase() !== configuredDelegate.toLowerCase())) {
     current.delegateAddress = configuredDelegate
     current.delegateStatus = 'not_configured'
+    current.delegateChains = []
     current.enabled = false
   }
   current.delegateStatus = current.delegateStatus || 'not_configured'
@@ -148,8 +150,9 @@ export function setPolicy(ownerAddress, input = {}) {
   const owner = normalizeOwner(ownerAddress)
   ensureUser(owner)
   const current = getPolicy(owner)
-  const delegateStatus = normalizeAutoPayStatus(input.delegateStatus || current.delegateStatus || (input.enabled ? 'ready' : 'not_configured'), Boolean(input.enabled))
+  const delegateStatus = normalizeAutoPayStatus(input.delegateStatus || current.delegateStatus || 'not_configured')
   const nextDelegateAddress = validEvmAddress(input.delegateAddress) ? input.delegateAddress : validEvmAddress(current.delegateAddress) ? current.delegateAddress : delegateAddress()
+  const delegateChains = normalizeDelegateChains(input.delegateChains ?? current.delegateChains)
   state.autoPayPolicy[owner] = {
     ...current,
     enabled: Boolean(input.enabled),
@@ -157,11 +160,20 @@ export function setPolicy(ownerAddress, input = {}) {
     source: 'unified_balance',
     delegateStatus,
     delegateAddress: nextDelegateAddress,
+    delegateChains: input.enabled ? delegateChains : [],
     status: input.enabled && delegateStatus === 'ready' ? 'ready' : input.enabled ? 'auto_pay_required' : 'off',
     updatedAt: new Date().toISOString(),
   }
   saveAiRouterStore()
   return state.autoPayPolicy[owner]
+}
+
+function normalizeDelegateChains(value) {
+  const supported = new Set(['Arc_Testnet', 'Base_Sepolia', 'Ethereum_Sepolia', 'Arbitrum_Sepolia'])
+  if (!Array.isArray(value)) return []
+  return value
+    .filter(item => supported.has(String(item?.chain || '')))
+    .map(item => ({ chain: String(item.chain), status: normalizeAutoPayStatus(item.status) }))
 }
 
 export function createPaymentIntent({ ownerAddress, agentId = '', amount, requestId, model }) {
@@ -311,16 +323,16 @@ export function normalizeOwner(ownerAddress) {
   return String(ownerAddress || '').trim().toLowerCase()
 }
 
-function normalizeAutoPayStatus(value, setupEnabled = false) {
+function normalizeAutoPayStatus(value) {
   if (value === true) return 'ready'
-  if (value === false || value === null) return setupEnabled ? 'ready' : 'not_configured'
+  if (value === false || value === null) return 'not_configured'
   const raw = typeof value === 'string' ? value : value?.status || value?.state || value?.delegateStatus || value?.readiness || ''
   const normalized = String(raw || '').toLowerCase().replaceAll('_', ' ').trim()
   if (['ready', 'enabled', 'active', 'approved', 'allowed', 'complete', 'completed', 'success', 'delegated'].includes(normalized)) return 'ready'
-  if (['none', 'missing', 'disabled', 'not configured', 'not ready'].includes(normalized)) return setupEnabled ? 'ready' : 'not_configured'
+  if (['none', 'missing', 'disabled', 'not configured', 'not ready'].includes(normalized)) return 'not_configured'
   if (normalized.includes('ready') || normalized.includes('enabled') || normalized.includes('active')) return 'ready'
-  if (normalized.includes('pending') || normalized.includes('processing')) return setupEnabled ? 'ready' : 'pending'
-  return setupEnabled ? 'ready' : normalized || 'not_configured'
+  if (normalized.includes('pending') || normalized.includes('processing')) return 'pending'
+  return normalized || 'not_configured'
 }
 
 function validEvmAddress(value) {

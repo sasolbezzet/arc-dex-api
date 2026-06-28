@@ -179,7 +179,8 @@ export async function openAiChatCompletions(req, res) {
   markPaymentStatus(payment.id, 'estimate_ready')
   let estimate
   try {
-    estimate = await estimateDelegatedAiSpend({ sourceAccount: owner, amount: cost })
+    estimate = await estimateDelegatedAiSpend({ sourceAccount: owner, amount: cost, sourceChains: readyDelegateChains(policy, owner) })
+    markPaymentStatus(payment.id, 'estimate_ready', { amount: estimate.spendAmount || cost, serviceAmount: cost, totalFee: estimate.totalFee || '0' })
   } catch (error) {
     return handlePaymentFailure({ res, paymentId: payment.id, error })
   }
@@ -210,7 +211,7 @@ export async function openAiChatCompletions(req, res) {
   let spend
   let memoProof = null
   try {
-    spend = await spendDelegatedAiPayment({ sourceAccount: owner, amount: cost, estimate })
+    spend = await spendDelegatedAiPayment({ sourceAccount: owner, amount: cost, estimate, sourceChains: readyDelegateChains(policy, owner) })
     if (apiKey.agentId && spend.txHash) {
       memoProof = await submitAgentMemoProof({
         agentId: apiKey.agentId,
@@ -218,7 +219,7 @@ export async function openAiChatCompletions(req, res) {
         requestId,
         service: 'ai_router',
         model: req.body?.model || 'arcox/auto',
-        amount: cost,
+        amount: spend.chargedAmount || cost,
         treasury: treasuryAddress(),
         settlementTxHash: spend.txHash,
       }).catch(() => null)
@@ -239,7 +240,7 @@ export async function openAiChatCompletions(req, res) {
     providerUsed: meta.providerUsed,
     inputTokens: usage.prompt_tokens || 0,
     outputTokens: usage.completion_tokens || 0,
-    cost,
+    cost: spend.chargedAmount || cost,
     paymentId: payment.id,
     txHash: spend.txHash,
     memoId: memoProof?.memoId || '',
@@ -251,7 +252,9 @@ export async function openAiChatCompletions(req, res) {
     ...data,
     arcox: {
       paidFrom: 'delegated_unified_balance',
-      cost,
+      cost: spend.chargedAmount || cost,
+      serviceCost: cost,
+      totalFee: spend.totalFee || '0',
       requestId,
       paymentId: payment.id,
       paymentStatus: 'paid',
@@ -434,6 +437,14 @@ function paymentRequired(res, message, detail) {
       action: 'Deposit USDC to Unified Balance and enable Auto Pay.',
     },
   })
+}
+
+function readyDelegateChains(policy, ownerAddress) {
+  if (delegateConfig().delegateAddress?.toLowerCase() === String(ownerAddress || '').toLowerCase()) {
+    return ['Arc_Testnet', 'Base_Sepolia', 'Ethereum_Sepolia', 'Arbitrum_Sepolia']
+  }
+  const ready = (policy?.delegateChains || []).filter(item => item?.status === 'ready').map(item => item.chain)
+  return ready.length ? ready : policy?.delegateStatus === 'ready' ? ['Arc_Testnet'] : []
 }
 
 function docs() {
