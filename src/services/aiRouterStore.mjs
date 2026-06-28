@@ -137,6 +137,10 @@ export function getPolicy(ownerAddress) {
     current.delegateChains = []
     current.enabled = false
   }
+  if (current.enabled && current.delegateAddress?.toLowerCase() === owner) {
+    current.delegateStatus = 'ready'
+    current.delegateChains = ['Arc_Testnet', 'Base_Sepolia', 'Ethereum_Sepolia', 'Arbitrum_Sepolia'].map(chain => ({ chain, status: 'ready' }))
+  }
   current.delegateStatus = current.delegateStatus || 'not_configured'
   if (current.delegateStatus === 'none') current.delegateStatus = 'not_configured'
   current.status = current.enabled
