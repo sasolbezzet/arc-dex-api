@@ -164,7 +164,7 @@ export function setPolicy(ownerAddress, input = {}) {
     source: 'unified_balance',
     delegateStatus,
     delegateAddress: nextDelegateAddress,
-    delegateChains: input.enabled ? delegateChains : [],
+    delegateChains,
     status: input.enabled && delegateStatus === 'ready' ? 'ready' : input.enabled ? 'auto_pay_required' : 'off',
     updatedAt: new Date().toISOString(),
   }

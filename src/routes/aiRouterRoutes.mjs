@@ -26,6 +26,7 @@ import { callChatCompletionWithFallback, publicModels, validateChatCompletionRou
 import { delegateConfig, estimateDelegatedAiSpend, spendDelegatedAiPayment } from '../services/aiRouterSpendService.mjs'
 import { listAgentIdentities, verifyAgentOwnership } from '../services/agentIdentityService.mjs'
 import { submitAgentMemoProof } from '../services/arcMemoService.mjs'
+import { getGatewayDelegateStatus } from '../services/gatewayDelegateService.mjs'
 
 const router = Router()
 
@@ -37,6 +38,19 @@ router.get('/status', async (req, res) => {
     res.json({ ok: true, ...getAiRouterStatus(ownerAddress), agentIdentity: identity.active, agentIdentities: identity.items, treasury: treasuryAddress(), docs: docs() })
   } catch (error) {
     res.status(502).json({ error: error?.message || 'Agent Identity lookup failed' })
+  }
+})
+
+router.get('/delegate-status', async (req, res) => {
+  const ownerAddress = normalizeOwner(req.query.ownerAddress)
+  const delegateAddress = normalizeOwner(req.query.delegateAddress)
+  const chain = String(req.query.chain || '')
+  if (!/^0x[a-f0-9]{40}$/.test(ownerAddress) || !/^0x[a-f0-9]{40}$/.test(delegateAddress)) return res.status(400).json({ error: 'Valid ownerAddress and delegateAddress are required' })
+  if (!['Arc_Testnet', 'Ethereum_Sepolia', 'Base_Sepolia', 'Arbitrum_Sepolia'].includes(chain)) return res.status(400).json({ error: 'Unsupported Unified Balance chain' })
+  try {
+    res.json({ ok: true, ...(await getGatewayDelegateStatus({ ownerAddress, delegateAddress, chain })) })
+  } catch (error) {
+    res.status(502).json({ error: error?.message || 'Gateway delegate status failed' })
   }
 })
 
