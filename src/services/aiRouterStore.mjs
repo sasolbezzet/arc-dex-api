@@ -1,21 +1,13 @@
-import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import { privateKeyToAccount } from 'viem/accounts'
+import { atomicWriteJsonFile, readJsonFile } from './jsonFileStore.mjs'
 
 const DB_FILE = process.env.AI_ROUTER_DB || './ai-router-db.json'
 const state = globalThis.__arcoxAiRouterStore || load()
 globalThis.__arcoxAiRouterStore = state
 
 function load() {
-  try {
-    if (existsSync(DB_FILE)) {
-      const parsed = JSON.parse(readFileSync(DB_FILE, 'utf8') || '{}')
-      return normalize(parsed)
-    }
-  } catch (error) {
-    console.error('[ai-router] failed to load db', error?.message || error)
-  }
-  return normalize({})
+  return normalize(readJsonFile(DB_FILE, {}))
 }
 
 function normalize(input) {
@@ -31,7 +23,7 @@ function normalize(input) {
 }
 
 export function saveAiRouterStore() {
-  writeFileSync(DB_FILE, JSON.stringify(state, null, 2))
+  atomicWriteJsonFile(DB_FILE, state)
 }
 
 export function hashApiKey(key) {

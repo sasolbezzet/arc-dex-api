@@ -4,12 +4,17 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "check": "node --check server.mjs && node --check src/routes/aiRouterRoutes.mjs && node --check src/routes/arkhamRoutes.mjs && node --check src/routes/treasuryRoutes.mjs && node --check src/routes/x402Routes.mjs",
+    "test": "npm run check",
+    "maintenance:prune": "node scripts/prune-runtime.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
+  "overrides": {
+    "form-data": "^4.0.6"
+  },
   "dependencies": {
     "@circle-fin/adapter-circle-wallets": "^1.3.2",
     "@circle-fin/adapter-viem-v2": "^1.11.2",

@@ -1,6 +1,6 @@
 import 'dotenv/config'
 import express from 'express'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'fs'
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto'
 import { AppKit, SwapChain } from '@circle-fin/app-kit'
 import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
@@ -56,6 +56,11 @@ function rateLimit({ windowMs, max, keyPrefix }) {
   const hits = new Map()
   return (req, res, next) => {
     const now = Date.now()
+    if (hits.size > 5000) {
+      for (const [storedKey, value] of hits) {
+        if (now > value.resetAt) hits.delete(storedKey)
+      }
+    }
     const ip = req.headers['x-forwarded-for']?.toString().split(',')[0].trim() || req.socket.remoteAddress || 'unknown'
     const key = `${keyPrefix}:${ip}`
     const current = hits.get(key)
@@ -86,7 +91,7 @@ const TX_HISTORY_DB = './tx-history-db.json'
 const INVOICE_DB = './invoices-db.json'
 const WEBHOOK_DB = './webhook-events-db.json'
 const JSON_BACKUP_DIR = './runtime-backups'
-const AUTH_SECRET = process.env.AUTH_SECRET || process.env.CIRCLE_ENTITY_SECRET || process.env.CIRCLE_API_KEY || ''
+const AUTH_SECRET = process.env.AUTH_SECRET || ''
 const ARCOX_PAY_BASE_URL = (process.env.ARCOX_PAY_BASE_URL || process.env.ARCOX_WEB_URL || 'https://arc-dex-bice.vercel.app').replace(/\/$/, '')
 const ENABLE_DEV_TOOLS = String(process.env.ENABLE_DEV_TOOLS || 'false').toLowerCase() === 'true'
 const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS || 24 * 60 * 60 * 1000)
@@ -546,9 +551,14 @@ function atomicWriteJson(path, db) {
   const data = JSON.stringify(db, null, 2)
   if (existsSync(path)) {
     copyFileSync(path, `${path}.bak`)
-    copyFileSync(path, `${JSON_BACKUP_DIR}/${path.replace(/[^a-zA-Z0-9_.-]/g, '_')}.${Date.now()}.bak`)
+    const prefix = path.replace(/[^a-zA-Z0-9_.-]/g, '_')
+    copyFileSync(path, `${JSON_BACKUP_DIR}/${prefix}.${Date.now()}.bak`)
+    const backups = readdirSync(JSON_BACKUP_DIR)
+      .filter(name => name.startsWith(`${prefix}.`) && name.endsWith('.bak'))
+      .sort()
+    for (const name of backups.slice(0, -10)) unlinkSync(`${JSON_BACKUP_DIR}/${name}`)
   }
-  writeFileSync(tmp, data)
+  writeFileSync(tmp, data, { mode: 0o600 })
   renameSync(tmp, path)
 }
 
@@ -1854,15 +1864,12 @@ app.post('/api/circle/webhook', apiLimiter, async (req, res) => {
 
 app.post('/api/webhooks/circle', apiLimiter, async (req, res) => {
   const rawBody = rawWebhookBody(req)
-  console.log('[webhook:circle-gateway] raw payload', rawBody)
   const payload = parseWebhookJson(rawBody)
 
   const verifyWebhook = String(process.env.CIRCLE_VERIFY_WEBHOOK || 'false').toLowerCase() === 'true'
   if (verifyWebhook) {
-    const signature = String(req.headers['circle-signature'] || req.headers['x-circle-signature'] || '')
-    // TODO: implement Circle Gateway webhook signature verification when Circle publishes/assigns the exact signing header and secret for this subscription.
-    if (!signature) return res.status(401).json({ ok: false, provider: 'circle', product: 'gateway', error: 'Circle webhook signature required' })
-    return res.status(401).json({ ok: false, provider: 'circle', product: 'gateway', error: 'Circle webhook signature verification is not configured yet' })
+    const verification = verifyCircleWebhookSignature(req, rawBody)
+    if (!verification.ok) return res.status(401).json({ ok: false, provider: 'circle', product: 'gateway', error: verification.error })
   }
 
   const fields = extractCircleGatewayFields(payload)

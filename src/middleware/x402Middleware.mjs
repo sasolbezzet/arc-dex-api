@@ -1,6 +1,6 @@
 import { randomUUID, createHmac, timingSafeEqual } from 'crypto'
-import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { createPublicClient, http, parseAbiItem, formatUnits, keccak256, toHex, decodeEventLog } from 'viem'
+import { atomicWriteJsonFile, readJsonFile } from '../services/jsonFileStore.mjs'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
@@ -24,8 +24,7 @@ function loadPersistentInvoices() {
   if (loadedPersistentInvoices) return
   loadedPersistentInvoices = true
   try {
-    if (!existsSync(X402_INVOICE_DB)) return
-    const parsed = JSON.parse(readFileSync(X402_INVOICE_DB, 'utf8') || '[]')
+    const parsed = readJsonFile(X402_INVOICE_DB, [])
     const list = Array.isArray(parsed) ? parsed : Object.values(parsed || {})
     for (const invoice of list) {
       if (!invoice?.invoiceId || !invoice?.paymentId) continue
@@ -46,7 +45,7 @@ function persistInvoices() {
       seen.add(invoice.invoiceId)
       unique.push(invoice)
     }
-    writeFileSync(X402_INVOICE_DB, JSON.stringify(unique, null, 2))
+    atomicWriteJsonFile(X402_INVOICE_DB, unique)
   } catch (error) {
     console.error('[x402] failed to persist invoice db', error?.message || error)
   }
@@ -406,6 +405,7 @@ export function processCircleX402Webhook(payload = {}) {
     createdAt: new Date().toISOString(),
   }
   webhookEvents.set(eventId, event)
+  while (webhookEvents.size > 5000) webhookEvents.delete(webhookEvents.keys().next().value)
 
   if (eventType !== 'transactions.inbound') {
     event.processed = true
@@ -461,6 +461,7 @@ export function processCircleX402Webhook(payload = {}) {
   event.processed = true
   event.processedAt = new Date().toISOString()
   unmatchedInboundEvents.push(event)
+  if (unmatchedInboundEvents.length > 1000) unmatchedInboundEvents.splice(0, unmatchedInboundEvents.length - 1000)
   return { duplicate: false, event, unmatched: true }
 }
 
