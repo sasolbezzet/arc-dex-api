@@ -16,13 +16,17 @@ function normalize(input) {
     apiKeys: input.apiKeys || {},
     autoPayPolicy: input.autoPayPolicy || {},
     payments: input.payments || {},
-    usageLogs: input.usageLogs || [],
+    usageLogs: (input.usageLogs || []).map(sanitizeUsageLog).slice(0, 1000),
+    agentJobs: input.agentJobs || {},
     modelRegistry: input.modelRegistry || {},
     providerHealth: input.providerHealth || {},
   }
 }
 
 export function saveAiRouterStore() {
+  state.usageLogs = state.usageLogs.slice(0, 1000)
+  state.payments = newestRecords(state.payments, 1000)
+  state.agentJobs = newestRecords(state.agentJobs, 500)
   atomicWriteJsonFile(DB_FILE, state)
 }
 
@@ -30,13 +34,14 @@ export function hashApiKey(key) {
   return createHash('sha256').update(String(key)).digest('hex')
 }
 
-export function issueApiKey({ ownerAddress, label = 'ARCOX AI Router', scopes = ['ai:chat', 'ai:models'] }) {
+export function issueApiKey({ ownerAddress, agentId = '', label = 'ARCOX AI Router', scopes = ['ai:chat', 'ai:models'] }) {
   const key = `arx_sk_${randomBytes(24).toString('base64url')}`
   const now = new Date().toISOString()
   const id = `key_${randomUUID().replaceAll('-', '').slice(0, 12)}`
   const rec = {
     id,
     ownerAddress: normalizeOwner(ownerAddress),
+    agentId: /^\d+$/.test(String(agentId || '')) ? String(agentId) : '',
     label,
     keyHash: hashApiKey(key),
     keyPreview: `${key.slice(0, 10)}...${key.slice(-4)}`,
@@ -76,6 +81,7 @@ export function publicApiKey(key) {
   return {
     id: key.id,
     ownerAddress: key.ownerAddress,
+    agentId: key.agentId || '',
     label: key.label,
     keyPreview: key.keyPreview,
     scopes: key.scopes,
@@ -99,12 +105,23 @@ export function ensureUser(ownerAddress) {
   return state.users[owner]
 }
 
+export function setActiveAgentIdentity(ownerAddress, agentId) {
+  const user = ensureUser(ownerAddress)
+  user.activeAgentId = /^\d+$/.test(String(agentId || '')) ? String(agentId) : ''
+  user.updatedAt = new Date().toISOString()
+  saveAiRouterStore()
+  return user.activeAgentId
+}
+
+export function getActiveAgentId(ownerAddress) {
+  return String(state.users[normalizeOwner(ownerAddress)]?.activeAgentId || '')
+}
+
 export function getPolicy(ownerAddress) {
   const owner = normalizeOwner(ownerAddress)
   const fallback = {
     ownerAddress: owner,
     enabled: false,
-    maxPerRequest: process.env.AI_ROUTER_DEFAULT_MAX_PER_REQUEST_USDC || '0.02',
     monthlyLimit: process.env.AI_ROUTER_DEFAULT_MONTHLY_LIMIT_USDC || '2.00',
     source: 'unified_balance',
     delegateStatus: 'not_configured',
@@ -136,7 +153,6 @@ export function setPolicy(ownerAddress, input = {}) {
   state.autoPayPolicy[owner] = {
     ...current,
     enabled: Boolean(input.enabled),
-    maxPerRequest: normalizeUsdc(input.maxPerRequest || current.maxPerRequest),
     monthlyLimit: normalizeUsdc(input.monthlyLimit || current.monthlyLimit),
     source: 'unified_balance',
     delegateStatus,
@@ -148,7 +164,7 @@ export function setPolicy(ownerAddress, input = {}) {
   return state.autoPayPolicy[owner]
 }
 
-export function createPaymentIntent({ ownerAddress, amount, requestId, model }) {
+export function createPaymentIntent({ ownerAddress, agentId = '', amount, requestId, model }) {
   const owner = normalizeOwner(ownerAddress)
   ensureUser(owner)
   const id = requestId || `air_pay_${randomUUID().replaceAll('-', '').slice(0, 14)}`
@@ -156,6 +172,7 @@ export function createPaymentIntent({ ownerAddress, amount, requestId, model }) 
   const payment = {
     id,
     ownerAddress: owner,
+    agentId: /^\d+$/.test(String(agentId || '')) ? String(agentId) : '',
     amount: normalizeUsdc(amount),
     asset: 'USDC',
     network: 'arc-testnet',
@@ -181,7 +198,8 @@ export function markPaymentSettled(id, patch = {}) {
   payment.paymentStatus = 'paid'
   payment.txHash = patch.txHash || payment.txHash || ''
   payment.transferId = patch.transferId || payment.transferId || ''
-  payment.estimate = patch.estimate || payment.estimate || null
+  payment.memoId = patch.memoId || payment.memoId || ''
+  payment.memoTxHash = patch.memoTxHash || payment.memoTxHash || ''
   payment.settledAt = new Date().toISOString()
   payment.updatedAt = payment.settledAt
   saveAiRouterStore()
@@ -200,10 +218,11 @@ export function markPaymentStatus(id, status, patch = {}) {
 }
 
 export function addUsageLog(entry) {
-  const log = {
+  const log = sanitizeUsageLog({
     requestId: entry.requestId || `air_req_${randomUUID().replaceAll('-', '').slice(0, 12)}`,
-    apiKeyId: entry.apiKeyId || '',
+    apiKeyIdHash: entry.apiKeyIdHash || hashApiKey(entry.apiKeyId || ''),
     ownerAddress: normalizeOwner(entry.ownerAddress),
+    agentId: /^\d+$/.test(String(entry.agentId || '')) ? String(entry.agentId) : '',
     model: entry.model || '',
     providerUsed: entry.providerUsed || '',
     inputTokens: Number(entry.inputTokens || 0),
@@ -211,12 +230,14 @@ export function addUsageLog(entry) {
     cost: normalizeUsdc(entry.cost || '0'),
     paymentId: entry.paymentId || '',
     txHash: entry.txHash || '',
+    memoId: entry.memoId || '',
+    jobId: entry.jobId || '',
     fallbackCount: Number(entry.fallbackCount || 0),
     status: entry.status || 'created',
     latency: Number(entry.latency || 0),
     error: entry.error || '',
     createdAt: entry.createdAt || new Date().toISOString(),
-  }
+  })
   state.usageLogs.unshift(log)
   state.usageLogs = state.usageLogs.slice(0, 1000)
   saveAiRouterStore()
@@ -243,6 +264,7 @@ export function getAiRouterStatus(ownerAddress) {
   const policy = getPolicy(owner)
   return {
     ownerAddress: owner,
+    activeAgentId: getActiveAgentId(owner),
     unifiedBalance: {
       available: 'read_with_circle_appkit_getBalances',
       source: 'user-owned Unified Balance',
@@ -257,6 +279,32 @@ export function getAiRouterStatus(ownerAddress) {
     usageLogs: usageForOwner(owner, 5),
     modelList: Object.values(state.modelRegistry),
   }
+}
+
+export function recordAgentJob(entry = {}) {
+  const id = String(entry.jobId || entry.id || '')
+  if (!/^\d+$/.test(id)) throw new Error('Invalid agent job ID')
+  const job = {
+    jobId: id,
+    agentId: String(entry.agentId || ''),
+    ownerAddress: normalizeOwner(entry.ownerAddress),
+    txHash: String(entry.txHash || ''),
+    memoId: String(entry.memoId || ''),
+    status: String(entry.status || 'created'),
+    createdAt: entry.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }
+  state.agentJobs[id] = { ...(state.agentJobs[id] || {}), ...job }
+  saveAiRouterStore()
+  return state.agentJobs[id]
+}
+
+export function listAgentJobs(ownerAddress, agentId, limit = 50) {
+  const owner = normalizeOwner(ownerAddress)
+  return Object.values(state.agentJobs)
+    .filter(job => job.ownerAddress === owner && (!agentId || String(job.agentId) === String(agentId)))
+    .sort((a, b) => Date.parse(b.updatedAt || b.createdAt || 0) - Date.parse(a.updatedAt || a.createdAt || 0))
+    .slice(0, Math.min(Math.max(Number(limit) || 50, 1), 500))
 }
 
 export function normalizeOwner(ownerAddress) {
@@ -329,6 +377,35 @@ function fromUnits(value) {
   const whole = n / 1_000_000n
   const fraction = `${n % 1_000_000n}`.padStart(6, '0')
   return `${whole}.${fraction}`
+}
+
+function sanitizeUsageLog(entry = {}) {
+  return {
+    requestId: String(entry.requestId || ''),
+    agentId: /^\d+$/.test(String(entry.agentId || '')) ? String(entry.agentId) : '',
+    apiKeyIdHash: String(entry.apiKeyIdHash || (entry.apiKeyId ? hashApiKey(entry.apiKeyId) : '')),
+    ownerAddress: normalizeOwner(entry.ownerAddress),
+    paymentId: String(entry.paymentId || ''),
+    txHash: String(entry.txHash || ''),
+    memoId: String(entry.memoId || ''),
+    jobId: String(entry.jobId || ''),
+    model: String(entry.model || '').slice(0, 96),
+    providerUsed: String(entry.providerUsed || '').slice(0, 96),
+    inputTokens: Number(entry.inputTokens || 0),
+    outputTokens: Number(entry.outputTokens || 0),
+    cost: normalizeUsdc(entry.cost || '0'),
+    fallbackCount: Number(entry.fallbackCount || 0),
+    status: String(entry.status || 'created').slice(0, 32),
+    latency: Number(entry.latency || 0),
+    error: String(entry.error || '').slice(0, 240),
+    createdAt: entry.createdAt || new Date().toISOString(),
+  }
+}
+
+function newestRecords(records, limit) {
+  return Object.fromEntries(Object.entries(records || {})
+    .sort(([, a], [, b]) => Date.parse(b.updatedAt || b.createdAt || 0) - Date.parse(a.updatedAt || a.createdAt || 0))
+    .slice(0, limit))
 }
 
 export { state as aiRouterState }

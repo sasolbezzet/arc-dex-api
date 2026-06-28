@@ -1,6 +1,8 @@
 import { randomUUID, createHmac, timingSafeEqual } from 'crypto'
 import { createPublicClient, http, parseAbiItem, formatUnits, keccak256, toHex, decodeEventLog } from 'viem'
 import { atomicWriteJsonFile, readJsonFile } from '../services/jsonFileStore.mjs'
+import { verifyAgentOwnership } from '../services/agentIdentityService.mjs'
+import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
@@ -45,7 +47,16 @@ function persistInvoices() {
       seen.add(invoice.invoiceId)
       unique.push(invoice)
     }
-    atomicWriteJsonFile(X402_INVOICE_DB, unique)
+    unique.sort((a, b) => Date.parse(b.updatedAt || b.createdAt || 0) - Date.parse(a.updatedAt || a.createdAt || 0))
+    const retained = unique.slice(0, 1000)
+    if (unique.length > retained.length) {
+      invoices.clear()
+      for (const invoice of retained) {
+        invoices.set(invoice.invoiceId, invoice)
+        invoices.set(invoice.paymentId, invoice)
+      }
+    }
+    atomicWriteJsonFile(X402_INVOICE_DB, retained)
   } catch (error) {
     console.error('[x402] failed to persist invoice db', error?.message || error)
   }
@@ -104,17 +115,15 @@ export function createX402Invoice(input = {}) {
   const paymentId = input.paymentId || `x402_${randomUUID().replaceAll('-', '').slice(0, 16)}`
   const baseAmount = normalizeAmount(input.amount || cfg.baseAmount)
   const uniqueAmount = normalizeAmount(input.uniqueAmount || nextUniqueAmount(baseAmount))
-  const memoId = input.memoId || keccak256(toHex(paymentId))
-  const memoData = input.memoData || toHex(JSON.stringify({
-    app: 'arcox',
-    type: 'x402',
-    invoiceId,
-    paymentId,
-    resource: String(input.resource || '/api/intel'),
-  }))
+  const agentId = /^\d+$/.test(String(input.agentId || '')) ? String(input.agentId) : ''
+  const agentMemo = buildAgentMemo({ agentId, paymentId, requestId: input.requestId || paymentId, service: input.service || 'x402', amount: uniqueAmount, treasury: cfg.circleTreasuryAddress })
+  const memoId = input.memoId || agentMemo?.memoId || keccak256(toHex(paymentId))
+  const memoData = input.memoData || agentMemo?.memoData || toHex(JSON.stringify({ app: 'arcox', service: 'x402', paymentIdHash: keccak256(toHex(paymentId)) }))
   const invoice = {
     invoiceId,
     paymentId,
+    agentId,
+    ownerWallet: String(input.ownerWallet || '').toLowerCase(),
     service: input.service || 'arcox_intel',
     resource: String(input.resource || '/api/intel'),
     status: 'payment_required',
@@ -196,6 +205,7 @@ export async function reconcileX402Invoice(id) {
       invoices.set(invoice.invoiceId, invoice)
       invoices.set(invoice.paymentId, invoice)
       persistInvoices()
+      scheduleAgentMemoProof(invoice)
       return invoice
     }
     const logs = await client.getLogs({
@@ -230,6 +240,7 @@ export async function reconcileX402Invoice(id) {
     invoices.set(invoice.invoiceId, invoice)
     invoices.set(invoice.paymentId, invoice)
     persistInvoices()
+    scheduleAgentMemoProof(invoice)
     return invoice
   } catch (error) {
     console.error('[x402] reconcile failed', error?.message || error)
@@ -242,6 +253,8 @@ export function publicInvoice(invoice) {
   return {
     invoiceId: invoice.invoiceId,
     paymentId: invoice.paymentId,
+    agentId: invoice.agentId || '',
+    ownerWallet: invoice.ownerWallet || '',
     service: invoice.service,
     resource: invoice.resource,
     status: invoice.status,
@@ -279,6 +292,8 @@ export function publicInvoice(invoice) {
     serviceUnlockedAt: invoice.serviceUnlockedAt,
     memoIndex: invoice.memoIndex,
     memoSender: invoice.memoSender,
+    memoProofTxHash: invoice.memoProofTxHash || '',
+    memoProofStatus: invoice.memoProofStatus || '',
   }
 }
 
@@ -399,13 +414,12 @@ export function processCircleX402Webhook(payload = {}) {
     id: eventId,
     provider: 'circle',
     eventType,
-    rawPayload: payload,
     processed: false,
     matched: false,
     createdAt: new Date().toISOString(),
   }
   webhookEvents.set(eventId, event)
-  while (webhookEvents.size > 5000) webhookEvents.delete(webhookEvents.keys().next().value)
+  while (webhookEvents.size > 1000) webhookEvents.delete(webhookEvents.keys().next().value)
 
   if (eventType !== 'transactions.inbound') {
     event.processed = true
@@ -445,16 +459,18 @@ export function processCircleX402Webhook(payload = {}) {
     latest.txHash = extracted.txHash || ''
     latest.paidAt = new Date().toISOString()
     latest.updatedAt = latest.paidAt
-    latest.rawWebhookEvent = payload
+    latest.webhookEventId = eventId
     event.processed = true
     event.matched = true
     event.relatedInvoiceId = latest.invoiceId
     event.relatedPaymentId = latest.paymentId
     event.relatedTxHash = latest.txHash
+    event.agentId = latest.agentId || ''
     event.processedAt = new Date().toISOString()
     invoices.set(latest.invoiceId, latest)
     invoices.set(latest.paymentId, latest)
     persistInvoices()
+    scheduleAgentMemoProof(latest)
     return { duplicate: false, event, invoice: latest }
   }
 
@@ -506,7 +522,7 @@ export function markUnifiedBalanceSpendSubmitted(invoiceId, input = {}) {
   invoice.paymentMethod = 'unified-balance-gateway'
   invoice.spendTxHash = input.txHash || input.spendTxHash || ''
   invoice.transferId = input.transferId || ''
-  invoice.spendResult = input.spendResult || null
+  invoice.spendSummary = { txHash: invoice.spendTxHash, transferId: invoice.transferId }
   invoice.updatedAt = now
   invoices.set(invoice.invoiceId, invoice)
   invoices.set(invoice.paymentId, invoice)
@@ -523,9 +539,17 @@ export function withArcoxX402(handler, config = {}) {
     if (!cfg.enabled) return handler(req, res, next)
 
     const resource = String(config.resource || req.originalUrl || req.path)
+    const ownerWallet = String(req.headers['x-arcox-owner'] || req.query?.ownerWallet || '').toLowerCase()
+    const agentId = String(req.headers['x-arcox-agent-id'] || req.query?.agentId || '')
+    if (agentId && !await verifyAgentOwnership(agentId, ownerWallet)) {
+      return res.status(403).json({ error: 'Agent identity mismatch' })
+    }
     const paymentId = String(req.headers['x-payment-id'] || req.headers['x-arcox-payment-request-id'] || req.query?.paymentId || '')
     if (paymentId) {
       const invoice = await reconcileX402Invoice(paymentId)
+      if (invoice && ((agentId && agentId !== String(invoice.agentId || '')) || (ownerWallet && invoice.ownerWallet && ownerWallet !== invoice.ownerWallet))) {
+        return res.status(403).json({ error: 'Agent identity mismatch' })
+      }
       if (invoice?.status === 'paid' && invoice.resource === resource) {
         invoice.serviceStatus = 'service_unlocked'
         invoice.serviceUnlockedAt = new Date().toISOString()
@@ -536,17 +560,19 @@ export function withArcoxX402(handler, config = {}) {
         return handler(req, res, next)
       }
       if (invoice && invoice.resource !== resource) {
-        const nextInvoice = createX402Invoice({ ...config, resource, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
+        const nextInvoice = createX402Invoice({ ...config, resource, ownerWallet, agentId, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
         return res.status(402).json({ error: 'x402 payment resource mismatch', x402: publicInvoice(nextInvoice) })
       }
       if (invoice?.status === 'expired') {
-        const nextInvoice = createX402Invoice({ ...config, resource, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
+        const nextInvoice = createX402Invoice({ ...config, resource, ownerWallet, agentId, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
         return res.status(402).json({ error: 'x402 invoice expired', x402: publicInvoice(nextInvoice) })
       }
     }
 
     const invoice = createX402Invoice({
       service: config.service || 'arcox_intel',
+      ownerWallet,
+      agentId,
       amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount),
       resource,
     })
@@ -555,4 +581,32 @@ export function withArcoxX402(handler, config = {}) {
     }
     return res.status(402).json({ error: 'Payment Required', x402: publicInvoice(invoice) })
   }
+}
+
+function scheduleAgentMemoProof(invoice) {
+  if (!invoice?.agentId || invoice.paymentMethod !== 'unified-balance-gateway' || !invoice.txHash || invoice.memoProofStatus === 'pending' || invoice.memoProofTxHash) return
+  invoice.memoProofStatus = 'pending'
+  persistInvoices()
+  void submitAgentMemoProof({
+    agentId: invoice.agentId,
+    paymentId: invoice.paymentId,
+    requestId: invoice.paymentId,
+    service: 'x402',
+    amount: invoice.uniqueAmount,
+    treasury: invoice.recipient,
+    settlementTxHash: invoice.txHash,
+  }).then(result => {
+    invoice.memoProofStatus = result.status
+    invoice.memoProofTxHash = result.txHash || ''
+    invoice.memoId = result.memoId || invoice.memoId
+    invoice.updatedAt = new Date().toISOString()
+    invoices.set(invoice.invoiceId, invoice)
+    invoices.set(invoice.paymentId, invoice)
+    persistInvoices()
+  }).catch(error => {
+    invoice.memoProofStatus = 'failed'
+    invoice.memoProofError = String(error?.message || error).slice(0, 200)
+    invoice.updatedAt = new Date().toISOString()
+    persistInvoices()
+  })
 }

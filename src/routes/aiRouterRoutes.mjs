@@ -2,32 +2,62 @@ import { Router } from 'express'
 import { createHmac, timingSafeEqual } from 'crypto'
 import {
   addUsageLog,
-  compareUsdc,
   createPaymentIntent,
   findApiKey,
+  getActiveAgentId,
   getAiRouterStatus,
   getPolicy,
   issueApiKey,
   listApiKeys,
+  listAgentJobs,
   markPaymentSettled,
   markPaymentStatus,
   normalizeOwner,
   normalizeUsdc,
   publicApiKey,
+  recordAgentJob,
   revokeApiKey,
   setPolicy,
+  setActiveAgentIdentity,
   treasuryAddress,
   usageForOwner,
 } from '../services/aiRouterStore.mjs'
 import { callChatCompletionWithFallback, publicModels, validateChatCompletionRoute } from '../services/aiProviderService.mjs'
 import { delegateConfig, estimateDelegatedAiSpend, spendDelegatedAiPayment } from '../services/aiRouterSpendService.mjs'
+import { listAgentIdentities, verifyAgentOwnership } from '../services/agentIdentityService.mjs'
+import { submitAgentMemoProof } from '../services/arcMemoService.mjs'
 
 const router = Router()
 
-router.get('/status', (req, res) => {
+router.get('/status', async (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
-  res.json({ ok: true, ...getAiRouterStatus(ownerAddress), treasury: treasuryAddress(), docs: docs() })
+  try {
+    const identity = await resolveActiveIdentity(ownerAddress)
+    res.json({ ok: true, ...getAiRouterStatus(ownerAddress), agentIdentity: identity.active, agentIdentities: identity.items, treasury: treasuryAddress(), docs: docs() })
+  } catch (error) {
+    res.status(502).json({ error: error?.message || 'Agent Identity lookup failed' })
+  }
+})
+
+router.get('/agent-identities', async (req, res) => {
+  const ownerAddress = normalizeOwner(req.query.ownerAddress)
+  if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
+  try {
+    const identity = await resolveActiveIdentity(ownerAddress, req.query.refresh === 'true')
+    res.json({ ok: true, ownerAddress, identities: identity.items, activeAgentIdentity: identity.active })
+  } catch (error) {
+    res.status(502).json({ error: error?.message || 'Agent Identity lookup failed' })
+  }
+})
+
+router.post('/agent-identities/select', requireOwnerAuth, async (req, res) => {
+  const ownerAddress = normalizeOwner(req.body?.ownerAddress)
+  const agentId = String(req.body?.agentId || '')
+  const identity = await verifyAgentOwnership(agentId, ownerAddress)
+  if (!identity) return res.status(403).json({ error: 'Agent identity mismatch' })
+  setActiveAgentIdentity(ownerAddress, agentId)
+  res.json({ ok: true, activeAgentIdentity: identity })
 })
 
 router.post('/auto-pay', requireOwnerAuth, (req, res) => {
@@ -42,13 +72,20 @@ router.get('/api-keys', (req, res) => {
   res.json({ ok: true, apiKeys: listApiKeys(ownerAddress) })
 })
 
-router.post('/api-keys', requireOwnerAuth, (req, res) => {
+router.post('/api-keys', requireOwnerAuth, async (req, res) => {
   const ownerAddress = normalizeOwner(req.body?.ownerAddress)
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
+  const identity = await resolveActiveIdentity(ownerAddress)
+  const requestedScopes = Array.isArray(req.body?.scopes) ? req.body.scopes : ['ai:chat', 'ai:models']
+  const scopes = [...new Set([
+    ...requestedScopes.filter(scope => ['ai:chat', 'ai:models'].includes(scope)),
+    ...(identity.active ? ['agent:jobs'] : []),
+  ])]
   const issued = issueApiKey({
     ownerAddress,
+    agentId: identity.active?.agentId || '',
     label: req.body?.label || 'ARCOX AI Router',
-    scopes: req.body?.scopes || ['ai:chat', 'ai:models'],
+    scopes,
   })
   res.json({
     ok: true,
@@ -69,7 +106,7 @@ router.post('/api-keys/:id/rotate', requireOwnerAuth, (req, res) => {
   const ownerAddress = normalizeOwner(req.body?.ownerAddress)
   const oldKey = revokeApiKey(req.params.id, ownerAddress)
   if (!oldKey) return res.status(404).json({ error: 'API key not found' })
-  const issued = issueApiKey({ ownerAddress, label: `${oldKey.label || 'ARCOX AI Router'} rotated`, scopes: oldKey.scopes })
+  const issued = issueApiKey({ ownerAddress, agentId: oldKey.agentId, label: `${oldKey.label || 'ARCOX AI Router'} rotated`, scopes: oldKey.scopes })
   res.json({ ok: true, revoked: oldKey, apiKey: issued.apiKey, key: issued.record })
 })
 
@@ -84,18 +121,39 @@ router.get('/usage', (req, res) => {
   res.json({ ok: true, usageLogs: usageForOwner(ownerAddress, limit) })
 })
 
+router.get('/agent-jobs', async (req, res) => {
+  const auth = await authenticateAiKey(req, 'agent:jobs')
+  if (!auth.ok) return res.status(auth.status).json(auth.body)
+  res.json({ ok: true, agentId: auth.apiKey.agentId, jobs: listAgentJobs(auth.apiKey.ownerAddress, auth.apiKey.agentId, req.query.limit) })
+})
+
+router.post('/agent-jobs', async (req, res) => {
+  const auth = await authenticateAiKey(req, 'agent:jobs')
+  if (!auth.ok) return res.status(auth.status).json(auth.body)
+  if (String(req.body?.agentId || auth.apiKey.agentId) !== auth.apiKey.agentId) return res.status(403).json({ error: 'Agent identity mismatch' })
+  const job = recordAgentJob({
+    jobId: req.body?.jobId,
+    agentId: auth.apiKey.agentId,
+    ownerAddress: auth.apiKey.ownerAddress,
+    txHash: req.body?.txHash,
+    memoId: req.body?.memoId,
+    status: req.body?.status || 'created',
+  })
+  res.json({ ok: true, job })
+})
+
 router.get('/docs', (_req, res) => {
   res.json({ ok: true, docs: docs() })
 })
 
 export async function openAiModels(req, res) {
-  const auth = authenticateAiKey(req, 'ai:models')
+  const auth = await authenticateAiKey(req, 'ai:models')
   if (!auth.ok) return res.status(auth.status).json(auth.body)
   res.json({ object: 'list', data: publicModels() })
 }
 
 export async function openAiChatCompletions(req, res) {
-  const auth = authenticateAiKey(req, 'ai:chat')
+  const auth = await authenticateAiKey(req, 'ai:chat')
   if (!auth.ok) return res.status(auth.status).json(auth.body)
   const requestId = `air_req_${Date.now().toString(36)}`
   const apiKey = auth.apiKey
@@ -105,7 +163,6 @@ export async function openAiChatCompletions(req, res) {
   if (!policy.enabled) return paymentRequired(res, 'Enable Auto Pay first', `Enable Auto Pay for API key owner ${shortAddress(owner)} before calling AI models. If the web UI is already ready, create/copy a fresh API key from that same connected wallet.`)
   if ((policy.delegateStatus || 'not_configured') !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', `Auto Pay is not ready for API key owner ${shortAddress(owner)}.`)
   if (!delegateConfig().enabled || !delegateConfig().delegateAddress) return paymentRequired(res, 'Enable Auto Pay first', 'Backend Auto Pay wallet is not configured.')
-  if (compareUsdc(cost, policy.maxPerRequest) > 0) return paymentRequired(res, 'Auto Pay limit reached', 'Request cost exceeds max per request limit.')
   try {
     await validateChatCompletionRoute(req.body || {})
   } catch (error) {
@@ -118,7 +175,7 @@ export async function openAiChatCompletions(req, res) {
   }
 
   const started = Date.now()
-  const payment = createPaymentIntent({ ownerAddress: owner, amount: cost, requestId, model: req.body?.model || 'arcox/auto' })
+  const payment = createPaymentIntent({ ownerAddress: owner, agentId: apiKey.agentId, amount: cost, requestId, model: req.body?.model || 'arcox/auto' })
   markPaymentStatus(payment.id, 'estimate_ready')
   let estimate
   try {
@@ -138,6 +195,7 @@ export async function openAiChatCompletions(req, res) {
       requestId,
       apiKeyId: apiKey.id,
       ownerAddress: owner,
+      agentId: apiKey.agentId,
       model: req.body?.model || 'arcox/auto',
       providerUsed: meta.providerUsed || '',
       cost: '0',
@@ -150,9 +208,22 @@ export async function openAiChatCompletions(req, res) {
   }
 
   let spend
+  let memoProof = null
   try {
     spend = await spendDelegatedAiPayment({ sourceAccount: owner, amount: cost, estimate })
-    markPaymentSettled(payment.id, { txHash: spend.txHash, transferId: spend.transferId, estimate: spend.estimate || estimate })
+    if (apiKey.agentId && spend.txHash) {
+      memoProof = await submitAgentMemoProof({
+        agentId: apiKey.agentId,
+        paymentId: payment.id,
+        requestId,
+        service: 'ai_router',
+        model: req.body?.model || 'arcox/auto',
+        amount: cost,
+        treasury: treasuryAddress(),
+        settlementTxHash: spend.txHash,
+      }).catch(() => null)
+    }
+    markPaymentSettled(payment.id, { txHash: spend.txHash, transferId: spend.transferId, memoId: memoProof?.memoId, memoTxHash: memoProof?.txHash })
   } catch (error) {
     return handlePaymentFailure({ res, paymentId: payment.id, error })
   }
@@ -163,13 +234,15 @@ export async function openAiChatCompletions(req, res) {
     requestId,
     apiKeyId: apiKey.id,
     ownerAddress: owner,
+    agentId: apiKey.agentId,
     model: req.body?.model || 'arcox/auto',
     providerUsed: meta.providerUsed,
     inputTokens: usage.prompt_tokens || 0,
     outputTokens: usage.completion_tokens || 0,
     cost,
-    paymentId: requestId,
+    paymentId: payment.id,
     txHash: spend.txHash,
+    memoId: memoProof?.memoId || '',
     fallbackCount: meta.fallbackCount,
     status: 'success',
     latency: meta.latency || Date.now() - started,
@@ -184,6 +257,9 @@ export async function openAiChatCompletions(req, res) {
       paymentStatus: 'paid',
       txHash: spend.txHash,
       transferId: spend.transferId,
+      agentId: apiKey.agentId || null,
+      memoId: memoProof?.memoId || null,
+      memoTxHash: memoProof?.txHash || null,
       usageLog: log,
       providerUsed: meta.providerUsed,
       fallbackCount: meta.fallbackCount,
@@ -284,13 +360,16 @@ function extractAssistantText(data) {
   return String(message.content || message.reasoning_content || message.reasoning || data?.output_text || '')
 }
 
-function authenticateAiKey(req, scope) {
+async function authenticateAiKey(req, scope) {
   const header = String(req.headers.authorization || '')
   const secret = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
   if (!secret.startsWith('arx_sk_')) return { ok: false, status: 401, body: { error: { message: 'Invalid ARCOX API key', type: 'authentication_error' } } }
   const apiKey = findApiKey(secret)
   if (!apiKey) return { ok: false, status: 401, body: { error: { message: 'Invalid ARCOX API key', type: 'authentication_error' } } }
   if (!apiKey.scopes?.includes(scope)) return { ok: false, status: 403, body: { error: { message: `Missing scope ${scope}`, type: 'permission_error' } } }
+  const claimedAgentId = String(req.headers['x-arcox-agent-id'] || req.body?.metadata?.agentId || req.body?.agentId || '')
+  if (claimedAgentId && claimedAgentId !== String(apiKey.agentId || '')) return { ok: false, status: 403, body: { error: { message: 'Agent identity mismatch', type: 'permission_error' } } }
+  if (apiKey.agentId && !await verifyAgentOwnership(apiKey.agentId, apiKey.ownerAddress)) return { ok: false, status: 403, body: { error: { message: 'Agent identity mismatch', type: 'permission_error' } } }
   return { ok: true, apiKey: publicApiKey(apiKey) }
 }
 
@@ -308,7 +387,7 @@ function requireOwnerAuth(req, res, next) {
 }
 
 function verifyAuthToken(req) {
-  const secret = process.env.AUTH_SECRET || process.env.CIRCLE_ENTITY_SECRET || process.env.CIRCLE_API_KEY || ''
+  const secret = process.env.AUTH_SECRET || ''
   if (!secret) return ''
   const header = String(req.headers.authorization || '')
   const token = header.startsWith('Bearer ') ? header.slice(7) : ''
@@ -326,6 +405,19 @@ function verifyAuthToken(req) {
   } catch {
     return ''
   }
+}
+
+async function resolveActiveIdentity(ownerAddress, refresh = false) {
+  const items = await listAgentIdentities(ownerAddress, { refresh })
+  let activeId = getActiveAgentId(ownerAddress)
+  let active = items.find(item => item.agentId === activeId) || null
+  if (!active && items.length) {
+    active = items[0]
+    activeId = setActiveAgentIdentity(ownerAddress, active.agentId)
+  } else if (!active && activeId) {
+    setActiveAgentIdentity(ownerAddress, '')
+  }
+  return { items, active }
 }
 
 function paymentRequired(res, message, detail) {

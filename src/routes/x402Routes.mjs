@@ -8,17 +8,21 @@ import {
   reconcileX402Invoice,
   x402Config,
 } from '../middleware/x402Middleware.mjs'
+import { verifyAgentOwnership } from '../services/agentIdentityService.mjs'
 
 const router = Router()
 
-router.post('/invoices/create', (req, res) => {
+router.post('/invoices/create', async (req, res) => {
   const body = req.body || {}
   const resource = String(body.resource || '').trim()
   if (!resource.startsWith('/api/')) return res.status(400).json({ error: 'resource must be an /api/... path' })
+  if (body.agentId && !await verifyAgentOwnership(body.agentId, body.ownerWallet)) return res.status(403).json({ error: 'Agent identity mismatch' })
   const invoice = createX402Invoice({
     service: body.service || 'arcox_intel',
     amount: body.amount,
     resource,
+    agentId: body.agentId,
+    ownerWallet: body.ownerWallet,
   })
   res.json({ ok: true, x402: publicInvoice(invoice), invoice: publicInvoice(invoice), config: publicConfig() })
 })
@@ -29,14 +33,17 @@ router.get('/invoices/:invoiceId/status', async (req, res) => {
   res.json({ ok: true, x402: publicInvoice(invoice), invoice: publicInvoice(invoice) })
 })
 
-router.post('/payment-request', (req, res) => {
+router.post('/payment-request', async (req, res) => {
   const body = req.body || {}
   const resource = String(body.resource || '').trim()
   if (!resource.startsWith('/api/')) return res.status(400).json({ error: 'resource must be an /api/... path' })
+  if (body.agentId && !await verifyAgentOwnership(body.agentId, body.ownerWallet)) return res.status(403).json({ error: 'Agent identity mismatch' })
   const invoice = createX402Invoice({
     service: body.service || 'arcox_intel',
     amount: body.amount,
     resource,
+    agentId: body.agentId,
+    ownerWallet: body.ownerWallet,
   })
   res.json({ ok: true, x402: publicInvoice(invoice), invoice: publicInvoice(invoice), config: publicConfig() })
 })

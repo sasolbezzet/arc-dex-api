@@ -44,7 +44,7 @@ app.use((req, res, next) => {
     res.setHeader('Vary', 'Origin')
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PATCH, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Arcox-Payment-Proof, X-Arcox-Payment-Request-Id, X-Arcox-Payment-Tx, X-Payment, X-Payment-Proof, X-Payment-ID, X-Payment-TX')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Arcox-Agent-Id, X-Arcox-Owner, X-Arcox-Payment-Proof, X-Arcox-Payment-Request-Id, X-Arcox-Payment-Tx, X-Payment, X-Payment-Proof, X-Payment-ID, X-Payment-TX')
   if (req.method === 'OPTIONS') return res.status(204).end()
   next()
 })

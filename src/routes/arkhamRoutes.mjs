@@ -19,6 +19,8 @@ function withPaymentMeta(req, payload, context = {}) {
     ...(invoice ? { x402Payment: {
       invoiceId: invoice.invoiceId,
       paymentId: invoice.paymentId,
+      agentId: invoice.agentId || '',
+      ownerWallet: invoice.ownerWallet || '',
       status: invoice.status,
       amount: invoice.uniqueAmount,
       asset: invoice.asset,
@@ -27,6 +29,8 @@ function withPaymentMeta(req, payload, context = {}) {
       txHash: invoice.txHash,
       paidAt: invoice.paidAt,
       reconciledBy: invoice.reconciledBy,
+      memoId: invoice.memoId,
+      memoProofTxHash: invoice.memoProofTxHash || '',
     } } : {}),
   }
 }
