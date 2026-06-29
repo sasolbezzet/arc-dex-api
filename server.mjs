@@ -294,6 +294,11 @@ function normalizeArcToken(value) {
   return raw.toUpperCase()
 }
 
+function tokenSymbolForAddress(address) {
+  const match = Object.entries(TOKENS).find(([, tokenAddress]) => tokenAddress.toLowerCase() === String(address || '').toLowerCase())
+  return match?.[0] || 'USDC'
+}
+
 function decimalToUnits(value, decimals) {
   const raw = normalizeAmount(value)
   const [whole, frac = ''] = raw.split('.')
@@ -363,7 +368,7 @@ function noSwapRouteResponse(res, err) {
   })
 }
 
-function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount }) {
+function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount, customFeeBps = PLATFORM_FEE_BPS }) {
   if (!KIT_KEY) throw new Error('KIT_KEY belum dikonfigurasi')
   if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) throw new Error('Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut))
   if (tokenIn === tokenOut) throw new Error('Token swap harus berbeda')
@@ -376,6 +381,14 @@ function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount }) {
     toAddress: owner,
     amount: decimalToUnits(amount, TOKEN_DECIMALS[tokenIn]).toString(),
     slippageBps: 300,
+    ...(customFeeBps > 0 ? {
+      config: {
+        customFee: {
+          percentageBps: customFeeBps,
+          recipientAddress: normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY'),
+        },
+      },
+    } : {}),
   }
 }
 
@@ -434,6 +447,7 @@ async function quotePreparedEoaRoute({ owner, tokenIn, tokenOut, amount }) {
     tokenIn,
     tokenOut: isEurcToCirBtc(tokenIn, tokenOut) ? 'USDC' : tokenOut,
     amount,
+    customFeeBps: 0,
   })
   const first = await stablecoinRequest('/v1/stablecoinKits/quote', { query: firstParams })
   if (!isEurcToCirBtc(tokenIn, tokenOut)) return { quote: first, legs: [{ params: firstParams, quote: first }] }
@@ -444,6 +458,7 @@ async function quotePreparedEoaRoute({ owner, tokenIn, tokenOut, amount }) {
     tokenIn: 'USDC',
     tokenOut: 'cirBTC',
     amount: unitsToDecimal(BigInt(intermediateUnits), TOKEN_DECIMALS.USDC),
+    customFeeBps: 0,
   })
   const second = await stablecoinRequest('/v1/stablecoinKits/quote', { query: secondParams })
   return { quote: second, legs: [{ params: firstParams, quote: first }, { params: secondParams, quote: second }] }
@@ -464,6 +479,7 @@ async function prepareEoaSwapLeg(params, tokenIn, tokenOut) {
     amountOut: unitsToDecimal(BigInt(prepared.estimatedAmount || '0'), TOKEN_DECIMALS[tokenOut]),
     stopLimit: prepared.stopLimit,
     estimatedAmount: prepared.estimatedAmount,
+    fees: prepared.fees || [],
     gasLimit: prepared.transaction.gasLimit,
     executionParams: prepared.transaction.executionParams,
     signature: prepared.transaction.signature,
@@ -485,6 +501,7 @@ async function prepareEoaSwapRoute({ owner, tokenIn, tokenOut, amount }) {
     tokenIn: 'USDC',
     tokenOut: 'cirBTC',
     amount: unitsToDecimal(BigInt(intermediateUnits), TOKEN_DECIMALS.USDC),
+    customFeeBps: 0,
   })
   const second = await prepareEoaSwapLeg(secondParams, 'USDC', 'cirBTC')
   return { amountOut: second.amountOut, route: 'EURC → USDC → cirBTC', legs: [first, second] }
@@ -1124,6 +1141,33 @@ const GATEWAY_TESTNET_CHAINS = [
   { domain: 3, chain: 'Arbitrum_Sepolia' },
 ]
 
+const GATEWAY_PROXY_PATH = /^\/v1\/(?:info|balances|deposits|estimate)(?:\?enableForwarder=true)?$/
+
+app.all('/api/unified-balance/gateway-proxy', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const path = String(req.query?.path || '')
+    if (!GATEWAY_PROXY_PATH.test(path)) return res.status(400).json({ error: 'Unsupported Gateway path' })
+    if (!['GET', 'POST'].includes(req.method)) return res.status(405).json({ error: 'Unsupported Gateway method' })
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), Number(process.env.GATEWAY_PROXY_TIMEOUT_MS || 15_000))
+    try {
+      const response = await fetch(`${GATEWAY_TESTNET_API}${path}`, {
+        method: req.method,
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'arcox-api/2.0' },
+        ...(req.method === 'POST' ? { body: JSON.stringify(req.body || {}) } : {}),
+      })
+      const payload = await response.text()
+      res.status(response.status).type(response.headers.get('content-type') || 'application/json').send(payload)
+    } finally {
+      clearTimeout(timeout)
+    }
+  } catch (error) {
+    const message = error?.name === 'AbortError' ? 'Circle Gateway request timed out' : (error?.message || 'Circle Gateway request failed')
+    res.status(502).json({ error: message })
+  }
+})
+
 app.post('/api/unified-balance/balances', apiLimiter, async (req, res) => {
   try {
     const address = normalizeAddress(req.body?.address, 'address')
@@ -1279,7 +1323,12 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
-    const prepared = await prepareEoaSwapRoute({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
+    const prepared = await prepareEoaSwapRoute({ owner, tokenIn, tokenOut, amount: safeAmount })
+    const developerFee = prepared.legs.flatMap(leg => leg.fees?.developer || [])[0]
+    const developerFeeToken = developerFee ? tokenSymbolForAddress(developerFee.token) : tokenOut
+    const developerFeeAmount = developerFee
+      ? unitsToDecimal(BigInt(developerFee.amount), TOKEN_DECIMALS[developerFeeToken] || 6)
+      : platformFee.feeAmount
     return res.json({
       success: true,
       source: 'stablecoin-service',
@@ -1294,9 +1343,10 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
       legs: prepared.legs,
       platformFee: {
         bps: platformFee.feeBps,
-        amount: platformFee.feeAmount,
-        token: tokenIn,
+        amount: developerFeeAmount,
+        token: developerFeeToken,
         treasury: normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY'),
+        collectedBy: 'swap-adapter',
       },
     })
   } catch(e) {
