@@ -200,5 +200,10 @@ function formatUsdc(value) {
 }
 
 function totalFeeUnits(fees) {
-  return (Array.isArray(fees) ? fees : []).reduce((total, fee) => total + usdcUnits(String(fee?.amount || '0')), 0n)
+  const entries = Array.isArray(fees) ? fees : []
+  const gasFeeIncludesForwarder = entries.some(fee => fee?.type === 'gasFee')
+  return entries.reduce((total, fee) => {
+    if (gasFeeIncludesForwarder && fee?.type === 'forwarder') return total
+    return total + usdcUnits(String(fee?.amount || '0'))
+  }, 0n)
 }
