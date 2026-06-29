@@ -54,6 +54,16 @@ router.get('/delegate-status', async (req, res) => {
   }
 })
 
+router.get('/auto-pay/readiness', async (req, res) => {
+  const ownerAddress = normalizeOwner(req.query.ownerAddress)
+  if (!/^0x[a-f0-9]{40}$/.test(ownerAddress)) return res.status(400).json({ error: 'Valid ownerAddress is required' })
+  try {
+    res.json({ ok: true, autoPay: await refreshAutoPayReadiness(ownerAddress) })
+  } catch (error) {
+    res.status(502).json({ error: error?.message || 'Auto Pay readiness refresh failed' })
+  }
+})
+
 router.get('/agent-identities', async (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
@@ -172,7 +182,10 @@ export async function openAiChatCompletions(req, res) {
   const requestId = `air_req_${Date.now().toString(36)}`
   const apiKey = auth.apiKey
   const owner = apiKey.ownerAddress
-  const policy = getPolicy(owner)
+  let policy = getPolicy(owner)
+  if (policy.delegateChains?.some(item => item?.status === 'pending')) {
+    policy = await refreshAutoPayReadiness(owner).catch(() => policy)
+  }
   const cost = normalizeUsdc(req.body?.metadata?.arcox_cost || process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001')
   if (!policy.enabled) return paymentRequired(res, 'Enable Auto Pay first', `Enable Auto Pay for API key owner ${shortAddress(owner)} before calling AI models. If the web UI is already ready, create/copy a fresh API key from that same connected wallet.`)
   if ((policy.delegateStatus || 'not_configured') !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', `Auto Pay is not ready for API key owner ${shortAddress(owner)}.`)
@@ -469,6 +482,25 @@ function readyDelegateChains(policy, ownerAddress) {
   }
   const ready = (policy?.delegateChains || []).filter(item => item?.status === 'ready').map(item => item.chain)
   return ready.length ? ready : policy?.delegateStatus === 'ready' ? ['Arc_Testnet'] : []
+}
+
+async function refreshAutoPayReadiness(ownerAddress) {
+  const policy = getPolicy(ownerAddress)
+  const delegateAddress = policy.delegateAddress || delegateConfig().delegateAddress
+  if (!policy.enabled || !delegateAddress || !Array.isArray(policy.delegateChains) || !policy.delegateChains.length) return policy
+  const delegateChains = await Promise.all(policy.delegateChains.map(async item => {
+    if (item?.status !== 'pending') return item
+    try {
+      const result = await getGatewayDelegateStatus({ ownerAddress, delegateAddress, chain: item.chain })
+      return { chain: item.chain, status: result.status === 'none' ? 'not_configured' : result.status }
+    } catch {
+      return item
+    }
+  }))
+  const delegateStatus = delegateChains.some(item => item.status === 'ready')
+    ? 'ready'
+    : delegateChains.some(item => item.status === 'pending') ? 'pending' : 'not_configured'
+  return setPolicy(ownerAddress, { enabled: policy.enabled, delegateStatus, delegateAddress, delegateChains })
 }
 
 function docs() {
