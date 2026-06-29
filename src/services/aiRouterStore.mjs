@@ -216,6 +216,10 @@ export function markPaymentSettled(id, patch = {}) {
   payment.transferId = patch.transferId || payment.transferId || ''
   payment.memoId = patch.memoId || payment.memoId || ''
   payment.memoTxHash = patch.memoTxHash || payment.memoTxHash || ''
+  if (patch.amount) payment.amount = normalizeUsdc(patch.amount)
+  if (patch.serviceAmount) payment.serviceAmount = normalizeUsdc(patch.serviceAmount)
+  if (patch.totalFee) payment.totalFee = normalizeUsdc(patch.totalFee)
+  if (Array.isArray(patch.sourceAllocations)) payment.sourceAllocations = patch.sourceAllocations.slice(0, 4)
   payment.settledAt = new Date().toISOString()
   payment.updatedAt = payment.settledAt
   saveAiRouterStore()

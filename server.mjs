@@ -1181,7 +1181,7 @@ function formatGatewayBalances(address, confirmed, pending) {
   const pendingTxByDomain = new Map()
   for (const deposit of pending?.deposits || []) {
     const domain = Number(deposit.domain)
-    const amount = String(deposit.amount || '0')
+    const amount = unitsToDecimal(BigInt(String(deposit.amount || '0')), 6)
     pendingByDomain.set(domain, addDecimalAmounts(pendingByDomain.get(domain) || '0', amount))
     const list = pendingTxByDomain.get(domain) || []
     list.push({

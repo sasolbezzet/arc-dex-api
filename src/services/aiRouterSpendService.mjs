@@ -56,32 +56,20 @@ export async function estimateDelegatedAiSpend({ sourceAccount, amount, sourceCh
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!cfg.recipient) throw new Error('ARCOX treasury recipient is not configured')
   const receiveUnits = usdcUnits(amount)
-  let spendUnits = receiveUnits
-  let estimate
-  let stable = false
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const spendAmount = formatUsdc(spendUnits)
-    const allocations = await delegatedAllocations(sourceAccount, spendAmount, sourceChains)
-    estimate = await getKit().unifiedBalance.estimateSpend({
-      from: [{ adapter: getAdapter(), sourceAccount, allocations }],
-      to: { chain: 'Arc_Testnet', recipientAddress: cfg.recipient, useForwarder: true },
-      amount: spendAmount,
-      token: 'USDC',
-    })
-    const nextSpend = receiveUnits + totalFeeUnits(estimate?.fees)
-    if (nextSpend === spendUnits) {
-      stable = true
-      break
-    }
-    spendUnits = nextSpend
+  const balances = await delegatedBalances(sourceAccount)
+  const allowed = new Set(sourceChains.length ? sourceChains : ['Arc_Testnet'])
+  const candidates = GATEWAY_CHAINS
+    .filter(item => allowed.has(item.chain) && (balances.get(item.domain) || 0n) > 0n)
+    .sort((left, right) => sourcePriority(left.chain) - sourcePriority(right.chain))
+  for (const candidate of candidates) {
+    try {
+      return await estimateForSources({ sourceAccount, receiveUnits, sourceChains: [candidate.chain], balances, recipient: cfg.recipient })
+    } catch {}
   }
-  if (!stable) throw new Error('Gateway fee estimate did not stabilize. Try again.')
-  return {
-    ...estimate,
-    requestedReceiveAmount: formatUsdc(receiveUnits),
-    spendAmount: formatUsdc(spendUnits),
-    totalFee: formatUsdc(spendUnits - receiveUnits),
+  if (candidates.length > 1) {
+    return estimateForSources({ sourceAccount, receiveUnits, sourceChains: candidates.map(item => item.chain), balances, recipient: cfg.recipient })
   }
+  throw new Error('Please deposit more USDC to Unified Balance or enable Auto Pay on another funded chain')
 }
 
 export async function spendDelegatedAiPayment({ sourceAccount, amount, estimate: preparedEstimate, sourceChains = [] }) {
@@ -90,7 +78,9 @@ export async function spendDelegatedAiPayment({ sourceAccount, amount, estimate:
   if (!cfg.recipient) throw new Error('ARCOX treasury recipient is not configured')
   const estimate = preparedEstimate || await estimateDelegatedAiSpend({ sourceAccount, amount, sourceChains })
   const spendAmount = estimate.spendAmount || amount
-  const allocations = await delegatedAllocations(sourceAccount, spendAmount, sourceChains)
+  const allocations = Array.isArray(estimate.sourceAllocations) && estimate.sourceAllocations.length
+    ? estimate.sourceAllocations
+    : await delegatedAllocations(sourceAccount, spendAmount, sourceChains)
   const result = await getKit().unifiedBalance.spend({
     from: [{
       adapter: getAdapter(),
@@ -105,27 +95,60 @@ export async function spendDelegatedAiPayment({ sourceAccount, amount, estimate:
     amount: spendAmount,
     token: 'USDC',
   })
+  const actualFeeUnits = totalFeeUnits(result?.fees || estimate.fees)
   return {
     estimate,
     result,
     txHash: result?.txHash || result?.transactionHash || result?.hash || result?.transactionHashDestination || result?.destinationTxHash || '',
     transferId: result?.transferId || result?.id || '',
-    chargedAmount: spendAmount,
+    chargedAmount: formatUsdc(usdcUnits(spendAmount) + actualFeeUnits),
     serviceAmount: amount,
-    totalFee: estimate.totalFee || '0',
+    totalFee: formatUsdc(actualFeeUnits),
+    sourceAllocations: allocations,
   }
 }
 
-async function delegatedAllocations(sourceAccount, amount, sourceChains) {
-  const allowed = new Set(sourceChains.length ? sourceChains : ['Arc_Testnet'])
+async function estimateForSources({ sourceAccount, receiveUnits, sourceChains, balances, recipient }) {
+  const spendAmount = formatUsdc(receiveUnits)
+  const sourceAllocations = await delegatedAllocations(sourceAccount, spendAmount, sourceChains, balances)
+  const estimate = await getKit().unifiedBalance.estimateSpend({
+    from: [{ adapter: getAdapter(), sourceAccount, allocations: sourceAllocations }],
+    to: { chain: 'Arc_Testnet', recipientAddress: recipient, useForwarder: true },
+    amount: spendAmount,
+    token: 'USDC',
+  })
+  const feeUnits = totalFeeUnits(estimate?.fees)
+  const availableUnits = GATEWAY_CHAINS
+    .filter(item => sourceChains.includes(item.chain))
+    .reduce((total, item) => total + (balances.get(item.domain) || 0n), 0n)
+  if (availableUnits < receiveUnits + feeUnits) throw new Error('Unified Balance source cannot cover the service amount and Gateway fee')
+  return {
+    ...estimate,
+    requestedReceiveAmount: spendAmount,
+    spendAmount,
+    totalFee: formatUsdc(feeUnits),
+    totalDebit: formatUsdc(receiveUnits + feeUnits),
+    sourceAllocations,
+  }
+}
+
+async function delegatedBalances(sourceAccount) {
   const response = await gatewayRequest('/v1/balances', {
     token: 'USDC',
     sources: GATEWAY_CHAINS.map(({ domain }) => ({ depositor: sourceAccount, domain })),
   })
-  const balances = new Map((response?.balances || []).map(item => [Number(item.domain), usdcUnits(String(item.balance || '0'))]))
+  return new Map((response?.balances || []).map(item => [Number(item.domain), usdcUnits(String(item.balance || '0'))]))
+}
+
+async function delegatedAllocations(sourceAccount, amount, sourceChains, knownBalances) {
+  const allowed = new Set(sourceChains.length ? sourceChains : ['Arc_Testnet'])
+  const balances = knownBalances || await delegatedBalances(sourceAccount)
   let remaining = usdcUnits(amount)
   const allocations = []
-  for (const { chain, domain } of GATEWAY_CHAINS) {
+  const orderedChains = GATEWAY_CHAINS
+    .filter(item => allowed.has(item.chain))
+    .sort((left, right) => sourcePriority(left.chain) - sourcePriority(right.chain))
+  for (const { chain, domain } of orderedChains) {
     if (!allowed.has(chain) || remaining <= 0n) continue
     const available = balances.get(domain) || 0n
     if (available <= 0n) continue
@@ -135,6 +158,10 @@ async function delegatedAllocations(sourceAccount, amount, sourceChains) {
   }
   if (remaining > 0n) throw new Error('Please deposit more USDC to Unified Balance or enable Auto Pay on another funded chain')
   return allocations
+}
+
+function sourcePriority(chain) {
+  return ({ Base_Sepolia: 0, Arbitrum_Sepolia: 1, Arc_Testnet: 2, Ethereum_Sepolia: 3 })[chain] ?? 9
 }
 
 async function gatewayRequest(path, body) {

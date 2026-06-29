@@ -194,7 +194,7 @@ export async function openAiChatCompletions(req, res) {
   let estimate
   try {
     estimate = await estimateDelegatedAiSpend({ sourceAccount: owner, amount: cost, sourceChains: readyDelegateChains(policy, owner) })
-    markPaymentStatus(payment.id, 'estimate_ready', { amount: estimate.spendAmount || cost, serviceAmount: cost, totalFee: estimate.totalFee || '0' })
+    markPaymentStatus(payment.id, 'estimate_ready', { amount: estimate.totalDebit || estimate.spendAmount || cost, serviceAmount: cost, totalFee: estimate.totalFee || '0' })
   } catch (error) {
     return handlePaymentFailure({ res, paymentId: payment.id, error })
   }
@@ -238,7 +238,16 @@ export async function openAiChatCompletions(req, res) {
         settlementTxHash: spend.txHash,
       }).catch(() => null)
     }
-    markPaymentSettled(payment.id, { txHash: spend.txHash, transferId: spend.transferId, memoId: memoProof?.memoId, memoTxHash: memoProof?.txHash })
+    markPaymentSettled(payment.id, {
+      txHash: spend.txHash,
+      transferId: spend.transferId,
+      memoId: memoProof?.memoId,
+      memoTxHash: memoProof?.txHash,
+      amount: spend.chargedAmount,
+      serviceAmount: spend.serviceAmount,
+      totalFee: spend.totalFee,
+      sourceAllocations: spend.sourceAllocations,
+    })
   } catch (error) {
     return handlePaymentFailure({ res, paymentId: payment.id, error })
   }
@@ -269,6 +278,7 @@ export async function openAiChatCompletions(req, res) {
       cost: spend.chargedAmount || cost,
       serviceCost: cost,
       totalFee: spend.totalFee || '0',
+      sourceAllocations: spend.sourceAllocations || [],
       requestId,
       paymentId: payment.id,
       paymentStatus: 'paid',
