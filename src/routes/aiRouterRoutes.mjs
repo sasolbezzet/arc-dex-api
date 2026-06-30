@@ -185,7 +185,9 @@ router.post('/sessions', async (req, res) => {
     if (!await isApiPassSigner(auth.apiKey, signer)) return walletMismatch(res)
     const policy = getPolicy(auth.apiKey.ownerAddress)
     if (!policy.enabled || policy.delegateStatus !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', 'Enable Unified Balance Auto Pay before creating an API session.')
-    await estimateDelegatedAiSpend({ sourceAccount: auth.apiKey.ownerAddress, amount: process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001', sourceChains: readyDelegateChains(policy, auth.apiKey.ownerAddress) })
+    if (req.body?.purpose !== 'models') {
+      await estimateDelegatedAiSpend({ sourceAccount: auth.apiKey.ownerAddress, amount: process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001', sourceChains: readyDelegateChains(policy, auth.apiKey.ownerAddress) })
+    }
     consumeSessionChallenge(challenge.id, auth.apiKey.id)
     res.json({ ok: true, ...issueApiSession(auth.apiKey, signer) })
   } catch (error) {
