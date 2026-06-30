@@ -202,3 +202,5 @@ Session endpoints:
 - `GET /api/ai-router/api-keys/status`
 
 Configure `ARCOX_API_PASS_ADDRESS`, `ARCOX_API_CHALLENGE_TTL_SECONDS`, and `ARCOX_API_SESSION_TTL_SECONDS`. API key secrets and session tokens are stored only as hashes.
+
+Set model prices only in `arc-dex-api/.env` with `AI_ROUTER_MODEL_PRICE_DEFAULT_USDC` and the JSON map `AI_ROUTER_MODEL_PRICES_USDC`. Client-provided prices are ignored. The local proxy supplies an idempotency key so a retried identical request is not charged twice.

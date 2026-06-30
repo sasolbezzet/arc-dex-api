@@ -361,6 +361,10 @@ export function createPaymentIntent({ ownerAddress, agentId = '', amount, reques
   return payment
 }
 
+export function getPaymentIntent(id) {
+  return state.payments[String(id || '')] || null
+}
+
 export function markPaymentSettled(id, patch = {}) {
   const payment = state.payments[id]
   if (!payment) return null

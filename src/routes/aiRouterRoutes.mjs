@@ -16,6 +16,7 @@ import {
   getActiveAgentId,
   getAiRouterStatus,
   getPolicy,
+  getPaymentIntent,
   issueApiSession,
   listApiKeys,
   listAgentJobs,
@@ -39,6 +40,8 @@ import { getGatewayDelegateStatus } from '../services/gatewayDelegateService.mjs
 import { apiPassAddress, apiPassExists, isApiPassSigner, verifyApiPass } from '../services/apiPassService.mjs'
 
 const router = Router()
+const aiResponseCache = new Map()
+const aiInflight = new Set()
 
 router.get('/status', async (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
@@ -186,7 +189,7 @@ router.post('/sessions', async (req, res) => {
     const policy = getPolicy(auth.apiKey.ownerAddress)
     if (!policy.enabled || policy.delegateStatus !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', 'Enable Unified Balance Auto Pay before creating an API session.')
     if (req.body?.purpose !== 'models') {
-      await estimateDelegatedAiSpend({ sourceAccount: auth.apiKey.ownerAddress, amount: process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001', sourceChains: readyDelegateChains(policy, auth.apiKey.ownerAddress) })
+      await estimateDelegatedAiSpend({ sourceAccount: auth.apiKey.ownerAddress, amount: process.env.AI_ROUTER_MODEL_PRICE_DEFAULT_USDC || process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001', sourceChains: readyDelegateChains(policy, auth.apiKey.ownerAddress) })
     }
     consumeSessionChallenge(challenge.id, auth.apiKey.id)
     res.json({ ok: true, ...issueApiSession(auth.apiKey, signer) })
@@ -197,7 +200,7 @@ router.post('/sessions', async (req, res) => {
 })
 
 router.get('/models', (_req, res) => {
-  res.json({ ok: true, data: publicModels(), object: 'list' })
+  res.json({ ok: true, data: pricedModels(), object: 'list' })
 })
 
 router.get('/usage', (req, res) => {
@@ -235,20 +238,42 @@ router.get('/docs', (_req, res) => {
 export async function openAiModels(req, res) {
   const auth = await authenticateAiKey(req, 'ai:models')
   if (!auth.ok) return res.status(auth.status).json(auth.body)
-  res.json({ object: 'list', data: publicModels() })
+  res.json({ object: 'list', data: pricedModels() })
 }
 
 export async function openAiChatCompletions(req, res) {
   const auth = await authenticateAiKey(req, 'ai:chat')
   if (!auth.ok) return res.status(auth.status).json(auth.body)
-  const requestId = `air_req_${Date.now().toString(36)}`
   const apiKey = auth.apiKey
+  const idempotencyKey = normalizeIdempotencyKey(req.headers['x-arcox-idempotency-key'])
+  const cacheKey = idempotencyKey ? `${apiKey.id}:${idempotencyKey}` : ''
+  const cached = cacheKey ? aiResponseCache.get(cacheKey) : null
+  if (cached && Date.now() < cached.expiresAt) return sendChatResponse(req, res, cached.body)
+  if (cacheKey && aiInflight.has(cacheKey)) return res.status(409).json({ error: { message: 'Identical AI request is already processing. Retry shortly.', type: 'request_in_progress', charged: false } })
+  if (cacheKey) {
+    aiInflight.add(cacheKey)
+    res.once('finish', () => aiInflight.delete(cacheKey))
+    res.once('close', () => aiInflight.delete(cacheKey))
+  }
+  const requestId = idempotencyKey ? `air_req_${idempotencyKey.slice(0, 20)}` : `air_req_${Date.now().toString(36)}`
+  const previousPayment = idempotencyKey ? getPaymentIntent(requestId) : null
+  if (previousPayment?.status === 'paid') {
+    return res.status(409).json({
+      error: {
+        message: 'This identical request was already paid. ARCOX will not charge it again.',
+        type: 'already_paid',
+        charged: false,
+        paymentId: previousPayment.id,
+        txHash: previousPayment.txHash || null,
+      },
+    })
+  }
   const owner = apiKey.ownerAddress
   let policy = getPolicy(owner)
   if (policy.delegateChains?.some(item => item?.status === 'pending')) {
     policy = await refreshAutoPayReadiness(owner).catch(() => policy)
   }
-  const cost = normalizeUsdc(req.body?.metadata?.arcox_cost || process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001')
+  const cost = priceForModel(req.body?.model || 'arcox/auto')
   if (!policy.enabled) return paymentRequired(res, 'Enable Auto Pay first', `Enable Auto Pay for API key owner ${shortAddress(owner)} before calling AI models. If the web UI is already ready, create/copy a fresh API key from that same connected wallet.`)
   if ((policy.delegateStatus || 'not_configured') !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', `Auto Pay is not ready for API key owner ${shortAddress(owner)}.`)
   if (!delegateConfig().enabled || !delegateConfig().delegateAddress) return paymentRequired(res, 'Enable Auto Pay first', 'Backend Auto Pay wallet is not configured.')
@@ -376,8 +401,36 @@ export async function openAiChatCompletions(req, res) {
       fallbackCount: meta.fallbackCount,
     },
   }
+  if (cacheKey) aiResponseCache.set(cacheKey, { body, expiresAt: Date.now() + Number(process.env.AI_ROUTER_IDEMPOTENCY_TTL_SECONDS || 300) * 1000 })
+  pruneAiResponseCache()
+  sendChatResponse(req, res, body)
+}
+
+function sendChatResponse(req, res, body) {
   if (req.body?.stream) return sendChatCompletionStream(res, body)
-  res.json(body)
+  return res.json(body)
+}
+
+function normalizeIdempotencyKey(value) {
+  const key = String(value || '').trim()
+  return /^[a-fA-F0-9]{32,64}$/.test(key) ? key.toLowerCase() : ''
+}
+
+function pruneAiResponseCache() {
+  const now = Date.now()
+  for (const [key, entry] of aiResponseCache) if (now >= entry.expiresAt) aiResponseCache.delete(key)
+  while (aiResponseCache.size > 100) aiResponseCache.delete(aiResponseCache.keys().next().value)
+}
+
+function priceForModel(model) {
+  let prices = {}
+  try { prices = JSON.parse(process.env.AI_ROUTER_MODEL_PRICES_USDC || '{}') } catch {}
+  const value = prices[String(model || '')] ?? process.env.AI_ROUTER_MODEL_PRICE_DEFAULT_USDC ?? process.env.AI_ROUTER_DEFAULT_COST_USDC ?? '0.001'
+  return normalizeUsdc(value)
+}
+
+function pricedModels() {
+  return publicModels().map(model => ({ ...model, price_usdc: priceForModel(model.id), payment_asset: 'USDC', payment_source: 'Unified Balance' }))
 }
 
 function handlePaymentFailure({ res, paymentId, error }) {
