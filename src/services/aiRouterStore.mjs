@@ -437,6 +437,16 @@ export function spendToday(ownerAddress) {
     .reduce((sum, log) => sumUsdc(sum, log.cost), '0.000000')
 }
 
+export function spendThisMonth(ownerAddress) {
+  const owner = normalizeOwner(ownerAddress)
+  const start = new Date()
+  start.setUTCDate(1)
+  start.setUTCHours(0, 0, 0, 0)
+  return state.usageLogs
+    .filter(log => log.ownerAddress === owner && log.status === 'success' && Date.parse(log.createdAt) >= start.getTime())
+    .reduce((sum, log) => sumUsdc(sum, log.cost), '0.000000')
+}
+
 export function getAiRouterStatus(ownerAddress) {
   const owner = normalizeOwner(ownerAddress)
   ensureUser(owner)
@@ -519,7 +529,7 @@ export function delegateAddress() {
 }
 
 function privateKeyAddress() {
-  const key = process.env.AI_ROUTER_DELEGATE_PRIVATE_KEY || process.env.EOA_PRIVATE_KEY || process.env.AGENT_PRIVATE_KEY || process.env.OWNER_PRIVATE_KEY || ''
+  const key = process.env.AI_ROUTER_DELEGATE_PRIVATE_KEY || ''
   if (!key) return ''
   try {
     const privateKey = key.startsWith('0x') ? key : `0x${key}`

@@ -16,6 +16,7 @@ import x402Routes from './src/routes/x402Routes.mjs'
 import aiRouterRoutes, { openAiChatCompletions, openAiModels } from './src/routes/aiRouterRoutes.mjs'
 import { processCircleX402Webhook, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
 
+process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
 process.on('unhandledRejection', (reason) => console.error('[UnhandledRejection]', reason?.message || reason))
 BigInt.prototype.toJSON = function() { return this.toString() }
@@ -37,6 +38,8 @@ app.use((req, res, next) => {
   const origin = req.headers.origin
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('X-Frame-Options', 'DENY')
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
   res.setHeader('Referrer-Policy', 'no-referrer')
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
@@ -44,7 +47,8 @@ app.use((req, res, next) => {
     res.setHeader('Vary', 'Origin')
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PATCH, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Arcox-Agent-Id, X-Arcox-Owner, X-Arcox-Payment-Proof, X-Arcox-Payment-Request-Id, X-Arcox-Payment-Tx, X-Payment, X-Payment-Proof, X-Payment-ID, X-Payment-TX')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Arcox-Agent-Id, X-Arcox-Idempotency-Key, X-Arcox-Owner, X-Arcox-Payment-Proof, X-Arcox-Payment-Request-Id, X-Arcox-Payment-Tx, X-Payment, X-Payment-Proof, X-Payment-ID, X-Payment-TX')
+  if (req.path.startsWith('/api/auth') || req.path.startsWith('/api/ai-router') || req.path.startsWith('/v1/')) res.setHeader('Cache-Control', 'no-store')
   if (req.method === 'OPTIONS') return res.status(204).end()
   next()
 })

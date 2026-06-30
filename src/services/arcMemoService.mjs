@@ -62,7 +62,7 @@ export async function submitAgentMemoProof(input = {}) {
 }
 
 function delegatePrivateKey() {
-  const key = process.env.AI_ROUTER_DELEGATE_PRIVATE_KEY || process.env.EOA_PRIVATE_KEY || process.env.AGENT_PRIVATE_KEY || process.env.OWNER_PRIVATE_KEY || ''
+  const key = process.env.AI_ROUTER_DELEGATE_PRIVATE_KEY || ''
   if (!key) return ''
   return key.startsWith('0x') ? key : `0x${key}`
 }

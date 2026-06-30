@@ -29,6 +29,8 @@ import {
   prepareApiKey,
   setPolicy,
   setActiveAgentIdentity,
+  spendThisMonth,
+  spendToday,
   treasuryAddress,
   usageForOwner,
 } from '../services/aiRouterStore.mjs'
@@ -42,13 +44,32 @@ import { apiPassAddress, apiPassExists, isApiPassSigner, verifyApiPass } from '.
 const router = Router()
 const aiResponseCache = new Map()
 const aiInflight = new Set()
+const aiOwnerInflight = new Set()
+const aiKeyRateBuckets = new Map()
 
 router.get('/status', async (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
   try {
     const identity = await resolveActiveIdentity(ownerAddress)
-    res.json({ ok: true, ...getAiRouterStatus(ownerAddress), apiPassAddress: apiPassAddress(), apiPassChainId: 5042002, agentIdentity: identity.active, agentIdentities: identity.items, treasury: treasuryAddress(), docs: docs() })
+    res.json({
+      ok: true,
+      ...getAiRouterStatus(ownerAddress),
+      apiPassAddress: apiPassAddress(),
+      apiPassChainId: 5042002,
+      agentIdentity: identity.active,
+      agentIdentities: identity.items,
+      treasury: treasuryAddress(),
+      security: {
+        apiPassRequired: true,
+        transactionWalletMatchRequired: true,
+        maxServiceCostUsdc: process.env.AI_ROUTER_MAX_SERVICE_COST_USDC || '0.01',
+        maxTotalDebitUsdc: process.env.AI_ROUTER_MAX_TOTAL_DEBIT_USDC || '0.05',
+        dailyLimitUsdc: process.env.AI_ROUTER_DAILY_LIMIT_USDC || '1',
+        monthlyLimitUsdc: process.env.AI_ROUTER_MONTHLY_LIMIT_USDC || '10',
+      },
+      docs: docs(),
+    })
   } catch (error) {
     res.status(502).json({ error: error?.message || 'Agent Identity lookup failed' })
   }
@@ -186,9 +207,9 @@ router.post('/sessions', async (req, res) => {
   try {
     const signer = await recoverMessageAddress({ message: challenge.message, signature: req.body?.signature })
     if (!await isApiPassSigner(auth.apiKey, signer)) return walletMismatch(res)
-    const policy = getPolicy(auth.apiKey.ownerAddress)
-    if (!policy.enabled || policy.delegateStatus !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', 'Enable Unified Balance Auto Pay before creating an API session.')
     if (req.body?.purpose !== 'models') {
+      const policy = getPolicy(auth.apiKey.ownerAddress)
+      if (!policy.enabled || policy.delegateStatus !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', 'Enable Unified Balance Auto Pay before creating a paid API session.')
       await estimateDelegatedAiSpend({ sourceAccount: auth.apiKey.ownerAddress, amount: process.env.AI_ROUTER_MODEL_PRICE_DEFAULT_USDC || process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001', sourceChains: readyDelegateChains(policy, auth.apiKey.ownerAddress) })
     }
     consumeSessionChallenge(challenge.id, auth.apiKey.id)
@@ -269,11 +290,18 @@ export async function openAiChatCompletions(req, res) {
     })
   }
   const owner = apiKey.ownerAddress
+  if (!consumeAiKeyRate(apiKey.id)) return res.status(429).json({ error: { message: 'AI Router request rate exceeded.', type: 'rate_limit', charged: false } })
+  if (aiOwnerInflight.has(owner)) return res.status(409).json({ error: { message: 'Another paid request for this wallet is still processing.', type: 'wallet_request_in_progress', charged: false } })
+  aiOwnerInflight.add(owner)
+  res.once('finish', () => aiOwnerInflight.delete(owner))
+  res.once('close', () => aiOwnerInflight.delete(owner))
   let policy = getPolicy(owner)
   if (policy.delegateChains?.some(item => item?.status === 'pending')) {
     policy = await refreshAutoPayReadiness(owner).catch(() => policy)
   }
   const cost = priceForModel(req.body?.model || 'arcox/auto')
+  const limitError = aiSpendLimitError(owner, cost)
+  if (limitError) return paymentRequired(res, 'Auto Pay limit reached', limitError)
   if (!policy.enabled) return paymentRequired(res, 'Enable Auto Pay first', `Enable Auto Pay for API key owner ${shortAddress(owner)} before calling AI models. If the web UI is already ready, create/copy a fresh API key from that same connected wallet.`)
   if ((policy.delegateStatus || 'not_configured') !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', `Auto Pay is not ready for API key owner ${shortAddress(owner)}.`)
   if (!delegateConfig().enabled || !delegateConfig().delegateAddress) return paymentRequired(res, 'Enable Auto Pay first', 'Backend Auto Pay wallet is not configured.')
@@ -294,6 +322,9 @@ export async function openAiChatCompletions(req, res) {
   let estimate
   try {
     estimate = await estimateDelegatedAiSpend({ sourceAccount: owner, amount: cost, sourceChains: readyDelegateChains(policy, owner) })
+    const totalDebit = normalizeUsdc(estimate.totalDebit || estimate.spendAmount || cost)
+    const maxDebit = normalizeUsdc(process.env.AI_ROUTER_MAX_TOTAL_DEBIT_USDC || '0.05')
+    if (Number(totalDebit) > Number(maxDebit)) throw new Error(`Total debit ${totalDebit} USDC exceeds the configured ${maxDebit} USDC safety cap`)
     markPaymentStatus(payment.id, 'estimate_ready', { amount: estimate.totalDebit || estimate.spendAmount || cost, serviceAmount: cost, totalFee: estimate.totalFee || '0' })
   } catch (error) {
     return handlePaymentFailure({ res, paymentId: payment.id, error })
@@ -431,6 +462,27 @@ function priceForModel(model) {
 
 function pricedModels() {
   return publicModels().map(model => ({ ...model, price_usdc: priceForModel(model.id), payment_asset: 'USDC', payment_source: 'Unified Balance' }))
+}
+
+function aiSpendLimitError(owner, cost) {
+  const perRequest = Number(process.env.AI_ROUTER_MAX_SERVICE_COST_USDC || '0.01')
+  const daily = Number(process.env.AI_ROUTER_DAILY_LIMIT_USDC || '1')
+  const monthly = Number(process.env.AI_ROUTER_MONTHLY_LIMIT_USDC || '10')
+  if (perRequest > 0 && Number(cost) > perRequest) return `Service cost ${cost} USDC exceeds the per-request limit ${perRequest} USDC.`
+  if (daily > 0 && Number(spendToday(owner)) + Number(cost) > daily) return `Daily AI Router limit ${daily} USDC reached.`
+  if (monthly > 0 && Number(spendThisMonth(owner)) + Number(cost) > monthly) return `Monthly AI Router limit ${monthly} USDC reached.`
+  return ''
+}
+
+function consumeAiKeyRate(apiKeyId) {
+  const now = Date.now()
+  const windowMs = 60_000
+  const max = Number(process.env.AI_ROUTER_REQUESTS_PER_MINUTE || '20')
+  const recent = (aiKeyRateBuckets.get(apiKeyId) || []).filter(time => now - time < windowMs)
+  if (recent.length >= max) return false
+  recent.push(now)
+  aiKeyRateBuckets.set(apiKeyId, recent)
+  return true
 }
 
 function handlePaymentFailure({ res, paymentId, error }) {
