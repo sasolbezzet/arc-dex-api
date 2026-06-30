@@ -14,6 +14,8 @@ function normalize(input) {
   return {
     users: input.users || {},
     apiKeys: input.apiKeys || {},
+    sessionChallenges: input.sessionChallenges || {},
+    apiSessions: input.apiSessions || {},
     autoPayPolicy: input.autoPayPolicy || {},
     payments: input.payments || {},
     usageLogs: (input.usageLogs || []).map(sanitizeUsageLog).slice(0, 1000),
@@ -27,6 +29,8 @@ export function saveAiRouterStore() {
   state.usageLogs = state.usageLogs.slice(0, 1000)
   state.payments = newestRecords(state.payments, 1000)
   state.agentJobs = newestRecords(state.agentJobs, 500)
+  state.sessionChallenges = newestRecords(state.sessionChallenges, 500)
+  state.apiSessions = newestRecords(state.apiSessions, 1000)
   atomicWriteJsonFile(DB_FILE, state)
 }
 
@@ -37,7 +41,7 @@ export function hashApiKey(key) {
 export function issueApiKey({ ownerAddress, agentId = '', label = 'ARCOX AI Router', scopes = ['ai:chat', 'ai:models'] }) {
   const key = `arx_sk_${randomBytes(24).toString('base64url')}`
   const now = new Date().toISOString()
-  const id = `key_${randomUUID().replaceAll('-', '').slice(0, 12)}`
+  const id = `key_${randomUUID().replaceAll('-', '')}`
   const rec = {
     id,
     ownerAddress: normalizeOwner(ownerAddress),
@@ -57,9 +61,57 @@ export function issueApiKey({ ownerAddress, agentId = '', label = 'ARCOX AI Rout
   return { apiKey: key, record: publicApiKey(rec) }
 }
 
+export function prepareApiKey({ ownerAddress, agentId = '', label = 'ARCOX AI Router', scopes = ['ai:chat', 'ai:models'] }) {
+  const now = new Date().toISOString()
+  const id = `key_${randomUUID().replaceAll('-', '')}`
+  const rec = {
+    id,
+    apiKeyIdHash: `0x${createHash('sha256').update(id).digest('hex')}`,
+    ownerAddress: normalizeOwner(ownerAddress),
+    agentId: /^\d+$/.test(String(agentId || '')) ? String(agentId) : '',
+    label,
+    keyHash: '',
+    keyPreview: '',
+    scopes,
+    status: 'pending_mint',
+    createdAt: now,
+    updatedAt: now,
+    revokedAt: null,
+  }
+  state.apiKeys[id] = rec
+  ensureUser(ownerAddress)
+  saveAiRouterStore()
+  return publicApiKey(rec)
+}
+
+export function activateApiKey(id, ownerAddress, { sbtTokenId, mintTxHash, apiPassAddress }) {
+  const rec = state.apiKeys[id]
+  if (!rec || rec.ownerAddress !== normalizeOwner(ownerAddress) || rec.status !== 'pending_mint') return null
+  const key = `arx_sk_${randomBytes(24).toString('base64url')}`
+  rec.keyHash = hashApiKey(key)
+  rec.keyPreview = `${key.slice(0, 10)}...${key.slice(-4)}`
+  rec.sbtTokenId = String(sbtTokenId)
+  rec.apiPassAddress = normalizeOwner(apiPassAddress)
+  rec.mintTxHash = String(mintTxHash || '')
+  rec.status = 'active'
+  rec.activatedAt = new Date().toISOString()
+  rec.updatedAt = rec.activatedAt
+  saveAiRouterStore()
+  return { apiKey: key, record: publicApiKey(rec) }
+}
+
 export function findApiKey(secret) {
   const keyHash = hashApiKey(secret || '')
   return Object.values(state.apiKeys).find(key => key.keyHash === keyHash && key.status === 'active') || null
+}
+
+export function findApiKeyForCredential(secret) {
+  const keyHash = hashApiKey(secret || '')
+  return Object.values(state.apiKeys).find(key => key.keyHash === keyHash) || null
+}
+
+export function getApiKey(id) {
+  return state.apiKeys[id] || null
 }
 
 export function listApiKeys(ownerAddress) {
@@ -76,6 +128,102 @@ export function revokeApiKey(id, ownerAddress) {
   return publicApiKey(key)
 }
 
+export function disableApiKey(id, ownerAddress) {
+  const key = state.apiKeys[id]
+  if (!key || key.ownerAddress !== normalizeOwner(ownerAddress)) return null
+  key.status = 'disabled_pending_burn'
+  key.disabledAt = new Date().toISOString()
+  key.updatedAt = key.disabledAt
+  revokeSessionsForKey(id)
+  saveAiRouterStore()
+  return publicApiKey(key)
+}
+
+export function finalizeApiKeyRevocation(id, ownerAddress, burnTxHash = '') {
+  const key = state.apiKeys[id]
+  if (!key || key.ownerAddress !== normalizeOwner(ownerAddress)) return null
+  key.status = 'revoked'
+  key.burnTxHash = String(burnTxHash || '')
+  key.revokedAt = new Date().toISOString()
+  key.updatedAt = key.revokedAt
+  revokeSessionsForKey(id)
+  saveAiRouterStore()
+  return publicApiKey(key)
+}
+
+export function createSessionChallenge(apiKey, messageFactory) {
+  const id = `challenge_${randomUUID().replaceAll('-', '')}`
+  const issuedAt = new Date()
+  const expiresAt = new Date(issuedAt.getTime() + Number(process.env.ARCOX_API_CHALLENGE_TTL_SECONDS || 300) * 1000)
+  const nonce = randomBytes(24).toString('base64url')
+  const challenge = {
+    id,
+    apiKeyId: apiKey.id,
+    ownerAddress: apiKey.ownerAddress,
+    nonce,
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    usedAt: null,
+  }
+  challenge.message = messageFactory(challenge)
+  state.sessionChallenges[id] = challenge
+  saveAiRouterStore()
+  return { ...challenge }
+}
+
+export function consumeSessionChallenge(id, apiKeyId) {
+  const challenge = state.sessionChallenges[id]
+  if (!challenge || challenge.apiKeyId !== apiKeyId || challenge.usedAt || Date.now() > Date.parse(challenge.expiresAt)) return null
+  challenge.usedAt = new Date().toISOString()
+  saveAiRouterStore()
+  return { ...challenge }
+}
+
+export function getSessionChallenge(id, apiKeyId) {
+  const challenge = state.sessionChallenges[id]
+  if (!challenge || challenge.apiKeyId !== apiKeyId || challenge.usedAt || Date.now() > Date.parse(challenge.expiresAt)) return null
+  return { ...challenge }
+}
+
+export function issueApiSession(apiKey, signerAddress) {
+  const token = `arx_sess_${randomBytes(32).toString('base64url')}`
+  const now = new Date()
+  const expiresAt = new Date(now.getTime() + Number(process.env.ARCOX_API_SESSION_TTL_SECONDS || 900) * 1000)
+  const id = `session_${randomUUID().replaceAll('-', '').slice(0, 16)}`
+  state.apiSessions[id] = {
+    id,
+    tokenHash: hashApiKey(token),
+    apiKeyId: apiKey.id,
+    ownerAddress: apiKey.ownerAddress,
+    signerAddress: normalizeOwner(signerAddress),
+    status: 'active',
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+  }
+  saveAiRouterStore()
+  return { sessionToken: token, expiresAt: expiresAt.toISOString(), apiKey: publicApiKey(apiKey) }
+}
+
+export function findApiSession(token) {
+  const tokenHash = hashApiKey(token || '')
+  const session = Object.values(state.apiSessions).find(item => item.tokenHash === tokenHash)
+  if (!session) return { status: 'invalid' }
+  if (session.status !== 'active' || Date.now() > Date.parse(session.expiresAt)) return { status: 'expired', session }
+  const apiKey = state.apiKeys[session.apiKeyId]
+  if (!apiKey) return { status: 'invalid' }
+  return { status: 'active', session, apiKey }
+}
+
+function revokeSessionsForKey(apiKeyId) {
+  for (const session of Object.values(state.apiSessions)) {
+    if (session.apiKeyId === apiKeyId && session.status === 'active') {
+      session.status = 'revoked'
+      session.updatedAt = new Date().toISOString()
+    }
+  }
+}
+
 export function publicApiKey(key) {
   if (!key) return null
   return {
@@ -84,11 +232,17 @@ export function publicApiKey(key) {
     agentId: key.agentId || '',
     label: key.label,
     keyPreview: key.keyPreview,
+    apiKeyIdHash: key.apiKeyIdHash || '',
+    sbtTokenId: key.sbtTokenId || '',
+    apiPassAddress: key.apiPassAddress || '',
+    mintTxHash: key.mintTxHash || '',
+    burnTxHash: key.burnTxHash || '',
     scopes: key.scopes,
     status: key.status,
     createdAt: key.createdAt,
     rotatedAt: key.rotatedAt,
     revokedAt: key.revokedAt,
+    activatedAt: key.activatedAt || null,
   }
 }
 
@@ -241,6 +395,7 @@ export function addUsageLog(entry) {
   const log = sanitizeUsageLog({
     requestId: entry.requestId || `air_req_${randomUUID().replaceAll('-', '').slice(0, 12)}`,
     apiKeyIdHash: entry.apiKeyIdHash || hashApiKey(entry.apiKeyId || ''),
+    sbtTokenId: String(entry.sbtTokenId || ''),
     ownerAddress: normalizeOwner(entry.ownerAddress),
     agentId: /^\d+$/.test(String(entry.agentId || '')) ? String(entry.agentId) : '',
     model: entry.model || '',
@@ -404,6 +559,7 @@ function sanitizeUsageLog(entry = {}) {
     requestId: String(entry.requestId || ''),
     agentId: /^\d+$/.test(String(entry.agentId || '')) ? String(entry.agentId) : '',
     apiKeyIdHash: String(entry.apiKeyIdHash || (entry.apiKeyId ? hashApiKey(entry.apiKeyId) : '')),
+    sbtTokenId: String(entry.sbtTokenId || ''),
     ownerAddress: normalizeOwner(entry.ownerAddress),
     paymentId: String(entry.paymentId || ''),
     txHash: String(entry.txHash || ''),

@@ -16,12 +16,16 @@ const ownerOfAbi = [{ type: 'function', name: 'ownerOf', stateMutability: 'view'
 
 export function buildAgentMemo(input = {}) {
   const agentId = String(input.agentId || '').trim()
-  if (!/^\d+$/.test(agentId)) return null
+  const sbtTokenId = String(input.sbtTokenId || '').trim()
+  if (!/^\d+$/.test(agentId) && !/^\d+$/.test(sbtTokenId)) return null
   const paymentId = String(input.paymentId || '')
   const referenceId = String(input.jobId || input.requestId || '')
-  const memoId = keccak256(toHex(`${agentId}:${paymentId}:${referenceId}`))
+  const identity = /^\d+$/.test(agentId) ? `agent:${agentId}` : `pass:${sbtTokenId}`
+  const memoId = keccak256(toHex(`${identity}:${paymentId}:${referenceId}`))
   const metadata = {
-    agentId,
+    ...(agentId ? { agentId } : {}),
+    ...(sbtTokenId ? { sbtTokenId } : {}),
+    ...(input.apiKeyIdHash ? { apiKeyIdHash: String(input.apiKeyIdHash) } : {}),
     paymentIdHash: paymentId ? keccak256(toHex(paymentId)) : undefined,
     ...(input.jobId ? { jobIdHash: keccak256(toHex(String(input.jobId))) } : {}),
     ...(input.requestId ? { requestIdHash: keccak256(toHex(String(input.requestId))) } : {}),
@@ -48,8 +52,10 @@ export async function submitAgentMemoProof(input = {}) {
   const transport = http(chain.rpcUrls.default.http[0], { timeout: 12_000, retryCount: 1 })
   const wallet = createWalletClient({ account, chain, transport })
   const publicClient = createPublicClient({ chain, transport })
-  const ownerOfData = encodeFunctionData({ abi: ownerOfAbi, functionName: 'ownerOf', args: [BigInt(input.agentId)] })
-  const txHash = await wallet.writeContract({ address: ARC_MEMO_CONTRACT, abi: memoAbi, functionName: 'memo', args: [IDENTITY_REGISTRY, ownerOfData, memo.memoId, memo.memoData] })
+  const tokenId = input.agentId || input.sbtTokenId
+  const target = input.agentId ? IDENTITY_REGISTRY : getAddress(input.apiPassAddress)
+  const ownerOfData = encodeFunctionData({ abi: ownerOfAbi, functionName: 'ownerOf', args: [BigInt(tokenId)] })
+  const txHash = await wallet.writeContract({ address: ARC_MEMO_CONTRACT, abi: memoAbi, functionName: 'memo', args: [target, ownerOfData, memo.memoId, memo.memoData] })
   const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 30_000 })
   if (receipt.status !== 'success') throw new Error('Agent memo proof transaction reverted')
   return { status: 'submitted', txHash, memoId: memo.memoId, memoData: memo.memoData }
