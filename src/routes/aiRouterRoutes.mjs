@@ -1,23 +1,14 @@
 import { Router } from 'express'
 import { createHmac, timingSafeEqual } from 'crypto'
-import { recoverMessageAddress } from 'viem'
 import {
   addUsageLog,
   createPaymentIntent,
-  activateApiKey,
-  consumeSessionChallenge,
-  createSessionChallenge,
-  disableApiKey,
-  finalizeApiKeyRevocation,
   findApiKeyForCredential,
-  findApiSession,
-  getApiKey,
-  getSessionChallenge,
   getActiveAgentId,
   getAiRouterStatus,
   getPolicy,
   getPaymentIntent,
-  issueApiSession,
+  issueApiKey,
   listApiKeys,
   listAgentJobs,
   markPaymentSettled,
@@ -26,7 +17,7 @@ import {
   normalizeUsdc,
   publicApiKey,
   recordAgentJob,
-  prepareApiKey,
+  revokeApiKey,
   setPolicy,
   setActiveAgentIdentity,
   spendThisMonth,
@@ -39,7 +30,6 @@ import { delegateConfig, estimateDelegatedAiSpend, spendDelegatedAiPayment } fro
 import { listAgentIdentities, verifyAgentOwnership } from '../services/agentIdentityService.mjs'
 import { submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { getGatewayDelegateStatus } from '../services/gatewayDelegateService.mjs'
-import { apiPassAddress, apiPassExists, isApiPassSigner, verifyApiPass } from '../services/apiPassService.mjs'
 
 const router = Router()
 const aiResponseCache = new Map()
@@ -55,13 +45,12 @@ router.get('/status', async (req, res) => {
     res.json({
       ok: true,
       ...getAiRouterStatus(ownerAddress),
-      apiPassAddress: apiPassAddress(),
-      apiPassChainId: 5042002,
       agentIdentity: identity.active,
       agentIdentities: identity.items,
       treasury: treasuryAddress(),
       security: {
-        apiPassRequired: true,
+        apiPassRequired: false,
+        sessionRequired: false,
         transactionWalletMatchRequired: true,
         maxServiceCostUsdc: process.env.AI_ROUTER_MAX_SERVICE_COST_USDC || '0.01',
         maxTotalDebitUsdc: process.env.AI_ROUTER_MAX_TOTAL_DEBIT_USDC || '0.05',
@@ -139,86 +128,46 @@ router.post('/api-keys', requireOwnerAuth, async (req, res) => {
     ...requestedScopes.filter(scope => ['ai:chat', 'ai:models'].includes(scope)),
     ...(identity.active ? ['agent:jobs'] : []),
   ])]
-  const key = prepareApiKey({
+  const created = issueApiKey({
     ownerAddress,
     agentId: identity.active?.agentId || '',
     label: req.body?.label || 'ARCOX AI Router',
     scopes,
   })
-  res.json({ ok: true, key, apiPassAddress: apiPassAddress(), chainId: 5042002, action: 'mint_api_pass' })
+  res.json({ ok: true, apiKey: created.apiKey, key: created.record, warning: 'Copy this key now. ARCOX stores only the hash and cannot show it again.' })
 })
 
-router.post('/api-keys/:id/activate', requireOwnerAuth, async (req, res) => {
-  const ownerAddress = normalizeOwner(req.body?.ownerAddress)
-  const key = getApiKey(req.params.id)
-  if (!key || key.ownerAddress !== ownerAddress || key.status !== 'pending_mint') return res.status(404).json({ error: 'Pending API key not found' })
-  try {
-    const pass = await verifyApiPass({ tokenId: req.body?.sbtTokenId, ownerAddress, apiKeyIdHash: key.apiKeyIdHash, txHash: req.body?.mintTxHash })
-    const activated = activateApiKey(key.id, ownerAddress, { sbtTokenId: pass.tokenId, mintTxHash: req.body?.mintTxHash, apiPassAddress: pass.address })
-    res.json({ ok: true, apiKey: activated.apiKey, key: activated.record, warning: 'Copy this key now. ARCOX stores only the hash and cannot show it again.' })
-  } catch (error) {
-    res.status(400).json({ error: error?.message || 'API Pass verification failed' })
-  }
-})
+router.post('/api-keys/:id/activate', (_req, res) => res.status(410).json({ error: 'API Pass activation is no longer required.' }))
 
 router.post('/api-keys/:id/disable', requireOwnerAuth, (req, res) => {
   const ownerAddress = normalizeOwner(req.body?.ownerAddress)
-  const key = disableApiKey(req.params.id, ownerAddress)
+  const key = revokeApiKey(req.params.id, ownerAddress)
   if (!key) return res.status(404).json({ error: 'API key not found' })
-  res.json({ ok: true, key, action: 'burn_api_pass' })
+  res.json({ ok: true, key })
 })
 
-router.post('/api-keys/:id/finalize-revoke', requireOwnerAuth, async (req, res) => {
+router.post('/api-keys/:id/finalize-revoke', requireOwnerAuth, (req, res) => {
   const ownerAddress = normalizeOwner(req.body?.ownerAddress)
-  const key = getApiKey(req.params.id)
-  if (!key || key.ownerAddress !== ownerAddress) return res.status(404).json({ error: 'API key not found' })
-  if (await apiPassExists(key)) return res.status(409).json({ error: 'API Pass still exists. Burn it before finalizing revocation.' })
-  res.json({ ok: true, key: finalizeApiKeyRevocation(key.id, ownerAddress, req.body?.burnTxHash) })
+  const key = revokeApiKey(req.params.id, ownerAddress)
+  if (!key) return res.status(404).json({ error: 'API key not found' })
+  res.json({ ok: true, key })
 })
 
 router.post('/api-keys/:id/revoke', requireOwnerAuth, (req, res) => {
   const ownerAddress = normalizeOwner(req.body?.ownerAddress)
-  const key = disableApiKey(req.params.id, ownerAddress)
+  const key = revokeApiKey(req.params.id, ownerAddress)
   if (!key) return res.status(404).json({ error: 'API key not found' })
-  res.json({ ok: true, key, action: 'burn_api_pass' })
+  res.json({ ok: true, key })
 })
 
-router.get('/api-keys/status', async (req, res) => {
+router.get('/api-keys/status', (req, res) => {
   const auth = credentialApiKey(req)
   if (!auth.ok) return res.status(auth.status).json(auth.body)
-  const passActive = auth.apiKey.status === 'active' && await apiPassExists(auth.apiKey)
-  res.json({ ok: true, key: publicApiKey(auth.apiKey), apiPassActive: passActive, sessionRequired: true })
+  res.json({ ok: true, key: publicApiKey(auth.apiKey), sessionRequired: false })
 })
 
-router.post('/sessions/challenge', async (req, res) => {
-  const auth = credentialApiKey(req)
-  if (!auth.ok) return res.status(auth.status).json(auth.body)
-  if (!await apiPassExists(auth.apiKey)) return revokedApiKey(res)
-  const challenge = createSessionChallenge(auth.apiKey, item => sessionMessage(auth.apiKey, item))
-  res.json({ ok: true, challengeId: challenge.id, message: challenge.message, ownerAddress: auth.apiKey.ownerAddress, sbtTokenId: auth.apiKey.sbtTokenId, expiresAt: challenge.expiresAt })
-})
-
-router.post('/sessions', async (req, res) => {
-  const auth = credentialApiKey(req)
-  if (!auth.ok) return res.status(auth.status).json(auth.body)
-  if (!await apiPassExists(auth.apiKey)) return revokedApiKey(res)
-  const challenge = getSessionChallenge(String(req.body?.challengeId || ''), auth.apiKey.id)
-  if (!challenge) return res.status(401).json({ error: { type: 'invalid_challenge', message: 'Session challenge is invalid or expired.' } })
-  try {
-    const signer = await recoverMessageAddress({ message: challenge.message, signature: req.body?.signature })
-    if (!await isApiPassSigner(auth.apiKey, signer)) return walletMismatch(res)
-    if (req.body?.purpose !== 'models') {
-      const policy = getPolicy(auth.apiKey.ownerAddress)
-      if (!policy.enabled || policy.delegateStatus !== 'ready') return paymentRequired(res, 'Enable Auto Pay first', 'Enable Unified Balance Auto Pay before creating a paid API session.')
-      await estimateDelegatedAiSpend({ sourceAccount: auth.apiKey.ownerAddress, amount: process.env.AI_ROUTER_MODEL_PRICE_DEFAULT_USDC || process.env.AI_ROUTER_DEFAULT_COST_USDC || '0.001', sourceChains: readyDelegateChains(policy, auth.apiKey.ownerAddress) })
-    }
-    consumeSessionChallenge(challenge.id, auth.apiKey.id)
-    res.json({ ok: true, ...issueApiSession(auth.apiKey, signer) })
-  } catch (error) {
-    if (/insufficient/i.test(String(error?.message || ''))) return paymentRequired(res, 'Please deposit more USDC to Unified Balance', error.message)
-    res.status(403).json({ error: { type: 'wallet_mismatch', message: 'API key is bound to a different wallet. Please create a valid ARCOX session with the owner or authorized delegate wallet.' } })
-  }
-})
+router.post('/sessions/challenge', (_req, res) => res.status(410).json({ error: 'Signed API sessions are no longer required.' }))
+router.post('/sessions', (_req, res) => res.status(410).json({ error: 'Signed API sessions are no longer required.' }))
 
 router.get('/models', (_req, res) => {
   res.json({ ok: true, data: pricedModels(), object: 'list' })
@@ -579,11 +528,9 @@ function extractAssistantText(data) {
 async function authenticateAiKey(req, scope) {
   const header = String(req.headers.authorization || '')
   const secret = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
-  if (!secret.startsWith('arx_sess_')) return { ok: false, status: 401, body: { error: { message: 'ARCOX session expired. Please sign a new session challenge.', type: 'session_expired' } } }
-  const auth = findApiSession(secret)
-  if (auth.status !== 'active') return { ok: false, status: 401, body: { error: { message: 'ARCOX session expired. Please sign a new session challenge.', type: 'session_expired' } } }
-  const apiKey = auth.apiKey
-  if (apiKey.status !== 'active' || !await apiPassExists(apiKey)) return { ok: false, status: 403, body: { error: { message: 'This API key has been revoked or its API Pass SBT has been burned.', type: 'api_key_revoked' } } }
+  if (!secret.startsWith('arx_sk_')) return { ok: false, status: 401, body: { error: { message: 'Invalid ARCOX API key', type: 'authentication_error' } } }
+  const apiKey = findApiKeyForCredential(secret)
+  if (!apiKey || apiKey.status !== 'active') return { ok: false, status: 403, body: { error: { message: 'This API key has been revoked.', type: 'api_key_revoked' } } }
   if (!apiKey.scopes?.includes(scope)) return { ok: false, status: 403, body: { error: { message: `Missing scope ${scope}`, type: 'permission_error' } } }
   const claimedAgentId = String(req.headers['x-arcox-agent-id'] || req.body?.metadata?.agentId || req.body?.agentId || '')
   if (claimedAgentId && claimedAgentId !== String(apiKey.agentId || '')) return { ok: false, status: 403, body: { error: { message: 'Agent identity mismatch', type: 'permission_error' } } }
@@ -597,30 +544,8 @@ function credentialApiKey(req) {
   if (!secret.startsWith('arx_sk_')) return { ok: false, status: 401, body: { error: { message: 'Invalid ARCOX API key', type: 'authentication_error' } } }
   const apiKey = findApiKeyForCredential(secret)
   if (!apiKey) return { ok: false, status: 401, body: { error: { message: 'Invalid ARCOX API key', type: 'authentication_error' } } }
-  if (apiKey.status !== 'active') return { ok: false, status: 403, body: { error: { message: 'This API key has been revoked or its API Pass SBT has been burned.', type: 'api_key_revoked' } } }
+  if (apiKey.status !== 'active') return { ok: false, status: 403, body: { error: { message: 'This API key has been revoked.', type: 'api_key_revoked' } } }
   return { ok: true, apiKey }
-}
-
-function sessionMessage(apiKey, challenge) {
-  return [
-    'ARCOX API Session',
-    `Challenge: ${challenge.nonce}`,
-    `API Key ID Hash: ${apiKey.apiKeyIdHash}`,
-    `Owner: ${apiKey.ownerAddress}`,
-    'Chain ID: 5042002',
-    `API Pass: ${apiKey.apiPassAddress}`,
-    `Token ID: ${apiKey.sbtTokenId}`,
-    `Issued At: ${challenge.issuedAt}`,
-    `Expires At: ${challenge.expiresAt}`,
-  ].join('\n')
-}
-
-function revokedApiKey(res) {
-  return res.status(403).json({ error: { type: 'api_key_revoked', message: 'This API key has been revoked or its API Pass SBT has been burned.' } })
-}
-
-function walletMismatch(res) {
-  return res.status(403).json({ error: { type: 'wallet_mismatch', message: 'API key is bound to a different wallet. Please create a valid ARCOX session with the owner or authorized delegate wallet.' } })
 }
 
 function shortAddress(address) {
@@ -722,9 +647,8 @@ function docs() {
       'Connect wallet in ARCOX DEX.',
       'Deposit USDC to Unified Balance.',
       'Turn Auto Pay ON.',
-      'Create API Key.',
-      'Mint the non-transferable API Pass and copy the key once.',
-      'Use a local ARCOX proxy to sign one session challenge before Hermes/OpenClaw requests.',
+      'Create and copy the API key once.',
+      'Use the production base URL directly in Hermes/OpenClaw.',
     ],
   }
 }

@@ -8,7 +8,7 @@ ARCOX uses separate trust domains:
 
 Controls implemented:
 
-- API Pass SBT and owner/device session verification.
+- Standard bearer API keys with hash-only storage, revocation, rate limits, and scoped access.
 - Exact wallet and Agent Identity binding before MCP value-moving actions.
 - Preview and explicit confirmation before local transactions.
 - Fixed ARCOX treasury recipient for delegated AI payments.

@@ -191,16 +191,8 @@ AI_PROVIDER_1_MODEL=
 4. Bayar exact Arc USDC via wallet memo.
 5. Cek invoice status sampai `paid`.
 6. Retry Intel request memakai `X-PAYMENT-ID`.
-# ARCOX API Pass sessions
+# ARCOX API keys
 
-AI Router API keys are activated only after the backend verifies their non-transferable API Pass on Arc Testnet. OpenAI-compatible routes accept short-lived `arx_sess_...` tokens, not raw `arx_sk_...` keys.
-
-Session endpoints:
-
-- `POST /api/ai-router/sessions/challenge`
-- `POST /api/ai-router/sessions`
-- `GET /api/ai-router/api-keys/status`
-
-Configure `ARCOX_API_PASS_ADDRESS`, `ARCOX_API_CHALLENGE_TTL_SECONDS`, and `ARCOX_API_SESSION_TTL_SECONDS`. API key secrets and session tokens are stored only as hashes.
+AI Router uses standard `arx_sk_...` bearer keys with the OpenAI-compatible production base URL. Keys are shown once, stored only as hashes, and can be revoked from the connected owner wallet.
 
 Set model prices only in `arc-dex-api/.env` with `AI_ROUTER_MODEL_PRICE_DEFAULT_USDC` and the JSON map `AI_ROUTER_MODEL_PRICES_USDC`. Client-provided prices are ignored. The local proxy supplies an idempotency key so a retried identical request is not charged twice.
