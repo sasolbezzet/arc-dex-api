@@ -55,6 +55,15 @@ export async function estimateDelegatedAiSpend({ sourceAccount, amount, sourceCh
   const cfg = delegateConfig()
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!cfg.recipient) throw new Error('ARCOX treasury recipient is not configured')
+  return estimateDelegatedUnifiedSpend({ sourceAccount, amount, sourceChains, destinationChain: 'Arc_Testnet', recipient: cfg.recipient })
+}
+
+export async function estimateDelegatedUnifiedSpend({ sourceAccount, amount, sourceChains = [], destinationChain = 'Arc_Testnet', recipient }) {
+  const cfg = delegateConfig()
+  if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
+  if (!/^0x[a-fA-F0-9]{40}$/.test(String(sourceAccount || ''))) throw new Error('Invalid Unified Balance owner')
+  if (!/^0x[a-fA-F0-9]{40}$/.test(String(recipient || ''))) throw new Error('Invalid Unified Balance recipient')
+  if (!GATEWAY_CHAINS.some(item => item.chain === destinationChain)) throw new Error('Unsupported Unified Balance destination chain')
   const receiveUnits = usdcUnits(amount)
   const balances = await delegatedBalances(sourceAccount)
   const allowed = new Set(sourceChains.length ? sourceChains : ['Arc_Testnet'])
@@ -63,11 +72,11 @@ export async function estimateDelegatedAiSpend({ sourceAccount, amount, sourceCh
     .sort((left, right) => sourcePriority(left.chain) - sourcePriority(right.chain))
   for (const candidate of candidates) {
     try {
-      return await estimateForSources({ sourceAccount, receiveUnits, sourceChains: [candidate.chain], balances, recipient: cfg.recipient })
+      return await estimateForSources({ sourceAccount, receiveUnits, sourceChains: [candidate.chain], balances, recipient, destinationChain })
     } catch {}
   }
   if (candidates.length > 1) {
-    return estimateForSources({ sourceAccount, receiveUnits, sourceChains: candidates.map(item => item.chain), balances, recipient: cfg.recipient })
+    return estimateForSources({ sourceAccount, receiveUnits, sourceChains: candidates.map(item => item.chain), balances, recipient, destinationChain })
   }
   throw new Error('Please deposit more USDC to Unified Balance or enable Auto Pay on another funded chain')
 }
@@ -76,7 +85,14 @@ export async function spendDelegatedAiPayment({ sourceAccount, amount, estimate:
   const cfg = delegateConfig()
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!cfg.recipient) throw new Error('ARCOX treasury recipient is not configured')
-  let estimate = preparedEstimate || await estimateDelegatedAiSpend({ sourceAccount, amount, sourceChains })
+  return spendDelegatedUnifiedBalance({ sourceAccount, amount, estimate: preparedEstimate, sourceChains, destinationChain: 'Arc_Testnet', recipient: cfg.recipient })
+}
+
+export async function spendDelegatedUnifiedBalance({ sourceAccount, amount, estimate: preparedEstimate, sourceChains = [], destinationChain = 'Arc_Testnet', recipient, maxTotalDebit }) {
+  let estimate = preparedEstimate || await estimateDelegatedUnifiedSpend({ sourceAccount, amount, sourceChains, destinationChain, recipient })
+  if (maxTotalDebit && usdcUnits(estimate.totalDebit || estimate.spendAmount || amount) > usdcUnits(maxTotalDebit)) {
+    throw new Error('Unified Balance fee changed above the approved preview. Estimate again before spending.')
+  }
   let result
   let allocations
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -87,7 +103,7 @@ export async function spendDelegatedAiPayment({ sourceAccount, amount, estimate:
     try {
       result = await getKit().unifiedBalance.spend({
         from: [{ adapter: getAdapter(), sourceAccount, allocations }],
-        to: { chain: 'Arc_Testnet', recipientAddress: cfg.recipient, useForwarder: true },
+        to: { chain: destinationChain, recipientAddress: recipient, useForwarder: true },
         amount: spendAmount,
         token: 'USDC',
       })
@@ -96,7 +112,10 @@ export async function spendDelegatedAiPayment({ sourceAccount, amount, estimate:
       const feeChanged = /Insufficient total maxFee across intents to cover forwarding fee/i.test(String(error?.message || ''))
       if (!feeChanged || attempt === 2) throw error
       await new Promise(resolve => setTimeout(resolve, 400))
-      estimate = await estimateDelegatedAiSpend({ sourceAccount, amount, sourceChains })
+      estimate = await estimateDelegatedUnifiedSpend({ sourceAccount, amount, sourceChains, destinationChain, recipient })
+      if (maxTotalDebit && usdcUnits(estimate.totalDebit || estimate.spendAmount || amount) > usdcUnits(maxTotalDebit)) {
+        throw new Error('Unified Balance fee changed above the approved preview. Estimate again before spending.')
+      }
     }
   }
   if (!result) throw new Error('Unified Balance spend did not return a result')
@@ -114,12 +133,12 @@ export async function spendDelegatedAiPayment({ sourceAccount, amount, estimate:
   }
 }
 
-async function estimateForSources({ sourceAccount, receiveUnits, sourceChains, balances, recipient }) {
+async function estimateForSources({ sourceAccount, receiveUnits, sourceChains, balances, recipient, destinationChain }) {
   const spendAmount = formatUsdc(receiveUnits)
   const sourceAllocations = await delegatedAllocations(sourceAccount, spendAmount, sourceChains, balances)
   const estimate = await getKit().unifiedBalance.estimateSpend({
     from: [{ adapter: getAdapter(), sourceAccount, allocations: sourceAllocations }],
-    to: { chain: 'Arc_Testnet', recipientAddress: recipient, useForwarder: true },
+    to: { chain: destinationChain, recipientAddress: recipient, useForwarder: true },
     amount: spendAmount,
     token: 'USDC',
   })

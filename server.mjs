@@ -14,7 +14,9 @@ import arkhamRoutes from './src/routes/arkhamRoutes.mjs'
 import treasuryRoutes from './src/routes/treasuryRoutes.mjs'
 import x402Routes from './src/routes/x402Routes.mjs'
 import aiRouterRoutes, { openAiChatCompletions, openAiModels } from './src/routes/aiRouterRoutes.mjs'
-import { processCircleX402Webhook, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
+import { estimateUnifiedBalanceX402, getX402Invoice, markUnifiedBalanceSpendSubmitted, processCircleX402Webhook, publicInvoice, reconcileX402Invoice, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
+import { getPolicy } from './src/services/aiRouterStore.mjs'
+import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
 
 process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -1190,6 +1192,77 @@ app.post('/api/unified-balance/balances', apiLimiter, async (req, res) => {
     res.status(error?.status || 502).json({ error: error.message || 'Unified Balance lookup failed' })
   }
 })
+
+app.post('/api/unified-balance/delegated/estimate', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const request = delegatedUnifiedRequest(req)
+    const estimate = await estimateDelegatedUnifiedSpend(request)
+    if (request.invoice) estimateUnifiedBalanceX402(request.invoice.invoiceId, {
+      route: 'Circle Gateway delegated Unified Balance -> Arc Testnet USDC',
+      fees: estimate.fees || [],
+      delegateStatus: 'ready',
+    })
+    res.json({ ok: true, mode: 'delegated-unified-balance', estimate: publicDelegatedEstimate(estimate), ...(request.invoice ? { invoice: publicInvoice(getX402Invoice(request.invoice.invoiceId)) } : {}) })
+  } catch (error) {
+    res.status(error?.status || 400).json({ error: error?.message || 'Delegated Unified Balance estimate failed' })
+  }
+})
+
+app.post('/api/unified-balance/delegated/spend', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const request = delegatedUnifiedRequest(req)
+    const spend = await spendDelegatedUnifiedBalance(request)
+    let invoice
+    if (request.invoice) {
+      markUnifiedBalanceSpendSubmitted(request.invoice.invoiceId, { txHash: spend.txHash, transferId: spend.transferId })
+      invoice = await reconcileX402Invoice(request.invoice.invoiceId)
+    }
+    res.json({ ok: true, mode: 'delegated-unified-balance', spend: publicDelegatedSpend(spend), ...(invoice ? { invoice: publicInvoice(invoice) } : {}) })
+  } catch (error) {
+    res.status(error?.status || 400).json({ error: error?.message || 'Delegated Unified Balance spend failed' })
+  }
+})
+
+function delegatedUnifiedRequest(req) {
+  const owner = getAddress(req.authAddress)
+  const amount = String(req.body?.amount || '').trim()
+  if (!/^\d+(\.\d{1,6})?$/.test(amount) || Number(amount) <= 0) throw Object.assign(new Error('Valid USDC amount is required'), { status: 400 })
+  const purpose = String(req.body?.purpose || '')
+  const destinationChain = String(req.body?.destinationChain || 'Arc_Testnet')
+  const supported = new Set(GATEWAY_TESTNET_CHAINS.map(item => item.chain))
+  if (!supported.has(destinationChain)) throw Object.assign(new Error('Unsupported Unified Balance destination chain'), { status: 400 })
+  const policy = getPolicy(owner)
+  const ready = (policy.delegateChains || []).filter(item => item?.status === 'ready').map(item => item.chain)
+  const requestedSource = String(req.body?.sourceChain || 'auto')
+  const sourceChains = requestedSource === 'auto' ? ready : ready.filter(chain => chain === requestedSource)
+  if (!policy.enabled || !sourceChains.length) throw Object.assign(new Error('Enable Auto Pay first'), { status: 402 })
+  if (purpose === 'withdraw') {
+    return { sourceAccount: owner, amount, sourceChains, destinationChain, recipient: owner, maxTotalDebit: optionalUsdc(req.body?.maxTotalDebit) }
+  }
+  if (purpose !== 'x402') throw Object.assign(new Error('Unsupported delegated spend purpose'), { status: 400 })
+  const invoice = getX402Invoice(req.body?.invoiceId)
+  if (!invoice) throw Object.assign(new Error('x402 invoice not found'), { status: 404 })
+  if (invoice.ownerWallet && invoice.ownerWallet !== owner.toLowerCase()) throw Object.assign(new Error('Invoice owner does not match authenticated wallet'), { status: 403 })
+  if (!['payment_required', 'estimate_ready', 'awaiting_signature', 'spend_submitted', 'settlement_pending', 'pending'].includes(invoice.status)) throw Object.assign(new Error(`Invoice cannot be paid in status ${invoice.status}`), { status: 409 })
+  if (invoice.uniqueAmount !== amount) throw Object.assign(new Error('Invoice amount mismatch'), { status: 400 })
+  if (destinationChain !== 'Arc_Testnet') throw Object.assign(new Error('x402 must settle on Arc Testnet'), { status: 400 })
+  return { sourceAccount: owner, amount, sourceChains, destinationChain, recipient: invoice.recipient, invoice, maxTotalDebit: optionalUsdc(req.body?.maxTotalDebit) }
+}
+
+function optionalUsdc(value) {
+  const amount = String(value || '').trim()
+  if (!amount) return undefined
+  if (!/^\d+(\.\d{1,6})?$/.test(amount) || Number(amount) <= 0) throw Object.assign(new Error('Invalid approved total debit'), { status: 400 })
+  return amount
+}
+
+function publicDelegatedEstimate(estimate) {
+  return { spendAmount: estimate.spendAmount, requestedReceiveAmount: estimate.requestedReceiveAmount, totalFee: estimate.totalFee, totalDebit: estimate.totalDebit, sourceAllocations: estimate.sourceAllocations || [], fees: estimate.fees || [] }
+}
+
+function publicDelegatedSpend(spend) {
+  return { txHash: spend.txHash, transferId: spend.transferId, chargedAmount: spend.chargedAmount, serviceAmount: spend.serviceAmount, totalFee: spend.totalFee, sourceAllocations: spend.sourceAllocations || [] }
+}
 
 async function gatewayBalanceRequest(path, body) {
   let lastError
