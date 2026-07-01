@@ -76,25 +76,31 @@ export async function spendDelegatedAiPayment({ sourceAccount, amount, estimate:
   const cfg = delegateConfig()
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!cfg.recipient) throw new Error('ARCOX treasury recipient is not configured')
-  const estimate = preparedEstimate || await estimateDelegatedAiSpend({ sourceAccount, amount, sourceChains })
+  let estimate = preparedEstimate || await estimateDelegatedAiSpend({ sourceAccount, amount, sourceChains })
+  let result
+  let allocations
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const spendAmount = estimate.spendAmount || amount
+    allocations = Array.isArray(estimate.sourceAllocations) && estimate.sourceAllocations.length
+      ? estimate.sourceAllocations
+      : await delegatedAllocations(sourceAccount, spendAmount, sourceChains)
+    try {
+      result = await getKit().unifiedBalance.spend({
+        from: [{ adapter: getAdapter(), sourceAccount, allocations }],
+        to: { chain: 'Arc_Testnet', recipientAddress: cfg.recipient, useForwarder: true },
+        amount: spendAmount,
+        token: 'USDC',
+      })
+      break
+    } catch (error) {
+      const feeChanged = /Insufficient total maxFee across intents to cover forwarding fee/i.test(String(error?.message || ''))
+      if (!feeChanged || attempt === 2) throw error
+      await new Promise(resolve => setTimeout(resolve, 400))
+      estimate = await estimateDelegatedAiSpend({ sourceAccount, amount, sourceChains })
+    }
+  }
+  if (!result) throw new Error('Unified Balance spend did not return a result')
   const spendAmount = estimate.spendAmount || amount
-  const allocations = Array.isArray(estimate.sourceAllocations) && estimate.sourceAllocations.length
-    ? estimate.sourceAllocations
-    : await delegatedAllocations(sourceAccount, spendAmount, sourceChains)
-  const result = await getKit().unifiedBalance.spend({
-    from: [{
-      adapter: getAdapter(),
-      sourceAccount,
-      allocations,
-    }],
-    to: {
-      chain: 'Arc_Testnet',
-      recipientAddress: cfg.recipient,
-      useForwarder: true,
-    },
-    amount: spendAmount,
-    token: 'USDC',
-  })
   const actualFeeUnits = totalFeeUnits(result?.fees || estimate.fees)
   return {
     estimate,
