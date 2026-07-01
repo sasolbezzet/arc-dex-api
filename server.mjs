@@ -1805,8 +1805,11 @@ app.get('/api/tx-history', apiLimiter, requireAuth, async (req, res) => {
 
 app.post('/api/tx-history', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const owner = req.body?.metamaskAddress || req.body?.owner || req.authAddress
-    const rec = appendTxHistory(owner, req.body?.record || req.body)
+    const claimedOwner = req.body?.metamaskAddress || req.body?.owner || req.body?.record?.owner
+    if (claimedOwner && normalizeAddress(claimedOwner, 'owner').toLowerCase() !== req.authAddress) {
+      return res.status(403).json({ error: 'History owner does not match authenticated wallet' })
+    }
+    const rec = appendTxHistory(req.authAddress, req.body?.record || req.body)
     res.json({ success: true, record: rec })
   } catch(e) { console.error('[tx-history]', e.message); res.status(400).json({ error: e.message }) }
 })
