@@ -176,7 +176,11 @@ function selectProviders(payload = {}) {
     throw err
   }
   const requestedModel = payload.model || 'arcox/auto'
-  if (requestedModel === 'arcox/auto') return providers
+  if (requestedModel === 'arcox/auto') {
+    const preferredModel = String(process.env.AI_ROUTER_AUTO_MODEL || '').trim()
+    if (!preferredModel) return providers
+    return [...providers].sort((left, right) => Number(modelMatches(right.model, preferredModel)) - Number(modelMatches(left.model, preferredModel)))
+  }
   const candidates = providers.filter(provider => modelMatches(provider.model, requestedModel))
   if (candidates.length) return candidates
   const err = new Error(`Model ${requestedModel} is not configured in ARCOX AI Router`)
