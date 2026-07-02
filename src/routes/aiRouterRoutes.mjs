@@ -34,7 +34,7 @@ import { getGatewayDelegateStatus } from '../services/gatewayDelegateService.mjs
 const router = Router()
 const aiResponseCache = new Map()
 const aiInflight = new Set()
-const aiOwnerInflight = new Set()
+const aiOwnerInflight = new Map()
 const aiKeyRateBuckets = new Map()
 
 router.get('/status', async (req, res) => {
@@ -241,10 +241,6 @@ export async function openAiChatCompletions(req, res) {
   }
   const owner = apiKey.ownerAddress
   if (!consumeAiKeyRate(apiKey.id)) return res.status(429).json({ error: { message: 'AI Router request rate exceeded.', type: 'rate_limit', charged: false } })
-  if (aiOwnerInflight.has(owner)) return res.status(409).json({ error: { message: 'Another paid request for this wallet is still processing.', type: 'wallet_request_in_progress', charged: false } })
-  aiOwnerInflight.add(owner)
-  res.once('finish', () => aiOwnerInflight.delete(owner))
-  res.once('close', () => aiOwnerInflight.delete(owner))
   let policy = getPolicy(owner)
   if (policy.delegateChains?.some(item => item?.status === 'pending')) {
     policy = await refreshAutoPayReadiness(owner).catch(() => policy)
@@ -307,8 +303,18 @@ export async function openAiChatCompletions(req, res) {
 
   let spend
   let memoProof = null
+  let releaseOwner
+  try {
+    releaseOwner = await acquireAiOwnerSlot(owner, res)
+  } catch (error) {
+    markPaymentStatus(payment.id, 'failed', { error: error?.message || 'Payment queue timeout', charged: false })
+    return res.status(error?.status || 503).json({ error: { message: error?.message || 'AI Router payment queue is busy.', type: error?.type || 'wallet_queue_timeout', charged: false } })
+  }
+  res.once('finish', releaseOwner)
+  res.once('close', releaseOwner)
   try {
     spend = await spendDelegatedAiPayment({ sourceAccount: owner, amount: cost, estimate, sourceChains: readyDelegateChains(policy, owner) })
+    releaseOwner()
     if (spend.txHash) {
       memoProof = await submitAgentMemoProof({
         agentId: apiKey.agentId,
@@ -335,6 +341,7 @@ export async function openAiChatCompletions(req, res) {
       sourceAllocations: spend.sourceAllocations,
     })
   } catch (error) {
+    releaseOwner()
     return handlePaymentFailure({ res, paymentId: payment.id, error })
   }
 
@@ -395,6 +402,30 @@ function sendChatResponse(req, res, body) {
 function normalizeIdempotencyKey(value) {
   const key = String(value || '').trim()
   return /^[a-fA-F0-9]{32,64}$/.test(key) ? key.toLowerCase() : ''
+}
+
+async function acquireAiOwnerSlot(owner, res) {
+  const timeoutMs = Math.max(10_000, Number(process.env.AI_ROUTER_WALLET_QUEUE_TIMEOUT_MS || 120_000))
+  const lockTtlMs = Math.max(timeoutMs, Number(process.env.AI_ROUTER_WALLET_LOCK_TTL_MS || 180_000))
+  const started = Date.now()
+  const token = Symbol(owner)
+  while (true) {
+    if (res.destroyed) throw Object.assign(new Error('AI request was cancelled before payment.'), { status: 499, type: 'request_cancelled' })
+    const current = aiOwnerInflight.get(owner)
+    if (!current || Date.now() >= current.expiresAt) {
+      aiOwnerInflight.set(owner, { token, expiresAt: Date.now() + lockTtlMs })
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        if (aiOwnerInflight.get(owner)?.token === token) aiOwnerInflight.delete(owner)
+      }
+    }
+    if (Date.now() - started >= timeoutMs) {
+      throw Object.assign(new Error('AI Router is finishing your previous request. Try again shortly.'), { status: 503, type: 'wallet_queue_timeout' })
+    }
+    await new Promise(resolve => setTimeout(resolve, 150))
+  }
 }
 
 function pruneAiResponseCache() {
