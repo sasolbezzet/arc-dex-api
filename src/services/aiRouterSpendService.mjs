@@ -108,14 +108,18 @@ export async function estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourc
   const candidates = GATEWAY_CHAINS
     .filter(item => allowed.has(item.chain) && (balances.get(item.domain) || 0n) > 0n)
     .sort((left, right) => sourcePriority(left.chain) - sourcePriority(right.chain))
+  let lastError
   for (const candidate of candidates) {
     try {
       return await estimateForSources({ sourceAccount, solanaSourceAccount, receiveUnits, sourceChains: [candidate.chain], balances, recipient, destinationChain })
-    } catch {}
+    } catch (error) {
+      lastError = error
+    }
   }
   if (candidates.length > 1) {
     return estimateForSources({ sourceAccount, solanaSourceAccount, receiveUnits, sourceChains: candidates.map(item => item.chain), balances, recipient, destinationChain })
   }
+  if (lastError) throw lastError
   throw new Error('Please deposit more USDC to Unified Balance or enable Auto Pay on another funded chain')
 }
 

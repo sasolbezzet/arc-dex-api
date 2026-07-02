@@ -1149,7 +1149,7 @@ const GATEWAY_TESTNET_CHAINS = [
   { domain: 5, chain: 'Solana_Devnet', ecosystem: 'solana' },
 ]
 
-const GATEWAY_PROXY_PATH = /^\/v1\/(?:info|balances|deposits|estimate)(?:\?enableForwarder=true)?$/
+const GATEWAY_PROXY_PATH = /^\/v1\/(?:info|balances|deposits|estimate|transfer(?:\/[0-9a-f-]{1,80})?)(?:\?enableForwarder=true)?$/i
 
 app.all('/api/unified-balance/gateway-proxy', apiLimiter, requireAuth, async (req, res) => {
   try {
@@ -1157,7 +1157,7 @@ app.all('/api/unified-balance/gateway-proxy', apiLimiter, requireAuth, async (re
     if (!GATEWAY_PROXY_PATH.test(path)) return res.status(400).json({ error: 'Unsupported Gateway path' })
     if (!['GET', 'POST'].includes(req.method)) return res.status(405).json({ error: 'Unsupported Gateway method' })
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), Number(process.env.GATEWAY_PROXY_TIMEOUT_MS || 15_000))
+    const timeout = setTimeout(() => controller.abort(), Number(process.env.GATEWAY_PROXY_TIMEOUT_MS || 40_000))
     try {
       const response = await fetch(`${GATEWAY_TESTNET_API}${path}`, {
         method: req.method,
@@ -1166,6 +1166,7 @@ app.all('/api/unified-balance/gateway-proxy', apiLimiter, requireAuth, async (re
         ...(req.method === 'POST' ? { body: JSON.stringify(req.body || {}) } : {}),
       })
       const payload = await response.text()
+      res.setHeader('Cache-Control', 'no-store')
       res.status(response.status).type(response.headers.get('content-type') || 'application/json').send(payload)
     } finally {
       clearTimeout(timeout)
