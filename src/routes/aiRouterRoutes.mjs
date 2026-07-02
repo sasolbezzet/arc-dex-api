@@ -45,6 +45,7 @@ router.get('/status', async (req, res) => {
     res.json({
       ok: true,
       ...getAiRouterStatus(ownerAddress),
+      solanaDelegateAddress: delegateConfig().solanaDelegateAddress || '',
       agentIdentity: identity.active,
       agentIdentities: identity.items,
       treasury: treasuryAddress(),
@@ -267,7 +268,7 @@ export async function openAiChatCompletions(req, res) {
   markPaymentStatus(payment.id, 'estimate_ready')
   let estimate
   try {
-    estimate = await estimateDelegatedAiSpend({ sourceAccount: owner, amount: cost, sourceChains: readyDelegateChains(policy, owner) })
+    estimate = await estimateDelegatedAiSpend({ sourceAccount: owner, solanaSourceAccount: policy.solanaOwnerAddress, amount: cost, sourceChains: readyDelegateChains(policy, owner) })
     const totalDebit = normalizeUsdc(estimate.totalDebit || estimate.spendAmount || cost)
     const maxDebit = normalizeUsdc(process.env.AI_ROUTER_MAX_TOTAL_DEBIT_USDC || '0.05')
     if (Number(totalDebit) > Number(maxDebit)) throw new Error(`Total debit ${totalDebit} USDC exceeds the configured ${maxDebit} USDC safety cap`)
@@ -313,7 +314,7 @@ export async function openAiChatCompletions(req, res) {
   res.once('finish', releaseOwner)
   res.once('close', releaseOwner)
   try {
-    spend = await spendDelegatedAiPayment({ sourceAccount: owner, amount: cost, estimate, sourceChains: readyDelegateChains(policy, owner) })
+    spend = await spendDelegatedAiPayment({ sourceAccount: owner, solanaSourceAccount: policy.solanaOwnerAddress, amount: cost, estimate, sourceChains: readyDelegateChains(policy, owner) })
     releaseOwner()
     if (spend.txHash) {
       memoProof = await submitAgentMemoProof({

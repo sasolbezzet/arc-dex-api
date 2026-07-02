@@ -1,15 +1,21 @@
 import { AppKit } from '@circle-fin/app-kit'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
+import { createSolanaKitAdapterFromPrivateKey } from '@circle-fin/adapter-solana-kit'
+import { createSolanaRpc } from '@solana/kit'
+import { Keypair } from '@solana/web3.js'
 import { privateKeyToAccount } from 'viem/accounts'
+import bs58 from 'bs58'
 
 let kit
 let adapter
+let solanaAdapter
 const GATEWAY_API = 'https://gateway-api-testnet.circle.com'
 const GATEWAY_CHAINS = [
   { chain: 'Arc_Testnet', domain: 26 },
   { chain: 'Base_Sepolia', domain: 6 },
   { chain: 'Ethereum_Sepolia', domain: 0 },
   { chain: 'Arbitrum_Sepolia', domain: 3 },
+  { chain: 'Solana_Devnet', domain: 5 },
 ]
 
 function getKit() {
@@ -24,12 +30,44 @@ function getAdapter() {
   return adapter
 }
 
+function getSolanaAdapter() {
+  if (!solanaAdapter) {
+    solanaAdapter = createSolanaKitAdapterFromPrivateKey({
+      privateKey: solanaDelegatePrivateKey(),
+      getRpc: () => createSolanaRpc(process.env.SOLANA_DEVNET_RPC || 'https://api.devnet.solana.com'),
+    })
+  }
+  return solanaAdapter
+}
+
 export function delegateConfig() {
   const signer = delegateSignerAddress()
   return {
     delegateAddress: firstValidAddress(process.env.AI_ROUTER_DELEGATE_ADDRESS, signer, process.env.CIRCLE_DELEGATE_ADDRESS),
+    solanaDelegateAddress: solanaDelegateSignerAddress(),
     recipient: firstValidAddress(process.env.AI_ROUTER_TREASURY_ADDRESS, process.env.ARCOX_TREASURY_WALLET_ADDRESS, process.env.X402_RECIPIENT_ADDRESS, process.env.CIRCLE_X402_TREASURY_ADDRESS),
     enabled: Boolean(delegatePrivateKey()),
+    solanaEnabled: Boolean(solanaDelegatePrivateKey()),
+  }
+}
+
+function solanaDelegatePrivateKey() {
+  return String(process.env.AI_ROUTER_SOLANA_DELEGATE_PRIVATE_KEY || '').trim()
+}
+
+function solanaDelegateSignerAddress() {
+  try {
+    const value = solanaDelegatePrivateKey()
+    if (!value) return ''
+    let bytes
+    if (value.startsWith('[')) bytes = Uint8Array.from(JSON.parse(value))
+    else {
+      try { bytes = bs58.decode(value) } catch { bytes = Uint8Array.from(Buffer.from(value, 'base64')) }
+    }
+    const keypair = bytes.length === 32 ? Keypair.fromSeed(bytes) : Keypair.fromSecretKey(bytes)
+    return keypair.publicKey.toBase58()
+  } catch {
+    return ''
   }
 }
 
@@ -51,45 +89,45 @@ function delegateSignerAddress() {
   }
 }
 
-export async function estimateDelegatedAiSpend({ sourceAccount, amount, sourceChains = [] }) {
+export async function estimateDelegatedAiSpend({ sourceAccount, solanaSourceAccount = '', amount, sourceChains = [] }) {
   const cfg = delegateConfig()
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!cfg.recipient) throw new Error('ARCOX treasury recipient is not configured')
-  return estimateDelegatedUnifiedSpend({ sourceAccount, amount, sourceChains, destinationChain: 'Arc_Testnet', recipient: cfg.recipient })
+  return estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourceAccount, amount, sourceChains, destinationChain: 'Arc_Testnet', recipient: cfg.recipient })
 }
 
-export async function estimateDelegatedUnifiedSpend({ sourceAccount, amount, sourceChains = [], destinationChain = 'Arc_Testnet', recipient }) {
+export async function estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourceAccount = '', amount, sourceChains = [], destinationChain = 'Arc_Testnet', recipient }) {
   const cfg = delegateConfig()
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!/^0x[a-fA-F0-9]{40}$/.test(String(sourceAccount || ''))) throw new Error('Invalid Unified Balance owner')
   if (!/^0x[a-fA-F0-9]{40}$/.test(String(recipient || ''))) throw new Error('Invalid Unified Balance recipient')
   if (!GATEWAY_CHAINS.some(item => item.chain === destinationChain)) throw new Error('Unsupported Unified Balance destination chain')
   const receiveUnits = usdcUnits(amount)
-  const balances = await delegatedBalances(sourceAccount)
+  const balances = await delegatedBalances(sourceAccount, solanaSourceAccount)
   const allowed = new Set(sourceChains.length ? sourceChains : ['Arc_Testnet'])
   const candidates = GATEWAY_CHAINS
     .filter(item => allowed.has(item.chain) && (balances.get(item.domain) || 0n) > 0n)
     .sort((left, right) => sourcePriority(left.chain) - sourcePriority(right.chain))
   for (const candidate of candidates) {
     try {
-      return await estimateForSources({ sourceAccount, receiveUnits, sourceChains: [candidate.chain], balances, recipient, destinationChain })
+      return await estimateForSources({ sourceAccount, solanaSourceAccount, receiveUnits, sourceChains: [candidate.chain], balances, recipient, destinationChain })
     } catch {}
   }
   if (candidates.length > 1) {
-    return estimateForSources({ sourceAccount, receiveUnits, sourceChains: candidates.map(item => item.chain), balances, recipient, destinationChain })
+    return estimateForSources({ sourceAccount, solanaSourceAccount, receiveUnits, sourceChains: candidates.map(item => item.chain), balances, recipient, destinationChain })
   }
   throw new Error('Please deposit more USDC to Unified Balance or enable Auto Pay on another funded chain')
 }
 
-export async function spendDelegatedAiPayment({ sourceAccount, amount, estimate: preparedEstimate, sourceChains = [] }) {
+export async function spendDelegatedAiPayment({ sourceAccount, solanaSourceAccount = '', amount, estimate: preparedEstimate, sourceChains = [] }) {
   const cfg = delegateConfig()
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!cfg.recipient) throw new Error('ARCOX treasury recipient is not configured')
-  return spendDelegatedUnifiedBalance({ sourceAccount, amount, estimate: preparedEstimate, sourceChains, destinationChain: 'Arc_Testnet', recipient: cfg.recipient })
+  return spendDelegatedUnifiedBalance({ sourceAccount, solanaSourceAccount, amount, estimate: preparedEstimate, sourceChains, destinationChain: 'Arc_Testnet', recipient: cfg.recipient })
 }
 
-export async function spendDelegatedUnifiedBalance({ sourceAccount, amount, estimate: preparedEstimate, sourceChains = [], destinationChain = 'Arc_Testnet', recipient, maxTotalDebit }) {
-  let estimate = preparedEstimate || await estimateDelegatedUnifiedSpend({ sourceAccount, amount, sourceChains, destinationChain, recipient })
+export async function spendDelegatedUnifiedBalance({ sourceAccount, solanaSourceAccount = '', amount, estimate: preparedEstimate, sourceChains = [], destinationChain = 'Arc_Testnet', recipient, maxTotalDebit }) {
+  let estimate = preparedEstimate || await estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourceAccount, amount, sourceChains, destinationChain, recipient })
   if (maxTotalDebit && usdcUnits(estimate.totalDebit || estimate.spendAmount || amount) > usdcUnits(maxTotalDebit)) {
     throw new Error('Unified Balance fee changed above the approved preview. Estimate again before spending.')
   }
@@ -99,10 +137,10 @@ export async function spendDelegatedUnifiedBalance({ sourceAccount, amount, esti
     const spendAmount = estimate.spendAmount || amount
     allocations = Array.isArray(estimate.sourceAllocations) && estimate.sourceAllocations.length
       ? estimate.sourceAllocations
-      : await delegatedAllocations(sourceAccount, spendAmount, sourceChains)
+      : await delegatedAllocations(sourceAccount, solanaSourceAccount, spendAmount, sourceChains)
     try {
       result = await getKit().unifiedBalance.spend({
-        from: [{ adapter: getAdapter(), sourceAccount, allocations }],
+        from: delegatedSources(sourceAccount, solanaSourceAccount, allocations),
         to: { chain: destinationChain, recipientAddress: recipient, useForwarder: true },
         amount: spendAmount,
         token: 'USDC',
@@ -112,7 +150,7 @@ export async function spendDelegatedUnifiedBalance({ sourceAccount, amount, esti
       const feeChanged = /Insufficient total maxFee across intents to cover forwarding fee/i.test(String(error?.message || ''))
       if (!feeChanged || attempt === 2) throw error
       await new Promise(resolve => setTimeout(resolve, 400))
-      estimate = await estimateDelegatedUnifiedSpend({ sourceAccount, amount, sourceChains, destinationChain, recipient })
+      estimate = await estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourceAccount, amount, sourceChains, destinationChain, recipient })
       if (maxTotalDebit && usdcUnits(estimate.totalDebit || estimate.spendAmount || amount) > usdcUnits(maxTotalDebit)) {
         throw new Error('Unified Balance fee changed above the approved preview. Estimate again before spending.')
       }
@@ -133,11 +171,11 @@ export async function spendDelegatedUnifiedBalance({ sourceAccount, amount, esti
   }
 }
 
-async function estimateForSources({ sourceAccount, receiveUnits, sourceChains, balances, recipient, destinationChain }) {
+async function estimateForSources({ sourceAccount, solanaSourceAccount, receiveUnits, sourceChains, balances, recipient, destinationChain }) {
   const spendAmount = formatUsdc(receiveUnits)
-  const sourceAllocations = await delegatedAllocations(sourceAccount, spendAmount, sourceChains, balances)
+  const sourceAllocations = await delegatedAllocations(sourceAccount, solanaSourceAccount, spendAmount, sourceChains, balances)
   const estimate = await getKit().unifiedBalance.estimateSpend({
-    from: [{ adapter: getAdapter(), sourceAccount, allocations: sourceAllocations }],
+    from: delegatedSources(sourceAccount, solanaSourceAccount, sourceAllocations),
     to: { chain: destinationChain, recipientAddress: recipient, useForwarder: true },
     amount: spendAmount,
     token: 'USDC',
@@ -157,17 +195,19 @@ async function estimateForSources({ sourceAccount, receiveUnits, sourceChains, b
   }
 }
 
-async function delegatedBalances(sourceAccount) {
+async function delegatedBalances(sourceAccount, solanaSourceAccount = '') {
   const response = await gatewayRequest('/v1/balances', {
     token: 'USDC',
-    sources: GATEWAY_CHAINS.map(({ domain }) => ({ depositor: sourceAccount, domain })),
+    sources: GATEWAY_CHAINS
+      .map(({ chain, domain }) => ({ depositor: chain === 'Solana_Devnet' ? solanaSourceAccount : sourceAccount, domain }))
+      .filter(item => Boolean(item.depositor)),
   })
   return new Map((response?.balances || []).map(item => [Number(item.domain), usdcUnits(String(item.balance || '0'))]))
 }
 
-async function delegatedAllocations(sourceAccount, amount, sourceChains, knownBalances) {
+async function delegatedAllocations(sourceAccount, solanaSourceAccount, amount, sourceChains, knownBalances) {
   const allowed = new Set(sourceChains.length ? sourceChains : ['Arc_Testnet'])
-  const balances = knownBalances || await delegatedBalances(sourceAccount)
+  const balances = knownBalances || await delegatedBalances(sourceAccount, solanaSourceAccount)
   let remaining = usdcUnits(amount)
   const allocations = []
   const orderedChains = GATEWAY_CHAINS
@@ -185,8 +225,20 @@ async function delegatedAllocations(sourceAccount, amount, sourceChains, knownBa
   return allocations
 }
 
+function delegatedSources(sourceAccount, solanaSourceAccount, allocations) {
+  const sources = []
+  const evmAllocations = allocations.filter(item => item.chain !== 'Solana_Devnet')
+  const solanaAllocations = allocations.filter(item => item.chain === 'Solana_Devnet')
+  if (evmAllocations.length) sources.push({ adapter: getAdapter(), sourceAccount, allocations: evmAllocations })
+  if (solanaAllocations.length) {
+    if (!solanaSourceAccount || !delegateConfig().solanaEnabled) throw new Error('Solana Auto Pay signer is not configured')
+    sources.push({ adapter: getSolanaAdapter(), sourceAccount: solanaSourceAccount, allocations: solanaAllocations })
+  }
+  return sources
+}
+
 function sourcePriority(chain) {
-  return ({ Base_Sepolia: 0, Arbitrum_Sepolia: 1, Arc_Testnet: 2, Ethereum_Sepolia: 3 })[chain] ?? 9
+  return ({ Base_Sepolia: 0, Arbitrum_Sepolia: 1, Arc_Testnet: 2, Ethereum_Sepolia: 3, Solana_Devnet: 4 })[chain] ?? 9
 }
 
 async function gatewayRequest(path, body) {

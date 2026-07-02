@@ -7,6 +7,7 @@ import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
 import { createPublicClient, createWalletClient, http, erc20Abi, formatUnits, defineChain, getAddress, isAddress, verifyMessage } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
+import { PublicKey } from '@solana/web3.js'
 import { initiateDeveloperControlledWalletsClient } from '@circle-fin/developer-controlled-wallets'
 import { quoteEcoRoutePayment } from './services/ecoAdapter.mjs'
 import { withX402PaymentRequired } from './middleware/x402.mjs'
@@ -174,7 +175,7 @@ const CCTP = {
     tokenMessenger: '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa',
     messageTransmitter: '0xe737e5cebeeba77efe34d4aa090756590b1ce275',
     explorer: 'https://sepolia.arbiscan.io/tx/',
-    chain: defineChain({ id: 421614, name: 'Arbitrum Sepolia', nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: ['https://arbitrum-sepolia.publicnode.com'] } } }),
+    chain: defineChain({ id: 421614, name: 'Arbitrum Sepolia', nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: ['https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com'] } } }),
   },
   HyperEVM_Testnet: {
     domain: 19,
@@ -1141,10 +1142,11 @@ app.get('/api/balance/:address', async (req, res) => {
 
 const GATEWAY_TESTNET_API = 'https://gateway-api-testnet.circle.com'
 const GATEWAY_TESTNET_CHAINS = [
-  { domain: 26, chain: 'Arc_Testnet' },
-  { domain: 6, chain: 'Base_Sepolia' },
-  { domain: 0, chain: 'Ethereum_Sepolia' },
-  { domain: 3, chain: 'Arbitrum_Sepolia' },
+  { domain: 26, chain: 'Arc_Testnet', ecosystem: 'evm' },
+  { domain: 6, chain: 'Base_Sepolia', ecosystem: 'evm' },
+  { domain: 0, chain: 'Ethereum_Sepolia', ecosystem: 'evm' },
+  { domain: 3, chain: 'Arbitrum_Sepolia', ecosystem: 'evm' },
+  { domain: 5, chain: 'Solana_Devnet', ecosystem: 'solana' },
 ]
 
 const GATEWAY_PROXY_PATH = /^\/v1\/(?:info|balances|deposits|estimate)(?:\?enableForwarder=true)?$/
@@ -1177,7 +1179,11 @@ app.all('/api/unified-balance/gateway-proxy', apiLimiter, requireAuth, async (re
 app.post('/api/unified-balance/balances', apiLimiter, async (req, res) => {
   try {
     const address = normalizeAddress(req.body?.address, 'address')
-    const sources = GATEWAY_TESTNET_CHAINS.map(({ domain }) => ({ depositor: address, domain }))
+    const solanaAddress = optionalSolanaAddress(req.body?.solanaAddress)
+    const depositorByDomain = new Map(GATEWAY_TESTNET_CHAINS.map(({ domain, ecosystem }) => [domain, ecosystem === 'solana' ? solanaAddress : address]))
+    const sources = GATEWAY_TESTNET_CHAINS
+      .map(({ domain }) => ({ depositor: depositorByDomain.get(domain), domain }))
+      .filter(source => Boolean(source.depositor))
     const requestBody = { token: 'USDC', sources }
     const [confirmed, pendingResult] = await Promise.all([
       gatewayBalanceRequest('/v1/balances', requestBody),
@@ -1186,7 +1192,7 @@ app.post('/api/unified-balance/balances', apiLimiter, async (req, res) => {
         return { token: 'USDC', deposits: [] }
       }),
     ])
-    res.json(formatGatewayBalances(address, confirmed, pendingResult))
+    res.json(formatGatewayBalances(depositorByDomain, confirmed, pendingResult))
   } catch (error) {
     console.error('[unified-balance]', error.message)
     res.status(error?.status || 502).json({ error: error.message || 'Unified Balance lookup failed' })
@@ -1229,7 +1235,7 @@ function delegatedUnifiedRequest(req) {
   if (!/^\d+(\.\d{1,6})?$/.test(amount) || Number(amount) <= 0) throw Object.assign(new Error('Valid USDC amount is required'), { status: 400 })
   const purpose = String(req.body?.purpose || '')
   const destinationChain = String(req.body?.destinationChain || 'Arc_Testnet')
-  const supported = new Set(GATEWAY_TESTNET_CHAINS.map(item => item.chain))
+  const supported = new Set(GATEWAY_TESTNET_CHAINS.filter(item => item.ecosystem === 'evm').map(item => item.chain))
   if (!supported.has(destinationChain)) throw Object.assign(new Error('Unsupported Unified Balance destination chain'), { status: 400 })
   const policy = getPolicy(owner)
   const ready = (policy.delegateChains || []).filter(item => item?.status === 'ready').map(item => item.chain)
@@ -1237,7 +1243,7 @@ function delegatedUnifiedRequest(req) {
   const sourceChains = requestedSource === 'auto' ? ready : ready.filter(chain => chain === requestedSource)
   if (!policy.enabled || !sourceChains.length) throw Object.assign(new Error('Enable Auto Pay first'), { status: 402 })
   if (purpose === 'withdraw') {
-    return { sourceAccount: owner, amount, sourceChains, destinationChain, recipient: owner, maxTotalDebit: optionalUsdc(req.body?.maxTotalDebit) }
+    return { sourceAccount: owner, solanaSourceAccount: policy.solanaOwnerAddress || '', amount, sourceChains, destinationChain, recipient: owner, maxTotalDebit: optionalUsdc(req.body?.maxTotalDebit) }
   }
   if (purpose !== 'x402') throw Object.assign(new Error('Unsupported delegated spend purpose'), { status: 400 })
   const invoice = getX402Invoice(req.body?.invoiceId)
@@ -1246,7 +1252,7 @@ function delegatedUnifiedRequest(req) {
   if (!['payment_required', 'estimate_ready', 'awaiting_signature', 'spend_submitted', 'settlement_pending', 'pending'].includes(invoice.status)) throw Object.assign(new Error(`Invoice cannot be paid in status ${invoice.status}`), { status: 409 })
   if (invoice.uniqueAmount !== amount) throw Object.assign(new Error('Invoice amount mismatch'), { status: 400 })
   if (destinationChain !== 'Arc_Testnet') throw Object.assign(new Error('x402 must settle on Arc Testnet'), { status: 400 })
-  return { sourceAccount: owner, amount, sourceChains, destinationChain, recipient: invoice.recipient, invoice, maxTotalDebit: optionalUsdc(req.body?.maxTotalDebit) }
+  return { sourceAccount: owner, solanaSourceAccount: policy.solanaOwnerAddress || '', amount, sourceChains, destinationChain, recipient: invoice.recipient, invoice, maxTotalDebit: optionalUsdc(req.body?.maxTotalDebit) }
 }
 
 function optionalUsdc(value) {
@@ -1303,7 +1309,7 @@ async function gatewayBalanceRequest(path, body) {
   throw error
 }
 
-function formatGatewayBalances(address, confirmed, pending) {
+function formatGatewayBalances(depositorByDomain, confirmed, pending) {
   const confirmedByDomain = new Map((confirmed?.balances || []).map(item => [Number(item.domain), String(item.balance || '0')]))
   const pendingByDomain = new Map()
   const pendingTxByDomain = new Map()
@@ -1320,26 +1326,39 @@ function formatGatewayBalances(address, confirmed, pending) {
     })
     pendingTxByDomain.set(domain, list)
   }
-  const chains = GATEWAY_TESTNET_CHAINS.map(({ domain, chain }) => ({
+  const chains = GATEWAY_TESTNET_CHAINS.filter(({ domain }) => Boolean(depositorByDomain.get(domain))).map(({ domain, chain }) => ({
     chain,
+    depositor: depositorByDomain.get(domain),
     confirmedBalance: fixedUsdc(confirmedByDomain.get(domain) || '0'),
     pendingBalance: fixedUsdc(pendingByDomain.get(domain) || '0'),
     pendingTransactions: pendingTxByDomain.get(domain) || [],
   }))
   const totalConfirmed = chains.reduce((total, item) => addDecimalAmounts(total, item.confirmedBalance), '0')
   const totalPending = chains.reduce((total, item) => addDecimalAmounts(total, item.pendingBalance), '0')
+  const grouped = new Map()
+  for (const item of chains) {
+    const list = grouped.get(item.depositor) || []
+    list.push(item)
+    grouped.set(item.depositor, list)
+  }
   return {
     token: 'USDC',
     totalConfirmedBalance: fixedUsdc(totalConfirmed),
     totalPendingBalance: fixedUsdc(totalPending),
-    breakdown: [{
-      depositor: address,
-      totalConfirmed: fixedUsdc(totalConfirmed),
-      totalPending: fixedUsdc(totalPending),
-      breakdown: chains,
-    }],
+    breakdown: [...grouped.entries()].map(([depositor, items]) => ({
+      depositor,
+      totalConfirmed: fixedUsdc(items.reduce((total, item) => addDecimalAmounts(total, item.confirmedBalance), '0')),
+      totalPending: fixedUsdc(items.reduce((total, item) => addDecimalAmounts(total, item.pendingBalance), '0')),
+      breakdown: items,
+    })),
     source: 'circle-gateway-server',
   }
+}
+
+function optionalSolanaAddress(value) {
+  const address = String(value || '').trim()
+  if (!address) return ''
+  try { return new PublicKey(address).toBase58() } catch { throw Object.assign(new Error('Invalid Solana wallet address'), { status: 400 }) }
 }
 
 function addDecimalAmounts(left, right) {

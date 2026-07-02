@@ -280,6 +280,7 @@ export function getPolicy(ownerAddress) {
     source: 'unified_balance',
     delegateStatus: 'not_configured',
     delegateAddress: delegateAddress(),
+    solanaOwnerAddress: '',
     delegateChains: [],
     status: 'deposit_required',
   }
@@ -318,6 +319,7 @@ export function setPolicy(ownerAddress, input = {}) {
     source: 'unified_balance',
     delegateStatus,
     delegateAddress: nextDelegateAddress,
+    solanaOwnerAddress: validSolanaAddress(input.solanaOwnerAddress) ? String(input.solanaOwnerAddress) : validSolanaAddress(current.solanaOwnerAddress) ? current.solanaOwnerAddress : '',
     delegateChains,
     status: input.enabled && delegateStatus === 'ready' ? 'ready' : input.enabled ? 'auto_pay_required' : 'off',
     updatedAt: new Date().toISOString(),
@@ -327,11 +329,15 @@ export function setPolicy(ownerAddress, input = {}) {
 }
 
 function normalizeDelegateChains(value) {
-  const supported = new Set(['Arc_Testnet', 'Base_Sepolia', 'Ethereum_Sepolia', 'Arbitrum_Sepolia'])
+  const supported = new Set(['Arc_Testnet', 'Base_Sepolia', 'Ethereum_Sepolia', 'Arbitrum_Sepolia', 'Solana_Devnet'])
   if (!Array.isArray(value)) return []
   return value
     .filter(item => supported.has(String(item?.chain || '')))
     .map(item => ({ chain: String(item.chain), status: normalizeAutoPayStatus(item.status) }))
+}
+
+function validSolanaAddress(value) {
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(String(value || '').trim())
 }
 
 export function createPaymentIntent({ ownerAddress, agentId = '', amount, requestId, model }) {
