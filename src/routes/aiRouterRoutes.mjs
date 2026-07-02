@@ -54,8 +54,9 @@ router.get('/status', async (req, res) => {
         transactionWalletMatchRequired: true,
         maxServiceCostUsdc: process.env.AI_ROUTER_MAX_SERVICE_COST_USDC || '0.01',
         maxTotalDebitUsdc: process.env.AI_ROUTER_MAX_TOTAL_DEBIT_USDC || '0.05',
-        dailyLimitUsdc: process.env.AI_ROUTER_DAILY_LIMIT_USDC || '1',
-        monthlyLimitUsdc: process.env.AI_ROUTER_MONTHLY_LIMIT_USDC || '10',
+        dailyLimitUsdc: process.env.AI_ROUTER_DAILY_LIMIT_USDC || '10',
+        weeklyLimitUsdc: 'unlimited',
+        monthlyLimitUsdc: Number(process.env.AI_ROUTER_MONTHLY_LIMIT_USDC || '0') > 0 ? process.env.AI_ROUTER_MONTHLY_LIMIT_USDC : 'unlimited',
       },
       docs: docs(),
     })
@@ -415,8 +416,8 @@ function pricedModels() {
 
 function aiSpendLimitError(owner, cost) {
   const perRequest = Number(process.env.AI_ROUTER_MAX_SERVICE_COST_USDC || '0.01')
-  const daily = Number(process.env.AI_ROUTER_DAILY_LIMIT_USDC || '1')
-  const monthly = Number(process.env.AI_ROUTER_MONTHLY_LIMIT_USDC || '10')
+  const daily = Number(process.env.AI_ROUTER_DAILY_LIMIT_USDC || '10')
+  const monthly = Number(process.env.AI_ROUTER_MONTHLY_LIMIT_USDC || '0')
   if (perRequest > 0 && Number(cost) > perRequest) return `Service cost ${cost} USDC exceeds the per-request limit ${perRequest} USDC.`
   if (daily > 0 && Number(spendToday(owner)) + Number(cost) > daily) return `Daily AI Router limit ${daily} USDC reached.`
   if (monthly > 0 && Number(spendThisMonth(owner)) + Number(cost) > monthly) return `Monthly AI Router limit ${monthly} USDC reached.`

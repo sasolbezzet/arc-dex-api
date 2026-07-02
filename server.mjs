@@ -1257,7 +1257,14 @@ function optionalUsdc(value) {
 }
 
 function publicDelegatedEstimate(estimate) {
-  return { spendAmount: estimate.spendAmount, requestedReceiveAmount: estimate.requestedReceiveAmount, totalFee: estimate.totalFee, totalDebit: estimate.totalDebit, sourceAllocations: estimate.sourceAllocations || [], fees: estimate.fees || [] }
+  return { spendAmount: estimate.spendAmount, requestedReceiveAmount: estimate.requestedReceiveAmount, totalFee: estimate.totalFee, totalDebit: estimate.totalDebit, maxTotalDebit: approvedMaxDebit(estimate.totalDebit || estimate.spendAmount), sourceAllocations: estimate.sourceAllocations || [], fees: estimate.fees || [] }
+}
+
+function approvedMaxDebit(totalDebit) {
+  const value = Number(totalDebit || 0)
+  const tolerance = Number(process.env.UNIFIED_BALANCE_FEE_TOLERANCE_USDC || '0.005')
+  if (!Number.isFinite(value) || !Number.isFinite(tolerance) || value <= 0 || tolerance < 0) return String(totalDebit || '')
+  return (Math.ceil((value + tolerance) * 1_000_000) / 1_000_000).toFixed(6).replace(/0+$/, '').replace(/\.$/, '')
 }
 
 function publicDelegatedSpend(spend) {
