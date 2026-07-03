@@ -11,6 +11,7 @@ export function configuredProviders() {
     const name = process.env[`AI_PROVIDER_${i}_NAME`]
     const baseUrl = process.env[`AI_PROVIDER_${i}_BASE_URL`]
     const model = process.env[`AI_PROVIDER_${i}_MODEL`]
+    const supportsTools = !/^(false|0|no)$/i.test(String(process.env[`AI_PROVIDER_${i}_SUPPORTS_TOOLS`] || 'true'))
     const singleKey = process.env[`AI_PROVIDER_${i}_API_KEY`]
     const namedKeys = name ? process.env[`AI_PROVIDER_${name.toUpperCase()}_API_KEYS`] : ''
     const keys = [
@@ -25,6 +26,7 @@ export function configuredProviders() {
           baseUrl: baseUrl.replace(/\/$/, ''),
           apiKey,
           model,
+          supportsTools,
         })
       })
     }
@@ -98,6 +100,7 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
     try {
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), Number(process.env.AI_PROVIDER_TIMEOUT_MS || 45_000))
+      const forwardedPayload = providerPayload(payload, provider.model)
       const response = await fetch(`${provider.baseUrl}/chat/completions`, {
         method: 'POST',
         signal: controller.signal,
@@ -107,7 +110,7 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
           ...(process.env.AI_ROUTER_HTTP_REFERER ? { 'HTTP-Referer': process.env.AI_ROUTER_HTTP_REFERER } : {}),
           ...(process.env.AI_ROUTER_APP_TITLE ? { 'X-OpenRouter-Title': process.env.AI_ROUTER_APP_TITLE } : {}),
         },
-        body: JSON.stringify(providerPayload(payload, provider.model)),
+        body: JSON.stringify(forwardedPayload),
       }).finally(() => clearTimeout(timeout))
       const text = await response.text()
       let data
@@ -116,7 +119,7 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
         const err = new Error(data?.error?.message || data?.message || `Provider ${provider.name} HTTP ${response.status}`)
         err.status = response.status
         err.provider = provider.name
-        if (shouldFallback(response.status)) {
+        if (shouldFallback(response.status, err.message, payload)) {
           errors.push({ provider: provider.name, status: response.status, message: err.message })
           fallbackCount += 1
           continue
@@ -132,11 +135,12 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
           fallbackCount,
           latency: Date.now() - started,
           errors,
+          toolsForwarded: Array.isArray(forwardedPayload.tools) ? forwardedPayload.tools.length : 0,
         },
       }
     } catch (error) {
       const status = error?.name === 'AbortError' ? 504 : Number(error?.status || 0)
-      if (shouldFallback(status)) {
+      if (shouldFallback(status, error?.message, payload)) {
         errors.push({ provider: provider.name, status, message: error?.message || 'temporary provider error' })
         fallbackCount += 1
         continue
@@ -160,7 +164,7 @@ function validateProviderChatData(data, provider) {
   throw err
 }
 
-function providerPayload(payload, model) {
+export function providerPayload(payload, model) {
   const body = { ...(payload || {}), model, stream: false }
   delete body.stream_options
   delete body.streamOptions
@@ -176,10 +180,14 @@ function selectProviders(payload = {}) {
     throw err
   }
   const requestedModel = payload.model || 'arcox/auto'
+  const toolsRequested = Array.isArray(payload.tools) && payload.tools.length > 0
   if (requestedModel === 'arcox/auto') {
     const preferredModel = String(process.env.AI_ROUTER_AUTO_MODEL || '').trim()
-    if (!preferredModel) return providers
-    return [...providers].sort((left, right) => Number(modelMatches(right.model, preferredModel)) - Number(modelMatches(left.model, preferredModel)))
+    return [...providers].sort((left, right) => {
+      const toolScore = toolsRequested ? Number(right.supportsTools) - Number(left.supportsTools) : 0
+      if (toolScore) return toolScore
+      return preferredModel ? Number(modelMatches(right.model, preferredModel)) - Number(modelMatches(left.model, preferredModel)) : 0
+    })
   }
   const candidates = providers.filter(provider => modelMatches(provider.model, requestedModel))
   if (candidates.length) return candidates
@@ -236,6 +244,9 @@ async function providerModels(provider) {
   return models
 }
 
-function shouldFallback(status) {
-  return [0, 408, 429, 500, 502, 503, 504].includes(Number(status))
+function shouldFallback(status, message = '', payload = {}) {
+  if ([0, 408, 429, 500, 502, 503, 504].includes(Number(status))) return true
+  if (![400, 404, 415, 422].includes(Number(status))) return false
+  if (!Array.isArray(payload?.tools) || payload.tools.length === 0) return false
+  return /tool|function|parallel_tool_calls|tool_choice|unsupported|not supported|unknown field|invalid parameter/i.test(String(message || ''))
 }

@@ -388,6 +388,7 @@ export async function openAiChatCompletions(req, res) {
       usageLog: log,
       providerUsed: meta.providerUsed,
       fallbackCount: meta.fallbackCount,
+      toolsForwarded: meta.toolsForwarded || 0,
     },
   }
   if (cacheKey) aiResponseCache.set(cacheKey, { body, expiresAt: Date.now() + Number(process.env.AI_ROUTER_IDEMPOTENCY_TTL_SECONDS || 300) * 1000 })

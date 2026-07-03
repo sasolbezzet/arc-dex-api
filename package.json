@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "check": "node --check server.mjs && node --check src/routes/aiRouterRoutes.mjs && node --check src/routes/arkhamRoutes.mjs && node --check src/routes/treasuryRoutes.mjs && node --check src/routes/x402Routes.mjs",
-    "test": "npm run check",
+    "test": "npm run check && node --test test/*.test.mjs",
     "maintenance:prune": "node scripts/prune-runtime.mjs"
   },
   "keywords": [],

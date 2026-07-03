@@ -91,6 +91,8 @@ ARCOX Intel:
 
 ARCOX AI Router adalah OpenAI-compatible API layer yang dibayar per request dari Unified Balance user melalui Auto Pay. Flow retail:
 
+OpenAI-compatible `tools`, `tool_choice`, and `parallel_tool_calls` are forwarded unchanged to tool-capable upstream providers. When a provider rejects tool calling, the router can fall back to another configured provider without reducing the Hermes tool schema.
+
 ```text
 Connect wallet -> Deposit USDC to Unified Balance -> Auto Pay ON -> Create API Key -> Use /v1/chat/completions
 ```
