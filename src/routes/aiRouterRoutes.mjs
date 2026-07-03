@@ -54,7 +54,7 @@ router.get('/status', async (req, res) => {
         sessionRequired: false,
         transactionWalletMatchRequired: true,
         maxServiceCostUsdc: process.env.AI_ROUTER_MAX_SERVICE_COST_USDC || '0.01',
-        maxTotalDebitUsdc: process.env.AI_ROUTER_MAX_TOTAL_DEBIT_USDC || '0.05',
+        maxTotalDebitUsdc: process.env.AI_ROUTER_MAX_TOTAL_DEBIT_USDC || '0.25',
         dailyLimitUsdc: process.env.AI_ROUTER_DAILY_LIMIT_USDC || '10',
         weeklyLimitUsdc: 'unlimited',
         monthlyLimitUsdc: Number(process.env.AI_ROUTER_MONTHLY_LIMIT_USDC || '0') > 0 ? process.env.AI_ROUTER_MONTHLY_LIMIT_USDC : 'unlimited',
@@ -270,7 +270,7 @@ export async function openAiChatCompletions(req, res) {
   try {
     estimate = await estimateDelegatedAiSpend({ sourceAccount: owner, solanaSourceAccount: policy.solanaOwnerAddress, amount: cost, sourceChains: readyDelegateChains(policy, owner) })
     const totalDebit = normalizeUsdc(estimate.totalDebit || estimate.spendAmount || cost)
-    const maxDebit = normalizeUsdc(process.env.AI_ROUTER_MAX_TOTAL_DEBIT_USDC || '0.05')
+    const maxDebit = normalizeUsdc(process.env.AI_ROUTER_MAX_TOTAL_DEBIT_USDC || '0.25')
     if (Number(totalDebit) > Number(maxDebit)) throw new Error(`Total debit ${totalDebit} USDC exceeds the configured ${maxDebit} USDC safety cap`)
     markPaymentStatus(payment.id, 'estimate_ready', { amount: estimate.totalDebit || estimate.spendAmount || cost, serviceAmount: cost, totalFee: estimate.totalFee || '0' })
   } catch (error) {

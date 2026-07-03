@@ -186,6 +186,20 @@ export async function reconcileX402Invoice(id) {
   if (!invoice || !isOpenStatus(invoice.status)) return invoice
   if (!invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) return invoice
   try {
+    const gatewayMatch = await findFinalizedGatewayTransfer(invoice)
+    if (gatewayMatch) {
+      invoice.status = 'paid'
+      invoice.settlementStatus = 'paid'
+      invoice.txHash = gatewayMatch.transactionHash
+      invoice.paidAt = new Date().toISOString()
+      invoice.updatedAt = invoice.paidAt
+      invoice.reconciledBy = 'circle-gateway-finalized-transfer'
+      invoices.set(invoice.invoiceId, invoice)
+      invoices.set(invoice.paymentId, invoice)
+      persistInvoices()
+      scheduleAgentMemoProof(invoice)
+      return invoice
+    }
     const rpc = process.env.ARC_RPC_URL || process.env.RPC || 'https://rpc.testnet.arc.network/'
     const client = createPublicClient({ transport: http(rpc, { timeout: 10_000, retryCount: 1 }) })
     const current = await client.getBlockNumber()
@@ -512,7 +526,7 @@ export function estimateUnifiedBalanceX402(invoiceId, input = {}) {
   return invoice
 }
 
-export function markUnifiedBalanceSpendSubmitted(invoiceId, input = {}) {
+export function markUnifiedBalanceSpendSubmitted(invoiceId, input = {}, options = {}) {
   const invoice = getX402Invoice(invoiceId)
   if (!invoice) return null
   if (!isOpenStatus(invoice.status)) return invoice
@@ -522,12 +536,27 @@ export function markUnifiedBalanceSpendSubmitted(invoiceId, input = {}) {
   invoice.paymentMethod = 'unified-balance-gateway'
   invoice.spendTxHash = input.txHash || input.spendTxHash || ''
   invoice.transferId = input.transferId || ''
+  invoice.trustedGatewaySpend = options.trustedGateway === true
   invoice.spendSummary = { txHash: invoice.spendTxHash, transferId: invoice.transferId }
   invoice.updatedAt = now
   invoices.set(invoice.invoiceId, invoice)
   invoices.set(invoice.paymentId, invoice)
   persistInvoices()
   return invoice
+}
+
+async function findFinalizedGatewayTransfer(invoice) {
+  if (!invoice.trustedGatewaySpend || !/^[0-9a-f-]{36}$/i.test(String(invoice.transferId || '')) || !/^0x[0-9a-f]{64}$/i.test(String(invoice.spendTxHash || ''))) return null
+  const response = await fetch(`${process.env.CIRCLE_GATEWAY_BASE_URL || 'https://gateway-api-testnet.circle.com'}/v1/transfer/${encodeURIComponent(invoice.transferId)}`, {
+    headers: { 'User-Agent': 'arcox-x402-reconciler/1.0' },
+    signal: AbortSignal.timeout(Number(process.env.X402_GATEWAY_RECONCILE_TIMEOUT_MS || 8_000)),
+  })
+  if (!response.ok) return null
+  const transfer = await response.json().catch(() => null)
+  if (!transfer || !['finalized', 'complete', 'completed'].includes(String(transfer.status || '').toLowerCase())) return null
+  if (Number(transfer.destinationDomain) !== 26) return null
+  if (normalizeAddress(transfer.transactionHash) !== normalizeAddress(invoice.spendTxHash)) return null
+  return transfer
 }
 
 export function withArcoxX402(handler, config = {}) {
