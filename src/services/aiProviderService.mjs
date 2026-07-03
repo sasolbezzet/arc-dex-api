@@ -168,7 +168,29 @@ export function providerPayload(payload, model) {
   const body = { ...(payload || {}), model, stream: false }
   delete body.stream_options
   delete body.streamOptions
+  applyArcoxToolRouting(body)
   return body
+}
+
+function applyArcoxToolRouting(body) {
+  if (!Array.isArray(body.tools) || !Array.isArray(body.messages)) return
+  if (body.tool_choice && body.tool_choice !== 'auto') return
+  const lastUserIndex = body.messages.findLastIndex(message => message?.role === 'user')
+  if (lastUserIndex < 0) return
+  const alreadyUsingTools = body.messages.slice(lastUserIndex + 1).some(message =>
+    message?.role === 'tool' || (message?.role === 'assistant' && Array.isArray(message?.tool_calls) && message.tool_calls.length > 0))
+  if (alreadyUsingTools) return
+  const prompt = messageText(body.messages[lastUserIndex]?.content).toLowerCase()
+  if (!/\b(?:swap|tukar)\b/.test(prompt)) return
+  const quoteSwap = body.tools.find(tool => /(?:^|_)arcox_quote_swap$/.test(String(tool?.function?.name || '')))
+  if (!quoteSwap?.function?.name) return
+  body.tool_choice = { type: 'function', function: { name: quoteSwap.function.name } }
+}
+
+function messageText(content) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content.map(item => typeof item === 'string' ? item : item?.type === 'text' ? item.text || '' : '').join(' ')
 }
 
 function selectProviders(payload = {}) {

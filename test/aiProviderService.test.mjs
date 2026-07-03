@@ -40,6 +40,41 @@ test('provider payload preserves the complete OpenAI tool surface', () => {
   assert.equal(result.parallel_tool_calls, true)
 })
 
+test('natural swap requests immediately select the ARCOX quote tool', () => {
+  const quoteTool = {
+    type: 'function',
+    function: {
+      name: 'mcp_arcox_arcox_quote_swap',
+      description: 'Quote an Arc swap',
+      parameters: { type: 'object', properties: {} },
+    },
+  }
+  const result = providerPayload({
+    messages: [{ role: 'user', content: 'swap 1 eurc ke usdc' }],
+    tools: [quoteTool, { type: 'function', function: { name: 'skill_view', parameters: { type: 'object' } } }],
+    tool_choice: 'auto',
+  }, 'openai/gpt-oss-120b')
+
+  assert.deepEqual(result.tool_choice, {
+    type: 'function',
+    function: { name: 'mcp_arcox_arcox_quote_swap' },
+  })
+})
+
+test('swap routing does not force the quote tool again after a tool result', () => {
+  const result = providerPayload({
+    messages: [
+      { role: 'user', content: 'swap 1 eurc ke usdc' },
+      { role: 'assistant', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'mcp_arcox_arcox_quote_swap', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_1', content: '{"previewId":"preview_1"}' },
+    ],
+    tools: [{ type: 'function', function: { name: 'mcp_arcox_arcox_quote_swap', parameters: { type: 'object' } } }],
+    tool_choice: 'auto',
+  }, 'openai/gpt-oss-120b')
+
+  assert.equal(result.tool_choice, 'auto')
+})
+
 test('tool requests fall back when the preferred provider rejects tool calling', async () => {
   Object.assign(process.env, {
     AI_PROVIDER_1_NAME: 'NO_TOOLS',
