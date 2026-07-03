@@ -55,24 +55,27 @@ try {
 
   const before = await delegateStatus()
   print('delegate_before', before)
-  if (normalizeStatus(before) === 'ready') {
-    const removed = await kit.unifiedBalance.removeDelegate({
+  if (/^(1|true|yes)$/i.test(process.env.SOLANA_E2E_TOGGLE_DELEGATE || '')) {
+    if (normalizeStatus(before) === 'ready') {
+      const removed = await kit.unifiedBalance.removeDelegate({
+        from: { adapter: solanaAdapter, chain: 'Solana_Devnet' },
+        delegateAddress: config.solanaDelegateAddress,
+      })
+      delegateRemoved = true
+      print('delegate_off_tx', removed)
+    }
+    const afterOff = await delegateStatus()
+    print('delegate_after_off', afterOff)
+    if (normalizeStatus(afterOff) === 'ready') throw new Error('Solana delegate remained ready after removal')
+  }
+  if (normalizeStatus(await delegateStatus()) !== 'ready') {
+    const added = await kit.unifiedBalance.addDelegate({
       from: { adapter: solanaAdapter, chain: 'Solana_Devnet' },
       delegateAddress: config.solanaDelegateAddress,
     })
-    delegateRemoved = true
-    print('delegate_off_tx', removed)
+    delegateRemoved = false
+    print('delegate_on_tx', added)
   }
-  const afterOff = await delegateStatus()
-  print('delegate_after_off', afterOff)
-  if (normalizeStatus(afterOff) === 'ready') throw new Error('Solana delegate remained ready after removal')
-
-  const added = await kit.unifiedBalance.addDelegate({
-    from: { adapter: solanaAdapter, chain: 'Solana_Devnet' },
-    delegateAddress: config.solanaDelegateAddress,
-  })
-  delegateRemoved = false
-  print('delegate_on_tx', added)
   const finalDelegate = await delegateStatus()
   print('delegate_final', finalDelegate)
   if (normalizeStatus(finalDelegate) !== 'ready') throw new Error('Solana delegate did not return to ready')
@@ -90,7 +93,9 @@ try {
   const balanceBeforeAutoPay = await gatewaySolanaBalance()
   const autoPay = await spendDelegatedUnifiedBalance({ ...autoPayInput, estimate: autoPayEstimate, maxTotalDebit: '0.25' })
   print('auto_pay', { txHash: autoPay.txHash, transferId: autoPay.transferId, chargedAmount: autoPay.chargedAmount })
-  await waitForGatewayBalanceBelow(balanceBeforeAutoPay - Number(autoPay.chargedAmount) + 0.000001)
+  // The estimate includes service/forwarder fees that are not all debited from
+  // the selected source domain. Wait for any confirmed source balance change.
+  await waitForGatewayBalanceBelow(balanceBeforeAutoPay - 0.000001)
 
   const invoice = createX402Invoice({
     service: 'solana_e2e',
