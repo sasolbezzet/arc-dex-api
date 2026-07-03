@@ -1,7 +1,7 @@
 import { AppKit } from '@circle-fin/app-kit'
-import { SolanaKitAdapter } from '@circle-fin/adapter-solana-kit'
+import { createSolanaKitAdapterFromProvider } from '@circle-fin/adapter-solana-kit'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
-import { address, createSolanaRpc, getBase64EncodedWireTransaction } from '@solana/kit'
+import { createSolanaRpc } from '@solana/kit'
 import { Keypair, VersionedTransaction } from '@solana/web3.js'
 import { privateKeyToAccount } from 'viem/accounts'
 import bs58 from 'bs58'
@@ -123,20 +123,24 @@ try {
 }
 
 function browserStyleSolanaAdapter(keypair) {
-  const signerAddress = address(keypair.publicKey.toBase58())
-  const signer = {
-    address: signerAddress,
-    signTransactions: async transactions => Promise.all(transactions.map(async transaction => {
-      const walletTransaction = VersionedTransaction.deserialize(Buffer.from(getBase64EncodedWireTransaction(transaction), 'base64'))
-      if (walletTransaction.message.staticAccountKeys[0].toBase58() !== keypair.publicKey.toBase58()) throw new Error('Browser signer fee payer mismatch')
+  const walletAddress = keypair.publicKey.toBase58()
+  const provider = {
+    address: walletAddress,
+    publicKey: keypair.publicKey,
+    isConnected: true,
+    connect: async () => ({ address: walletAddress, publicKey: keypair.publicKey }),
+    signTransaction: async encoded => {
+      const walletTransaction = VersionedTransaction.deserialize(Buffer.from(encoded, 'base64'))
+      if (walletTransaction.message.staticAccountKeys[0].toBase58() !== walletAddress) throw new Error('Browser signer fee payer mismatch')
       walletTransaction.sign([keypair])
-      return { [signerAddress]: walletTransaction.signatures[0] }
-    })),
+      return walletTransaction
+    },
   }
-  return new SolanaKitAdapter({
+  return createSolanaKitAdapterFromProvider({
+    provider,
     getRpc: () => createSolanaRpc(process.env.SOLANA_DEVNET_RPC || 'https://api.devnet.solana.com'),
-    getSigner: async () => signer,
-  }, { addressContext: 'user-controlled' })
+    capabilities: { addressContext: 'user-controlled' },
+  })
 }
 
 function parseSolanaKey(value = '') {
