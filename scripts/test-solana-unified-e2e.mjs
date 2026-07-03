@@ -1,7 +1,7 @@
 import { AppKit } from '@circle-fin/app-kit'
-import { createSolanaKitAdapterFromProvider } from '@circle-fin/adapter-solana-kit'
+import { SolanaKitAdapter } from '@circle-fin/adapter-solana-kit'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
-import { createSolanaRpc } from '@solana/kit'
+import { address, createSolanaRpc, getBase64EncodedWireTransaction } from '@solana/kit'
 import { Keypair, VersionedTransaction } from '@solana/web3.js'
 import { privateKeyToAccount } from 'viem/accounts'
 import bs58 from 'bs58'
@@ -87,8 +87,10 @@ try {
   }
   const autoPayEstimate = await estimateDelegatedUnifiedSpend(autoPayInput)
   print('auto_pay_estimate', { totalFee: autoPayEstimate.totalFee, totalDebit: autoPayEstimate.totalDebit })
+  const balanceBeforeAutoPay = await gatewaySolanaBalance()
   const autoPay = await spendDelegatedUnifiedBalance({ ...autoPayInput, estimate: autoPayEstimate, maxTotalDebit: '0.25' })
   print('auto_pay', { txHash: autoPay.txHash, transferId: autoPay.transferId, chargedAmount: autoPay.chargedAmount })
+  await waitForGatewayBalanceBelow(balanceBeforeAutoPay - Number(autoPay.chargedAmount) + 0.000001)
 
   const invoice = createX402Invoice({
     service: 'solana_e2e',
@@ -123,24 +125,20 @@ try {
 }
 
 function browserStyleSolanaAdapter(keypair) {
-  const walletAddress = keypair.publicKey.toBase58()
-  const provider = {
-    address: walletAddress,
-    publicKey: keypair.publicKey,
-    isConnected: true,
-    connect: async () => ({ address: walletAddress, publicKey: keypair.publicKey }),
-    signTransaction: async encoded => {
-      const walletTransaction = VersionedTransaction.deserialize(Buffer.from(encoded, 'base64'))
-      if (walletTransaction.message.staticAccountKeys[0].toBase58() !== walletAddress) throw new Error('Browser signer fee payer mismatch')
+  const signerAddress = address(keypair.publicKey.toBase58())
+  const signer = {
+    address: signerAddress,
+    signTransactions: async transactions => Promise.all(transactions.map(async transaction => {
+      const walletTransaction = VersionedTransaction.deserialize(Buffer.from(getBase64EncodedWireTransaction(transaction), 'base64'))
+      if (walletTransaction.message.staticAccountKeys[0].toBase58() !== keypair.publicKey.toBase58()) throw new Error('Browser signer fee payer mismatch')
       walletTransaction.sign([keypair])
-      return walletTransaction
-    },
+      return { [signerAddress]: walletTransaction.signatures[0] }
+    })),
   }
-  return createSolanaKitAdapterFromProvider({
-    provider,
+  return new SolanaKitAdapter({
     getRpc: () => createSolanaRpc(process.env.SOLANA_DEVNET_RPC || 'https://api.devnet.solana.com'),
-    capabilities: { addressContext: 'user-controlled' },
-  })
+    getSigner: async () => signer,
+  }, { addressContext: 'user-controlled' })
 }
 
 function parseSolanaKey(value = '') {
@@ -179,6 +177,15 @@ async function waitForGatewayBalance(minimum) {
     await new Promise(resolve => setTimeout(resolve, 2_000))
   }
   throw new Error(`Gateway balance did not reach ${minimum}`)
+}
+
+async function waitForGatewayBalanceBelow(maximum) {
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    const balance = await gatewaySolanaBalance()
+    if (balance <= maximum) return balance
+    await new Promise(resolve => setTimeout(resolve, 2_000))
+  }
+  throw new Error(`Gateway balance did not fall below ${maximum}`)
 }
 
 function print(step, value) {
