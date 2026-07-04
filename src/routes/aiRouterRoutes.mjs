@@ -387,6 +387,7 @@ export async function openAiChatCompletions(req, res) {
       memoTxHash: memoProof?.txHash || null,
       usageLog: log,
       providerUsed: meta.providerUsed,
+      providerModel: meta.providerModel,
       fallbackCount: meta.fallbackCount,
       toolsForwarded: meta.toolsForwarded || 0,
     },

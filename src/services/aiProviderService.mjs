@@ -12,6 +12,7 @@ export function configuredProviders() {
     const baseUrl = process.env[`AI_PROVIDER_${i}_BASE_URL`]
     const model = process.env[`AI_PROVIDER_${i}_MODEL`]
     const supportsTools = !/^(false|0|no)$/i.test(String(process.env[`AI_PROVIDER_${i}_SUPPORTS_TOOLS`] || 'true'))
+    const timeoutMs = positiveNumber(process.env[`AI_PROVIDER_${i}_TIMEOUT_MS`], process.env.AI_PROVIDER_TIMEOUT_MS || 45_000)
     const singleKey = process.env[`AI_PROVIDER_${i}_API_KEY`]
     const namedKeys = name ? process.env[`AI_PROVIDER_${name.toUpperCase()}_API_KEYS`] : ''
     const keys = [
@@ -27,6 +28,7 @@ export function configuredProviders() {
           apiKey,
           model,
           supportsTools,
+          timeoutMs,
         })
       })
     }
@@ -99,7 +101,7 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
   for (const provider of queue) {
     try {
       const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), Number(process.env.AI_PROVIDER_TIMEOUT_MS || 45_000))
+      const timeout = setTimeout(() => controller.abort(), provider.timeoutMs)
       const forwardedPayload = providerPayload(payload, provider.model)
       const response = await fetch(`${provider.baseUrl}/chat/completions`, {
         method: 'POST',
@@ -127,6 +129,7 @@ export async function callChatCompletionWithFallback(payload, options = {}) {
         throw err
       }
       validateProviderChatData(data, provider)
+      normalizeForcedArcoxToolCall(data, forwardedPayload)
       return {
         data,
         meta: {
@@ -187,6 +190,38 @@ function applyArcoxToolRouting(body) {
   body.tool_choice = { type: 'function', function: { name: quoteSwap.function.name } }
 }
 
+export function normalizeForcedArcoxToolCall(data, forwardedPayload) {
+  const forcedName = String(forwardedPayload?.tool_choice?.function?.name || '')
+  if (!/(?:^|_)arcox_quote_swap$/.test(forcedName)) return data
+  const lastUser = [...(forwardedPayload.messages || [])].reverse().find(message => message?.role === 'user')
+  const parsed = parseNaturalSwap(messageText(lastUser?.content))
+  if (!parsed) return data
+  const choice = data?.choices?.[0]
+  if (!choice?.message) return data
+  choice.message = {
+    role: 'assistant',
+    content: null,
+    tool_calls: [{
+      id: `call_arcox_quote_${Date.now().toString(36)}`,
+      type: 'function',
+      function: { name: forcedName, arguments: JSON.stringify(parsed) },
+    }],
+  }
+  choice.finish_reason = 'tool_calls'
+  return data
+}
+
+function parseNaturalSwap(content) {
+  const text = String(content || '').trim()
+  const match = text.match(/\b(?:swap|tukar)\s+(\d+(?:[.,]\d+)?)\s+([a-zA-Z][a-zA-Z0-9-]*)\s+(?:ke|to|for|menjadi)\s+([a-zA-Z][a-zA-Z0-9-]*)\b/i)
+  if (!match) return null
+  return {
+    tokenIn: match[2].toUpperCase(),
+    tokenOut: match[3].toUpperCase(),
+    amountIn: match[1].replace(',', '.'),
+  }
+}
+
 function messageText(content) {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
@@ -212,7 +247,13 @@ function selectProviders(payload = {}) {
     })
   }
   const candidates = providers.filter(provider => modelMatches(provider.model, requestedModel))
-  if (candidates.length) return candidates
+  if (candidates.length) {
+    if (!/^(true|1|yes)$/i.test(String(process.env.AI_ROUTER_ALLOW_MODEL_FALLBACK || 'false'))) return candidates
+    const fallback = providers
+      .filter(provider => !candidates.includes(provider) && (!toolsRequested || provider.supportsTools))
+      .sort((left, right) => Number(right.supportsTools) - Number(left.supportsTools))
+    return [...candidates, ...fallback]
+  }
   const err = new Error(`Model ${requestedModel} is not configured in ARCOX AI Router`)
   err.status = 400
   err.type = 'model_not_found'
@@ -236,6 +277,13 @@ function addPublicModel(models, id, owner) {
     created: 0,
     owned_by: owner,
   })
+}
+
+function positiveNumber(value, fallback) {
+  const parsed = Number(value)
+  if (Number.isFinite(parsed) && parsed >= 1_000) return parsed
+  const defaultValue = Number(fallback)
+  return Number.isFinite(defaultValue) && defaultValue >= 1_000 ? defaultValue : 45_000
 }
 
 const modelCache = new Map()
@@ -267,7 +315,7 @@ async function providerModels(provider) {
 }
 
 function shouldFallback(status, message = '', payload = {}) {
-  if ([0, 408, 429, 500, 502, 503, 504].includes(Number(status))) return true
+  if ([0, 401, 402, 403, 408, 429, 500, 502, 503, 504].includes(Number(status))) return true
   if (![400, 404, 415, 422].includes(Number(status))) return false
   if (!Array.isArray(payload?.tools) || payload.tools.length === 0) return false
   return /tool|function|parallel_tool_calls|tool_choice|unsupported|not supported|unknown field|invalid parameter/i.test(String(message || ''))

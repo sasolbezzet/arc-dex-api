@@ -10,7 +10,7 @@ for (let i = 1; i <= 8; i += 1) {
   delete process.env[`AI_PROVIDER_${i}_SUPPORTS_TOOLS`]
 }
 
-const { callChatCompletionWithFallback, providerPayload } = await import('../src/services/aiProviderService.mjs')
+const { callChatCompletionWithFallback, normalizeForcedArcoxToolCall, providerPayload } = await import('../src/services/aiProviderService.mjs')
 
 test('provider payload preserves the complete OpenAI tool surface', () => {
   const tools = Array.from({ length: 24 }, (_, index) => ({
@@ -75,6 +75,30 @@ test('swap routing does not force the quote tool again after a tool result', () 
   assert.equal(result.tool_choice, 'auto')
 })
 
+test('forced ARCOX quote produces concise deterministic tool arguments', () => {
+  const payload = providerPayload({
+    messages: [{ role: 'user', content: 'swap 1 eurc ke usdc' }],
+    tools: [{ type: 'function', function: { name: 'mcp_arcox_arcox_quote_swap', parameters: { type: 'object' } } }],
+    tool_choice: 'auto',
+  }, 'fallback-model')
+  const data = {
+    choices: [{
+      message: { role: 'assistant', content: 'Long internal instructions', reasoning_content: 'Long reasoning' },
+      finish_reason: 'length',
+    }],
+  }
+  normalizeForcedArcoxToolCall(data, payload)
+  assert.equal(data.choices[0].finish_reason, 'tool_calls')
+  assert.equal(data.choices[0].message.content, null)
+  assert.equal(data.choices[0].message.reasoning_content, undefined)
+  assert.equal(data.choices[0].message.tool_calls[0].function.name, 'mcp_arcox_arcox_quote_swap')
+  assert.deepEqual(JSON.parse(data.choices[0].message.tool_calls[0].function.arguments), {
+    tokenIn: 'EURC',
+    tokenOut: 'USDC',
+    amountIn: '1',
+  })
+})
+
 test('tool requests fall back when the preferred provider rejects tool calling', async () => {
   Object.assign(process.env, {
     AI_PROVIDER_1_NAME: 'NO_TOOLS',
@@ -115,5 +139,47 @@ test('tool requests fall back when the preferred provider rejects tool calling',
     assert.equal(result.meta.toolsForwarded, 1)
   } finally {
     globalThis.fetch = originalFetch
+  }
+})
+
+test('an explicitly requested model can fall back after a temporary provider failure', async () => {
+  Object.assign(process.env, {
+    AI_PROVIDER_1_NAME: 'PRIMARY',
+    AI_PROVIDER_1_BASE_URL: 'https://primary.test/v1',
+    AI_PROVIDER_1_MODEL: 'requested-model',
+    AI_PROVIDER_1_API_KEY: 'primary-key',
+    AI_PROVIDER_1_TIMEOUT_MS: '1000',
+    AI_PROVIDER_2_NAME: 'FALLBACK',
+    AI_PROVIDER_2_BASE_URL: 'https://fallback.test/v1',
+    AI_PROVIDER_2_MODEL: 'fallback-model',
+    AI_PROVIDER_2_API_KEY: 'fallback-key',
+    AI_ROUTER_ALLOW_MODEL_FALLBACK: 'true',
+  })
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), body: JSON.parse(init.body) })
+    if (String(url).includes('primary.test')) {
+      return new Response(JSON.stringify({ error: { message: 'temporarily unavailable' } }), { status: 503, headers: { 'content-type': 'application/json' } })
+    }
+    return new Response(JSON.stringify({
+      id: 'chatcmpl-fallback',
+      model: 'fallback-model',
+      choices: [{ message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  try {
+    const result = await callChatCompletionWithFallback({
+      model: 'requested-model',
+      messages: [{ role: 'user', content: 'reply OK' }],
+    })
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0].body.model, 'requested-model')
+    assert.equal(calls[1].body.model, 'fallback-model')
+    assert.equal(result.meta.providerModel, 'fallback-model')
+    assert.equal(result.meta.fallbackCount, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+    delete process.env.AI_ROUTER_ALLOW_MODEL_FALLBACK
   }
 })
