@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import { privateKeyToAccount } from 'viem/accounts'
 import { atomicWriteJsonFile, readJsonFile } from './jsonFileStore.mjs'
+import { treasuryAddress as configuredTreasuryAddress } from '../config/treasury.mjs'
 
 const DB_FILE = process.env.AI_ROUTER_DB || './ai-router-db.json'
 const state = globalThis.__arcoxAiRouterStore || load()
@@ -523,7 +524,7 @@ function validEvmAddress(value) {
 }
 
 export function treasuryAddress() {
-  return process.env.AI_ROUTER_TREASURY_ADDRESS || process.env.ARCOX_TREASURY_WALLET_ADDRESS || process.env.X402_RECIPIENT_ADDRESS || process.env.CIRCLE_X402_TREASURY_ADDRESS || ''
+  return configuredTreasuryAddress()
 }
 
 export function delegateAddress() {

@@ -1,8 +1,9 @@
-import { randomUUID, createHmac, timingSafeEqual } from 'crypto'
+import { createPublicKey, randomUUID, verify as verifySignature } from 'crypto'
 import { createPublicClient, http, parseAbiItem, formatUnits, keccak256, toHex, decodeEventLog } from 'viem'
 import { atomicWriteJsonFile, readJsonFile } from '../services/jsonFileStore.mjs'
 import { verifyAgentOwnership } from '../services/agentIdentityService.mjs'
 import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
+import { treasuryAddress } from '../config/treasury.mjs'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
@@ -20,6 +21,9 @@ const ARC_MEMO_CONTRACT = process.env.ARC_MEMO_CONTRACT || '0x5294E9927c3306DcBa
 const TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 value)')
 const MEMO_EVENT = parseAbiItem('event Memo(address indexed sender,address indexed target,bytes32 callDataHash,bytes32 indexed memoId,bytes memo,uint256 memoIndex)')
 const OPEN_STATUSES = new Set(['created', 'payment_required', 'estimate_ready', 'awaiting_signature', 'spend_submitted', 'settlement_pending', 'recovery_required', 'pending'])
+const CIRCLE_WEBHOOK_KEY_TTL_MS = 60 * 60 * 1000
+const circleWebhookPublicKeys = globalThis.__arcoxCircleWebhookPublicKeys || new Map()
+globalThis.__arcoxCircleWebhookPublicKeys = circleWebhookPublicKeys
 let loadedPersistentInvoices = false
 
 function loadPersistentInvoices() {
@@ -79,7 +83,7 @@ export function x402Config() {
     circleEnvironment: process.env.CIRCLE_ENV || 'testnet',
     circleBaseUrl: process.env.CIRCLE_BASE_URL || 'https://api-sandbox.circle.com',
     circleTreasuryWalletId: process.env.CIRCLE_X402_TREASURY_WALLET_ID || '',
-    circleTreasuryAddress: process.env.X402_RECIPIENT_ADDRESS || process.env.CIRCLE_X402_TREASURY_ADDRESS || process.env.ARCOX_TREASURY_WALLET_ADDRESS || '',
+    circleTreasuryAddress: treasuryAddress(),
     memoContract: ARC_MEMO_CONTRACT,
   }
 }
@@ -400,20 +404,47 @@ function isFinalCircleStatus(status) {
   return ['final', 'finalized', 'confirmed', 'complete', 'completed', 'success', 'succeeded'].includes(status)
 }
 
-export function verifyCircleWebhookSignature(req, rawBody) {
-  const secret = process.env.CIRCLE_WEBHOOK_SECRET || ''
-  if (!secret) return { ok: false, error: 'CIRCLE_WEBHOOK_SECRET is required' }
-  const signature = String(req.headers['circle-signature'] || req.headers['x-circle-signature'] || req.headers['circle-signature-sha256'] || '')
-  if (!signature) return { ok: false, error: 'Circle webhook signature required' }
-  const expected = createHmac('sha256', secret).update(rawBody).digest('hex')
-  const normalized = signature.replace(/^sha256=/i, '')
+async function circleWebhookPublicKey(keyId) {
+  const cached = circleWebhookPublicKeys.get(keyId)
+  if (cached && cached.expiresAt > Date.now()) return cached.key
+
+  const apiKey = String(process.env.CIRCLE_API_KEY || '').trim()
+  if (!apiKey) throw new Error('CIRCLE_API_KEY is required for Circle webhook verification')
+  const baseUrl = String(process.env.CIRCLE_BASE_URL || 'https://api-sandbox.circle.com').replace(/\/+$/, '')
+  const response = await fetch(`${baseUrl}/v2/notifications/publicKey/${encodeURIComponent(keyId)}`, {
+    headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+    signal: AbortSignal.timeout(8_000),
+  })
+  if (!response.ok) throw new Error(`Circle public-key lookup failed (${response.status})`)
+  const payload = await response.json()
+  const data = payload?.data || payload
+  if (data?.algorithm && data.algorithm !== 'ECDSA_SHA_256') throw new Error('Unsupported Circle webhook signature algorithm')
+  const encodedKey = String(data?.publicKey || '').trim()
+  if (!encodedKey) throw new Error('Circle public-key response is incomplete')
+
+  const key = encodedKey.includes('BEGIN PUBLIC KEY')
+    ? createPublicKey(encodedKey)
+    : createPublicKey({ key: Buffer.from(encodedKey, 'base64'), format: 'der', type: 'spki' })
+  if (circleWebhookPublicKeys.size >= 100) circleWebhookPublicKeys.delete(circleWebhookPublicKeys.keys().next().value)
+  circleWebhookPublicKeys.set(keyId, { key, expiresAt: Date.now() + CIRCLE_WEBHOOK_KEY_TTL_MS })
+  return key
+}
+
+export async function verifyCircleWebhookSignature(req, rawBody) {
+  const signature = String(req.headers['x-circle-signature'] || '').trim()
+  const keyId = String(req.headers['x-circle-key-id'] || '').trim()
+  if (!signature) return { ok: false, error: 'X-Circle-Signature header is required' }
+  if (!keyId) return { ok: false, error: 'X-Circle-Key-Id header is required' }
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(keyId)) return { ok: false, error: 'Invalid Circle webhook key ID' }
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(signature)) return { ok: false, error: 'Invalid Circle webhook signature format' }
   try {
-    const a = Buffer.from(expected, 'hex')
-    const b = Buffer.from(normalized, 'hex')
-    if (a.length !== b.length || !timingSafeEqual(a, b)) return { ok: false, error: 'Invalid Circle webhook signature' }
+    const key = await circleWebhookPublicKey(keyId)
+    const signatureBytes = Buffer.from(signature.replace(/-/g, '+').replace(/_/g, '/'), 'base64')
+    const ok = verifySignature('sha256', Buffer.from(rawBody), key, signatureBytes)
+    if (!ok) return { ok: false, error: 'Invalid Circle webhook signature' }
     return { ok: true }
-  } catch {
-    return { ok: false, error: 'Invalid Circle webhook signature format' }
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Circle webhook verification failed' }
   }
 }
 

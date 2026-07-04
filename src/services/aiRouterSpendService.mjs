@@ -5,6 +5,7 @@ import { createSolanaRpc } from '@solana/kit'
 import { Keypair } from '@solana/web3.js'
 import { privateKeyToAccount } from 'viem/accounts'
 import bs58 from 'bs58'
+import { treasuryAddress } from '../config/treasury.mjs'
 
 let kit
 let adapter
@@ -45,7 +46,7 @@ export function delegateConfig() {
   return {
     delegateAddress: firstValidAddress(process.env.AI_ROUTER_DELEGATE_ADDRESS, signer, process.env.CIRCLE_DELEGATE_ADDRESS),
     solanaDelegateAddress: solanaDelegateSignerAddress(),
-    recipient: firstValidAddress(process.env.AI_ROUTER_TREASURY_ADDRESS, process.env.ARCOX_TREASURY_WALLET_ADDRESS, process.env.X402_RECIPIENT_ADDRESS, process.env.CIRCLE_X402_TREASURY_ADDRESS),
+    recipient: firstValidAddress(treasuryAddress()),
     enabled: Boolean(delegatePrivateKey()),
     solanaEnabled: Boolean(solanaDelegatePrivateKey()),
   }

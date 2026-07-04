@@ -37,7 +37,7 @@ const aiInflight = new Set()
 const aiOwnerInflight = new Map()
 const aiKeyRateBuckets = new Map()
 
-router.get('/status', async (req, res) => {
+router.get('/status', requireOwnerQueryAuth, async (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
   try {
@@ -79,7 +79,7 @@ router.get('/delegate-status', async (req, res) => {
   }
 })
 
-router.get('/auto-pay/readiness', async (req, res) => {
+router.get('/auto-pay/readiness', requireOwnerQueryAuth, async (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
   if (!/^0x[a-f0-9]{40}$/.test(ownerAddress)) return res.status(400).json({ error: 'Valid ownerAddress is required' })
   try {
@@ -115,7 +115,7 @@ router.post('/auto-pay', requireOwnerAuth, (req, res) => {
   res.json({ ok: true, autoPay: setPolicy(ownerAddress, req.body || {}) })
 })
 
-router.get('/api-keys', (req, res) => {
+router.get('/api-keys', requireOwnerQueryAuth, (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
   res.json({ ok: true, apiKeys: listApiKeys(ownerAddress) })
@@ -175,7 +175,7 @@ router.get('/models', (_req, res) => {
   res.json({ ok: true, data: pricedModels(), object: 'list' })
 })
 
-router.get('/usage', (req, res) => {
+router.get('/usage', requireOwnerQueryAuth, (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
   const limit = Number(req.query.limit || 5)
@@ -592,6 +592,16 @@ function requireOwnerAuth(req, res, next) {
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
   const authAddress = verifyAuthToken(req)
   if (!authAddress || authAddress !== ownerAddress) return res.status(401).json({ error: 'Wallet authentication required for AI Router key and payment changes' })
+  next()
+}
+
+function requireOwnerQueryAuth(req, res, next) {
+  const ownerAddress = normalizeOwner(req.query?.ownerAddress)
+  if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
+  const authAddress = verifyAuthToken(req)
+  if (!authAddress || authAddress !== ownerAddress) {
+    return res.status(401).json({ error: 'Wallet authentication required for private AI Router data' })
+  }
   next()
 }
 

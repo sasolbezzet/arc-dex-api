@@ -18,6 +18,7 @@ import aiRouterRoutes, { openAiChatCompletions, openAiModels } from './src/route
 import { estimateUnifiedBalanceX402, getX402Invoice, markUnifiedBalanceSpendSubmitted, processCircleX402Webhook, publicInvoice, reconcileX402Invoice, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
 import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
+import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
 
 process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -55,7 +56,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.status(204).end()
   next()
 })
-app.use(['/api/webhooks/circle', '/api/circle/webhook'], express.raw({ type: '*/*', limit: '256kb' }))
+app.use(['/api/webhooks/circle', '/api/webhooks/circle-gateway', '/api/circle/webhook'], express.raw({ type: '*/*', limit: '256kb' }))
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || process.env.AI_ROUTER_JSON_BODY_LIMIT || '8mb'
 app.use(express.json({ limit: JSON_BODY_LIMIT }))
 
@@ -112,6 +113,10 @@ const arcTestnet = defineChain({
   rpcUrls: { default: { http: ['https://rpc.testnet.arc.network/'] } },
   blockExplorers: { default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' } },
 })
+const arcPublicClient = createPublicClient({
+  chain: arcTestnet,
+  transport: http(process.env.ARC_RPC_URL || process.env.RPC || arcTestnet.rpcUrls.default.http[0]),
+})
 
 const TOKENS = {
   cirBTC: '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF',
@@ -140,7 +145,7 @@ function swapTokenParam(token) {
 }
 
 const PLATFORM_FEE_BPS = Number(process.env.ARCOX_ROUTER_FEE_BPS || 30)
-const PLATFORM_TREASURY = process.env.ARCOX_FEE_TREASURY || '0xE34FF1D2C925DDafB28C95C2396fC49A6f64569e'
+const platformTreasury = () => requireTreasuryAddress()
 const ARC_APPKIT_ADAPTER = '0xBBD70b01a1CAbc96d5b7b129Ae1AAabdf50dd40b'
 const STABLECOIN_SERVICE_BASE_URL = 'https://api.circle.com'
 
@@ -224,6 +229,8 @@ const circleAdapter = createCircleWalletsAdapter({
   entitySecret: process.env.CIRCLE_ENTITY_SECRET,
 })
 const kit = new AppKit()
+
+for (const issue of treasuryConfigurationIssues()) console.warn(`[treasury] ${issue}`)
 
 function b64url(input) {
   return Buffer.from(input).toString('base64url')
@@ -392,7 +399,7 @@ function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount, customFee
       config: {
         customFee: {
           percentageBps: customFeeBps,
-          recipientAddress: normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY'),
+          recipientAddress: normalizeAddress(platformTreasury(), 'ARCOX_TREASURY_WALLET_ADDRESS'),
         },
       },
     } : {}),
@@ -763,7 +770,7 @@ function markInvoicePaid(invoiceId, input = {}) {
 async function verifyInvoicePaymentTx(invoice, input = {}) {
   const txHash = normalizeTxHash(input.txHash, 'txHash')
   const payerAddress = input.payerAddress ? normalizeAddress(input.payerAddress, 'payerAddress') : ''
-  const receipt = await publicClient.getTransactionReceipt({ hash: txHash }).catch(() => null)
+  const receipt = await arcPublicClient.getTransactionReceipt({ hash: txHash }).catch(() => null)
   if (!receipt) throw new Error('Payment transaction receipt not found')
   if (receipt.status !== 'success') throw new Error('Payment transaction failed on-chain')
   const expectedAmount = decimalToUnits(invoice.amount, 6)
@@ -928,6 +935,10 @@ async function processCircleGatewayWebhook(payload = {}) {
   }
   const mapped = statusMap[fields.eventType]
   if (mapped && target.status !== 'paid') {
+    if (mapped.status === 'paid') {
+      if (!fields.txHash) throw new Error('Finalized Gateway webhook is missing a transaction hash')
+      await verifyInvoicePaymentTx(target, { txHash: fields.txHash })
+    }
     target.status = mapped.status
     if (fields.txHash) target.txHash = fields.txHash
     if (mapped.status === 'paid') target.paidAt = target.paidAt || nowIso()
@@ -1406,7 +1417,7 @@ app.post('/api/eoa-swap-quote', apiLimiter, requireAuth, async (req, res) => {
         bps: platformFee.feeBps,
         amount: platformFee.feeAmount,
         token: tokenIn,
-        treasury: PLATFORM_TREASURY,
+        treasury: platformTreasury(),
         swapAmountIn: platformFee.netAmount,
       },
       rate: Number(amountOut || 0) / Number(safeAmount || 1),
@@ -1449,7 +1460,7 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
         bps: platformFee.feeBps,
         amount: developerFeeAmount,
         token: developerFeeToken,
-        treasury: normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY'),
+        treasury: normalizeAddress(platformTreasury(), 'ARCOX_TREASURY_WALLET_ADDRESS'),
         collectedBy: 'swap-adapter',
       },
     })
@@ -1490,7 +1501,7 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
           bps: platformFee.feeBps,
           amount: platformFee.feeAmount,
           token: tokenIn,
-          treasury: PLATFORM_TREASURY,
+          treasury: platformTreasury(),
           swapAmountIn: platformFee.netAmount,
         },
         rate: Number(estimate.estimatedOutput?.amount || 0) / Number(safeAmount || 1),
@@ -1545,7 +1556,7 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
     })
     let feeResult = null
     let feeError = ''
-    const treasury = normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY')
+    const treasury = normalizeAddress(platformTreasury(), 'ARCOX_TREASURY_WALLET_ADDRESS')
     if (platformFee.feeUnits > 0n) {
       try {
         feeResult = await kit.send({
@@ -1845,7 +1856,7 @@ app.post('/api/send-estimate', apiLimiter, requireAuth, async (req, res) => {
         bps: platformFee.feeBps,
         amount: platformFee.feeAmount,
         token,
-        treasury: normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY'),
+        treasury: normalizeAddress(platformTreasury(), 'ARCOX_TREASURY_WALLET_ADDRESS'),
       },
       grossAmount: safeAmount,
       recipientReceives: platformFee.netAmount,
@@ -1870,7 +1881,7 @@ app.post('/api/send', apiLimiter, requireAuth, async (req, res) => {
     const wallet = await getOrCreateWallet(owner)
     const fromCtx = { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address }
     const platformFee = splitPlatformFee(safeAmount, token)
-    const treasury = normalizeAddress(PLATFORM_TREASURY, 'ARCOX_FEE_TREASURY')
+    const treasury = normalizeAddress(platformTreasury(), 'ARCOX_TREASURY_WALLET_ADDRESS')
     let feeResult = null
     if (platformFee.feeUnits > 0n) {
       feeResult = await kit.send({ from: fromCtx, to: treasury, amount: platformFee.feeAmount, token: resolvedToken })
@@ -1931,8 +1942,15 @@ app.get('/api/invoices/:invoiceId', apiLimiter, async (req, res) => {
   }
 })
 
-app.patch('/api/invoices/:invoiceId', apiLimiter, async (req, res) => {
+app.patch('/api/invoices/:invoiceId', apiLimiter, requireAuth, async (req, res) => {
   try {
+    const invoice = getInvoiceOrThrow(req.params.invoiceId)
+    if (invoice.merchantAddress.toLowerCase() !== req.authAddress) {
+      return res.status(403).json({ error: 'Only the authenticated merchant can update this invoice' })
+    }
+    if (req.body?.status === 'paid' || req.body?.txHash || req.body?.payerAddress) {
+      return res.status(403).json({ error: 'Payment fields can only be updated by verified on-chain settlement' })
+    }
     res.json(patchInvoice(req.params.invoiceId, req.body || {}))
   } catch(e) {
     res.status(400).json({ error: e.message })
@@ -1998,7 +2016,7 @@ app.get('/api/circle/webhook', (_req, res) => {
 app.post('/api/circle/webhook', apiLimiter, async (req, res) => {
   const rawBody = rawWebhookBody(req)
   const payload = parseWebhookJson(rawBody)
-  const verification = verifyCircleWebhookSignature(req, rawBody)
+  const verification = await verifyCircleWebhookSignature(req, rawBody)
   if (!verification.ok) return res.status(401).json({ ok: false, provider: 'circle', error: verification.error })
   const result = processCircleX402Webhook(payload)
   res.json({
@@ -2023,12 +2041,8 @@ app.post('/api/circle/webhook', apiLimiter, async (req, res) => {
 app.post('/api/webhooks/circle', apiLimiter, async (req, res) => {
   const rawBody = rawWebhookBody(req)
   const payload = parseWebhookJson(rawBody)
-
-  const verifyWebhook = String(process.env.CIRCLE_VERIFY_WEBHOOK || 'false').toLowerCase() === 'true'
-  if (verifyWebhook) {
-    const verification = verifyCircleWebhookSignature(req, rawBody)
-    if (!verification.ok) return res.status(401).json({ ok: false, provider: 'circle', product: 'gateway', error: verification.error })
-  }
+  const verification = await verifyCircleWebhookSignature(req, rawBody)
+  if (!verification.ok) return res.status(401).json({ ok: false, provider: 'circle', product: 'gateway', error: verification.error })
 
   const fields = extractCircleGatewayFields(payload)
   const saved = saveGenericWebhookEvent('circle-gateway', fields.eventId || `circle_${Date.now()}`, fields.eventType || 'gateway.unknown', payload, {
@@ -2062,8 +2076,10 @@ app.post('/api/webhooks/circle', apiLimiter, async (req, res) => {
 
 app.post('/api/webhooks/circle-gateway', apiLimiter, async (req, res) => {
   try {
-    // TODO: verify Circle Gateway webhook signature once Circle webhook secret/header format is configured.
-    const result = await processCircleGatewayWebhook(req.body || {})
+    const rawBody = rawWebhookBody(req)
+    const verification = await verifyCircleWebhookSignature(req, rawBody)
+    if (!verification.ok) return res.status(401).json({ ok: false, provider: 'circle', product: 'gateway', error: verification.error })
+    const result = await processCircleGatewayWebhook(parseWebhookJson(rawBody))
     res.json({ ok: true, ...result })
   } catch(e) {
     res.status(400).json({ ok: false, error: e.message })

@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { randomUUID } from 'crypto'
+import { solanaTreasuryAddress, treasuryAddress } from '../config/treasury.mjs'
 
 const router = Router()
 const ledger = globalThis.__arcoxTreasuryLedger || { deposits: [], spends: [], settlements: [] }
@@ -13,7 +14,8 @@ function cfg() {
     chainId: Number(process.env.ARC_CHAIN_ID || 5042002),
     asset: 'USDC',
     decimals: 6,
-    treasuryWallet: process.env.ARCOX_TREASURY_WALLET_ADDRESS || process.env.ARCOX_TREASURY_WALLET || '',
+    treasuryWallet: treasuryAddress(),
+    solanaTreasuryWallet: solanaTreasuryAddress(),
     destinationWallet: process.env.DESTINATION_WALLET_ADDRESS || '',
     feeRouter: process.env.ARCOX_FEE_ROUTER_ADDRESS || '',
     feeRecipient: process.env.ARCOX_FEE_RECIPIENT || '',
@@ -21,6 +23,13 @@ function cfg() {
     maxFeeBps: 500,
     label: 'real testnet - Unified Balance is a USDC routing layer, not a third wallet.',
   }
+}
+
+function requireDevTools(_req, res, next) {
+  if (String(process.env.ENABLE_DEV_TOOLS || 'false').toLowerCase() !== 'true') {
+    return res.status(404).json({ error: 'Not found' })
+  }
+  next()
 }
 
 router.get('/status', (_req, res) => {
@@ -56,13 +65,13 @@ router.post('/quote-settlement', (req, res) => {
   })
 })
 
-router.post('/simulate-settlement', (req, res) => {
+router.post('/simulate-settlement', requireDevTools, (req, res) => {
   const rec = { id: `settle_${randomUUID().slice(0, 8)}`, createdAt: new Date().toISOString(), mode: 'testnet-ledger', status: 'settlement_pending', ...req.body }
   ledger.settlements.push(rec)
   res.json({ ok: true, settlement: rec, config: cfg() })
 })
 
-router.post('/unified-balance/deposit', (req, res) => {
+router.post('/unified-balance/deposit', requireDevTools, (req, res) => {
   const rec = { id: `ub_dep_${randomUUID().slice(0, 8)}`, createdAt: new Date().toISOString(), mode: 'real-testnet-intent', asset: 'USDC', status: 'awaiting_signature', ...req.body }
   ledger.deposits.push(rec)
   res.json({ ok: true, deposit: rec, note: 'Use Circle AppKit deposit/spend in the frontend wallet session; backend records intent only.' })
@@ -89,7 +98,7 @@ router.post('/unified-balance/estimate-spend', (req, res) => {
   })
 })
 
-router.post('/unified-balance/spend', (req, res) => {
+router.post('/unified-balance/spend', requireDevTools, (req, res) => {
   const rec = { id: `ub_spend_${randomUUID().slice(0, 8)}`, createdAt: new Date().toISOString(), mode: 'real-testnet-ledger', asset: 'USDC', status: 'settlement_pending', ...req.body }
   ledger.spends.push(rec)
   res.json({ ok: true, spend: rec, note: 'Spend submitted. Wait for on-chain transfer or Circle webhook before marking paid.' })
