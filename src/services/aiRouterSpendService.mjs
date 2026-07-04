@@ -107,7 +107,7 @@ export async function estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourc
   const allowed = new Set(sourceChains.length ? sourceChains : ['Arc_Testnet'])
   const candidates = GATEWAY_CHAINS
     .filter(item => allowed.has(item.chain) && (balances.get(item.domain) || 0n) > 0n)
-    .sort((left, right) => sourcePriority(left.chain) - sourcePriority(right.chain))
+    .sort((left, right) => sourcePriority(left.chain, destinationChain) - sourcePriority(right.chain, destinationChain))
   let lastError
   for (const candidate of candidates) {
     try {
@@ -241,8 +241,9 @@ function delegatedSources(sourceAccount, solanaSourceAccount, allocations) {
   return sources
 }
 
-function sourcePriority(chain) {
-  return ({ Base_Sepolia: 0, Arbitrum_Sepolia: 1, Arc_Testnet: 2, Ethereum_Sepolia: 3, Solana_Devnet: 4 })[chain] ?? 9
+function sourcePriority(chain, destinationChain = 'Arc_Testnet') {
+  if (chain === destinationChain) return 0
+  return ({ Base_Sepolia: 1, Arbitrum_Sepolia: 2, Ethereum_Sepolia: 3, Solana_Devnet: 4, Arc_Testnet: 5 })[chain] ?? 9
 }
 
 async function gatewayRequest(path, body) {
