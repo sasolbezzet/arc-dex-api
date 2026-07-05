@@ -146,7 +146,7 @@ export async function spendDelegatedUnifiedBalance({ sourceAccount, solanaSource
     try {
       result = await getKit().unifiedBalance.spend({
         from: delegatedSources(sourceAccount, solanaSourceAccount, allocations),
-        to: { chain: destinationChain, recipientAddress: recipient, useForwarder: true },
+        to: delegatedDestination(destinationChain, recipient),
         amount: spendAmount,
         token: 'USDC',
       })
@@ -181,7 +181,7 @@ async function estimateForSources({ sourceAccount, solanaSourceAccount, receiveU
   const sourceAllocations = await delegatedAllocations(sourceAccount, solanaSourceAccount, spendAmount, sourceChains, balances)
   const estimate = await getKit().unifiedBalance.estimateSpend({
     from: delegatedSources(sourceAccount, solanaSourceAccount, sourceAllocations),
-    to: { chain: destinationChain, recipientAddress: recipient, useForwarder: true },
+    to: delegatedDestination(destinationChain, recipient),
     amount: spendAmount,
     token: 'USDC',
   })
@@ -240,6 +240,14 @@ function delegatedSources(sourceAccount, solanaSourceAccount, allocations) {
     sources.push({ adapter: getSolanaAdapter(), sourceAccount: solanaSourceAccount, allocations: solanaAllocations })
   }
   return sources
+}
+
+export function delegatedDestination(destinationChain, recipient, destinationAdapter = getAdapter()) {
+  return {
+    adapter: destinationAdapter,
+    chain: destinationChain,
+    recipientAddress: recipient,
+  }
 }
 
 function sourcePriority(chain, destinationChain = 'Arc_Testnet') {
