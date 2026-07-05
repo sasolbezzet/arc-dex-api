@@ -19,8 +19,8 @@ function cfg() {
     destinationWallet: process.env.DESTINATION_WALLET_ADDRESS || '',
     feeRouter: process.env.ARCOX_FEE_ROUTER_ADDRESS || '',
     feeRecipient: process.env.ARCOX_FEE_RECIPIENT || '',
-    feeBps: Math.min(Number(process.env.ARCOX_FEE_BPS || 50), 500),
-    maxFeeBps: 500,
+    feeBps: Math.min(Number(process.env.ARCOX_ROUTER_FEE_BPS || process.env.ARCOX_FEE_BPS || 30), 1_000),
+    maxFeeBps: 1_000,
     label: 'real testnet - Unified Balance is a USDC routing layer, not a third wallet.',
   }
 }
