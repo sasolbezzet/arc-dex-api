@@ -1139,16 +1139,19 @@ app.post('/api/wallet', apiLimiter, requireAuth, async (req, res) => {
 app.get('/api/balance/:address', async (req, res) => {
   try {
     const target = normalizeAddress(req.params.address, 'address')
-    const client = createPublicClient({ chain: arcTestnet, transport: http() })
-    const result = {}
-    for (const [sym, addr] of Object.entries(TOKENS)) {
-      try {
-        const bal = await client.readContract({ address: addr, abi: erc20Abi, functionName: 'balanceOf', args: [target] })
-        result[sym] = formatUnits(bal, TOKEN_DECIMALS[sym] || 6)
-      } catch { result[sym] = '0' }
-    }
-    res.json(result)
-  } catch(e) { res.status(500).json({ error: e.message }) }
+    const client = createPublicClient({
+      chain: arcTestnet,
+      transport: http(process.env.ARC_RPC_URL || process.env.RPC || arcTestnet.rpcUrls.default.http[0], { retryCount: 1, timeout: 10_000 }),
+    })
+    const entries = await Promise.all(Object.entries(TOKENS).map(async ([sym, addr]) => {
+      const bal = await client.readContract({ address: addr, abi: erc20Abi, functionName: 'balanceOf', args: [target] })
+      return [sym, formatUnits(bal, TOKEN_DECIMALS[sym] || 6)]
+    }))
+    res.json(Object.fromEntries(entries))
+  } catch(e) {
+    console.error('[balance]', e.message)
+    res.status(503).json({ error: 'Arc RPC balance lookup failed. Existing balance was kept.' })
+  }
 })
 
 const GATEWAY_TESTNET_API = 'https://gateway-api-testnet.circle.com'
