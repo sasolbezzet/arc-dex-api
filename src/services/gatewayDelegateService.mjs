@@ -7,7 +7,7 @@ const STATUS_ABI = parseAbi([
 ])
 
 const CHAINS = {
-  Arc_Testnet: chainConfig(5042002, 'Arc Testnet', 'USDC', 26, 'ARC', 'Testnet', '0x3600000000000000000000000000000000000000', 'ARC_RPC_URL', 'https://rpc.testnet.arc.network/'),
+  Arc_Testnet: chainConfig(5042002, 'Arc Testnet', 'USDC', 26, 'ARC', 'Testnet', '0x3600000000000000000000000000000000000000', 'ARC_RPC_URL', 'https://arc-testnet.drpc.org'),
   Ethereum_Sepolia: chainConfig(11155111, 'Ethereum Sepolia', 'ETH', 0, 'Ethereum', 'Sepolia', '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', 'ETHEREUM_SEPOLIA_RPC', 'https://ethereum-sepolia-rpc.publicnode.com'),
   Base_Sepolia: chainConfig(84532, 'Base Sepolia', 'ETH', 6, 'Base', 'Sepolia', '0x036CbD53842c5426634e7929541eC2318f3dCF7e', 'BASE_SEPOLIA_RPC', 'https://sepolia.base.org'),
   Arbitrum_Sepolia: chainConfig(421614, 'Arbitrum Sepolia', 'ETH', 3, 'Arbitrum', 'Sepolia', '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d', 'ARBITRUM_SEPOLIA_RPC', ['https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com']),

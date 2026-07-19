@@ -47,7 +47,7 @@ export async function submitAgentMemoProof(input = {}) {
   const chain = defineChain({
     id: Number(process.env.ARC_CHAIN_ID || 5042002), name: 'Arc Testnet',
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-    rpcUrls: { default: { http: [process.env.ARC_RPC_URL || process.env.RPC || 'https://rpc.testnet.arc.network/'] } },
+    rpcUrls: { default: { http: [process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'] } },
   })
   const transport = http(chain.rpcUrls.default.http[0], { timeout: 12_000, retryCount: 1 })
   const wallet = createWalletClient({ account, chain, transport })

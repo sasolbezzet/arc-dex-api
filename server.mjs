@@ -106,16 +106,17 @@ const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS || 24 * 60 * 60 * 1000)
 const LOGIN_WINDOW_MS = 5 * 60 * 1000
 if (!process.env.AUTH_SECRET) console.warn('[security] AUTH_SECRET not set. Set a dedicated random AUTH_SECRET before production.')
 
+const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'
 const arcTestnet = defineChain({
   id: 5042002,
   name: 'Arc Testnet',
   nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-  rpcUrls: { default: { http: ['https://rpc.testnet.arc.network/'] } },
+  rpcUrls: { default: { http: ['https://arc-testnet.drpc.org'] } },
   blockExplorers: { default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' } },
 })
 const arcPublicClient = createPublicClient({
   chain: arcTestnet,
-  transport: http(process.env.ARC_RPC_URL || process.env.RPC || arcTestnet.rpcUrls.default.http[0]),
+  transport: http(ARC_RPC_URL),
 })
 
 const TOKENS = {
@@ -1122,6 +1123,29 @@ app.post('/api/auth/session', authLimiter, async (req, res) => {
   } catch(e) {
     console.error('[auth]', e.message)
     res.status(400).json({ error: e.message })
+  }
+})
+
+app.post('/api/rpc/arc', apiLimiter, async (req, res) => {
+  try {
+    const request = req.body
+    const requests = Array.isArray(request) ? request : [request]
+    if (!requests.length || requests.length > 20 || requests.some(item => !item || item.jsonrpc !== '2.0' || typeof item.method !== 'string' || !Array.isArray(item.params))) {
+      return res.status(400).json({ error: 'Invalid JSON-RPC request' })
+    }
+    const upstream = await fetch(ARC_RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+      signal: AbortSignal.timeout(10_000),
+    })
+    const responseBody = await upstream.text()
+    if (!upstream.ok) return res.status(502).json({ error: 'Arc RPC upstream failed' })
+    res.setHeader('Cache-Control', 'no-store')
+    res.type('application/json').send(responseBody)
+  } catch (error) {
+    console.error('[arc-rpc]', error.message)
+    res.status(502).json({ error: 'Arc RPC unavailable' })
   }
 })
 

@@ -11,7 +11,7 @@ const chain = defineChain({
   id: 5042002,
   name: 'Arc Testnet',
   nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-  rpcUrls: { default: { http: [process.env.ARC_RPC_URL || process.env.RPC || 'https://rpc.testnet.arc.network/'] } },
+  rpcUrls: { default: { http: [process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'] } },
 })
 
 function config() {
@@ -19,7 +19,7 @@ function config() {
   if (!/^0x[a-fA-F0-9]{40}$/.test(address)) throw new Error('ARCOX_API_PASS_ADDRESS is not configured')
   return {
     address: getAddress(address),
-    client: createPublicClient({ chain, transport: http(process.env.ARC_RPC_URL || process.env.RPC || 'https://rpc.testnet.arc.network/') }),
+    client: createPublicClient({ chain, transport: http(process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org') }),
   }
 }
 

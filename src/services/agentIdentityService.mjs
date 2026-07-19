@@ -15,7 +15,7 @@ function client() {
     id: Number(process.env.ARC_CHAIN_ID || 5042002),
     name: 'Arc Testnet',
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-    rpcUrls: { default: { http: [process.env.ARC_RPC_URL || process.env.RPC || 'https://rpc.testnet.arc.network/'] } },
+    rpcUrls: { default: { http: [process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'] } },
   })
   return createPublicClient({ chain, transport: http(chain.rpcUrls.default.http[0], { timeout: 10_000, retryCount: 1 }) })
 }

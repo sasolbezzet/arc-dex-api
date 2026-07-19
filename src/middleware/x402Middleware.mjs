@@ -204,7 +204,7 @@ export async function reconcileX402Invoice(id) {
       scheduleAgentMemoProof(invoice)
       return invoice
     }
-    const rpc = process.env.ARC_RPC_URL || process.env.RPC || 'https://rpc.testnet.arc.network/'
+    const rpc = process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'
     const client = createPublicClient({ transport: http(rpc, { timeout: 10_000, retryCount: 1 }) })
     const current = await client.getBlockNumber()
     const lookback = BigInt(Number(process.env.X402_RECONCILE_LOOKBACK_BLOCKS || '25000'))
