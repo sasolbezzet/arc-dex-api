@@ -10,7 +10,8 @@ Backend retail proxy untuk ARCOX DEX.
 - Circle Gateway webhook foundation dan dev simulator.
 - Eco route preview untuk future cross-chain stablecoin invoice.
 - x402 middleware untuk premium API endpoint memakai real Arc Testnet USDC invoice.
-- Arc Transaction Memo reconciliation untuk x402 payment.
+- Arc Transaction Memo reconciliation untuk x402 payment dengan chunked `eth_getLogs` (8k block range per request) untuk menghormati batas 10k RPC.
+- Reconcile invoice yang sudah `expired` tetap diproses jika ada bukti pembayaran on-chain (memo transfer atau Gateway record).
 - `wallets-db.json` sebagai mapping owner ke Circle wallet proxy.
 - `tx-history-db.json` sebagai history transaksi web UI dan agent.
 - `invoices-db.json` sebagai invoice/payment request runtime storage.
@@ -170,6 +171,8 @@ X402_CHAIN_ID=5042002
 X402_USDC_ADDRESS=0x3600000000000000000000000000000000000000
 X402_BASE_AMOUNT=0.005
 X402_PAYMENT_TTL_SECONDS=300
+X402_RECONCILE_LOOKBACK_BLOCKS=8000
+ARC_RPC_URL=https://rpc.testnet.arc.network
 CIRCLE_X402_TREASURY_WALLET_ID=
 CIRCLE_X402_NETWORK=arc-testnet
 ARC_MEMO_CONTRACT=0x5294E9927c3306DcBaDb03fe70b92e01cCede505
@@ -198,6 +201,14 @@ yang sudah ter-deploy menyimpan treasury on-chain; owner juga harus memanggil
 4. Bayar exact Arc USDC via wallet memo.
 5. Cek invoice status sampai `paid`.
 6. Retry Intel request memakai `X-PAYMENT-ID`.
+
+Catatan teknis:
+
+- RPC `rpc.testnet.arc.network` adalah RPC publik yang sinkron dan direkomendasikan. Jangan pakai `arc-node.thecanteenapp.com` karena tertinggal ~1 blok dan menyebabkan nonce konflik.
+- `eth_getLogs` pada RPC publik dibatasi 10,000 block range per request. Backend memecah lookback menjadi chunk 8,000 block untuk menghindari error.
+- Invoice yang sudah `expired` tetap di-reconcile jika ada bukti pembayaran on-chain (memo atau Gateway). Ini mencegah dana terkunci saat TTL 300 detik berlalu sebelum reconcile sempat berjalan.
+- PM2 membutuhkan `--update-env` setelah mengubah `.env` agar env baru dimuat. Tanpa ini, process restart dengan env lama.
+- Hati-hati zombie process: pastikan tidak ada process lama yang masih mendengarkan di port 3001 sebelum start backend baru.
 # ARCOX API keys
 
 AI Router uses standard `arx_sk_...` bearer keys with the OpenAI-compatible production base URL. Keys are shown once, stored only as hashes, and can be revoked from the connected owner wallet.
