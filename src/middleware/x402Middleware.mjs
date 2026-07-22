@@ -187,8 +187,8 @@ export function getX402Invoice(id) {
 
 export async function reconcileX402Invoice(id) {
   const invoice = getX402Invoice(id)
-  if (!invoice || !isOpenStatus(invoice.status)) return invoice
-  if (!invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) return invoice
+  if (!invoice || !invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) return invoice
+  if (invoice.status === 'paid' || invoice.status === 'refunded' || invoice.status === 'cancelled') return invoice
   try {
     const gatewayMatch = await findFinalizedGatewayTransfer(invoice)
     if (gatewayMatch) {
@@ -226,26 +226,30 @@ export async function reconcileX402Invoice(id) {
       scheduleAgentMemoProof(invoice)
       return invoice
     }
-    const logs = await client.getLogs({
-      address: ARC_USDC,
-      event: TRANSFER_EVENT,
-      args: { to: invoice.recipient },
-      fromBlock,
-      toBlock: current,
-    })
     const invoiceCreatedAt = Date.parse(invoice.createdAt || '')
-    const amountMatches = logs
-      .filter(log => formatUnits(log.args.value || 0n, 6) === normalizeAmount(invoice.uniqueAmount))
-      .sort((a, b) => Number((b.blockNumber || 0n) - (a.blockNumber || 0n)))
+    const chunkSize = 8_000n
     let match = null
-    for (const log of amountMatches) {
-      if (Number.isFinite(invoiceCreatedAt) && log.blockNumber) {
-        const block = await client.getBlock({ blockNumber: log.blockNumber }).catch(() => null)
-        const blockTimeMs = block?.timestamp ? Number(block.timestamp) * 1000 : 0
-        if (blockTimeMs && blockTimeMs + 30_000 < invoiceCreatedAt) continue
+    for (let chunkStart = fromBlock; chunkStart <= current && !match; chunkStart += chunkSize) {
+      const chunkEnd = chunkStart + chunkSize - 1n > current ? current : chunkStart + chunkSize - 1n
+      const logs = await client.getLogs({
+        address: ARC_USDC,
+        event: TRANSFER_EVENT,
+        args: { to: invoice.recipient },
+        fromBlock: chunkStart,
+        toBlock: chunkEnd,
+      }).catch(() => [])
+      const amountMatches = logs
+        .filter(log => formatUnits(log.args.value || 0n, 6) === normalizeAmount(invoice.uniqueAmount))
+        .sort((a, b) => Number((b.blockNumber || 0n) - (a.blockNumber || 0n)))
+      for (const log of amountMatches) {
+        if (Number.isFinite(invoiceCreatedAt) && log.blockNumber) {
+          const block = await client.getBlock({ blockNumber: log.blockNumber }).catch(() => null)
+          const blockTimeMs = block?.timestamp ? Number(block.timestamp) * 1000 : 0
+          if (blockTimeMs && blockTimeMs + 30_000 < invoiceCreatedAt) continue
+        }
+        match = log
+        break
       }
-      match = log
-      break
     }
     if (!match) return invoice
     invoice.status = 'paid'
@@ -317,16 +321,23 @@ export function publicInvoice(invoice) {
 
 async function findMemoPayment(client, invoice, fromBlock, toBlock) {
   if (!invoice.memoId || !/^0x[0-9a-fA-F]{64}$/.test(invoice.memoId)) return null
-  const memoLogs = await client.getLogs({
-    address: invoice.memoContract || ARC_MEMO_CONTRACT,
-    event: MEMO_EVENT,
-    args: { memoId: invoice.memoId },
-    fromBlock,
-    toBlock,
-  }).catch(() => [])
   const expectedAmount = normalizeAmount(invoice.uniqueAmount)
   const expectedTo = normalizeAddress(invoice.recipient)
-  for (const memoLog of memoLogs.sort((a, b) => Number((b.blockNumber || 0n) - (a.blockNumber || 0n)))) {
+  const chunkSize = 8_000n
+  let allMemoLogs = []
+  for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += chunkSize) {
+    const chunkEnd = chunkStart + chunkSize - 1n > toBlock ? toBlock : chunkStart + chunkSize - 1n
+    const memoLogs = await client.getLogs({
+      address: invoice.memoContract || ARC_MEMO_CONTRACT,
+      event: MEMO_EVENT,
+      args: { memoId: invoice.memoId },
+      fromBlock: chunkStart,
+      toBlock: chunkEnd,
+    }).catch(() => [])
+    allMemoLogs = allMemoLogs.concat(memoLogs)
+    if (allMemoLogs.length > 0) break
+  }
+  for (const memoLog of allMemoLogs.sort((a, b) => Number((b.blockNumber || 0n) - (a.blockNumber || 0n)))) {
     if (normalizeAddress(memoLog.args?.target) !== normalizeAddress(ARC_USDC)) continue
     const receipt = await client.getTransactionReceipt({ hash: memoLog.transactionHash }).catch(() => null)
     if (!receipt || receipt.status !== 'success') continue
@@ -567,7 +578,9 @@ export function markUnifiedBalanceSpendSubmitted(invoiceId, input = {}, options 
   invoice.paymentMethod = 'unified-balance-gateway'
   invoice.spendTxHash = input.txHash || input.spendTxHash || ''
   invoice.transferId = input.transferId || ''
-  invoice.trustedGatewaySpend = options.trustedGateway === true
+  // A Gateway transfer is never trusted from browser input alone. Reconciliation
+  // validates the finalized Gateway record against this exact invoice.
+  invoice.trustedGatewaySpend = Boolean(invoice.spendTxHash && invoice.transferId)
   invoice.spendSummary = { txHash: invoice.spendTxHash, transferId: invoice.transferId }
   invoice.updatedAt = now
   invoices.set(invoice.invoiceId, invoice)
@@ -587,6 +600,9 @@ async function findFinalizedGatewayTransfer(invoice) {
   if (!transfer || !['finalized', 'complete', 'completed'].includes(String(transfer.status || '').toLowerCase())) return null
   if (Number(transfer.destinationDomain) !== 26) return null
   if (normalizeAddress(transfer.transactionHash) !== normalizeAddress(invoice.spendTxHash)) return null
+  if (normalizeAddress(transfer.destinationAddress) !== normalizeAddress(invoice.recipient)) return null
+  if (normalizeAsset(transfer.token || transfer.asset) !== normalizeAsset(invoice.asset)) return null
+  if (normalizeAmount(transfer.amount) !== normalizeAmount(invoice.uniqueAmount)) return null
   return transfer
 }
 

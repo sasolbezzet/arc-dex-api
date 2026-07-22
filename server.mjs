@@ -1259,7 +1259,7 @@ app.post('/api/unified-balance/delegated/spend', apiLimiter, requireAuth, async 
     const spend = await spendDelegatedUnifiedBalance(request)
     let invoice
     if (request.invoice) {
-      markUnifiedBalanceSpendSubmitted(request.invoice.invoiceId, { txHash: spend.txHash, transferId: spend.transferId }, { trustedGateway: true })
+      markUnifiedBalanceSpendSubmitted(request.invoice.invoiceId, { txHash: spend.txHash, transferId: spend.transferId })
       invoice = await reconcileX402Invoice(request.invoice.invoiceId)
     }
     res.json({ ok: true, mode: 'delegated-unified-balance', spend: publicDelegatedSpend(spend), ...(invoice ? { invoice: publicInvoice(invoice) } : {}) })
