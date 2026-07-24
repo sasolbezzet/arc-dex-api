@@ -163,6 +163,44 @@ const platformTreasury = () => requireTreasuryAddress()
 const ARC_APPKIT_ADAPTER = '0xBBD70b01a1CAbc96d5b7b129Ae1AAabdf50dd40b'
 const STABLECOIN_SERVICE_BASE_URL = 'https://api.circle.com'
 
+// cirBTC AMM Router — on-chain fallback when Circle API doesn't support cirBTC
+const CIRBTC_AMM_ROUTER = process.env.CIRBTC_AMM_ROUTER || '0x0c72563b9846df4355244a9671918e59c620c580'
+const CIRBTC_AMM_ROUTER_ABI = [
+  { type: 'function', name: 'getAmountOut', stateMutability: 'view', inputs: [{ name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' }, { name: 'amountIn', type: 'uint256' }], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'swapWithFee', stateMutability: 'nonpayable', inputs: [{ name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' }, { name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' }], outputs: [{ name: 'amountOut', type: 'uint256' }] },
+  { type: 'function', name: 'getReserves', stateMutability: 'view', inputs: [{ name: 'token0', type: 'address' }, { name: 'token1', type: 'address' }], outputs: [{ name: 'reserve0', type: 'uint256' }, { name: 'reserve1', type: 'uint256' }] },
+]
+function isCirBtcSwap(tokenIn, tokenOut) {
+  return tokenIn === 'cirBTC' || tokenOut === 'cirBTC'
+}
+async function quoteCirBtcAmmRoute(tokenIn, tokenOut, amount) {
+  const tokenInAddr = TOKENS[tokenIn]
+  const tokenOutAddr = TOKENS[tokenOut]
+  const amountUnits = decimalToUnits(amount, TOKEN_DECIMALS[tokenIn])
+  const amountOut = await arcPublicClient.readContract({
+    address: CIRBTC_AMM_ROUTER, abi: CIRBTC_AMM_ROUTER_ABI, functionName: 'getAmountOut',
+    args: [tokenInAddr, tokenOutAddr, amountUnits],
+  })
+  const amountOutDecimal = unitsToDecimal(amountOut, TOKEN_DECIMALS[tokenOut])
+  return {
+    available: true,
+    source: 'arcox-amm-router',
+    route: `${tokenIn} → ${tokenOut}`,
+    provider: 'arcox-amm',
+    amountOut: amountOutDecimal,
+    minAmountOut: amountOutDecimal,
+    fee: '0.000000',
+    platformFee: {
+      bps: PLATFORM_FEE_BPS,
+      amount: ((Number(amount) * PLATFORM_FEE_BPS) / 10000).toFixed(TOKEN_DECIMALS[tokenIn]),
+      token: tokenIn,
+      treasury: platformTreasury(),
+      swapAmountIn: amount,
+    },
+    rate: Number(amountOutDecimal) / Number(amount || 1),
+  }
+}
+
 const CCTP = {
   Arc_Testnet: {
     domain: 26,
@@ -1495,6 +1533,11 @@ app.post('/api/eoa-swap-quote', apiLimiter, requireAuth, async (req, res) => {
     if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
+    // cirBTC swaps use on-chain AMM router — Circle API doesn't support cirBTC
+    if (isCirBtcSwap(tokenIn, tokenOut)) {
+      const ammQuote = await quoteCirBtcAmmRoute(tokenIn, tokenOut, safeAmount)
+      return res.json(ammQuote)
+    }
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
     const routeQuote = await quotePreparedEoaRoute({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
     const quote = routeQuote.quote
@@ -1534,6 +1577,24 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
     if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
+    // cirBTC swaps: return AMM router info for on-chain execution by agent
+    if (isCirBtcSwap(tokenIn, tokenOut)) {
+      const ammQuote = await quoteCirBtcAmmRoute(tokenIn, tokenOut, safeAmount)
+      return res.json({
+        success: true,
+        source: 'arcox-amm-router',
+        route: ammQuote.route,
+        tokenIn,
+        tokenOut,
+        grossAmountIn: safeAmount,
+        amountIn: safeAmount,
+        amountOut: ammQuote.amountOut,
+        legs: [],
+        platformFee: ammQuote.platformFee,
+        ammRouter: CIRBTC_AMM_ROUTER,
+        note: 'cirBTC swap uses on-chain AMM router. Agent executes approve + swapWithFee directly.',
+      })
+    }
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
     const prepared = await prepareEoaSwapRoute({ owner, tokenIn, tokenOut, amount: safeAmount })
     const developerFee = prepared.legs.flatMap(leg => leg.fees?.developer || [])[0]
@@ -1579,6 +1640,11 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
     if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
     if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
     if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
+    // cirBTC swaps use on-chain AMM router — Circle API doesn't support cirBTC
+    if (isCirBtcSwap(tokenIn, tokenOut)) {
+      const ammQuote = await quoteCirBtcAmmRoute(tokenIn, tokenOut, safeAmount)
+      return res.json(ammQuote)
+    }
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
     try {
       const wallet = await getOrCreateWallet(owner)
