@@ -17,7 +17,9 @@ function client() {
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
     rpcUrls: { default: { http: [process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'] } },
   })
-  return createPublicClient({ chain, transport: http(chain.rpcUrls.default.http[0], { timeout: 10_000, retryCount: 1 }) })
+  const drpcKey = process.env.DRPC_KEY || ''
+  const fetchOptions = drpcKey ? { headers: { Authorization: `Bearer ${drpcKey}` } } : undefined
+  return createPublicClient({ chain, transport: http(chain.rpcUrls.default.http[0], { timeout: 10_000, retryCount: 2, ...(fetchOptions ? { fetchOptions } : {}) }) })
 }
 
 export async function getAgentIdentity(agentId) {
