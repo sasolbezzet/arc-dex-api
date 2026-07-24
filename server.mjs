@@ -1133,16 +1133,43 @@ app.post('/api/rpc/arc', apiLimiter, async (req, res) => {
     if (!requests.length || requests.length > 20 || requests.some(item => !item || item.jsonrpc !== '2.0' || typeof item.method !== 'string' || !Array.isArray(item.params))) {
       return res.status(400).json({ error: 'Invalid JSON-RPC request' })
     }
-    const upstream = await fetch(ARC_RPC_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(request),
-      signal: AbortSignal.timeout(10_000),
-    })
-    const responseBody = await upstream.text()
-    if (!upstream.ok) return res.status(502).json({ error: 'Arc RPC upstream failed' })
-    res.setHeader('Cache-Control', 'no-store')
-    res.type('application/json').send(responseBody)
+    // Arc Testnet RPC rate-limits aggressively. Retry with backoff on 429/-32011.
+    const maxRetries = 2
+    let lastError = null
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const upstream = await fetch(ARC_RPC_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+          signal: AbortSignal.timeout(10_000),
+        })
+        const responseBody = await upstream.text()
+        if (upstream.ok) {
+          res.setHeader('Cache-Control', 'no-store')
+          return res.type('application/json').send(responseBody)
+        }
+        // Check for rate-limit in body
+        const parsed = JSON.parse(responseBody)
+        const isRateLimit = upstream.status === 429 || (parsed.error?.code === -32011)
+        if (isRateLimit && attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 300 * (attempt + 1)))
+          continue
+        }
+        if (isRateLimit) {
+          return res.status(429).json({ jsonrpc: '2.0', error: { code: -32011, message: 'request limit reached' }, id: (requests[0]?.id ?? null) })
+        }
+        return res.status(502).json({ error: 'Arc RPC upstream failed' })
+      } catch (fetchErr) {
+        lastError = fetchErr
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 300 * (attempt + 1)))
+          continue
+        }
+      }
+    }
+    console.error('[arc-rpc]', lastError?.message || 'unknown')
+    res.status(502).json({ error: 'Arc RPC unavailable' })
   } catch (error) {
     console.error('[arc-rpc]', error.message)
     res.status(502).json({ error: 'Arc RPC unavailable' })
@@ -1160,18 +1187,44 @@ app.post('/api/wallet', apiLimiter, requireAuth, async (req, res) => {
 })
 
 // ── Balance ──
-app.get('/api/balance/:address', async (req, res) => {
+app.get('/api/balance/:address', apiLimiter, async (req, res) => {
   try {
     const target = normalizeAddress(req.params.address, 'address')
-    const client = createPublicClient({
-      chain: arcTestnet,
-      transport: http(process.env.ARC_RPC_URL || process.env.RPC || arcTestnet.rpcUrls.default.http[0], { retryCount: 1, timeout: 10_000 }),
-    })
-    const entries = await Promise.all(Object.entries(TOKENS).map(async ([sym, addr]) => {
-      const bal = await client.readContract({ address: addr, abi: erc20Abi, functionName: 'balanceOf', args: [target] })
-      return [sym, formatUnits(bal, TOKEN_DECIMALS[sym] || 6)]
-    }))
-    res.json(Object.fromEntries(entries))
+    const rpcUrl = process.env.ARC_RPC_URL || process.env.RPC || arcTestnet.rpcUrls.default.http[0]
+    // Read tokens individually with 1s delay to respect Arc RPC rate limit.
+    const data = '0x70a08231' + target.slice(2).toLowerCase().padStart(64, '0')
+    const entries = []
+    const errors = []
+    for (const [sym, addr] of Object.entries(TOKENS)) {
+      let bal = null
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const resp = await fetch(rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_call', params: [{ to: addr, data }, 'latest'], id: 1 }),
+            signal: AbortSignal.timeout(8_000),
+          })
+          const text = await resp.text()
+          if (!resp.ok) throw new Error(`RPC HTTP ${resp.status}`)
+          const result = JSON.parse(text)
+          if (result?.result && result.result !== '0x') {
+            bal = result.result
+            break
+          }
+          if (attempt < 2) { await new Promise(r => setTimeout(r, 2000)); continue }
+          break
+        } catch {
+          if (attempt < 2) { await new Promise(r => setTimeout(r, 2000)); continue }
+          break
+        }
+      }
+      if (bal) entries.push([sym, formatUnits(BigInt(bal), TOKEN_DECIMALS[sym] || 6)])
+      else errors.push(`${sym} RPC error`)
+      await new Promise(r => setTimeout(r, 2000))
+    }
+    if (entries.length === 0) return res.status(503).json({ error: 'Arc RPC balance lookup failed for all tokens.' })
+    res.json({ ...Object.fromEntries(entries), ...(errors.length ? { _errors: errors } : {}) })
   } catch(e) {
     console.error('[balance]', e.message)
     res.status(503).json({ error: 'Arc RPC balance lookup failed. Existing balance was kept.' })
