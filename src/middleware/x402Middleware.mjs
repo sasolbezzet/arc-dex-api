@@ -1,5 +1,5 @@
 import { createPublicKey, randomUUID, verify as verifySignature } from 'crypto'
-import { createPublicClient, http, parseAbiItem, formatUnits, keccak256, toHex, decodeEventLog } from 'viem'
+import { createPublicClient, http, fallback, parseAbiItem, formatUnits, keccak256, toHex, decodeEventLog } from 'viem'
 import { atomicWriteJsonFile, readJsonFile } from '../services/jsonFileStore.mjs'
 import { verifyAgentOwnership } from '../services/agentIdentityService.mjs'
 import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
@@ -205,7 +205,13 @@ export async function reconcileX402Invoice(id) {
       return invoice
     }
     const rpc = process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'
-    const client = createPublicClient({ transport: http(rpc, { timeout: 10_000, retryCount: 1 }) })
+    const drpcKey = process.env.DRPC_KEY || ''
+    const fallbackRpcs = ['https://rpc.testnet.arc.network', 'https://arc-testnet.drpc.org', 'https://rpc.testnet.arc-node.thecanteenapp.com/v1/swrm_cb280d6a2612407c4a1dfc8ae235c0ae62bdfe0740559a355dcb7c48b22b345a'].filter(u => u !== rpc)
+    const transports = [
+      http(rpc, { timeout: 8_000, retryCount: 1, ...(drpcKey ? { fetchOptions: { headers: { Authorization: `Bearer ${drpcKey}` } } } : {}) }),
+      ...fallbackRpcs.map(u => http(u, { timeout: 8_000, retryCount: 1 })),
+    ]
+    const client = createPublicClient({ transport: fallback(transports, { retryCount: 2, rank: false }) })
     const current = await client.getBlockNumber()
     const lookback = BigInt(Number(process.env.X402_RECONCILE_LOOKBACK_BLOCKS || '25000'))
     const fromBlock = current > lookback ? current - lookback : 0n

@@ -5,7 +5,7 @@ import { createHmac, randomUUID, timingSafeEqual } from 'crypto'
 import { AppKit, SwapChain } from '@circle-fin/app-kit'
 import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
-import { createPublicClient, createWalletClient, http, erc20Abi, formatUnits, defineChain, getAddress, isAddress, verifyMessage } from 'viem'
+import { createPublicClient, createWalletClient, http, fallback, erc20Abi, formatUnits, defineChain, getAddress, isAddress, verifyMessage } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { PublicKey } from '@solana/web3.js'
 import { initiateDeveloperControlledWalletsClient } from '@circle-fin/developer-controlled-wallets'
@@ -108,6 +108,12 @@ if (!process.env.AUTH_SECRET) console.warn('[security] AUTH_SECRET not set. Set 
 
 const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'
 const DRPC_KEY = process.env.DRPC_KEY || ''
+// Public Arc RPC endpoints — used as fallback when DRPC rate-limits.
+const ARC_PUBLIC_RPC_URLS = [
+  'https://rpc.testnet.arc.network',
+  'https://arc-testnet.drpc.org',
+  'https://rpc.testnet.arc-node.thecanteenapp.com/v1/swrm_cb280d6a2612407c4a1dfc8ae235c0ae62bdfe0740559a355dcb7c48b22b345a',
+]
 /** Drpc.org fetch wrapper — adds Bearer auth header if DRPC_KEY is set. */
 function drpcFetch(url, opts = {}) {
   const headers = { ...(opts.headers || {}) }
@@ -120,16 +126,28 @@ const arcTestnet = defineChain({
   id: 5042002,
   name: 'Arc Testnet',
   nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-  rpcUrls: { default: { http: [ARC_RPC_URL] } },
+  rpcUrls: { default: { http: [ARC_RPC_URL, ...ARC_PUBLIC_RPC_URLS.filter(u => u !== ARC_RPC_URL)] } },
   blockExplorers: { default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' } },
 })
+// Build fallback transports: DRPC (with Bearer auth) → arc.network → thecanteenapp
+function arcHttpTransports() {
+  const transports = []
+  // DRPC with auth (if configured)
+  transports.push(http(ARC_RPC_URL, {
+    retryCount: 1,
+    timeout: 8_000,
+    ...(DRPC_KEY ? { fetchOptions: { headers: { Authorization: `Bearer ${DRPC_KEY}` } } } : {}),
+  }))
+  // Public fallbacks (no auth needed)
+  for (const url of ARC_PUBLIC_RPC_URLS) {
+    if (url === ARC_RPC_URL) continue
+    transports.push(http(url, { retryCount: 1, timeout: 8_000 }))
+  }
+  return fallback(transports, { retryCount: 2, rank: false })
+}
 const arcPublicClient = createPublicClient({
   chain: arcTestnet,
-  transport: http(ARC_RPC_URL, {
-    retryCount: 3,
-    timeout: 10_000,
-    ...(DRPC_KEY ? { fetchOptions: { headers: { Authorization: `Bearer ${DRPC_KEY}` } } } : {}),
-  }),
+  transport: arcHttpTransports(),
 })
 
 const TOKENS = {

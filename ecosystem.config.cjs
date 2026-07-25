@@ -6,6 +6,10 @@ module.exports = {
       cwd: __dirname,
       interpreter: '/usr/bin/node',
       node_args: '--env-file=.env',
+      env: {
+        NODE_ENV: 'production',
+      },
+      env_file: '.env',
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,

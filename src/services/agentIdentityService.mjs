@@ -1,4 +1,4 @@
-import { createPublicClient, defineChain, getAddress, http, isAddress, parseAbiItem } from 'viem'
+import { createPublicClient, defineChain, getAddress, http, fallback, isAddress, parseAbiItem } from 'viem'
 
 export const IDENTITY_REGISTRY = '0x8004A818BFB912233c491871b3d84c89A494BD9e'
 const TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 indexed tokenId)')
@@ -10,16 +10,26 @@ const identityAbi = [
   { type: 'function', name: 'tokenURI', stateMutability: 'view', inputs: [{ name: 'tokenId', type: 'uint256' }], outputs: [{ name: '', type: 'string' }] },
 ]
 
+const ARC_FALLBACK_RPCS = [
+  'https://rpc.testnet.arc.network',
+  'https://arc-testnet.drpc.org',
+  'https://rpc.testnet.arc-node.thecanteenapp.com/v1/swrm_cb280d6a2612407c4a1dfc8ae235c0ae62bdfe0740559a355dcb7c48b22b345a',
+]
+
 function client() {
+  const primaryRpc = process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'
   const chain = defineChain({
     id: Number(process.env.ARC_CHAIN_ID || 5042002),
     name: 'Arc Testnet',
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-    rpcUrls: { default: { http: [process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'] } },
+    rpcUrls: { default: { http: [primaryRpc, ...ARC_FALLBACK_RPCS.filter(u => u !== primaryRpc)] } },
   })
   const drpcKey = process.env.DRPC_KEY || ''
-  const fetchOptions = drpcKey ? { headers: { Authorization: `Bearer ${drpcKey}` } } : undefined
-  return createPublicClient({ chain, transport: http(chain.rpcUrls.default.http[0], { timeout: 10_000, retryCount: 2, ...(fetchOptions ? { fetchOptions } : {}) }) })
+  const transports = [
+    http(primaryRpc, { timeout: 8_000, retryCount: 1, ...(drpcKey ? { fetchOptions: { headers: { Authorization: `Bearer ${drpcKey}` } } } : {}) }),
+    ...ARC_FALLBACK_RPCS.filter(u => u !== primaryRpc).map(u => http(u, { timeout: 8_000, retryCount: 1 })),
+  ]
+  return createPublicClient({ chain, transport: fallback(transports, { retryCount: 2, rank: false }) })
 }
 
 export async function getAgentIdentity(agentId) {
