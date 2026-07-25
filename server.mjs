@@ -182,16 +182,65 @@ const ARC_APPKIT_ADAPTER = '0xBBD70b01a1CAbc96d5b7b129Ae1AAabdf50dd40b'
 const STABLECOIN_SERVICE_BASE_URL = 'https://api.circle.com'
 
 // cirBTC AMM Router — on-chain fallback when Circle API doesn't support cirBTC
-const CIRBTC_AMM_ROUTER = process.env.CIRBTC_AMM_ROUTER || '0x0c72563b9846df4355244a9671918e59c620c580'
+const CIRBTC_AMM_ROUTER = process.env.CIRBTC_AMM_ROUTER || '0x9f2443691bddd8343590c68e2a2cdec5fd0b6124'
 const CIRBTC_AMM_ROUTER_ABI = [
   { type: 'function', name: 'getAmountOut', stateMutability: 'view', inputs: [{ name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' }, { name: 'amountIn', type: 'uint256' }], outputs: [{ name: '', type: 'uint256' }] },
   { type: 'function', name: 'swapWithFee', stateMutability: 'nonpayable', inputs: [{ name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' }, { name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' }], outputs: [{ name: 'amountOut', type: 'uint256' }] },
   { type: 'function', name: 'getReserves', stateMutability: 'view', inputs: [{ name: 'token0', type: 'address' }, { name: 'token1', type: 'address' }], outputs: [{ name: 'reserve0', type: 'uint256' }, { name: 'reserve1', type: 'uint256' }] },
+  { type: 'function', name: 'getEurcToCirBtcAmountOut', stateMutability: 'view', inputs: [{ name: 'usdcIntermediateAmount', type: 'uint256' }], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'getCirBtcToUsdcAmountOut', stateMutability: 'view', inputs: [{ name: 'cirbtcAmountIn', type: 'uint256' }], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'swapUsdcToCirBtc', stateMutability: 'nonpayable', inputs: [{ name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' }], outputs: [{ name: 'amountOut', type: 'uint256' }] },
+  { type: 'function', name: 'swapCirBtcToUsdc', stateMutability: 'nonpayable', inputs: [{ name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' }], outputs: [{ name: 'amountOut', type: 'uint256' }] },
 ]
 function isCirBtcSwap(tokenIn, tokenOut) {
   return tokenIn === 'cirBTC' || tokenOut === 'cirBTC'
 }
+function isEurcCirBtcSwap(tokenIn, tokenOut) {
+  return (tokenIn === 'EURC' && tokenOut === 'cirBTC') || (tokenIn === 'cirBTC' && tokenOut === 'EURC')
+}
 async function quoteCirBtcAmmRoute(tokenIn, tokenOut, amount) {
+  const feeBps = PLATFORM_FEE_BPS
+  const feeAmount = ((Number(amount) * feeBps) / 10000).toFixed(TOKEN_DECIMALS[tokenIn])
+  // EURC↔cirBTC: 2-leg via USDC. Leg 1 EURC→USDC via Circle API, Leg 2 USDC→cirBTC via AMM.
+  if (isEurcCirBtcSwap(tokenIn, tokenOut)) {
+    if (tokenIn === 'EURC' && tokenOut === 'cirBTC') {
+      const leg1Params = buildStablecoinSwapParams({ owner: platformTreasury(), tokenIn: 'EURC', tokenOut: 'USDC', amount: decimalToUnits(amount, 6) })
+      const leg1 = await stablecoinRequest('/v1/stablecoinKits/quote', { query: leg1Params })
+      const usdcAmount = unitsToDecimal(BigInt(leg1?.quote?.estimatedAmount || '0'), 6)
+      if (Number(usdcAmount) <= 0) throw new Error('EURC→USDC leg returned zero')
+      const usdcUnits = decimalToUnits(usdcAmount, 6)
+      const cirbtcOut = await arcPublicClient.readContract({
+        address: CIRBTC_AMM_ROUTER, abi: CIRBTC_AMM_ROUTER_ABI, functionName: 'getEurcToCirBtcAmountOut',
+        args: [usdcUnits],
+      })
+      const finalOut = unitsToDecimal(cirbtcOut, 8)
+      return {
+        available: true, source: 'arcox-amm-router',
+        route: 'EURC → USDC → cirBTC', provider: 'arcox-amm-2leg',
+        amountOut: finalOut, minAmountOut: finalOut, fee: '0.000000',
+        platformFee: { bps: feeBps, amount: feeAmount, token: tokenIn, treasury: platformTreasury(), swapAmountIn: amount },
+        rate: Number(finalOut) / Number(amount || 1), intermediateAmount: usdcAmount,
+      }
+    } else {
+      const cirbtcUnits = decimalToUnits(amount, 8)
+      const usdcOut = await arcPublicClient.readContract({
+        address: CIRBTC_AMM_ROUTER, abi: CIRBTC_AMM_ROUTER_ABI, functionName: 'getCirBtcToUsdcAmountOut',
+        args: [cirbtcUnits],
+      })
+      const usdcAmount = unitsToDecimal(usdcOut, 6)
+      const leg2Params = buildStablecoinSwapParams({ owner: platformTreasury(), tokenIn: 'USDC', tokenOut: 'EURC', amount: decimalToUnits(usdcAmount, 6) })
+      const leg2 = await stablecoinRequest('/v1/stablecoinKits/quote', { query: leg2Params })
+      const eurcAmount = unitsToDecimal(BigInt(leg2?.quote?.estimatedAmount || '0'), 6)
+      return {
+        available: true, source: 'arcox-amm-router',
+        route: 'cirBTC → USDC → EURC', provider: 'arcox-amm-2leg',
+        amountOut: eurcAmount, minAmountOut: eurcAmount, fee: '0.000000',
+        platformFee: { bps: feeBps, amount: feeAmount, token: tokenIn, treasury: platformTreasury(), swapAmountIn: amount },
+        rate: Number(eurcAmount) / Number(amount || 1), intermediateAmount: usdcAmount,
+      }
+    }
+  }
+  // Direct USDC↔cirBTC: single-leg AMM
   const tokenInAddr = TOKENS[tokenIn]
   const tokenOutAddr = TOKENS[tokenOut]
   const amountUnits = decimalToUnits(amount, TOKEN_DECIMALS[tokenIn])
