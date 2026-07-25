@@ -193,7 +193,8 @@ const CIRBTC_AMM_ROUTER_ABI = [
   { type: 'function', name: 'swapCirBtcToUsdc', stateMutability: 'nonpayable', inputs: [{ name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' }], outputs: [{ name: 'amountOut', type: 'uint256' }] },
 ]
 function isCirBtcSwap(tokenIn, tokenOut) {
-  return tokenIn === 'cirBTC' || tokenOut === 'cirBTC'
+  // Only USDC↔cirBTC goes through AMM router. EURC↔cirBTC uses Circle API 2-leg path.
+  return (tokenIn === 'USDC' && tokenOut === 'cirBTC') || (tokenIn === 'cirBTC' && tokenOut === 'USDC')
 }
 function isEurcCirBtcSwap(tokenIn, tokenOut) {
   return (tokenIn === 'EURC' && tokenOut === 'cirBTC') || (tokenIn === 'cirBTC' && tokenOut === 'EURC')
