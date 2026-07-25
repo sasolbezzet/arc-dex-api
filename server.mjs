@@ -417,7 +417,7 @@ function normalizeAmount(value) {
   if (!/^\d+(\.\d{1,18})?$/.test(raw)) throw new Error('Invalid amount')
   const num = Number(raw)
   if (!Number.isFinite(num) || num <= 0) throw new Error('Invalid amount')
-  if (num > 1_000_000) throw new Error('Amount exceeds safety limit')
+  if (num > 10_000_000) throw new Error('Amount exceeds safety limit (max 10,000,000)')
   return raw
 }
 
