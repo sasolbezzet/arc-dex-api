@@ -444,7 +444,7 @@ async function verifySiweSession({ message, signature, expectedAddress }) {
       throw new Error('SIWE message expired')
     }
   }
-  const result = await siwe.validate(signature)
+  const result = await siwe.verify({ signature })
   if (!result.success) throw new Error('SIWE signature verification failed')
   return siwe
 }
