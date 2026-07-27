@@ -7,6 +7,7 @@ import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
 import { createPublicClient, createWalletClient, http, fallback, erc20Abi, formatUnits, defineChain, getAddress, isAddress, verifyMessage } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
+import { SiweMessage } from 'siwe'
 import { PublicKey } from '@solana/web3.js'
 import { initiateDeveloperControlledWalletsClient } from '@circle-fin/developer-controlled-wallets'
 import { quoteEcoRoutePayment } from './services/ecoAdapter.mjs'
@@ -104,6 +105,8 @@ const ARCOX_PAY_BASE_URL = (process.env.ARCOX_PAY_BASE_URL || process.env.ARCOX_
 const ENABLE_DEV_TOOLS = String(process.env.ENABLE_DEV_TOOLS || 'false').toLowerCase() === 'true'
 const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS || 24 * 60 * 60 * 1000)
 const LOGIN_WINDOW_MS = 5 * 60 * 1000
+const DEFAULT_SIWE_DOMAINS = ['localhost', 'localhost:5173', 'localhost:4173', 'arc-dex-bice.vercel.app', '43.163.98.128.nip.io']
+const SIWE_ALLOWED_DOMAINS = (process.env.SIWE_ALLOWED_DOMAINS || DEFAULT_SIWE_DOMAINS.join(',')).split(',').map(d => d.trim()).filter(Boolean)
 if (!process.env.AUTH_SECRET) console.warn('[security] AUTH_SECRET not set. Set a dedicated random AUTH_SECRET before production.')
 
 const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'
@@ -368,6 +371,82 @@ function authMessage(address, issuedAt) {
     `Issued At: ${issuedAt}`,
     'Network: Arc Testnet',
   ].join('\n')
+}
+
+// In-memory replay store for SIWE nonces. OK for a single-node deployment;
+// for horizontal scaling, move this to Redis or a persistent cache.
+const usedNonces = new Map()
+const NONCE_TTL_MS = 24 * 60 * 60 * 1000
+function cleanupUsedNonces() {
+  const cutoff = Date.now() - NONCE_TTL_MS
+  for (const [nonce, usedAt] of usedNonces) {
+    if (usedAt < cutoff) usedNonces.delete(nonce)
+  }
+}
+setInterval(cleanupUsedNonces, 60 * 60 * 1000).unref()
+function isNonceUsed(nonce) {
+  cleanupUsedNonces()
+  return usedNonces.has(nonce)
+}
+function markNonceUsed(nonce) {
+  usedNonces.set(nonce, Date.now())
+}
+function normalizeSiweDomain(domain) {
+  return String(domain || '').split(':')[0].trim().toLowerCase()
+}
+function verifySiweDomain(domain) {
+  return SIWE_ALLOWED_DOMAINS.some(d => normalizeSiweDomain(d) === normalizeSiweDomain(domain))
+}
+async function verifySiweSession({ message, signature, expectedAddress }) {
+  if (!message || typeof message !== 'string') throw new Error('SIWE message required')
+  if (!signature || typeof signature !== 'string') throw new Error('Signature required')
+  const siwe = new SiweMessage(message)
+  if (siwe.address?.toLowerCase() !== getAddress(expectedAddress).toLowerCase()) {
+    throw new Error('SIWE address mismatch')
+  }
+  if (!verifySiweDomain(siwe.domain)) {
+    throw new Error('Invalid SIWE domain')
+  }
+  let origin
+  try {
+    origin = siwe.uri ? new URL(siwe.uri).origin : null
+  } catch {
+    throw new Error('Invalid SIWE URI')
+  }
+  const allowedOrigins = ALLOWED_ORIGINS.map(o => {
+    try { return new URL(o).origin } catch { return null }
+  }).filter(Boolean)
+  if (!origin || !allowedOrigins.includes(origin)) {
+    throw new Error('Invalid SIWE origin')
+  }
+  if (siwe.statement !== 'Only sign this message on the official ARCOX DEX website.') {
+    throw new Error('Invalid SIWE statement')
+  }
+  if (String(siwe.chainId) !== '5042002') {
+    throw new Error('Invalid chain ID')
+  }
+  if (!siwe.nonce) {
+    throw new Error('SIWE nonce required')
+  }
+  if (isNonceUsed(siwe.nonce)) {
+    throw new Error('SIWE nonce has already been used')
+  }
+  // Mark nonce as used immediately to prevent replay attempts, even if
+  // signature verification eventually fails.
+  markNonceUsed(siwe.nonce)
+  const issuedAt = Date.parse(siwe.issuedAt)
+  if (!Number.isFinite(issuedAt) || Math.abs(Date.now() - issuedAt) > LOGIN_WINDOW_MS) {
+    throw new Error('SIWE issued-at timestamp expired')
+  }
+  if (siwe.expirationTime) {
+    const expires = Date.parse(siwe.expirationTime)
+    if (!Number.isFinite(expires) || expires < Date.now()) {
+      throw new Error('SIWE message expired')
+    }
+  }
+  const result = await siwe.validate(signature)
+  if (!result.success) throw new Error('SIWE signature verification failed')
+  return siwe
 }
 
 function createAuthToken(address) {
@@ -1225,20 +1304,21 @@ app.post('/api/agent/ask', apiLimiter, requireAuth, async (req, res) => {
 
 app.post('/api/auth/session', authLimiter, async (req, res) => {
   try {
-    const { address, issuedAt, signature } = req.body || {}
+    const { address, issuedAt, signature, mode, message: siweMessageText } = req.body || {}
     const normalized = normalizeAddress(address, 'address')
-    const issuedTime = Date.parse(issuedAt)
-    if (!issuedAt || !Number.isFinite(issuedTime) || Math.abs(Date.now() - issuedTime) > LOGIN_WINDOW_MS) {
-      return res.status(400).json({ error: 'Login signature expired. Please reconnect wallet.' })
+    if (mode === 'siwe') {
+      await verifySiweSession({ message: siweMessageText, signature, expectedAddress: normalized })
+      res.json({ success: true, token: createAuthToken(normalized), address: normalized })
+    } else {
+      const issuedTime = Date.parse(issuedAt)
+      if (!issuedAt || !Number.isFinite(issuedTime) || Math.abs(Date.now() - issuedTime) > LOGIN_WINDOW_MS) {
+        return res.status(400).json({ error: 'Login signature expired. Please reconnect wallet.' })
+      }
+      if (!signature || !/^0x[0-9a-f]+$/i.test(signature)) return res.status(400).json({ error: 'Invalid signature' })
+      const ok = await verifyMessage({ address: normalized, message: authMessage(normalized, issuedAt), signature })
+      if (!ok) return res.status(401).json({ error: 'Invalid wallet signature' })
+      res.json({ success: true, token: createAuthToken(normalized), address: normalized })
     }
-    if (!signature || !/^0x[0-9a-f]+$/i.test(signature)) return res.status(400).json({ error: 'Invalid signature' })
-    const ok = await verifyMessage({
-      address: normalized,
-      message: authMessage(normalized, issuedAt),
-      signature,
-    })
-    if (!ok) return res.status(401).json({ error: 'Invalid wallet signature' })
-    res.json({ success: true, token: createAuthToken(normalized), address: normalized })
   } catch(e) {
     console.error('[auth]', e.message)
     res.status(400).json({ error: e.message })
