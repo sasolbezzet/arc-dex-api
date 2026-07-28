@@ -109,15 +109,16 @@ const DEFAULT_SIWE_DOMAINS = ['localhost', 'localhost:5173', 'localhost:4173', '
 const SIWE_ALLOWED_DOMAINS = (process.env.SIWE_ALLOWED_DOMAINS || DEFAULT_SIWE_DOMAINS.join(',')).split(',').map(d => d.trim()).filter(Boolean)
 if (!process.env.AUTH_SECRET) console.warn('[security] AUTH_SECRET not set. Set a dedicated random AUTH_SECRET before production.')
 
-const ARC_RPC_URL = process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'
 const DRPC_KEY = process.env.DRPC_KEY || ''
-// Public Arc RPC endpoints — used as fallback when DRPC rate-limits.
-const ARC_PUBLIC_RPC_URLS = [
+// Primary public Arc RPC, plus fallbacks. Order matters: public Arc first, then dRPC, then canteenapp.
+const ARC_RPC_URLS = [
   'https://rpc.testnet.arc.network',
   'https://arc-testnet.drpc.org',
   'https://rpc.testnet.arc-node.thecanteenapp.com/v1/swrm_cb280d6a2612407c4a1dfc8ae235c0ae62bdfe0740559a355dcb7c48b22b345a',
 ]
-/** Drpc.org fetch wrapper — adds Bearer auth header if DRPC_KEY is set. */
+const ARC_RPC_PRIMARY = ARC_RPC_URLS[0]
+const ARC_RPC_DRPC = 'https://arc-testnet.drpc.org'
+/** Fetch wrapper — adds Bearer auth header for dRPC when DRPC_KEY is set. */
 function drpcFetch(url, opts = {}) {
   const headers = { ...(opts.headers || {}) }
   if (DRPC_KEY && url.includes('drpc.org')) {
@@ -129,23 +130,19 @@ const arcTestnet = defineChain({
   id: 5042002,
   name: 'Arc Testnet',
   nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-  rpcUrls: { default: { http: [ARC_RPC_URL, ...ARC_PUBLIC_RPC_URLS.filter(u => u !== ARC_RPC_URL)] } },
+  rpcUrls: { default: { http: ARC_RPC_URLS } },
   blockExplorers: { default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' } },
 })
-// Build fallback transports: DRPC (with Bearer auth) → arc.network → thecanteenapp
+// Build fallback transports: public Arc → dRPC (with Bearer auth) → canteenapp
 function arcHttpTransports() {
-  const transports = []
-  // DRPC with auth (if configured)
-  transports.push(http(ARC_RPC_URL, {
-    retryCount: 1,
-    timeout: 8_000,
-    ...(DRPC_KEY ? { fetchOptions: { headers: { Authorization: `Bearer ${DRPC_KEY}` } } } : {}),
-  }))
-  // Public fallbacks (no auth needed)
-  for (const url of ARC_PUBLIC_RPC_URLS) {
-    if (url === ARC_RPC_URL) continue
-    transports.push(http(url, { retryCount: 1, timeout: 8_000 }))
-  }
+  const transports = ARC_RPC_URLS.map((url, index) => {
+    const isDrpc = url.includes('drpc.org')
+    return http(url, {
+      retryCount: 1,
+      timeout: 8_000,
+      ...(isDrpc && DRPC_KEY ? { fetchOptions: { headers: { Authorization: `Bearer ${DRPC_KEY}` } } } : {}),
+    })
+  })
   return fallback(transports, { retryCount: 2, rank: false })
 }
 const arcPublicClient = createPublicClient({
@@ -1330,42 +1327,45 @@ app.post('/api/rpc/arc', apiLimiter, async (req, res) => {
     if (!requests.length || requests.length > 20 || requests.some(item => !item || item.jsonrpc !== '2.0' || typeof item.method !== 'string' || !Array.isArray(item.params))) {
       return res.status(400).json({ error: 'Invalid JSON-RPC request' })
     }
-    // Arc Testnet RPC rate-limits aggressively. Retry with backoff on 429/-32011.
-    const maxRetries = 2
+    // Try RPCs in order: public Arc → dRPC (with auth) → canteenapp fallback.
     let lastError = null
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      try {
-        const upstream = await drpcFetch(ARC_RPC_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(request),
-          signal: AbortSignal.timeout(10_000),
-        })
-        const responseBody = await upstream.text()
-        if (upstream.ok) {
-          res.setHeader('Cache-Control', 'no-store')
-          return res.type('application/json').send(responseBody)
-        }
-        // Check for rate-limit in body
-        const parsed = JSON.parse(responseBody)
-        const isRateLimit = upstream.status === 429 || (parsed.error?.code === -32011)
-        if (isRateLimit && attempt < maxRetries) {
-          await new Promise(r => setTimeout(r, 300 * (attempt + 1)))
-          continue
-        }
-        if (isRateLimit) {
-          return res.status(429).json({ jsonrpc: '2.0', error: { code: -32011, message: 'request limit reached' }, id: (requests[0]?.id ?? null) })
-        }
-        return res.status(502).json({ error: 'Arc RPC upstream failed' })
-      } catch (fetchErr) {
-        lastError = fetchErr
-        if (attempt < maxRetries) {
-          await new Promise(r => setTimeout(r, 300 * (attempt + 1)))
-          continue
+    for (let rpcIndex = 0; rpcIndex < ARC_RPC_URLS.length; rpcIndex++) {
+      const rpcUrl = ARC_RPC_URLS[rpcIndex]
+      const maxRetries = rpcIndex === 0 ? 2 : 1
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          const upstream = await drpcFetch(rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(request),
+            signal: AbortSignal.timeout(10_000),
+          })
+          const responseBody = await upstream.text()
+          if (upstream.ok) {
+            res.setHeader('Cache-Control', 'no-store')
+            return res.type('application/json').send(responseBody)
+          }
+          // Check for rate-limit in body
+          let parsed = {}
+          try { parsed = JSON.parse(responseBody) } catch { }
+          const isRateLimit = upstream.status === 429 || (parsed.error?.code === -32011)
+          if (isRateLimit && attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, 300 * (attempt + 1)))
+            continue
+          }
+          if (isRateLimit) break // try next RPC
+          return res.status(502).json({ error: 'Arc RPC upstream failed' })
+        } catch (fetchErr) {
+          lastError = fetchErr
+          if (attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, 300 * (attempt + 1)))
+            continue
+          }
+          break // try next RPC
         }
       }
     }
-    console.error('[arc-rpc]', lastError?.message || 'unknown')
+    console.error('[arc-rpc]', lastError?.message || 'All Arc RPC endpoints failed')
     res.status(502).json({ error: 'Arc RPC unavailable' })
   } catch (error) {
     console.error('[arc-rpc]', error.message)
@@ -1387,8 +1387,7 @@ app.post('/api/wallet', apiLimiter, requireAuth, async (req, res) => {
 app.get('/api/balance/:address', apiLimiter, async (req, res) => {
   try {
     const target = normalizeAddress(req.params.address, 'address')
-    const rpcUrl = process.env.ARC_RPC_URL || process.env.RPC || arcTestnet.rpcUrls.default.http[0]
-    // Batch JSON-RPC (1 request → 4 balanceOf) with Bearer auth + retry on rate limit.
+    // Batch JSON-RPC (1 request → 4 balanceOf) with fallback on rate limit.
     const data = '0x70a08231' + target.slice(2).toLowerCase().padStart(64, '0')
     const batch = Object.entries(TOKENS).map(([sym, addr], i) => ({
       jsonrpc: '2.0', method: 'eth_call',
@@ -1396,33 +1395,40 @@ app.get('/api/balance/:address', apiLimiter, async (req, res) => {
     }))
     const entries = []
     const errors = []
-    for (let attempt = 0; attempt < 4; attempt++) {
-      entries.length = 0
-      errors.length = 0
-      const resp = await drpcFetch(rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(batch),
-        signal: AbortSignal.timeout(10_000),
-      })
-      const text = await resp.text()
-      if (!resp.ok) {
-        if (resp.status === 429 && attempt < 3) { await new Promise(r => setTimeout(r, 3000)); continue }
-        throw new Error(`RPC HTTP ${resp.status}`)
-      }
-      const results = JSON.parse(text)
-      if (!Array.isArray(results)) throw new Error('RPC returned non-array')
-      for (let i = 0; i < results.length; i++) {
-        const sym = Object.keys(TOKENS)[i]
-        const item = results[i]
-        if (item?.result && item.result !== '0x') {
-          entries.push([sym, formatUnits(BigInt(item.result), TOKEN_DECIMALS[sym] || 6)])
-        } else if (item?.error) {
-          errors.push(`${sym}: ${item.error.code}`)
+    let lastRpcError = null
+    for (const rpcUrl of ARC_RPC_URLS) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const resp = await drpcFetch(rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(batch),
+            signal: AbortSignal.timeout(10_000),
+          })
+          const text = await resp.text()
+          if (!resp.ok) {
+            if (resp.status === 429) { lastRpcError = `RPC HTTP ${resp.status}`; break }
+            throw new Error(`RPC HTTP ${resp.status}`)
+          }
+          const results = JSON.parse(text)
+          if (!Array.isArray(results)) throw new Error('RPC returned non-array')
+          entries.length = 0
+          errors.length = 0
+          for (let i = 0; i < results.length; i++) {
+            const sym = Object.keys(TOKENS)[i]
+            const item = results[i]
+            if (item?.result && item.result !== '0x') {
+              entries.push([sym, formatUnits(BigInt(item.result), TOKEN_DECIMALS[sym] || 6)])
+            } else if (item?.error) {
+              errors.push(`${sym}: ${item.error.code}`)
+            }
+          }
+          if (entries.length === Object.keys(TOKENS).length) break
+        } catch (e) {
+          lastRpcError = e.message
         }
       }
       if (entries.length === Object.keys(TOKENS).length) break
-      if (attempt < 2) await new Promise(r => setTimeout(r, 2000))
     }
     if (entries.length === 0) return res.status(503).json({ error: 'Arc RPC balance lookup failed for all tokens.' })
     res.json({ ...Object.fromEntries(entries), ...(errors.length ? { _errors: errors } : {}) })
@@ -2121,7 +2127,7 @@ app.post('/api/mint-cctp-from-solana', apiLimiter, requireServerSignedMintAuth, 
     if (!att) return res.status(400).json({ error: 'Attestation timeout from Solana. Please retry.' })
     const account = privateKeyToAccount(process.env.OWNER_PRIVATE_KEY)
     const wc = createWalletClient({ account, chain: arcTestnet, transport: http() })
-    const pc = createPublicClient({ chain: arcTestnet, transport: http(ARC_RPC_URL, { ...(DRPC_KEY ? { fetchOptions: { headers: { Authorization: `Bearer ${DRPC_KEY}` } } } : {}) }) })
+    const pc = createPublicClient({ chain: arcTestnet, transport: arcHttpTransports() })
     // Retry mint up to 3 times
     let txHash
     for (let attempt = 0; attempt < 3; attempt++) {
