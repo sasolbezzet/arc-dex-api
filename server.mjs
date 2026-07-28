@@ -125,12 +125,11 @@ async function drpcFetch(url, opts = {}) {
   if (DRPC_KEY && url.includes('drpc.org')) {
     headers['Authorization'] = `Bearer ${DRPC_KEY}`
   }
-  const body = opts.body || (opts as any)?.body
   const maxRetries = 5
   let lastError
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const res = await fetch(url, { ...opts, headers, body })
+      const res = await fetch(url, { ...opts, headers })
       if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
         lastError = new Error(`RPC ${res.status}: ${res.statusText}`)
         if (attempt === maxRetries) return res
