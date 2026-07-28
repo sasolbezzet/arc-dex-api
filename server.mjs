@@ -1285,6 +1285,7 @@ async function checkAttestationOnce(domain, txHash) {
 // ── Health ──
 app.get('/health', (_, res) => res.json({ ok: true, time: new Date(), version: '2.0.0' }))
 
+
 app.get('/api/config', (_, res) => {
   res.json({ kitKey: KIT_KEY || '' })
 })
