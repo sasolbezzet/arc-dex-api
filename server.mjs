@@ -118,13 +118,35 @@ const ARC_RPC_URLS = [
 ]
 const ARC_RPC_PRIMARY = ARC_RPC_URLS[0]
 const ARC_RPC_DRPC = 'https://arc-testnet.drpc.org'
-/** Fetch wrapper — adds Bearer auth header for dRPC when DRPC_KEY is set. */
-function drpcFetch(url, opts = {}) {
+/** Fetch wrapper — adds Bearer auth header for dRPC when DRPC_KEY is set and
+ *  retries on 429/5xx with exponential backoff to survive rate limits. */
+async function drpcFetch(url, opts = {}) {
   const headers = { ...(opts.headers || {}) }
   if (DRPC_KEY && url.includes('drpc.org')) {
     headers['Authorization'] = `Bearer ${DRPC_KEY}`
   }
-  return fetch(url, { ...opts, headers })
+  const body = opts.body || (opts as any)?.body
+  const maxRetries = 5
+  let lastError
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(url, { ...opts, headers, body })
+      if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+        lastError = new Error(`RPC ${res.status}: ${res.statusText}`)
+        if (attempt === maxRetries) return res
+        const delay = Math.min(1000 * 2 ** attempt, 10_000) + Math.floor(Math.random() * 500)
+        await new Promise(resolve => setTimeout(resolve, delay))
+        continue
+      }
+      return res
+    } catch (err) {
+      lastError = err
+      if (attempt === maxRetries) throw lastError
+      const delay = Math.min(1000 * 2 ** attempt, 10_000) + Math.floor(Math.random() * 500)
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
+  }
+  throw lastError
 }
 const arcTestnet = defineChain({
   id: 5042002,
@@ -133,13 +155,46 @@ const arcTestnet = defineChain({
   rpcUrls: { default: { http: ARC_RPC_URLS } },
   blockExplorers: { default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' } },
 })
+// Retry helper for RPC fetches — survives 429/5xx from any provider.
+async function fetchWithRetry(url, opts = {}, maxRetries = 4) {
+  let lastError
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(url, opts)
+      if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+        lastError = new Error(`RPC ${res.status}: ${res.statusText}`)
+        if (attempt === maxRetries) return res
+        const delay = Math.min(500 * 2 ** attempt, 8_000) + Math.floor(Math.random() * 300)
+        await new Promise(resolve => setTimeout(resolve, delay))
+        continue
+      }
+      return res
+    } catch (err) {
+      lastError = err
+      if (attempt === maxRetries) throw lastError
+      const delay = Math.min(500 * 2 ** attempt, 8_000) + Math.floor(Math.random() * 300)
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
+  }
+  throw lastError
+}
+// viem's http transport uses global fetch; wrap it for the Arc RPC endpoints so
+// rate-limit responses are retried with exponential backoff before falling back.
+const _originalFetch = globalThis.fetch
+const _rpcUrlSet = new Set(ARC_RPC_URLS)
+globalThis.fetch = async (input, init) => {
+  let url
+  try { url = new URL(typeof input === 'string' ? input : (input?.url || input)) } catch { return _originalFetch(input, init) }
+  if (!_rpcUrlSet.has(url.origin + url.pathname)) return _originalFetch(input, init)
+  return fetchWithRetry(input, init, 4)
+}
 // Build fallback transports: public Arc → dRPC (with Bearer auth) → canteenapp
 function arcHttpTransports() {
-  const transports = ARC_RPC_URLS.map((url, index) => {
+  const transports = ARC_RPC_URLS.map((url) => {
     const isDrpc = url.includes('drpc.org')
     return http(url, {
       retryCount: 1,
-      timeout: 8_000,
+      timeout: 12_000,
       ...(isDrpc && DRPC_KEY ? { fetchOptions: { headers: { Authorization: `Bearer ${DRPC_KEY}` } } } : {}),
     })
   })
