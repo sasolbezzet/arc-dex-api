@@ -2208,6 +2208,91 @@ app.post('/api/mint-cctp-from-solana', apiLimiter, requireServerSignedMintAuth, 
 
 
 // ── Mint Direct (fallback manual receiveMessage) - EVM → EVM tanpa AppKit ──
+// ── Auto-mint worker (for web bridge) ───────────────────────────
+// Background worker yang poll attestation untuk bridge yang timeout di frontend.
+// Saat attestation siap, frontend bisa mint via MetaMask menggunakan data dari worker.
+const autoMintJobs = new Map() // jobId -> { burnTx, fromChain, toChain, status, attestation, message, messageTransmitter, error, createdAt }
+
+function startAutoMintWorker(jobId, burnTx, fromChain, toChain) {
+  const fromInfo = CCTP[fromChain]
+  const toInfo = CCTP[toChain]
+  if (!fromInfo || !toInfo) return
+
+  const job = autoMintJobs.get(jobId) || { burnTx, fromChain, toChain, status: 'polling', createdAt: Date.now() }
+  autoMintJobs.set(jobId, job)
+
+  console.log(`[auto-mint] worker started for ${burnTx.slice(0, 16)}... ${fromChain}→${toChain}`)
+
+  ;(async () => {
+    const maxAttempts = 200 // ~10 menit @ 3s
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        const current = autoMintJobs.get(jobId)
+        if (!current || current.status === 'cancelled') return
+
+        const att = await pollAttestation(fromInfo.domain, burnTx, 1, false)
+        if (att) {
+          autoMintJobs.set(jobId, {
+            ...current,
+            status: 'ready',
+            attestation: att.attestation,
+            message: att.message,
+            messageTransmitter: toInfo.messageTransmitter,
+            toChain,
+            fromChain,
+            burnTx,
+            readyAt: Date.now(),
+          })
+          console.log(`[auto-mint] attestation ready for ${burnTx.slice(0, 16)}...`)
+          return
+        }
+        autoMintJobs.set(jobId, { ...current, attempts: i + 1 })
+        await new Promise(r => setTimeout(r, 3000))
+      } catch (e) {
+        console.error(`[auto-mint] poll error attempt ${i + 1}:`, e.message)
+        await new Promise(r => setTimeout(r, 5000))
+      }
+    }
+    const final = autoMintJobs.get(jobId)
+    if (final && final.status === 'polling') {
+      autoMintJobs.set(jobId, { ...final, status: 'timeout', error: 'Attestation timeout after 200 attempts' })
+      console.log(`[auto-mint] timeout for ${burnTx.slice(0, 16)}...`)
+    }
+  })()
+}
+
+app.post('/api/auto-mint/register', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { burnTxHash, fromChain, toChain } = req.body
+    if (!burnTxHash || !fromChain || !toChain) return res.status(400).json({ error: 'Missing params' })
+    const safeBurnTx = normalizeTxHash(burnTxHash, 'burnTxHash')
+    if (!CCTP[fromChain] || !CCTP[toChain]) return res.status(400).json({ error: 'Unsupported chain' })
+
+    const jobId = safeBurnTx
+    const existing = autoMintJobs.get(jobId)
+    if (existing && (existing.status === 'ready' || existing.status === 'polling')) {
+      return res.json({ jobId, status: existing.status, message: 'Job already exists' })
+    }
+
+    startAutoMintWorker(jobId, safeBurnTx, fromChain, toChain)
+    res.json({ jobId, status: 'polling', message: 'Auto-mint worker started' })
+  } catch (e) {
+    console.error('[auto-mint/register]', e.message)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.get('/api/auto-mint/status/:jobId', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const jobId = normalizeTxHash(req.params.jobId, 'jobId')
+    const job = autoMintJobs.get(jobId)
+    if (!job) return res.status(404).json({ error: 'Job not found' })
+    res.json(job)
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
 app.post('/api/mint-direct', apiLimiter, requireServerSignedMintAuth, async (req, res) => {
   try {
     const { burnTxHash, fromChain, toChain, toAddress, amount: reqAmount } = req.body
