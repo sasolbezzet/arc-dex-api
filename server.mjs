@@ -1502,7 +1502,7 @@ const GATEWAY_TESTNET_CHAINS = [
   { domain: 5, chain: 'Solana_Devnet', ecosystem: 'solana' },
 ]
 
-const GATEWAY_PROXY_PATH = /^\/v1\/(?:info|balances|deposits|estimate|transfer(?:\/[0-9a-f-]{1,80})?)(?:\?enableForwarder=true)?$/i
+const GATEWAY_PROXY_PATH = /^\/v1\/(?:info|balances|deposits|estimate|transfer(?:\/[0-9a-f-]{1,80})?)(?:\?.*)?$/i
 
 app.all('/api/unified-balance/gateway-proxy', apiLimiter, requireAuth, async (req, res) => {
   try {
