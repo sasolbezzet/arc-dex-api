@@ -39,10 +39,10 @@ async function testSiwe() {
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString()
   const nonce = Array.from({ length: 16 }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join('')
   const siwe = new SiweMessage({
-    domain: 'arc-dex-bice.vercel.app',
+    domain: 'arcoxdex.vercel.app',
     address,
     statement: 'Only sign this message on the official ARCOX DEX website.',
-    uri: 'https://arc-dex-bice.vercel.app/',
+    uri: 'https://arcoxdex.vercel.app/',
     version: '1',
     chainId: 5042002,
     nonce,

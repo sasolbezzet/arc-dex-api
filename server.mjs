@@ -33,7 +33,6 @@ const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:4173',
   'https://43.163.98.128.nip.io',
   'https://43.163.98.128.nip.io/arc-dex',
-  'https://arc-dex-bice.vercel.app',
   'https://arcoxdex.vercel.app',
 ]
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(','))
@@ -106,7 +105,7 @@ const ARCOX_PAY_BASE_URL = (process.env.ARCOX_PAY_BASE_URL || process.env.ARCOX_
 const ENABLE_DEV_TOOLS = String(process.env.ENABLE_DEV_TOOLS || 'false').toLowerCase() === 'true'
 const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS || 24 * 60 * 60 * 1000)
 const LOGIN_WINDOW_MS = 5 * 60 * 1000
-const DEFAULT_SIWE_DOMAINS = ['localhost', 'localhost:5173', 'localhost:4173', 'arc-dex-bice.vercel.app', 'arcoxdex.vercel.app', '43.163.98.128.nip.io']
+const DEFAULT_SIWE_DOMAINS = ['localhost', 'localhost:5173', 'localhost:4173', 'arcoxdex.vercel.app', '43.163.98.128.nip.io']
 const SIWE_ALLOWED_DOMAINS = (process.env.SIWE_ALLOWED_DOMAINS || DEFAULT_SIWE_DOMAINS.join(',')).split(',').map(d => d.trim()).filter(Boolean)
 if (!process.env.AUTH_SECRET) console.warn('[security] AUTH_SECRET not set. Set a dedicated random AUTH_SECRET before production.')
 

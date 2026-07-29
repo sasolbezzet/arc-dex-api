@@ -115,7 +115,7 @@ POST /v1/chat/completions
 OpenAI-compatible config:
 
 ```text
-base_url = https://arc-dex-bice.vercel.app/v1
+base_url = https://arcoxdex.vercel.app/v1
 api_key = arx_sk_...
 model = arcox/auto
 ```
@@ -152,7 +152,7 @@ GET /api/nanopayments/capabilities
 ## Env Tambahan
 
 ```text
-ARCOX_PAY_BASE_URL=https://arc-dex-bice.vercel.app
+ARCOX_PAY_BASE_URL=https://arcoxdex.vercel.app
 ENABLE_DEV_TOOLS=false
 CIRCLE_API_KEY=
 CIRCLE_WEBHOOK_SECRET=
