@@ -315,6 +315,10 @@ export async function mcpHttpHandler(req, res) {
     return res.status(401).json({ error: 'invalid_token', error_description: 'Token expired or invalid' })
   }
 
+  // Track MCP session for connection status
+  const { registerMcpSession } = await import('./vaultStore.mjs')
+  registerMcpSession(auth.userId, auth.clientId, 'chatgpt-mcp')
+
   // Handle MCP initialize and tool calls via Streamable HTTP
   const sessionId = req.headers['mcp-session-id'] || randomUUID()
   

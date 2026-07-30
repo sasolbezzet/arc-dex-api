@@ -4,6 +4,60 @@ import { randomUUID } from 'crypto'
 const VAULT_PATH = process.env.VAULT_PATH || './data/vault.json'
 const ACTIVITY_PATH = process.env.VAULT_ACTIVITY_PATH || './data/vault-activity.json'
 
+// ── Session tokens (in-memory, TTL 24h) ──
+const sessionTokens = new Map() // token -> { userId, expires }
+
+export function createSession(userId) {
+  const token = 'arx_vs_' + randomUUID().replace(/-/g, '')
+  sessionTokens.set(token, { userId, expires: Date.now() + 86400000 })
+  return token
+}
+
+export function validateSession(token) {
+  const s = sessionTokens.get(token)
+  if (!s) return null
+  if (Date.now() > s.expires) { sessionTokens.delete(token); return null }
+  return s.userId
+}
+
+// ── Pending SIWE challenges (in-memory, TTL 5 min) ──
+const challenges = new Map() // nonce -> { address, message, expires }
+export function createChallenge(address) {
+  const nonce = randomUUID().slice(0, 8)
+  const domain = 'arcoxdex.vercel.app'
+  const message = `${domain} wants you to sign in with your Ethereum account:\n${address}\n\nAuthorize ARCOX Vault Access\n\nURI: https://arcoxdex.vercel.app\nVersion: 1\nChain ID: 5042002\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`
+  challenges.set(nonce, { address: address.toLowerCase(), message, expires: Date.now() + 300000 })
+  return { nonce, message }
+}
+export function getChallenge(nonce) {
+  const c = challenges.get(nonce)
+  if (!c) return null
+  if (Date.now() > c.expires) { challenges.delete(nonce); return null }
+  return c
+}
+export function consumeChallenge(nonce) {
+  const c = challenges.get(nonce)
+  challenges.delete(nonce)
+  return c
+}
+
+// ── MCP session tracking ──
+const mcpSessions = new Map() // userId -> [{ clientId, agent, connectedAt, lastActivity }]
+export function registerMcpSession(userId, clientId, agent) {
+  if (!mcpSessions.has(userId)) mcpSessions.set(userId, [])
+  const sessions = mcpSessions.get(userId)
+  const existing = sessions.find(s => s.clientId === clientId)
+  if (existing) {
+    existing.lastActivity = Date.now()
+    existing.active = true
+  } else {
+    sessions.push({ clientId, agent, connectedAt: Date.now(), lastActivity: Date.now(), active: true })
+  }
+}
+export function listMcpSessions(userId) {
+  return mcpSessions.get(userId) || []
+}
+
 // ── Helpers ──
 function loadVault() {
   return readJsonFile(VAULT_PATH, { credentials: [], limits: {}, approvals: [] })
