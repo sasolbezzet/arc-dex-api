@@ -8,18 +8,33 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs'
 
 // ── In-memory session store (production: use Redis) ──
 const sessions = new Map() // sessionId -> { transport, server }
-const oauthClients = new Map() // clientId -> { clientSecret, redirectUris, clientName }
 const authCodes = new Map() // code -> { clientId, userId, expires }
 const accessTokens = new Map() // token -> { userId, clientId, expires }
 
 const SERVER_URL = process.env.SERVER_URL || 'https://arcoxdex.vercel.app'
 const TOKEN_TTL = 3600 * 24 // 24 hours
+const OAUTH_PATH = process.env.OAUTH_PATH || './data/oauth-clients.json'
+
+// ── Persistent OAuth client store ──
+import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
+
+function loadClients() {
+  const d = readJsonFile(OAUTH_PATH, { clients: {} })
+  return new Map(Object.entries(d.clients || {}))
+}
+function saveClients(map) {
+  const obj = Object.fromEntries(map)
+  atomicWriteJsonFile(OAUTH_PATH, { clients: obj })
+}
+
+const oauthClients = loadClients()
 
 // ── OAuth helpers ──
 export function registerOAuthClient({ clientName, redirectUris = [] }) {
   const clientId = 'arcox_' + randomUUID().slice(0, 12)
   const clientSecret = randomUUID()
   oauthClients.set(clientId, { clientSecret, redirectUris, clientName })
+  saveClients(oauthClients)
   return { clientId, clientSecret, clientName, redirectUris }
 }
 

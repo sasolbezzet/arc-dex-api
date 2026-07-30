@@ -1,0 +1,11 @@
+{
+  "clients": {
+    "arcox_9faca9ec-cf2": {
+      "clientSecret": "423c8c49-6e15-4023-9316-19c66dd9ac76",
+      "redirectUris": [
+        "https://chatgpt.com/connector/oauth/test123"
+      ],
+      "clientName": "ChatGPT"
+    }
+  }
+}
