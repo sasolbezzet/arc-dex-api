@@ -16,6 +16,7 @@ import arkhamRoutes from './src/routes/arkhamRoutes.mjs'
 import treasuryRoutes from './src/routes/treasuryRoutes.mjs'
 import x402Routes from './src/routes/x402Routes.mjs'
 import aiRouterRoutes, { openAiChatCompletions, openAiModels } from './src/routes/aiRouterRoutes.mjs'
+import vaultRoutes from './src/routes/vaultRoutes.mjs'
 import { estimateUnifiedBalanceX402, getX402Invoice, markUnifiedBalanceSpendSubmitted, processCircleX402Webhook, publicInvoice, reconcileX402Invoice, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
 import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
@@ -90,6 +91,7 @@ app.use('/api/intel', apiLimiter, arkhamRoutes)
 app.use('/api/treasury', apiLimiter, treasuryRoutes)
 app.use('/api/x402', apiLimiter, x402Routes)
 app.use('/api/ai-router', apiLimiter, aiRouterRoutes)
+app.use('/api/vault', apiLimiter, vaultRoutes)
 app.get('/v1/models', apiLimiter, openAiModels)
 app.post('/v1/chat/completions', apiLimiter, openAiChatCompletions)
 
