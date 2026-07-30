@@ -17,6 +17,7 @@ import treasuryRoutes from './src/routes/treasuryRoutes.mjs'
 import x402Routes from './src/routes/x402Routes.mjs'
 import aiRouterRoutes, { openAiChatCompletions, openAiModels } from './src/routes/aiRouterRoutes.mjs'
 import vaultRoutes from './src/routes/vaultRoutes.mjs'
+import { oauthMetadataHandler, protectedResourceHandler, oauthAuthorizeHandler, siweMessageHandler, siweVerifyHandler, oauthTokenHandler, oauthRegisterHandler, mcpHttpHandler } from './src/services/mcpServer.mjs'
 import { estimateUnifiedBalanceX402, getX402Invoice, markUnifiedBalanceSpendSubmitted, processCircleX402Webhook, publicInvoice, reconcileX402Invoice, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
 import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
@@ -92,6 +93,16 @@ app.use('/api/treasury', apiLimiter, treasuryRoutes)
 app.use('/api/x402', apiLimiter, x402Routes)
 app.use('/api/ai-router', apiLimiter, aiRouterRoutes)
 app.use('/api/vault', apiLimiter, vaultRoutes)
+
+// ── Remote HTTP MCP + OAuth 2.1 ──
+app.get('/.well-known/oauth-authorization-server', oauthMetadataHandler)
+app.get('/.well-known/protected-resource', protectedResourceHandler)
+app.get('/api/auth/authorize', oauthAuthorizeHandler)
+app.get('/api/auth/siwe-message', siweMessageHandler)
+app.post('/api/auth/siwe-verify', siweVerifyHandler)
+app.post('/api/auth/token', oauthTokenHandler)
+app.post('/api/auth/register', oauthRegisterHandler)
+app.all('/mcp', mcpHttpHandler)
 app.get('/v1/models', apiLimiter, openAiModels)
 app.post('/v1/chat/completions', apiLimiter, openAiChatCompletions)
 
