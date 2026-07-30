@@ -92,77 +92,16 @@ export function oauthAuthorizeHandler(req, res) {
   const client = oauthClients.get(client_id)
   if (!client) return res.status(400).json({ error: 'invalid_client', error_description: 'Unknown client_id' })
 
-  // Return HTML page for wallet login (SIWE)
-  const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ARCOX MCP Auth</title>
-<style>
-  body{background:#0f0f1a;color:#e2e8f0;font-family:Inter,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-  .box{background:#1a1a2e;border-radius:16px;padding:32px;max-width:400px;width:90%}
-  h1{font-size:18px;margin:0 0 8px}
-  p{color:#94a3b8;font-size:13px;margin:0 0 20px}
-  button{width:100%;padding:12px;border-radius:10px;border:1px solid rgba(99,102,241,0.4);background:rgba(99,102,241,0.15);color:#818cf8;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:8px}
-  button:hover{background:rgba(99,102,241,0.25)}
-  .status{font-size:12px;color:#94a3b8;text-align:center;margin-top:12px;word-break:break-all}
-  input{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #2a2a3e;background:#0f0f1a;color:#e2e8f0;font-size:13px;margin-bottom:8px}
-</style></head><body>
-<div class="box">
-  <h1>🔐 ARCOX MCP Authorization</h1>
-  <p>Sign with your wallet to authorize MCP access.</p>
-  <input id="address" placeholder="0x... wallet address" value="">
-  <button onclick="signIn()">Sign in with Wallet</button>
-  <div class="status" id="status"></div>
-</div>
-<script>
-  const params = new URLSearchParams(location.search);
-  const clientId = params.get('client_id');
-  const redirectUri = params.get('redirect_uri');
-  const state = params.get('state');
-  const codeChallenge = params.get('code_challenge');
-
-  async function signIn() {
-    const address = document.getElementById('address').value.trim();
-    if (!address) { document.getElementById('status').textContent = 'Enter wallet address'; return; }
-    document.getElementById('status').textContent = 'Requesting SIWE message...';
-    try {
-      const msgResp = await fetch('/api/auth/siwe-message?address=' + address + '&client_id=' + clientId);
-      const msgData = await msgResp.json();
-      if (!msgData.message) throw new Error('Failed to get SIWE message');
-      
-      // Request wallet signature
-      const provider = window.ethereum;
-      if (!provider) {
-        // Fallback: auto-approve for testing (address ownership check)
-        document.getElementById('status').textContent = 'No MetaMask. Auto-approving...';
-        const codeResp = await fetch('/api/auth/siwe-verify', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ address, message: msgData.message, signature: '0x_auto', clientId, redirectUri, state, codeChallenge }),
-        });
-        const codeData = await codeResp.json();
-        if (codeData.redirect) { window.location.href = codeData.redirect; return; }
-        throw new Error(codeData.error || 'Auth failed');
-      }
-      
-      const accounts = await provider.request({ method: 'eth_requestAccounts' });
-      const from = accounts[0];
-      const signature = await provider.request({ method: 'personal_sign', params: [msgData.message, from] });
-      
-      const codeResp = await fetch('/api/auth/siwe-verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ address: from, message: msgData.message, signature, clientId, redirectUri, state, codeChallenge }),
-      });
-      const codeData = await codeResp.json();
-      if (codeData.redirect) { window.location.href = codeData.redirect; return; }
-      throw new Error(codeData.error || 'Auth failed');
-    } catch(e) {
-      document.getElementById('status').textContent = 'Error: ' + e.message;
-    }
-  }
-</script></body></html>`
-  res.setHeader('Content-Type', 'text/html')
-  res.send(html)
+  // Redirect to frontend Plugin page with OAuth params
+  // Frontend handles SIWE login + approval, then redirects back to ChatGPT
+  const params = new URLSearchParams({
+    auth: 'mcp',
+    client_id,
+    redirect_uri,
+    state: state || '',
+    code_challenge: code_challenge || '',
+  })
+  res.redirect(302, `${SERVER_URL}/plugin?${params.toString()}`)
 }
 
 // ── SIWE message generation ──

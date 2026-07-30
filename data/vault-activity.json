@@ -118,5 +118,25 @@
       "amount": "200"
     },
     "ts": 1785415623963
+  },
+  {
+    "id": "47da6f9b-3b95-4c47-af29-31ddaaea119f",
+    "owner": "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e",
+    "type": "credential_added",
+    "data": {
+      "type": "eoa",
+      "label": "MetaMask EOA"
+    },
+    "ts": 1785420597614
+  },
+  {
+    "id": "f13415c2-934c-45b3-9d2f-be515b6ef499",
+    "owner": "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e",
+    "type": "credential_added",
+    "data": {
+      "type": "circle",
+      "label": "Circle Wallet"
+    },
+    "ts": 1785420597730
   }
 ]

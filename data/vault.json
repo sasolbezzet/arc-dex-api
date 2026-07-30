@@ -15,6 +15,22 @@
       "label": "MetaMask EOA",
       "value": "0xE34FF1D2C925DDafB28C95C2396fC49A6f64569e",
       "createdAt": 1785415623903
+    },
+    {
+      "id": "162ee2d6-a821-4df8-b079-ac7c9f59d65d",
+      "owner": "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e",
+      "type": "eoa",
+      "label": "MetaMask EOA",
+      "value": "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e",
+      "createdAt": 1785420597610
+    },
+    {
+      "id": "3c07c40a-346d-42f8-96c9-4b225833b51c",
+      "owner": "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e",
+      "type": "circle",
+      "label": "Circle Wallet",
+      "value": "0x65435be73e1ffa6037eed3304e11688b507d3ad4",
+      "createdAt": 1785420597729
     }
   ],
   "limits": {
