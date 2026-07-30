@@ -93,10 +93,16 @@ export function oauthMetadataHandler(req, res) {
   })
 }
 
-// ── Protected resource metadata ──
+// ── Protected resource metadata (RFC 9728) ──
+// The MCP resource server is the /mcp endpoint. Per RFC 9728 §3.1 the well-known
+// document lives at /.well-known/oauth-protected-resource[/<resource-path>].
+// We serve both the root and the /mcp-suffixed variant so Claude/ChatGPT can
+// discover it regardless of how they compute the metadata URL.
+const MCP_RESOURCE_URL = `${SERVER_URL}/mcp`
+
 export function protectedResourceHandler(req, res) {
   res.json({
-    resource: SERVER_URL,
+    resource: MCP_RESOURCE_URL,
     authorization_servers: [SERVER_URL],
     bearer_methods_supported: ['header'],
     scopes_supported: ['mcp:tools'],
@@ -136,7 +142,7 @@ export function siweMessageHandler(req, res) {
 // ── SIWE verify + issue auth code ──
 import { verifyMessage } from 'viem'
 export function siweVerifyHandler(req, res) {
-  const { address, message, signature, clientId, redirectUri, state, codeChallenge } = req.body
+  const { address, message, signature, clientId, redirectUri, state, codeChallenge } = req.body || {}
   if (!address || !message || !clientId) return res.status(400).json({ error: 'missing fields' })
   
   // For auto-sign (no MetaMask), accept if address matches message
@@ -158,7 +164,7 @@ export function siweVerifyHandler(req, res) {
 
 // ── Token endpoint ──
 export function oauthTokenHandler(req, res) {
-  const { grant_type, code, client_id, client_secret, redirect_uri } = req.body
+  const { grant_type, code, client_id, client_secret, redirect_uri } = req.body || {}
   if (grant_type === 'authorization_code') {
     const result = exchangeCodeForToken(code, client_id, client_secret)
     if (result.error) return res.status(400).json(result)
@@ -170,7 +176,7 @@ export function oauthTokenHandler(req, res) {
 
 // ── Dynamic Client Registration ──
 export function oauthRegisterHandler(req, res) {
-  const { client_name, redirect_uris = [], grant_types = ['authorization_code'], response_types = ['code'], token_endpoint_auth_method = 'none' } = req.body
+  const { client_name, redirect_uris = [], grant_types = ['authorization_code'], response_types = ['code'], token_endpoint_auth_method = 'none' } = req.body || {}
   const client = registerOAuthClient({ clientName: client_name || 'mcp-client', redirectUris: redirect_uris })
   res.status(201).json({
     client_id: client.clientId,
@@ -436,12 +442,12 @@ export async function mcpHttpHandler(req, res) {
   // Validate bearer token
   const token = extractBearer(req)
   if (!token) {
-    res.setHeader('WWW-Authenticate', 'Bearer realm="ARCOX MCP"')
+    res.setHeader('WWW-Authenticate', `Bearer realm="ARCOX MCP", resource_metadata="${SERVER_URL}/.well-known/oauth-protected-resource"`)
     return res.status(401).json({ error: 'invalid_token', error_description: 'Bearer token required' })
   }
   const auth = validateAccessToken(token)
   if (!auth) {
-    res.setHeader('WWW-Authenticate', 'Bearer realm="ARCOX MCP", error="invalid_token"')
+    res.setHeader('WWW-Authenticate', `Bearer realm="ARCOX MCP", error="invalid_token", resource_metadata="${SERVER_URL}/.well-known/oauth-protected-resource"`)
     return res.status(401).json({ error: 'invalid_token', error_description: 'Token expired or invalid' })
   }
 

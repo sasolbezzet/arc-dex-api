@@ -62,6 +62,10 @@ app.use((req, res, next) => {
 app.use(['/api/webhooks/circle', '/api/webhooks/circle-gateway', '/api/circle/webhook'], express.raw({ type: '*/*', limit: '256kb' }))
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || process.env.AI_ROUTER_JSON_BODY_LIMIT || '8mb'
 app.use(express.json({ limit: JSON_BODY_LIMIT }))
+// OAuth 2.1 token/registration endpoints send application/x-www-form-urlencoded.
+// express.json() ignores that content-type (leaving req.body undefined), so we
+// also parse urlencoded bodies. Runs after json(); for JSON requests this is a no-op.
+app.use(express.urlencoded({ extended: true, limit: JSON_BODY_LIMIT }))
 
 function rateLimit({ windowMs, max, keyPrefix }) {
   const hits = new Map()
@@ -96,7 +100,11 @@ app.use('/api/vault', apiLimiter, vaultRoutes)
 
 // ── Remote HTTP MCP + OAuth 2.1 ──
 app.get('/.well-known/oauth-authorization-server', oauthMetadataHandler)
+app.get('/.well-known/oauth-authorization-server/mcp', oauthMetadataHandler)
+// RFC 9728 canonical protected-resource metadata paths (Claude/ChatGPT probe these)
 app.get('/.well-known/protected-resource', protectedResourceHandler)
+app.get('/.well-known/oauth-protected-resource', protectedResourceHandler)
+app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceHandler)
 app.get('/api/auth/authorize', oauthAuthorizeHandler)
 app.get('/api/auth/siwe-message', siweMessageHandler)
 app.post('/api/auth/siwe-verify', siweVerifyHandler)
