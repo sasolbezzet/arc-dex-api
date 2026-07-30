@@ -171,6 +171,25 @@ function extractBearer(req) {
   return auth.slice(7)
 }
 
+// ── Backend API helper ──
+const BACKEND_URL = process.env.ARCOX_BACKEND_URL || 'http://localhost:3001'
+
+async function apiGet(path, token) {
+  const r = await fetch(`${BACKEND_URL}${path}`, {
+    headers: token ? { 'x-arcox-owner': token } : {},
+  })
+  return r.json()
+}
+
+async function apiPost(path, body, token) {
+  const r = await fetch(`${BACKEND_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token ? { 'x-arcox-owner': token } : {}) },
+    body: JSON.stringify(body),
+  })
+  return r.json()
+}
+
 // ── MCP Server factory ──
 export function createMcpServer(userId) {
   const server = new McpServer({
@@ -178,30 +197,178 @@ export function createMcpServer(userId) {
     version: '1.0.0',
   })
 
-  // Tool: wallet balances
-  server.tool('arcox_wallet_balances', 'Show all wallet balances (EOA Arc, Circle proxy, Solana)', {}, async () => {
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          status: 'ok',
-          message: 'Use arcox-agent MCP for live balance queries. This remote MCP proxy confirms auth.',
-          userId,
-          tools: ['swap', 'bridge', 'send', 'intel', 'pay', 'ai_router', 'agentic_jobs'],
-        })
-      }]
-    }
+  // ── READ-ONLY TOOLS ──
+
+  server.tool('arcox_wallet_balances', 'Show all wallet balances (EOA Arc, Circle proxy, Solana Devnet USDC)', {}, async () => {
+    const data = await apiGet(`/api/balance/${userId}`, userId)
+    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
   })
 
-  // Tool: list vault credentials
+  server.tool('arcox_transaction_history', 'Check transaction history and auto-mint worker status', {}, async () => {
+    const data = await apiGet(`/api/tx-history?address=${userId}`, userId)
+    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+  })
+
+  server.tool('arcox_route_status', 'Check if a swap/bridge/send route is supported', {
+    action: z.string().describe('swap, bridge, or send'),
+    fromChain: z.string().optional().describe('Source chain'),
+    toChain: z.string().optional().describe('Destination chain'),
+    token: z.string().optional().describe('Token symbol (USDC, EURC, cirBTC)'),
+    source: z.string().optional().describe('eoa or circle'),
+  }, async (params) => {
+    // Return supported routes info
+    return { content: [{ type: 'text', text: JSON.stringify({
+      supported: true,
+      action: params.action,
+      chains: { 'arc-testnet': 5042002, 'ethereum-sepolia': 11155111, 'base-sepolia': 84532, 'arbitrum-sepolia': 421614, 'solana-devnet': 'solana' },
+      tokens: ['USDC', 'EURC', 'cirBTC'],
+      sources: ['eoa', 'circle'],
+      note: 'Call arcox_quote_swap or arcox_quote_bridge for a preview',
+    }) }] }
+  })
+
+  // ── SWAP TOOLS (quote → confirm → execute) ──
+
+  server.tool('arcox_quote_swap', 'Get a swap quote preview. Show preview to user, wait for confirmation, then call arcox_execute_swap', {
+    tokenIn: z.string().describe('Input token symbol (USDC, EURC, cirBTC)'),
+    tokenOut: z.string().describe('Output token symbol'),
+    amountIn: z.string().describe('Amount in human readable (e.g. "1")'),
+    source: z.string().optional().describe('eoa or circle. Default eoa'),
+  }, async (params) => {
+    const data = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn }, userId)
+    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+  })
+
+  server.tool('arcox_execute_swap', 'Execute a confirmed swap. Requires previewId from arcox_quote_swap and user confirmation. This triggers MetaMask signing via the frontend Plugin approval flow.', {
+    tokenIn: z.string().describe('Input token symbol'),
+    tokenOut: z.string().describe('Output token symbol'),
+    amountIn: z.string().describe('Exact amount from quote'),
+    source: z.string().optional().describe('eoa or circle'),
+    previewId: z.string().describe('Preview ID from arcox_quote_swap'),
+    confirmed: z.boolean().describe('Must be true to execute'),
+    confirmationText: z.string().describe('User confirmation text (yes/ya)'),
+  }, async (params) => {
+    if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
+    // Create vault approval for user to sign via MetaMask in frontend
+    const { createApproval } = await import('./vaultStore.mjs')
+    const approval = createApproval(userId, {
+      agent: 'chatgpt-mcp',
+      action: 'swap',
+      amount: params.amountIn,
+      token: params.tokenIn,
+      source: params.source || 'eoa',
+      details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
+    })
+    return { content: [{ type: 'text', text: JSON.stringify({
+      status: 'approval_created',
+      approval,
+      message: 'Approval request sent to user. Ask user to open arcoxdex.vercel.app/plugin and approve the transaction in the Approvals section. The swap will execute via MetaMask signing.',
+      safeNextStep: 'Tell the user to check the Plugin page Approvals section and click Approve. The transaction requires MetaMask signature.',
+    }) }] }
+  })
+
+  // ── BRIDGE TOOLS (route → quote → confirm → execute) ──
+
+  server.tool('arcox_quote_bridge', 'Get a bridge quote preview. Show preview to user, wait for confirmation, then call arcox_execute_bridge', {
+    fromChain: z.string().describe('Source chain (arc-testnet, ethereum-sepolia, base-sepolia, arbitrum-sepolia, solana-devnet)'),
+    toChain: z.string().describe('Destination chain'),
+    amount: z.string().describe('Amount in human readable'),
+    token: z.string().optional().describe('Token symbol. Default USDC'),
+    source: z.string().optional().describe('eoa or circle. Default eoa'),
+  }, async (params) => {
+    const data = await apiPost('/api/prepare-bridge', {
+      fromChain: params.fromChain,
+      toChain: params.toChain,
+      amount: params.amount,
+      token: params.token || 'USDC',
+      source: params.source || 'eoa',
+    }, userId)
+    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+  })
+
+  server.tool('arcox_execute_bridge', 'Execute a confirmed bridge. Requires previewId from arcox_quote_bridge and user confirmation. Triggers MetaMask signing via frontend Plugin approval flow.', {
+    fromChain: z.string().describe('Source chain'),
+    toChain: z.string().describe('Destination chain'),
+    amount: z.string().describe('Exact amount from quote'),
+    token: z.string().optional().describe('Token symbol'),
+    source: z.string().optional().describe('eoa or circle'),
+    previewId: z.string().describe('Preview ID from arcox_quote_bridge'),
+    confirmed: z.boolean().describe('Must be true to execute'),
+    confirmationText: z.string().describe('User confirmation text (yes/ya)'),
+  }, async (params) => {
+    if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
+    const { createApproval } = await import('./vaultStore.mjs')
+    const approval = createApproval(userId, {
+      agent: 'chatgpt-mcp',
+      action: 'bridge',
+      amount: params.amount,
+      token: params.token || 'USDC',
+      source: params.source || 'eoa',
+      to: params.toChain,
+      details: JSON.stringify({ fromChain: params.fromChain, toChain: params.toChain, previewId: params.previewId }),
+    })
+    return { content: [{ type: 'text', text: JSON.stringify({
+      status: 'approval_created',
+      approval,
+      message: 'Bridge approval request sent to user. Ask user to open arcoxdex.vercel.app/plugin and approve in the Approvals section.',
+      safeNextStep: 'Tell the user to check the Plugin page Approvals section and click Approve.',
+    }) }] }
+  })
+
+  // ── SEND TOOLS (quote → confirm → execute) ──
+
+  server.tool('arcox_quote_send', 'Get a send quote preview. Show preview to user, wait for confirmation, then call arcox_execute_send', {
+    to: z.string().describe('Recipient address'),
+    amount: z.string().describe('Amount in human readable'),
+    token: z.string().optional().describe('Token symbol. Default USDC'),
+    source: z.string().optional().describe('eoa or circle. Default eoa'),
+  }, async (params) => {
+    const data = await apiPost('/api/send-estimate', {
+      to: params.to,
+      amount: params.amount,
+      token: params.token || 'USDC',
+      source: params.source || 'eoa',
+    }, userId)
+    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+  })
+
+  server.tool('arcox_execute_send', 'Execute a confirmed token send. Requires previewId from arcox_quote_send and user confirmation. Triggers MetaMask signing via frontend Plugin approval flow.', {
+    to: z.string().describe('Recipient address'),
+    amount: z.string().describe('Exact amount from quote'),
+    token: z.string().optional().describe('Token symbol'),
+    source: z.string().optional().describe('eoa or circle'),
+    previewId: z.string().describe('Preview ID from arcox_quote_send'),
+    confirmed: z.boolean().describe('Must be true to execute'),
+    confirmationText: z.string().describe('User confirmation text (yes/ya)'),
+  }, async (params) => {
+    if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
+    const { createApproval } = await import('./vaultStore.mjs')
+    const approval = createApproval(userId, {
+      agent: 'chatgpt-mcp',
+      action: 'send',
+      amount: params.amount,
+      token: params.token || 'USDC',
+      source: params.source || 'eoa',
+      to: params.to,
+      details: JSON.stringify({ previewId: params.previewId }),
+    })
+    return { content: [{ type: 'text', text: JSON.stringify({
+      status: 'approval_created',
+      approval,
+      message: 'Send approval request sent to user. Ask user to open arcoxdex.vercel.app/plugin and approve in the Approvals section.',
+      safeNextStep: 'Tell the user to check the Plugin page Approvals section and click Approve.',
+    }) }] }
+  })
+
+  // ── VAULT TOOLS ──
+
   server.tool('arcox_vault_list_credentials', 'List vault credentials for the authenticated user', {}, async () => {
     const { listCredentials } = await import('./vaultStore.mjs')
     const creds = listCredentials(userId)
     return { content: [{ type: 'text', text: JSON.stringify({ credentials: creds }) }] }
   })
 
-  // Tool: request approval
-  server.tool('arcox_vault_request_approval', 'Request user approval for a transaction', {
+  server.tool('arcox_vault_request_approval', 'Request user approval for a transaction. Agent calls this before executing value-moving actions', {
     action: z.string().describe('swap, bridge, send'),
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol (USDC, EURC, etc)'),
@@ -213,15 +380,15 @@ export function createMcpServer(userId) {
     return { content: [{ type: 'text', text: JSON.stringify({ approval }) }] }
   })
 
-  // Tool: get limits
   server.tool('arcox_vault_get_limits', 'Get spending limits for the authenticated user', {}, async () => {
     const { getLimits } = await import('./vaultStore.mjs')
     const limits = getLimits(userId)
     return { content: [{ type: 'text', text: JSON.stringify({ limits }) }] }
   })
 
-  // Tool: MCP info
-  server.tool('arcox_mcp_info', 'Get ARCOX MCP server info and available services', {}, async () => {
+  // ── INFO TOOL ──
+
+  server.tool('arcox_mcp_info', 'Get ARCOX MCP server info, available services, and execution guide', {}, async () => {
     return {
       content: [{
         type: 'text',
@@ -230,8 +397,13 @@ export function createMcpServer(userId) {
           version: '1.0.0',
           url: SERVER_URL,
           userId,
-          services: ['wallet_balances', 'swap', 'bridge', 'send', 'intel', 'pay', 'ai_router', 'agentic_jobs', 'vault'],
-          safety: 'All value-moving actions require user confirmation. Use arcox_vault_request_approval before executing transactions.',
+          services: ['wallet_balances', 'swap', 'bridge', 'send', 'vault', 'transaction_history', 'route_status'],
+          safety: 'All value-moving actions require quote preview + user confirmation. Flow: quote → show preview → user says yes → execute with previewId + confirmed=true.',
+          execution_guide: {
+            swap: ['arcox_quote_swap → show preview → user yes → arcox_execute_swap'],
+            bridge: ['arcox_route_status → arcox_quote_bridge → show preview → user yes → arcox_execute_bridge'],
+            send: ['arcox_quote_send → show preview → user yes → arcox_execute_send'],
+          },
         })
       }]
     }
