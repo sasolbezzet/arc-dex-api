@@ -3,13 +3,18 @@ import { listCredentials, addCredential, revealCredential, deleteCredential, get
 
 const vault = Router()
 
-// ── Auth middleware: require SIWE session or address param ──
+// ── Auth middleware: require wallet address + validate format ──
 function requireOwner(req, res, next) {
   const owner = req.headers['x-wallet-address'] || req.query.address || req.body?.address
   if (!owner || typeof owner !== 'string') {
     return res.status(401).json({ error: 'Wallet address required (x-wallet-address header)' })
   }
-  req.owner = owner.toLowerCase()
+  // Basic validation: must look like EVM address or Solana pubkey
+  const clean = owner.toLowerCase().trim()
+  if (!/^0x[a-f0-9]{40}$/.test(clean) && !/^[1-9a-hj-np-z]{32,44}$/.test(owner.trim())) {
+    return res.status(400).json({ error: 'Invalid wallet address format' })
+  }
+  req.owner = clean
   next()
 }
 

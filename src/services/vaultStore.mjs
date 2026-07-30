@@ -1,5 +1,5 @@
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
-import { createHmac, randomUUID } from 'crypto'
+import { randomUUID } from 'crypto'
 
 const VAULT_PATH = process.env.VAULT_PATH || './data/vault.json'
 const ACTIVITY_PATH = process.env.VAULT_ACTIVITY_PATH || './data/vault-activity.json'

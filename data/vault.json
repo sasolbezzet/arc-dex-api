@@ -1,0 +1,73 @@
+{
+  "credentials": [
+    {
+      "id": "0b32773c-7e06-4910-b066-eaaf3bd7f997",
+      "owner": "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e",
+      "type": "api_key",
+      "label": "Test Key",
+      "value": "sk_test_123",
+      "createdAt": 1785415178569
+    },
+    {
+      "id": "10465e02-8b36-4b68-93de-82047be82985",
+      "owner": "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e",
+      "type": "eoa",
+      "label": "MetaMask EOA",
+      "value": "0xE34FF1D2C925DDafB28C95C2396fC49A6f64569e",
+      "createdAt": 1785415623903
+    }
+  ],
+  "limits": {
+    "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e": {
+      "maxPerTx": 50,
+      "dailyLimit": 200,
+      "autoApprove": true,
+      "whitelist": [
+        "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD38"
+      ]
+    }
+  },
+  "approvals": [
+    {
+      "id": "d1545c02-9d96-40c4-95e3-6c04a523461c",
+      "owner": "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e",
+      "agent": "test",
+      "action": "swap",
+      "amount": "30",
+      "token": "USDC",
+      "source": "eoa",
+      "to": "",
+      "details": "",
+      "status": "auto_approved",
+      "createdAt": 1785415623942
+    },
+    {
+      "id": "46892591-f60e-4d11-9e7f-2c5dbfb54f4e",
+      "owner": "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e",
+      "agent": "test",
+      "action": "send",
+      "amount": "100",
+      "token": "USDC",
+      "source": "circle",
+      "to": "",
+      "details": "",
+      "status": "approved",
+      "createdAt": 1785415623946,
+      "approvedAt": 1785415623951
+    },
+    {
+      "id": "36aa2d2c-689f-4d71-b685-69975f3aabbf",
+      "owner": "0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e",
+      "agent": "test",
+      "action": "swap",
+      "amount": "200",
+      "token": "USDC",
+      "source": "eoa",
+      "to": "",
+      "details": "",
+      "status": "rejected",
+      "createdAt": 1785415623958,
+      "rejectedAt": 1785415623962
+    }
+  ]
+}
