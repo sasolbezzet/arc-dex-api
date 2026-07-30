@@ -49,7 +49,11 @@ export function exchangeCodeForToken(code, clientId, clientSecret) {
   if (!auth) return { error: 'invalid_grant', error_description: 'Invalid authorization code' }
   if (Date.now() > auth.expires) return { error: 'invalid_grant', error_description: 'Code expired' }
   const client = oauthClients.get(clientId)
-  if (!client || client.clientSecret !== clientSecret) return { error: 'invalid_client' }
+  if (!client) return { error: 'invalid_client', error_description: 'Unknown client_id' }
+  // If client registered with token_endpoint_auth_method=none, skip secret check
+  if (clientSecret !== undefined && clientSecret !== '') {
+    if (client.clientSecret !== clientSecret) return { error: 'invalid_client', error_description: 'Invalid client_secret' }
+  }
   authCodes.delete(code)
   const token = 'arx_at_' + randomUUID().replace(/-/g, '')
   accessTokens.set(token, { userId: auth.userId, clientId, expires: Date.now() + TOKEN_TTL * 1000 })
