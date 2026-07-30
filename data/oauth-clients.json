@@ -55,6 +55,13 @@
         "https://claude.ai/callback"
       ],
       "clientName": "Claude-test"
+    },
+    "arcox_b2ca60f7-e4c": {
+      "clientSecret": "714b372e-8968-4b05-a6c4-17c1b3d2ab18",
+      "redirectUris": [
+        "https://chatgpt.com/connector/oauth/kq__8q3_cIdq"
+      ],
+      "clientName": "ChatGPT"
     }
   }
 }

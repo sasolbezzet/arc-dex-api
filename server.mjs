@@ -167,12 +167,15 @@ const arcTestnet = defineChain({
   rpcUrls: { default: { http: ARC_RPC_URLS } },
   blockExplorers: { default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' } },
 })
+// Save original fetch before override — needed by fetchWithRetry
+const _originalFetch = globalThis.fetch
+
 // Retry helper for RPC fetches — survives 429/5xx from any provider.
 async function fetchWithRetry(url, opts = {}, maxRetries = 4) {
   let lastError
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const res = await fetch(url, opts)
+      const res = await _originalFetch(url, opts)
       if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
         lastError = new Error(`RPC ${res.status}: ${res.statusText}`)
         if (attempt === maxRetries) return res
@@ -192,7 +195,6 @@ async function fetchWithRetry(url, opts = {}, maxRetries = 4) {
 }
 // viem's http transport uses global fetch; wrap it for the Arc RPC endpoints so
 // rate-limit responses are retried with exponential backoff before falling back.
-const _originalFetch = globalThis.fetch
 const _rpcUrlSet = new Set(ARC_RPC_URLS)
 globalThis.fetch = async (input, init) => {
   let url
