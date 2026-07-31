@@ -3,20 +3,42 @@ import { randomUUID } from 'crypto'
 
 const VAULT_PATH = process.env.VAULT_PATH || './data/vault.json'
 const ACTIVITY_PATH = process.env.VAULT_ACTIVITY_PATH || './data/vault-activity.json'
+const SESSION_PATH = process.env.VAULT_SESSION_PATH || './data/vault-sessions.json'
 
-// ── Session tokens (in-memory, TTL 24h) ──
-const sessionTokens = new Map() // token -> { userId, expires }
+// ── Session tokens (persisted to disk, TTL 24h) ──
+// Backend session tokens used to live only in memory, so every backend restart
+// (systemd Restart=always, cron */5 restart-if-down) silently logged every user
+// out — the frontend held a token the server no longer knew and got 401 on the
+// vault deep-link. Persisting them to a JSON file survives restarts.
+const SESSION_TTL_MS = 86400000 // 24h
+function loadSessions() {
+  const data = readJsonFile(SESSION_PATH, { tokens: {} })
+  const map = new Map(Object.entries(data.tokens || {}))
+  // Drop anything already expired at load time.
+  const now = Date.now()
+  let changed = false
+  for (const [tok, s] of map) {
+    if (!s || now > s.expires) { map.delete(tok); changed = true }
+  }
+  if (changed) persistSessions(map)
+  return map
+}
+function persistSessions(map) {
+  atomicWriteJsonFile(SESSION_PATH, { tokens: Object.fromEntries(map) })
+}
+const sessionTokens = loadSessions() // token -> { userId, expires }
 
 export function createSession(userId) {
   const token = 'arx_vs_' + randomUUID().replace(/-/g, '')
-  sessionTokens.set(token, { userId, expires: Date.now() + 86400000 })
+  sessionTokens.set(token, { userId, expires: Date.now() + SESSION_TTL_MS })
+  persistSessions(sessionTokens)
   return token
 }
 
 export function validateSession(token) {
   const s = sessionTokens.get(token)
   if (!s) return null
-  if (Date.now() > s.expires) { sessionTokens.delete(token); return null }
+  if (Date.now() > s.expires) { sessionTokens.delete(token); persistSessions(sessionTokens); return null }
   return s.userId
 }
 
