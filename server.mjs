@@ -3,6 +3,7 @@ import express from 'express'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'fs'
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto'
 import { AppKit, SwapChain } from '@circle-fin/app-kit'
+import * as BridgeKitChains from '@circle-fin/bridge-kit'
 import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
 import { createPublicClient, createWalletClient, http, fallback, erc20Abi, formatUnits, defineChain, getAddress, isAddress, verifyMessage } from 'viem'
@@ -2449,6 +2450,63 @@ app.post('/api/send', apiLimiter, requireAuth, async (req, res) => {
       },
     })
   } catch(e) { console.error('[send]', e.message); res.status(500).json({ error: e.message }) }
+})
+
+// ── Bridge (Circle-source, server-signed via CCTP) ──
+// Executes a full CCTP bridge from the user's Circle proxy wallet WITHOUT a
+// browser signature. Only valid for source='circle'. EOA bridges must still be
+// signed in the browser (burn tx) — this endpoint rejects source='eoa'.
+// Chain names use the CCTP config keys (Arc_Testnet, Base_Sepolia, ...).
+const BRIDGE_CHAIN_DEF = {
+  Arc_Testnet: BridgeKitChains.ArcTestnet,
+  Ethereum_Sepolia: BridgeKitChains.EthereumSepolia,
+  Base_Sepolia: BridgeKitChains.BaseSepolia,
+  Arbitrum_Sepolia: BridgeKitChains.ArbitrumSepolia,
+  HyperEVM_Testnet: BridgeKitChains.HyperEVMTestnet,
+}
+
+app.post('/api/bridge', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { metamaskAddress, amount, source } = req.body
+    const fromChain = req.body.fromChain
+    const toChain = req.body.toChain
+    const token = normalizeArcToken(req.body.token || 'USDC')
+    if (!metamaskAddress || !amount || !fromChain || !toChain) return res.status(400).json({ error: 'Missing params' })
+    if (source === 'eoa') {
+      return res.status(400).json({ error: 'EOA bridge harus ditandatangani langsung dari wallet browser.' })
+    }
+    if (token !== 'USDC') {
+      return res.status(400).json({ error: 'Circle bridge hanya mendukung USDC. Token lain perlu di-swap ke USDC dulu.' })
+    }
+    const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
+    const safeAmount = normalizeAmount(amount)
+    const fromDef = BRIDGE_CHAIN_DEF[fromChain]
+    const toDef = BRIDGE_CHAIN_DEF[toChain]
+    if (!fromDef || !toDef) return res.status(400).json({ error: 'Unsupported bridge chain (Circle): ' + fromChain + ' → ' + toChain })
+    if (fromChain === toChain) return res.status(400).json({ error: 'Source dan destination chain harus berbeda' })
+    const wallet = await getOrCreateWallet(owner)
+    // Recipient on destination = the user's own EOA (owner), funded from their Circle wallet on source.
+    const result = await kit.bridge({
+      from: { adapter: circleAdapter, chain: fromDef, address: wallet.address },
+      to: { adapter: circleAdapter, chain: toDef, address: owner, recipientAddress: owner, useForwarder: true },
+      amount: safeAmount,
+      token: 'USDC',
+    })
+    const safe = (o) => JSON.parse(JSON.stringify(o, (k, v) => typeof v === 'bigint' ? v.toString() : v))
+    const steps = result?.steps || []
+    const burnStep = steps.find(s => s.name === 'burn')
+    const mintStep = steps.find(s => s.name === 'mint')
+    const explorerUrl = mintStep?.txHash ? (CCTP[toChain]?.explorer + mintStep.txHash) : (burnStep?.txHash ? (CCTP[fromChain]?.explorer + burnStep.txHash) : undefined)
+    res.json({
+      success: result?.state === 'success',
+      state: result?.state,
+      txHash: mintStep?.txHash || burnStep?.txHash,
+      burnTxHash: burnStep?.txHash,
+      mintTxHash: mintStep?.txHash,
+      explorerUrl,
+      result: safe(result),
+    })
+  } catch(e) { console.error('[bridge]', e.message); res.status(500).json({ error: e.message }) }
 })
 
 app.get('/api/tx-history', apiLimiter, requireAuth, async (req, res) => {

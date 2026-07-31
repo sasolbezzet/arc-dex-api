@@ -75,6 +75,15 @@ export function validateAccessToken(token) {
   return auth
 }
 
+// Periodic sweep of expired auth codes + access tokens so these maps can't grow
+// unbounded and contribute to gradual memory pressure / OOM kills.
+const _authSweep = setInterval(() => {
+  const now = Date.now()
+  for (const [code, v] of authCodes) if (now > v.expires) authCodes.delete(code)
+  for (const [tok, v] of accessTokens) if (now > v.expires) accessTokens.delete(tok)
+}, 10 * 60 * 1000)
+if (_authSweep.unref) _authSweep.unref()
+
 // Map an OAuth clientId to a normalized agent name (contains 'claude' or
 // 'chatgpt' so the frontend StatusDot matching works). Falls back to the
 // registered client name, then to a generic label.
@@ -234,6 +243,58 @@ async function apiPost(path, body, ownerAddress) {
   return r.json()
 }
 
+// ── Auto-execute helper (Circle-source, server-signed) ──
+// Map MCP chain slugs → backend CCTP keys.
+const CHAIN_SLUG_TO_KEY = {
+  'arc-testnet': 'Arc_Testnet', 'arc': 'Arc_Testnet', 'arc_testnet': 'Arc_Testnet',
+  'ethereum-sepolia': 'Ethereum_Sepolia', 'eth-sepolia': 'Ethereum_Sepolia', 'ethereum_sepolia': 'Ethereum_Sepolia',
+  'base-sepolia': 'Base_Sepolia', 'base_sepolia': 'Base_Sepolia',
+  'arbitrum-sepolia': 'Arbitrum_Sepolia', 'arbitrum_sepolia': 'Arbitrum_Sepolia',
+  'hyperevm-testnet': 'HyperEVM_Testnet', 'hyperevm_testnet': 'HyperEVM_Testnet',
+}
+function chainKey(slug) {
+  if (!slug) return undefined
+  const s = String(slug).toLowerCase().trim()
+  return CHAIN_SLUG_TO_KEY[s] || slug
+}
+
+// Decide whether an agent-initiated action can auto-execute server-side.
+// Only Circle-source actions within the per-tx limit qualify — EOA needs a
+// browser signature and over-limit needs explicit web approval.
+async function canAutoExecute(userId, source, amount) {
+  if ((source || 'circle') !== 'circle') return { ok: false, reason: 'eoa' }
+  try {
+    const { getLimits } = await import('./vaultStore.mjs')
+    const limits = getLimits(userId)
+    const amt = Number(amount)
+    if (!Number.isFinite(amt) || amt <= 0) return { ok: false, reason: 'bad_amount' }
+    if (limits.autoApprove === false) return { ok: false, reason: 'auto_off' }
+    if (amt > Number(limits.maxPerTx)) return { ok: false, reason: 'over_limit', limit: limits.maxPerTx }
+    return { ok: true, limits }
+  } catch { return { ok: false, reason: 'limits_error' } }
+}
+
+// Record an auto-executed action into the vault as an approved entry (for the
+// Plugin history + audit trail), with the on-chain txHash.
+async function recordAutoExec(userId, { agent, action, amount, token, source, to, details, txHash, explorerUrl }) {
+  const vault = await import('./vaultStore.mjs')
+  const approval = vault.createApproval(userId, { agent, action, amount, token, source, to, details, forcePending: true })
+  vault.approveRequest(userId, approval.id, { txHash, explorerUrl })
+  return approval
+}
+
+// Best-effort current agent label for a user, from the most recent MCP session.
+function resolveAgentForUser(userId) {
+  try {
+    const list = mcpSessionsRef?.(userId) || []
+    const active = list.filter(s => s.active !== false).sort((a, b) => (b.lastActivity || 0) - (a.lastActivity || 0))
+    return active[0]?.agent || 'mcp-agent'
+  } catch { return 'mcp-agent' }
+}
+let mcpSessionsRef = null
+
+
+
 // ── MCP Server factory ──
 export function createMcpServer(userId) {
   const server = new McpServer({
@@ -293,22 +354,51 @@ export function createMcpServer(userId) {
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
     if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
-    // Create vault approval for user to sign via MetaMask in frontend
+    const source = params.source || 'circle'
+    // AUTO-EXECUTE: Circle-source within limit → sign server-side, no browser needed.
+    const gate = await canAutoExecute(userId, source, params.amountIn)
+    if (gate.ok) {
+      const data = await apiPost('/api/swap', {
+        metamaskAddress: userId,
+        tokenIn: params.tokenIn,
+        tokenOut: params.tokenOut,
+        amountIn: params.amountIn,
+        source: 'circle',
+      }, userId)
+      if (data && data.success) {
+        const txHash = data.result?.txHash || data.txHash
+        const explorerUrl = data.result?.explorerUrl || data.explorerUrl
+        await recordAutoExec(userId, {
+          agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
+          source: 'circle', details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
+          txHash, explorerUrl,
+        })
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash, explorerUrl, result: data.result || data, message: `Swap ${params.amountIn} ${params.tokenIn} → ${params.tokenOut} berhasil dieksekusi via Circle Wallet.` }) }] }
+      }
+      // Circle route unavailable / failed → fall through to approval path.
+      const reason = data?.error || 'Circle swap gagal'
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, safeNextStep: `Circle route tidak tersedia (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/plugin?tab=approvals` }) }] }
+    }
+    // FALLBACK: EOA or over-limit → create pending approval for browser signing.
     const { createApproval } = await import('./vaultStore.mjs')
     const approval = createApproval(userId, {
-      agent: 'chatgpt-mcp',
+      agent: resolveAgentForUser(userId),
       action: 'swap',
       amount: params.amountIn,
       token: params.tokenIn,
-      source: params.source || 'eoa',
+      source,
       details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
       forcePending: true,
     })
     return { content: [{ type: 'text', text: JSON.stringify({
       status: 'approval_created',
+      executed: false,
+      reason: gate.reason,
       approval,
       approvalUrl: `${SERVER_URL}/plugin?tab=approvals&approval=${approval.id}`,
-      message: `Permintaan swap dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
+      message: gate.reason === 'over_limit'
+        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/plugin?tab=approvals`
+        : `Permintaan swap dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
       safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
     }) }] }
   })
@@ -352,22 +442,55 @@ export function createMcpServer(userId) {
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
     if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
+    const source = params.source || 'circle'
+    const token = params.token || 'USDC'
+    const fromKey = chainKey(params.fromChain)
+    const toKey = chainKey(params.toChain)
+    // AUTO-EXECUTE: Circle-source USDC within limit → server-signed CCTP bridge.
+    const gate = await canAutoExecute(userId, source, params.amount)
+    if (gate.ok && token === 'USDC') {
+      const data = await apiPost('/api/bridge', {
+        metamaskAddress: userId,
+        fromChain: fromKey,
+        toChain: toKey,
+        amount: params.amount,
+        token: 'USDC',
+        source: 'circle',
+      }, userId)
+      if (data && data.success) {
+        const txHash = data.txHash
+        const explorerUrl = data.explorerUrl
+        await recordAutoExec(userId, {
+          agent: resolveAgentForUser(userId), action: 'bridge', amount: params.amount, token: 'USDC',
+          source: 'circle', to: toKey, details: JSON.stringify({ fromChain: fromKey, toChain: toKey, burnTxHash: data.burnTxHash, mintTxHash: data.mintTxHash, previewId: params.previewId }),
+          txHash, explorerUrl,
+        })
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash, burnTxHash: data.burnTxHash, mintTxHash: data.mintTxHash, explorerUrl, message: `Bridge ${params.amount} USDC ${fromKey} → ${toKey} berhasil via Circle Wallet.` }) }] }
+      }
+      const reason = data?.error || 'Circle bridge gagal'
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, state: data?.state, safeNextStep: `Circle bridge tidak selesai (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/plugin?tab=approvals` }) }] }
+    }
+    // FALLBACK: EOA / non-USDC / over-limit → pending approval for browser signing.
     const { createApproval } = await import('./vaultStore.mjs')
     const approval = createApproval(userId, {
-      agent: 'chatgpt-mcp',
+      agent: resolveAgentForUser(userId),
       action: 'bridge',
       amount: params.amount,
-      token: params.token || 'USDC',
-      source: params.source || 'eoa',
-      to: params.toChain,
-      details: JSON.stringify({ fromChain: params.fromChain, toChain: params.toChain, previewId: params.previewId }),
+      token,
+      source,
+      to: toKey,
+      details: JSON.stringify({ fromChain: fromKey, toChain: toKey, previewId: params.previewId }),
       forcePending: true,
     })
     return { content: [{ type: 'text', text: JSON.stringify({
       status: 'approval_created',
+      executed: false,
+      reason: gate.ok ? 'non_usdc' : gate.reason,
       approval,
       approvalUrl: `${SERVER_URL}/plugin?tab=approvals&approval=${approval.id}`,
-      message: `Permintaan bridge dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
+      message: (!gate.ok && gate.reason === 'over_limit')
+        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/plugin?tab=approvals`
+        : `Permintaan bridge dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
       safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
     }) }] }
   })
@@ -418,22 +541,52 @@ export function createMcpServer(userId) {
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
     if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
+    const source = params.source || 'circle'
+    const token = params.token || 'USDC'
+    // AUTO-EXECUTE: Circle-source within limit → sign server-side.
+    const gate = await canAutoExecute(userId, source, params.amount)
+    if (gate.ok) {
+      const data = await apiPost('/api/send', {
+        metamaskAddress: userId,
+        toAddress: params.to,
+        amount: params.amount,
+        token,
+        source: 'circle',
+      }, userId)
+      if (data && data.success) {
+        const txHash = data.result?.txHash || data.txHash
+        const explorerUrl = data.result?.explorerUrl || data.explorerUrl
+        await recordAutoExec(userId, {
+          agent: resolveAgentForUser(userId), action: 'send', amount: params.amount, token,
+          source: 'circle', to: params.to, details: JSON.stringify({ previewId: params.previewId }),
+          txHash, explorerUrl,
+        })
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash, explorerUrl, result: data.result || data, message: `Kirim ${params.amount} ${token} ke ${params.to} berhasil via Circle Wallet.` }) }] }
+      }
+      const reason = data?.error || 'Circle send gagal'
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, safeNextStep: `Circle route tidak tersedia (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/plugin?tab=approvals` }) }] }
+    }
+    // FALLBACK: EOA or over-limit → pending approval for browser signing.
     const { createApproval } = await import('./vaultStore.mjs')
     const approval = createApproval(userId, {
-      agent: 'chatgpt-mcp',
+      agent: resolveAgentForUser(userId),
       action: 'send',
       amount: params.amount,
-      token: params.token || 'USDC',
-      source: params.source || 'eoa',
+      token,
+      source,
       to: params.to,
       details: JSON.stringify({ previewId: params.previewId }),
       forcePending: true,
     })
     return { content: [{ type: 'text', text: JSON.stringify({
       status: 'approval_created',
+      executed: false,
+      reason: gate.reason,
       approval,
       approvalUrl: `${SERVER_URL}/plugin?tab=approvals&approval=${approval.id}`,
-      message: `Permintaan send dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
+      message: gate.reason === 'over_limit'
+        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/plugin?tab=approvals`
+        : `Permintaan send dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
       safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
     }) }] }
   })
@@ -507,9 +660,10 @@ export async function mcpHttpHandler(req, res) {
   // Track MCP session for connection status — derive the REAL agent name from
   // the registered OAuth client (Claude vs ChatGPT) instead of hardcoding it, so
   // the Plugin page can show which agent is actually connected.
-  const { registerMcpSession } = await import('./vaultStore.mjs')
+  const { registerMcpSession, listMcpSessions } = await import('./vaultStore.mjs')
   const agentName = resolveAgentName(auth.clientId)
   registerMcpSession(auth.userId, auth.clientId, agentName)
+  mcpSessionsRef = listMcpSessions
 
   // Handle MCP initialize and tool calls via Streamable HTTP
   const sessionId = req.headers['mcp-session-id'] || randomUUID()
