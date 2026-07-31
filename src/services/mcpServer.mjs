@@ -199,17 +199,24 @@ function extractBearer(req) {
 // ── Backend API helper ──
 const BACKEND_URL = process.env.ARCOX_BACKEND_URL || 'http://localhost:3001'
 
-async function apiGet(path, token) {
+import { mintOwnerToken } from './authToken.mjs'
+
+// The MCP userId IS the SIWE-verified wallet address. Mint a backend auth token
+// for it so the protected money endpoints (requireAuth) accept read-only quote
+// calls. This does NOT move funds — execute tools still go through vault approval.
+async function apiGet(path, ownerAddress) {
+  const bearer = mintOwnerToken(ownerAddress)
   const r = await fetch(`${BACKEND_URL}${path}`, {
-    headers: token ? { 'x-arcox-owner': token } : {},
+    headers: bearer ? { Authorization: `Bearer ${bearer}` } : {},
   })
   return r.json()
 }
 
-async function apiPost(path, body, token) {
+async function apiPost(path, body, ownerAddress) {
+  const bearer = mintOwnerToken(ownerAddress)
   const r = await fetch(`${BACKEND_URL}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(token ? { 'x-arcox-owner': token } : {}) },
+    headers: { 'Content-Type': 'application/json', ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}) },
     body: JSON.stringify(body),
   })
   return r.json()
@@ -260,7 +267,7 @@ export function createMcpServer(userId) {
     amountIn: z.string().describe('Amount in human readable (e.g. "1")'),
     source: z.string().optional().describe('eoa or circle. Default eoa'),
   }, async (params) => {
-    const data = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn }, userId)
+    const data = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: userId }, userId)
     return { content: [{ type: 'text', text: JSON.stringify(data) }] }
   })
 
@@ -283,12 +290,14 @@ export function createMcpServer(userId) {
       token: params.tokenIn,
       source: params.source || 'eoa',
       details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
+      forcePending: true,
     })
     return { content: [{ type: 'text', text: JSON.stringify({
       status: 'approval_created',
       approval,
-      message: 'Approval request sent to user. Ask user to open arcoxdex.vercel.app/plugin and approve the transaction in the Approvals section. The swap will execute via MetaMask signing.',
-      safeNextStep: 'Tell the user to check the Plugin page Approvals section and click Approve. The transaction requires MetaMask signature.',
+      approvalUrl: `${SERVER_URL}/plugin?tab=approvals&approval=${approval.id}`,
+      message: `Permintaan swap dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
+      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
     }) }] }
   })
 
@@ -301,14 +310,23 @@ export function createMcpServer(userId) {
     token: z.string().optional().describe('Token symbol. Default USDC'),
     source: z.string().optional().describe('eoa or circle. Default eoa'),
   }, async (params) => {
-    const data = await apiPost('/api/prepare-bridge', {
-      fromChain: params.fromChain,
-      toChain: params.toChain,
-      amount: params.amount,
-      token: params.token || 'USDC',
-      source: params.source || 'eoa',
-    }, userId)
-    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+    // NOTE: /api/prepare-bridge actually performs a Circle→EOA transfer (moves
+    // funds); it is NOT a read-only quote. So a quote tool must NOT call it.
+    // Return an informational preview instead. Real execution happens via
+    // arcox_execute_bridge → vault approval → frontend MetaMask signing.
+    const token = params.token || 'USDC'
+    const src = params.source || 'eoa'
+    return { content: [{ type: 'text', text: JSON.stringify({
+      preview: true,
+      route: `${params.fromChain} → ${params.toChain}`,
+      amountIn: params.amount,
+      token,
+      source: src,
+      estimatedReceive: `~${params.amount} ${token}`,
+      note: 'CCTP bridge: burn on source, mint on destination. Native (non-USDC) tokens to Arc are auto-swapped to USDC. Actual on-chain amounts and gas are finalized at signing.',
+      previewId: `bridge_${Date.now()}`,
+      safeNextStep: 'Show this preview to the user. On confirmation, call arcox_execute_bridge — the user approves and signs via the Plugin page (MetaMask).',
+    }) }] }
   })
 
   server.tool('arcox_execute_bridge', 'Execute a confirmed bridge. Requires previewId from arcox_quote_bridge and user confirmation. Triggers MetaMask signing via frontend Plugin approval flow.', {
@@ -331,12 +349,14 @@ export function createMcpServer(userId) {
       source: params.source || 'eoa',
       to: params.toChain,
       details: JSON.stringify({ fromChain: params.fromChain, toChain: params.toChain, previewId: params.previewId }),
+      forcePending: true,
     })
     return { content: [{ type: 'text', text: JSON.stringify({
       status: 'approval_created',
       approval,
-      message: 'Bridge approval request sent to user. Ask user to open arcoxdex.vercel.app/plugin and approve in the Approvals section.',
-      safeNextStep: 'Tell the user to check the Plugin page Approvals section and click Approve.',
+      approvalUrl: `${SERVER_URL}/plugin?tab=approvals&approval=${approval.id}`,
+      message: `Permintaan bridge dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
+      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
     }) }] }
   })
 
@@ -348,13 +368,32 @@ export function createMcpServer(userId) {
     token: z.string().optional().describe('Token symbol. Default USDC'),
     source: z.string().optional().describe('eoa or circle. Default eoa'),
   }, async (params) => {
-    const data = await apiPost('/api/send-estimate', {
+    const token = params.token || 'USDC'
+    const src = params.source || 'eoa'
+    // /api/send-estimate only supports Circle source (EOA is estimated in the
+    // browser wallet). Map param names to what the backend expects.
+    if (src === 'circle') {
+      const data = await apiPost('/api/send-estimate', {
+        toAddress: params.to,
+        amount: params.amount,
+        token,
+        source: 'circle',
+        metamaskAddress: userId,
+      }, userId)
+      return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+    }
+    // EOA preview (gas is estimated at signing in the browser)
+    return { content: [{ type: 'text', text: JSON.stringify({
+      preview: true,
+      action: 'send',
       to: params.to,
       amount: params.amount,
-      token: params.token || 'USDC',
-      source: params.source || 'eoa',
-    }, userId)
-    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+      token,
+      source: 'eoa',
+      note: 'EOA send: gas estimated by the wallet at signing time. A 30bps platform fee applies.',
+      previewId: `send_${Date.now()}`,
+      safeNextStep: 'Show this preview to the user. On confirmation, call arcox_execute_send — the user approves and signs via the Plugin page (MetaMask).',
+    }) }] }
   })
 
   server.tool('arcox_execute_send', 'Execute a confirmed token send. Requires previewId from arcox_quote_send and user confirmation. Triggers MetaMask signing via frontend Plugin approval flow.', {
@@ -376,12 +415,14 @@ export function createMcpServer(userId) {
       source: params.source || 'eoa',
       to: params.to,
       details: JSON.stringify({ previewId: params.previewId }),
+      forcePending: true,
     })
     return { content: [{ type: 'text', text: JSON.stringify({
       status: 'approval_created',
       approval,
-      message: 'Send approval request sent to user. Ask user to open arcoxdex.vercel.app/plugin and approve in the Approvals section.',
-      safeNextStep: 'Tell the user to check the Plugin page Approvals section and click Approve.',
+      approvalUrl: `${SERVER_URL}/plugin?tab=approvals&approval=${approval.id}`,
+      message: `Permintaan send dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
+      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
     }) }] }
   })
 

@@ -134,10 +134,14 @@ export function listApprovals(owner) {
   return v.approvals.filter(a => a.owner === owner)
 }
 
-export function createApproval(owner, { agent, action, amount, token, source, to, details }) {
+export function createApproval(owner, { agent, action, amount, token, source, to, details, forcePending }) {
   const v = loadVault()
   const limits = getLimits(owner)
-  const withinLimit = limits.autoApprove && Number(amount) <= limits.maxPerTx
+  // Agent-initiated (MCP) transactions ALWAYS require the user to sign via
+  // MetaMask on the frontend, so they must stay actionable (pending) even when
+  // within auto-approve limits. Auto-approve only makes sense for flows that can
+  // execute without a browser signature — which the remote MCP server cannot do.
+  const withinLimit = !forcePending && limits.autoApprove && Number(amount) <= limits.maxPerTx
 
   const approval = {
     id: randomUUID(),
