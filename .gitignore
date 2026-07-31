@@ -24,3 +24,6 @@ server.pid
 *.backup
 *.bak
 *.old
+
+# runtime state (never commit real clients/approvals/activity)
+data/

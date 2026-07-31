@@ -75,6 +75,18 @@ export function validateAccessToken(token) {
   return auth
 }
 
+// Map an OAuth clientId to a normalized agent name (contains 'claude' or
+// 'chatgpt' so the frontend StatusDot matching works). Falls back to the
+// registered client name, then to a generic label.
+export function resolveAgentName(clientId) {
+  const client = oauthClients.get(clientId)
+  const name = (client?.clientName || '').toLowerCase()
+  if (name.includes('claude')) return 'claude-mcp'
+  if (name.includes('chatgpt') || name.includes('openai') || name.includes('gpt')) return 'chatgpt-mcp'
+  // Unknown client — return the registered name if any, else generic.
+  return client?.clientName || 'mcp-agent'
+}
+
 // ── OAuth metadata endpoints ──
 export function oauthMetadataHandler(req, res) {
   res.json({
@@ -492,9 +504,12 @@ export async function mcpHttpHandler(req, res) {
     return res.status(401).json({ error: 'invalid_token', error_description: 'Token expired or invalid' })
   }
 
-  // Track MCP session for connection status
+  // Track MCP session for connection status — derive the REAL agent name from
+  // the registered OAuth client (Claude vs ChatGPT) instead of hardcoding it, so
+  // the Plugin page can show which agent is actually connected.
   const { registerMcpSession } = await import('./vaultStore.mjs')
-  registerMcpSession(auth.userId, auth.clientId, 'chatgpt-mcp')
+  const agentName = resolveAgentName(auth.clientId)
+  registerMcpSession(auth.userId, auth.clientId, agentName)
 
   // Handle MCP initialize and tool calls via Streamable HTTP
   const sessionId = req.headers['mcp-session-id'] || randomUUID()

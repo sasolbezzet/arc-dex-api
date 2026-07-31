@@ -162,14 +162,16 @@ export function createApproval(owner, { agent, action, amount, token, source, to
   return approval
 }
 
-export function approveRequest(owner, id) {
+export function approveRequest(owner, id, extra = {}) {
   const v = loadVault()
   const a = v.approvals.find(x => x.owner === owner && x.id === id && x.status === 'pending')
   if (!a) return null
   a.status = 'approved'
   a.approvedAt = Date.now()
+  if (extra.txHash) a.txHash = extra.txHash
+  if (extra.explorerUrl) a.explorerUrl = extra.explorerUrl
   saveVault(v)
-  logActivity(owner, 'approval_approved', { id, action: a.action, amount: a.amount })
+  logActivity(owner, 'approval_approved', { id, action: a.action, amount: a.amount, txHash: extra.txHash || '' })
   return a
 }
 

@@ -111,7 +111,8 @@ vault.post('/approvals', requireAuth, (req, res) => {
 })
 
 vault.post('/approvals/:id/approve', requireAuth, (req, res) => {
-  const a = approveRequest(req.owner, req.params.id)
+  const { txHash, explorerUrl } = req.body || {}
+  const a = approveRequest(req.owner, req.params.id, { txHash, explorerUrl })
   if (!a) return res.status(404).json({ error: 'Pending approval not found' })
   res.json({ approval: a })
 })
