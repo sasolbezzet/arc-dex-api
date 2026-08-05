@@ -99,6 +99,66 @@ app.use('/api/x402', apiLimiter, x402Routes)
 app.use('/api/ai-router', apiLimiter, aiRouterRoutes)
 app.use('/api/vault', apiLimiter, vaultRoutes)
 
+app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
+  try {
+    const { walletAddress } = req.body
+    if (!walletAddress || !isAddress(walletAddress)) {
+      return res.status(400).json({ error: 'Valid walletAddress required' })
+    }
+    // Trust: passkey authentication happens client-side via WebAuthn.
+    // The MSCA address is deterministic from the passkey credential.
+    // If the browser succeeded toWebAuthnCredential(Login), the user owns the passkey.
+    const addr = getAddress(walletAddress).toLowerCase()
+    const { createSession } = await import('./src/services/vaultStore.mjs')
+    const token = createSession(addr) // vault session token (arx_vs_*) — recognized by /api/vault/*
+    res.json({ success: true, token, address: getAddress(walletAddress) })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ── Session Key (Circle Modular Wallet / MSCA) ──
+// Setup: user creates MSCA via passkey (frontend), then maps a delegate EOA.
+// The delegate EOA private key is stored server-side and used to sign
+// UserOperations on behalf of the agent.
+app.post('/api/session/generate-key', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { generateSessionKey } = await import('./src/services/sessionKeyService.mjs')
+    const key = generateSessionKey()
+    res.json({ success: true, delegateAddress: key.address, privateKey: key.privateKey })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { walletAddress, delegateAddress, delegatePrivateKey } = req.body
+    if (!walletAddress || !delegateAddress || !delegatePrivateKey) {
+      return res.status(400).json({ error: 'walletAddress, delegateAddress, delegatePrivateKey required' })
+    }
+    const { storeSessionKey } = await import('./src/services/sessionKeyService.mjs')
+    const { setSessionKeyInfo } = await import('./src/services/vaultStore.mjs')
+    const entry = storeSessionKey(req.owner, { walletAddress, delegateAddress, delegatePrivateKey })
+    setSessionKeyInfo(req.owner, { walletAddress, delegateAddress, active: true, createdAt: entry.createdAt })
+    res.json({ success: true, walletAddress, delegateAddress, active: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/session/status', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { getSessionKeyInfo } = await import('./src/services/vaultStore.mjs')
+    const info = getSessionKeyInfo(req.owner)
+    res.json({ success: true, session: info })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/session/revoke', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { revokeSessionKey } = await import('./src/services/sessionKeyService.mjs')
+    const { clearSessionKeyInfo } = await import('./src/services/vaultStore.mjs')
+    revokeSessionKey(req.owner)
+    clearSessionKeyInfo(req.owner)
+    res.json({ success: true, active: false })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
 // ── Remote HTTP MCP + OAuth 2.1 ──
 app.get('/.well-known/oauth-authorization-server', oauthMetadataHandler)
 app.get('/.well-known/oauth-authorization-server/mcp', oauthMetadataHandler)

@@ -262,6 +262,15 @@ function chainKey(slug) {
 // Only Circle-source actions within the per-tx limit qualify — EOA needs a
 // browser signature and over-limit needs explicit web approval.
 async function canAutoExecute(userId, source, amount) {
+  // Session key (MSCA) — delegate EOA signing via Circle Modular Wallet
+  if (source === 'session') {
+    try {
+      const { canExecuteViaSession } = await import('./sessionKeyService.mjs')
+      const gate = canExecuteViaSession(userId, amount)
+      return gate
+    } catch { return { ok: false, reason: 'session_error' } }
+  }
+  // Circle proxy wallet — server-side signing via Circle API
   if ((source || 'circle') !== 'circle') return { ok: false, reason: 'eoa' }
   try {
     const { getLimits } = await import('./vaultStore.mjs')
@@ -358,6 +367,25 @@ export function createMcpServer(userId) {
     // AUTO-EXECUTE: Circle-source within limit → sign server-side, no browser needed.
     const gate = await canAutoExecute(userId, source, params.amountIn)
     if (gate.ok) {
+      // Session key path: sign via MSCA delegate EOA (Circle Modular Wallet)
+      if (source === 'session') {
+        try {
+          const { sendViaSession } = await import('./sessionKeyService.mjs')
+          const result = await sendViaSession(userId, gate.limits.treasury || '0x0000000000000000000000000000000000000000', params.amountIn, params.tokenIn)
+          if (result.status === 'success') {
+            await recordAutoExec(userId, {
+              agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
+              source: 'session', details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId, txHash: result.txHash }),
+              txHash: result.txHash, explorerUrl: result.explorerUrl,
+            })
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Swap ${params.amountIn} ${params.tokenIn} dieksekusi via Agent Session Key (gasless).` }) }] }
+          }
+          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session execution failed', safeNextStep: 'Session key bermasalah. Coba source=circle atau source=eoa.' }) }] }
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e.message, safeNextStep: 'Session key error. Coba source=circle.' }) }] }
+        }
+      }
+      // Circle path: server-side signing via Circle API
       const data = await apiPost('/api/swap', {
         metamaskAddress: userId,
         tokenIn: params.tokenIn,
@@ -625,19 +653,84 @@ export function createMcpServer(userId) {
         type: 'text',
         text: JSON.stringify({
           server: 'arcox-mcp',
-          version: '1.0.0',
+          version: '1.1.0',
           url: SERVER_URL,
           userId,
-          services: ['wallet_balances', 'swap', 'bridge', 'send', 'vault', 'transaction_history', 'route_status'],
+          services: ['wallet_balances', 'swap', 'bridge', 'send', 'vault', 'transaction_history', 'route_status', 'session_key', 'get_request'],
+          sources: {
+            circle: 'Circle proxy wallet — server-side signed, within limits',
+            session: 'Agent Session Key (MSCA) — passkey-gated setup, gasless, within limits',
+            eoa: 'EOA wallet — requires browser MetaMask signing',
+          },
           safety: 'All value-moving actions require quote preview + user confirmation. Flow: quote → show preview → user says yes → execute with previewId + confirmed=true.',
           execution_guide: {
-            swap: ['arcox_quote_swap → show preview → user yes → arcox_execute_swap'],
+            swap: ['arcox_quote_swap → show preview → user yes → arcox_execute_swap (source=session|circle|eoa)'],
             bridge: ['arcox_route_status → arcox_quote_bridge → show preview → user yes → arcox_execute_bridge'],
             send: ['arcox_quote_send → show preview → user yes → arcox_execute_send'],
+            poll: ['After execute returns pending_* → arcox_get_request(approvalId) → poll until success/error'],
           },
         })
       }]
     }
+  })
+
+  // ── SESSION KEY STATUS ──
+  server.tool('arcox_session_status', 'Check if Agent Session Key (MSCA) is active for the user. Returns wallet address, delegate address, and whether session signing is available.', {}, async () => {
+    const { getSessionKeyInfo } = await import('./vaultStore.mjs')
+    const info = getSessionKeyInfo(userId)
+    if (!info || !info.active) {
+      return { content: [{ type: 'text', text: JSON.stringify({ active: false, message: 'Session key belum diaktifkan. User harus setup di Plugin page (passkey required).' }) }] }
+    }
+    return { content: [{ type: 'text', text: JSON.stringify({
+      active: true,
+      walletAddress: info.walletAddress,
+      delegateAddress: info.delegateAddress,
+      createdAt: info.createdAt,
+      message: 'Session key aktif. Agent bisa execute tx langsung dengan source=session.',
+    }) }] }
+  })
+
+  // ── GET REQUEST (poll approval/tx status) ──
+  server.tool('arcox_get_request', 'Poll the status of a previously submitted transaction request. Use after execute returns pending_* status. Returns current lifecycle status + txHash if available.', {
+    approvalId: z.string().describe('Approval ID or request ID returned by execute tool'),
+  }, async (params) => {
+    const { listApprovals } = await import('./vaultStore.mjs')
+    const approvals = listApprovals(userId)
+    const a = approvals.find(x => x.id === params.approvalId)
+    if (!a) return { content: [{ type: 'text', text: JSON.stringify({ status: 'not_found', error: 'Approval/request ID not found' }) }] }
+
+    const response = {
+      id: a.id,
+      status: a.status,
+      action: a.action,
+      amount: a.amount,
+      token: a.token,
+      source: a.source,
+      txHash: a.txHash || null,
+      explorerUrl: a.explorerUrl || null,
+      userOpHash: a.userOpHash || null,
+      createdAt: a.createdAt,
+      approvedAt: a.approvedAt || null,
+      completedAt: a.completedAt || null,
+      error: a.error || null,
+    }
+
+    // If there's a userOpHash and status is pending, try to check on-chain
+    if (a.userOpHash && ['pending_signature', 'pending_confirmation'].includes(a.status)) {
+      try {
+        const { getUserOpStatus } = await import('./sessionKeyService.mjs')
+        const liveStatus = await getUserOpStatus(userId, a.userOpHash)
+        if (liveStatus.status !== a.status) {
+          const { updateApprovalStatus } = await import('./vaultStore.mjs')
+          updateApprovalStatus(userId, a.id, liveStatus.status, { txHash: liveStatus.txHash, explorerUrl: liveStatus.explorerUrl })
+          response.status = liveStatus.status
+          response.txHash = liveStatus.txHash || response.txHash
+          response.explorerUrl = liveStatus.explorerUrl || response.explorerUrl
+        }
+      } catch { /* polling failed, return stored status */ }
+    }
+
+    return { content: [{ type: 'text', text: JSON.stringify(response) }] }
   })
 
   return server

@@ -175,7 +175,10 @@ export function createApproval(owner, { agent, action, amount, token, source, to
     source: source || 'eoa',
     to: to || '',
     details: details || '',
+    // Lifecycle: pending → approved → pending_signature → pending_confirmation → success/error
+    // Or: pending → rejected, denied, error
     status: withinLimit ? 'auto_approved' : 'pending',
+    paramHash: '', // ponytail: operation-bound hash — add when security hardened
     createdAt: Date.now(),
   }
   v.approvals.push(approval)
@@ -206,6 +209,52 @@ export function rejectRequest(owner, id) {
   saveVault(v)
   logActivity(owner, 'approval_rejected', { id, action: a.action, amount: a.amount })
   return a
+}
+
+// ── Lifecycle status transitions ──
+// pending → approved → pending_signature → pending_confirmation → success/error
+// pending → rejected, denied
+export function updateApprovalStatus(owner, id, status, extra = {}) {
+  const v = loadVault()
+  const a = v.approvals.find(x => x.owner === owner && x.id === id)
+  if (!a) return null
+  a.status = status
+  if (extra.txHash) a.txHash = extra.txHash
+  if (extra.explorerUrl) a.explorerUrl = extra.explorerUrl
+  if (extra.userOpHash) a.userOpHash = extra.userOpHash
+  if (extra.error) a.error = extra.error
+  if (status === 'success') a.completedAt = Date.now()
+  saveVault(v)
+  logActivity(owner, `approval_${status}`, { id, action: a.action, txHash: extra.txHash || '' })
+  return a
+}
+
+// ── Session key info (lightweight, stored in vault) ──
+// Full delegate private key stored in sessionKeyService (separate file).
+// This stores only the public address + wallet address for the vault UI.
+export function getSessionKeyInfo(owner) {
+  const v = loadVault()
+  return v.sessionKeys?.[owner] || null
+}
+
+export function setSessionKeyInfo(owner, info) {
+  const v = loadVault()
+  if (!v.sessionKeys) v.sessionKeys = {}
+  v.sessionKeys[owner] = { ...info, updatedAt: Date.now() }
+  saveVault(v)
+  logActivity(owner, 'session_key_updated', { walletAddress: info.walletAddress, delegateAddress: info.delegateAddress, active: info.active })
+  return v.sessionKeys[owner]
+}
+
+export function clearSessionKeyInfo(owner) {
+  const v = loadVault()
+  if (v.sessionKeys?.[owner]) {
+    v.sessionKeys[owner].active = false
+    v.sessionKeys[owner].revokedAt = Date.now()
+    saveVault(v)
+    logActivity(owner, 'session_key_revoked', {})
+  }
+  return v.sessionKeys?.[owner] || null
 }
 
 // ── Activity ──

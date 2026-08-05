@@ -19,8 +19,9 @@ export function configuredProviders() {
       ...(singleKey ? [singleKey] : []),
       ...(namedKeys ? namedKeys.split(',').map(v => v.trim()).filter(Boolean) : []),
     ]
-    if (name && baseUrl && model && keys.length) {
-      keys.forEach((apiKey, keyIndex) => {
+    if (name && baseUrl && model && (keys.length || !singleKey)) {
+      const effectiveKeys = keys.length ? keys : [""]
+      effectiveKeys.forEach((apiKey, keyIndex) => {
         providers.push({
           id: `${name}_${keyIndex + 1}`,
           name,
