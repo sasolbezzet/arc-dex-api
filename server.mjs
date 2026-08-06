@@ -99,6 +99,33 @@ app.use('/api/x402', apiLimiter, x402Routes)
 app.use('/api/ai-router', apiLimiter, aiRouterRoutes)
 app.use('/api/vault', apiLimiter, vaultRoutes)
 
+// ── Circle Modular Wallet proxy ──
+// Browser → /api/circle-modular/* → https://modular-sdk.circle.com/v1/rpc/*
+// Used so mobile browsers never fetch modular-sdk.circle.com directly
+// (mobile networks, ad-block, captive portals often block it).
+const CIRCLE_MODULAR_KEY = process.env.CIRCLE_CLIENT_KEY || process.env.VITE_CIRCLE_CLIENT_KEY || ''
+app.use('/api/circle-modular', express.json({ limit: '128kb' }), async (req, res) => {
+  try {
+    const tail = req.url.replace(/^\//, '')
+    const target = `https://modular-sdk.circle.com/v1/rpc/${tail}`
+    const upstream = await fetch(target, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': req.headers['authorization'] || `Bearer ${CIRCLE_MODULAR_KEY}`,
+        'X-AppInfo': req.headers['x-appinfo'] || 'platform=web;version=1.0.15;uri=arcoxdex.vercel.app',
+      },
+      body: JSON.stringify(req.body || {}),
+    })
+    res.status(upstream.status)
+    const text = await upstream.text()
+    res.set('Content-Type', upstream.headers.get('content-type') || 'application/json')
+    res.send(text)
+  } catch (e) {
+    res.status(502).json({ error: 'circle_modular_proxy_failed', message: e?.message || String(e) })
+  }
+})
+
 app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
   try {
     const { walletAddress } = req.body
