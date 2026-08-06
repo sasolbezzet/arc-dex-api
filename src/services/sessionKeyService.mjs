@@ -229,7 +229,7 @@ export async function sendViaSession(userId, to, amount, token = 'USDC') {
     abi: erc20Abi,
     functionName: 'transfer',
     args: [getAddress(to), amountBigInt],
-  }])
+  }], { paymaster: true })
 }
 
 /**
@@ -250,7 +250,7 @@ export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, prep
       to: preparedCalldata.to,
       data: preparedCalldata.data,
       value: preparedCalldata.value || 0n,
-    }])
+    }], { paymaster: true })
   }
 
   // Fallback: simple USDC transfer (for send-as-swap without router)
@@ -266,7 +266,7 @@ export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, prep
     abi: erc20Abi,
     functionName: 'transfer',
     args: [getAddress(gate.limits.treasury || USDC_ADDRESS), amountBigInt],
-  }])
+  }], { paymaster: true })
 }
 
 /**
