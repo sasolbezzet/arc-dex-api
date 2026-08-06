@@ -8,7 +8,7 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs'
 
 // ── In-memory session store (production: use Redis) ──
 const sessions = new Map() // sessionId -> { transport, server }
-const authCodes = new Map() // code -> { clientId, userId, expires }
+const authCodes = new Map() // code -> { clientId, userId, redirectUri, codeChallenge, expires }
 const accessTokens = new Map() // token -> { userId, clientId, expires }
 
 const SERVER_URL = process.env.SERVER_URL || 'https://arcoxdex.vercel.app'
@@ -38,16 +38,21 @@ export function registerOAuthClient({ clientName, redirectUris = [] }) {
   return { clientId, clientSecret, clientName, redirectUris }
 }
 
-export function createAuthCode(clientId, userId) {
+export function createAuthCode(clientId, userId, { redirectUri, codeChallenge } = {}) {
   const code = randomUUID()
-  authCodes.set(code, { clientId, userId, expires: Date.now() + 600000 }) // 10 min
+  authCodes.set(code, { clientId, userId, redirectUri, codeChallenge, expires: Date.now() + 600000 }) // 10 min
   return code
 }
 
-export function exchangeCodeForToken(code, clientId, clientSecret) {
+export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, codeVerifier) {
   const auth = authCodes.get(code)
   if (!auth) return { error: 'invalid_grant', error_description: 'Invalid authorization code' }
   if (Date.now() > auth.expires) return { error: 'invalid_grant', error_description: 'Code expired' }
+  if (auth.clientId !== clientId) return { error: 'invalid_grant', error_description: 'client_id mismatch' }
+  if (!redirectUri || auth.redirectUri !== redirectUri) return { error: 'invalid_grant', error_description: 'redirect_uri mismatch' }
+  if (!auth.codeChallenge || !codeVerifier || createHash('sha256').update(codeVerifier).digest('base64url') !== auth.codeChallenge) {
+    return { error: 'invalid_grant', error_description: 'PKCE verification failed' }
+  }
   const client = oauthClients.get(clientId)
   if (!client) return { error: 'invalid_client', error_description: 'Unknown client_id' }
   // If client registered with token_endpoint_auth_method=none, skip secret check
@@ -147,7 +152,7 @@ export function oauthAuthorizeHandler(req, res) {
     state: state || '',
     code_challenge: code_challenge || '',
   })
-  res.redirect(302, `${SERVER_URL}/plugin?${params.toString()}`)
+  res.redirect(302, `${SERVER_URL}/arc-dex/plugin?${params.toString()}`)
 }
 
 // ── SIWE message generation ──
@@ -162,32 +167,31 @@ export function siweMessageHandler(req, res) {
 
 // ── SIWE verify + issue auth code ──
 import { verifyMessage } from 'viem'
-export function siweVerifyHandler(req, res) {
+export async function siweVerifyHandler(req, res) {
   const { address, message, signature, clientId, redirectUri, state, codeChallenge } = req.body || {}
   if (!address || !message || !clientId) return res.status(400).json({ error: 'missing fields' })
   
-  // For auto-sign (no MetaMask), accept if address matches message
-  const isAutoSign = signature === '0x_auto'
-  if (!isAutoSign) {
-    try {
-      const valid = verifyMessage({ address, message, signature })
-      if (!valid) return res.status(401).json({ error: 'invalid_signature' })
-    } catch {
-      return res.status(401).json({ error: 'signature_verification_failed' })
-    }
+  if (!redirectUri || !codeChallenge) return res.status(400).json({ error: 'missing_pkce_or_redirect_uri' })
+  const client = oauthClients.get(clientId)
+  if (!client || !client.redirectUris.includes(redirectUri)) return res.status(400).json({ error: 'invalid_redirect_uri' })
+  try {
+    const valid = await verifyMessage({ address, message, signature })
+    if (!valid) return res.status(401).json({ error: 'invalid_signature' })
+  } catch {
+    return res.status(401).json({ error: 'signature_verification_failed' })
   }
   
   const userId = address.toLowerCase()
-  const code = createAuthCode(clientId, userId)
+  const code = createAuthCode(clientId, userId, { redirectUri, codeChallenge })
   const redirect = `${redirectUri}?code=${code}&state=${state || ''}`
   res.json({ redirect })
 }
 
 // ── Token endpoint ──
 export function oauthTokenHandler(req, res) {
-  const { grant_type, code, client_id, client_secret, redirect_uri } = req.body || {}
+  const { grant_type, code, client_id, client_secret, redirect_uri, code_verifier } = req.body || {}
   if (grant_type === 'authorization_code') {
-    const result = exchangeCodeForToken(code, client_id, client_secret)
+    const result = exchangeCodeForToken(code, client_id, client_secret, redirect_uri, code_verifier)
     if (result.error) return res.status(400).json(result)
     return res.json(result)
   }
@@ -369,21 +373,13 @@ export function createMcpServer(userId) {
     if (gate.ok) {
       // Session key path: sign via MSCA delegate EOA (Circle Modular Wallet)
       if (source === 'session') {
-        try {
-          const { sendViaSession } = await import('./sessionKeyService.mjs')
-          const result = await sendViaSession(userId, gate.limits.treasury || '0x0000000000000000000000000000000000000000', params.amountIn, params.tokenIn)
-          if (result.status === 'success') {
-            await recordAutoExec(userId, {
-              agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
-              source: 'session', details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId, txHash: result.txHash }),
-              txHash: result.txHash, explorerUrl: result.explorerUrl,
-            })
-            return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Swap ${params.amountIn} ${params.tokenIn} dieksekusi via Agent Session Key (gasless).` }) }] }
-          }
-          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session execution failed', safeNextStep: 'Session key bermasalah. Coba source=circle atau source=eoa.' }) }] }
-        } catch (e) {
-          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e.message, safeNextStep: 'Session key error. Coba source=circle.' }) }] }
-        }
+        // Never substitute a token transfer for a swap. Session swaps need
+        // verified router calldata before they can be safely enabled.
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'session_not_supported', executed: false,
+          error: 'Session-key swap belum tersedia: calldata router belum diverifikasi.',
+          safeNextStep: 'Gunakan source=circle atau source=eoa untuk swap.',
+        }) }] }
       }
       // Circle path: server-side signing via Circle API
       const data = await apiPost('/api/swap', {
@@ -405,7 +401,7 @@ export function createMcpServer(userId) {
       }
       // Circle route unavailable / failed → fall through to approval path.
       const reason = data?.error || 'Circle swap gagal'
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, safeNextStep: `Circle route tidak tersedia (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/plugin?tab=approvals` }) }] }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, safeNextStep: `Circle route tidak tersedia (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/arc-dex/plugin?tab=approvals` }) }] }
     }
     // FALLBACK: EOA or over-limit → create pending approval for browser signing.
     const { createApproval } = await import('./vaultStore.mjs')
@@ -423,11 +419,11 @@ export function createMcpServer(userId) {
       executed: false,
       reason: gate.reason,
       approval,
-      approvalUrl: `${SERVER_URL}/plugin?tab=approvals&approval=${approval.id}`,
+      approvalUrl: `${SERVER_URL}/arc-dex/plugin?tab=approvals&approval=${approval.id}`,
       message: gate.reason === 'over_limit'
-        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/plugin?tab=approvals`
-        : `Permintaan swap dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
-      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
+        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/arc-dex/plugin?tab=approvals`
+        : `Permintaan swap dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/arc-dex/plugin?tab=approvals`,
+      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/arc-dex/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
     }) }] }
   })
 
@@ -496,7 +492,7 @@ export function createMcpServer(userId) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash, burnTxHash: data.burnTxHash, mintTxHash: data.mintTxHash, explorerUrl, message: `Bridge ${params.amount} USDC ${fromKey} → ${toKey} berhasil via Circle Wallet.` }) }] }
       }
       const reason = data?.error || 'Circle bridge gagal'
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, state: data?.state, safeNextStep: `Circle bridge tidak selesai (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/plugin?tab=approvals` }) }] }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, state: data?.state, safeNextStep: `Circle bridge tidak selesai (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/arc-dex/plugin?tab=approvals` }) }] }
     }
     // FALLBACK: EOA / non-USDC / over-limit → pending approval for browser signing.
     const { createApproval } = await import('./vaultStore.mjs')
@@ -515,11 +511,11 @@ export function createMcpServer(userId) {
       executed: false,
       reason: gate.ok ? 'non_usdc' : gate.reason,
       approval,
-      approvalUrl: `${SERVER_URL}/plugin?tab=approvals&approval=${approval.id}`,
+      approvalUrl: `${SERVER_URL}/arc-dex/plugin?tab=approvals&approval=${approval.id}`,
       message: (!gate.ok && gate.reason === 'over_limit')
-        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/plugin?tab=approvals`
-        : `Permintaan bridge dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
-      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
+        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/arc-dex/plugin?tab=approvals`
+        : `Permintaan bridge dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/arc-dex/plugin?tab=approvals`,
+      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/arc-dex/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
     }) }] }
   })
 
@@ -592,7 +588,7 @@ export function createMcpServer(userId) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash, explorerUrl, result: data.result || data, message: `Kirim ${params.amount} ${token} ke ${params.to} berhasil via Circle Wallet.` }) }] }
       }
       const reason = data?.error || 'Circle send gagal'
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, safeNextStep: `Circle route tidak tersedia (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/plugin?tab=approvals` }) }] }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, safeNextStep: `Circle route tidak tersedia (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/arc-dex/plugin?tab=approvals` }) }] }
     }
     // FALLBACK: EOA or over-limit → pending approval for browser signing.
     const { createApproval } = await import('./vaultStore.mjs')
@@ -611,11 +607,11 @@ export function createMcpServer(userId) {
       executed: false,
       reason: gate.reason,
       approval,
-      approvalUrl: `${SERVER_URL}/plugin?tab=approvals&approval=${approval.id}`,
+      approvalUrl: `${SERVER_URL}/arc-dex/plugin?tab=approvals&approval=${approval.id}`,
       message: gate.reason === 'over_limit'
-        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/plugin?tab=approvals`
-        : `Permintaan send dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/plugin?tab=approvals`,
-      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
+        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/arc-dex/plugin?tab=approvals`
+        : `Permintaan send dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/arc-dex/plugin?tab=approvals`,
+      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/arc-dex/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
     }) }] }
   })
 
