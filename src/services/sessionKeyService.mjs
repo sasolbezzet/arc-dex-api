@@ -13,11 +13,12 @@
 // ponytail: no on-chain spend limit enforcement yet — limits checked in
 // backend (vaultStore). Upgrade to ERC-6900 session key module for on-chain
 // enforcement when Circle ships the module SDK.
-
-import { createWalletClient, createPublicClient, defineChain, http, encodeFunctionData, getAddress } from 'viem'
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
+import { createPublicClient, http, encodeFunctionData, getAddress } from 'viem'
+import { arcTestnet } from 'viem/chains'
 import { toModularTransport, toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
 import { sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
+import { encrypt, decrypt } from './crypto.mjs'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { getLimits } from './vaultStore.mjs'
 
@@ -51,10 +52,20 @@ function saveStore(data) {
 /**
  * Get session key info for a user.
  * Returns { walletAddress, delegateAddress, delegatePrivateKey, createdAt, active }
+ * delegatePrivateKey is decrypted from vault storage.
  */
 export function getSessionKey(userId) {
   const store = loadStore()
-  return store.users[userId.toLowerCase()] || null
+  const entry = store.users[userId.toLowerCase()]
+  if (!entry) return null
+  // Decrypt delegate key for in-memory use only (never written back encrypted twice)
+  if (entry.delegatePrivateKey && !entry._decrypted) {
+    try {
+      entry.delegatePrivateKey = decrypt(entry.delegatePrivateKey)
+      entry._decrypted = true
+    } catch { /* key was stored pre-encryption or corrupted */ }
+  }
+  return entry
 }
 
 /**
@@ -69,13 +80,14 @@ export function generateSessionKey() {
 
 /**
  * Store session key for a user (called after frontend passkey setup + mapping).
+ * delegatePrivateKey is encrypted at rest using SESSION_KEY_ENCRYPTION_KEY.
  */
 export function storeSessionKey(userId, { walletAddress, delegateAddress, delegatePrivateKey }) {
   const store = loadStore()
   store.users[userId.toLowerCase()] = {
     walletAddress: getAddress(walletAddress),
     delegateAddress: getAddress(delegateAddress),
-    delegatePrivateKey,
+    delegatePrivateKey: encrypt(delegatePrivateKey),
     createdAt: Date.now(),
     active: true,
   }
