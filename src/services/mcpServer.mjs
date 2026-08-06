@@ -373,13 +373,22 @@ export function createMcpServer(userId) {
     if (gate.ok) {
       // Session key path: sign via MSCA delegate EOA (Circle Modular Wallet)
       if (source === 'session') {
-        // Never substitute a token transfer for a swap. Session swaps need
-        // verified router calldata before they can be safely enabled.
-        return { content: [{ type: 'text', text: JSON.stringify({
-          status: 'session_not_supported', executed: false,
-          error: 'Session-key swap belum tersedia: calldata router belum diverifikasi.',
-          safeNextStep: 'Gunakan source=circle atau source=eoa untuk swap.',
-        }) }] }
+        // Session key path: swap via MSCA delegate EOA
+        try {
+          const { swapViaSession } = await import('./sessionKeyService.mjs')
+          const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn })
+          if (result.status === 'success') {
+            await recordAutoExec(userId, {
+              agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
+              source: 'session', details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
+              txHash: result.txHash, explorerUrl: result.explorerUrl,
+            })
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Swap ${params.amountIn} ${params.tokenIn} → ${params.tokenOut} berhasil via MSCA (session key).` }) }] }
+          }
+          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session swap gagal', safeNextStep: 'Gunakan source=eoa dan tanda tangani via Plugin.' }) }] }
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e?.message || 'Session error', safeNextStep: 'Gunakan source=eoa dan tanda tangani via Plugin.' }) }] }
+        }
       }
       // Circle path: server-side signing via Circle API
       const data = await apiPost('/api/swap', {
@@ -570,6 +579,25 @@ export function createMcpServer(userId) {
     // AUTO-EXECUTE: Circle-source within limit → sign server-side.
     const gate = await canAutoExecute(userId, source, params.amount)
     if (gate.ok) {
+      // Session key path: send via MSCA delegate EOA
+      if (source === 'session') {
+        try {
+          const { sendViaSession } = await import('./sessionKeyService.mjs')
+          const result = await sendViaSession(userId, params.to, params.amount, token)
+          if (result.status === 'success') {
+            await recordAutoExec(userId, {
+              agent: resolveAgentForUser(userId), action: 'send', amount: params.amount, token,
+              source: 'session', to: params.to, details: JSON.stringify({ previewId: params.previewId }),
+              txHash: result.txHash, explorerUrl: result.explorerUrl,
+            })
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Kirim ${params.amount} ${token} ke ${params.to} berhasil via MSCA (session key).` }) }] }
+          }
+          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session send gagal', safeNextStep: 'Gunakan source=eoa dan tanda tangani via Plugin.' }) }] }
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e?.message || 'Session error', safeNextStep: 'Gunakan source=eoa dan tanda tangani via Plugin.' }) }] }
+        }
+      }
+      // Circle path: server-side signing via Circle API
       const data = await apiPost('/api/send', {
         metamaskAddress: userId,
         toAddress: params.to,
