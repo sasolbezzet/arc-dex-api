@@ -6,39 +6,38 @@
 //
 // Lifecycle:
 //   1. generateSessionKey() → new EOA keypair (stored encrypted in vault)
-//   2. installSessionKey(walletAddress, delegateAddress) → createAddressMapping
-//   3. executeViaSession(walletAddress, calls, paymaster) → sendUserOperation
+//   2. installSessionKey(walletAddress, delegateAddress, chainKey) → createAddressMapping
+//   3. executeViaSession(walletAddress, calls, paymaster, chainKey) → sendUserOperation
 //   4. revokeSessionKey(walletAddress, delegateAddress) → remove mapping
 //
 // ponytail: no on-chain spend limit enforcement yet — limits checked in
 // backend (vaultStore). Upgrade to ERC-6900 session key module for on-chain
 // enforcement when Circle ships the module SDK.
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
-import { createPublicClient, http, encodeFunctionData, getAddress } from 'viem'
-import { arcTestnet } from 'viem/chains'
+import { createPublicClient, http, encodeFunctionData, getAddress, defineChain } from 'viem'
 import { toModularTransport, toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
 import { sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
 import { encrypt, decrypt } from './crypto.mjs'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { getLimits } from './vaultStore.mjs'
+import { CHAINS } from './chains.mjs'
 
 const CLIENT_URL = process.env.CIRCLE_CLIENT_URL || ''
 const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
 
 const SESSION_KEYS_PATH = process.env.SESSION_KEYS_PATH || './data/session-keys.json'
-const ARC_CHAIN_ID = Number(process.env.ARC_CHAIN_ID || 5042002)
-const ARC_RPC = process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'
 
-// USDC ERC-20 on Arc Testnet
-const USDC_ADDRESS = '0x3600000000000000000000000000000000000000'
-
-// ── Arc chain definition ──
-const arcChain = defineChain({
-  id: ARC_CHAIN_ID,
-  name: 'Arc Testnet',
-  nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-  rpcUrls: { default: { http: [ARC_RPC] } },
-})
+// ── Build viem chain object from CHAINS config ──
+function buildViemChain(chainKey) {
+  const c = CHAINS[chainKey]
+  if (!c) throw new Error(`Unknown chain: ${chainKey}`)
+  return defineChain({
+    id: c.id,
+    name: c.name,
+    nativeCurrency: c.nativeCurrency,
+    rpcUrls: { default: { http: [c.rpcUrl] } },
+  })
+}
 
 // ── Session key store (per user) ──
 function loadStore() {
@@ -81,13 +80,15 @@ export function generateSessionKey() {
 /**
  * Store session key for a user (called after frontend passkey setup + mapping).
  * delegatePrivateKey is encrypted at rest using SESSION_KEY_ENCRYPTION_KEY.
+ * @param options.chain — chain key (e.g., 'arc-testnet', 'ethereum-sepolia')
  */
-export function storeSessionKey(userId, { walletAddress, delegateAddress, delegatePrivateKey }) {
+export function storeSessionKey(userId, { walletAddress, delegateAddress, delegatePrivateKey, chain = 'arc-testnet' }) {
   const store = loadStore()
   store.users[userId.toLowerCase()] = {
     walletAddress: getAddress(walletAddress),
     delegateAddress: getAddress(delegateAddress),
     delegatePrivateKey: encrypt(delegatePrivateKey),
+    chain,
     createdAt: Date.now(),
     active: true,
   }
@@ -123,22 +124,26 @@ export function canExecuteViaSession(userId, amount) {
 }
 
 /**
- * Create a viem wallet client for the delegate EOA.
+ * Build a viem wallet client for the delegate EOA.
  */
-function delegateWalletClient(privateKey) {
+function delegateWalletClient(privateKey, chainKey = 'arc-testnet') {
   const account = privateKeyToAccount(privateKey)
-  return createWalletClient({ account, chain: arcChain, transport: http(ARC_RPC) })
+  const chain = buildViemChain(chainKey)
+  return createWalletClient({ account, chain, transport: http(CHAINS[chainKey].rpcUrl) })
 }
 
 /**
  * Build a Circle Smart Account client using the delegate EOA as owner.
  * This lets the delegate sign UserOperations for the MSCA.
  */
-async function buildSmartAccountClient(walletAddress, delegatePrivateKey) {
+async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainKey = 'arc-testnet') {
   if (!CLIENT_URL || !CLIENT_KEY) throw new Error('CIRCLE_CLIENT_URL and CIRCLE_CLIENT_KEY must be set')
+  const chain = CHAINS[chainKey]
+  if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
 
-  const transport = toModularTransport(`${CLIENT_URL}/arcTestnet`, CLIENT_KEY)
-  const baseClient = createPublicClient({ chain: arcChain, transport })
+  const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+  const viemChain = buildViemChain(chainKey)
+  const baseClient = createPublicClient({ chain: viemChain, transport })
   const modularClient = toCircleModularWalletClient({ client: baseClient })
 
   const ownerAccount = privateKeyToAccount(delegatePrivateKey)
@@ -158,14 +163,15 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey) {
  *
  * @param userId — vault user ID (wallet address)
  * @param calls — array of { to, value, data } or { to, value, abi, functionName, args }
- * @param options — { paymaster: true/false }
+ * @param options — { paymaster: true/false, chainKey: string }
  */
 export async function executeViaSession(userId, calls, options = {}) {
   const gate = canExecuteViaSession(userId, 0) // amount check done by caller
   if (!gate.ok) throw new Error(`Session not available: ${gate.reason}`)
 
   const { entry } = gate
-  const { smartAccount } = await buildSmartAccountClient(entry.walletAddress, entry.delegatePrivateKey)
+  const chainKey = options.chainKey || entry.chain || 'arc-testnet'
+  const { smartAccount } = await buildSmartAccountClient(entry.walletAddress, entry.delegatePrivateKey, chainKey)
 
   // Normalize calls to { to, value, data }
   const normalizedCalls = calls.map(c => {
@@ -209,10 +215,20 @@ export async function executeViaSession(userId, calls, options = {}) {
 
 /**
  * Execute a USDC transfer via session key.
+ * @param options.chainKey — which chain to execute on (default: session's chain)
  */
-export async function sendViaSession(userId, to, amount, token = 'USDC') {
+export async function sendViaSession(userId, to, amount, token = 'USDC', options = {}) {
   const gate = canExecuteViaSession(userId, amount)
   if (!gate.ok) return { status: 'denied', reason: gate.reason }
+
+  const chainKey = options.chainKey || gate.entry?.chain || 'arc-testnet'
+  const chain = CHAINS[chainKey]
+  if (!chain) return { status: 'denied', reason: 'unknown_chain' }
+
+  const tokenAddress = chain.tokens[token]
+  if (!tokenAddress && token !== chain.nativeCurrency.symbol) {
+    return { status: 'denied', reason: 'token_not_supported', chain: chainKey, token }
+  }
 
   // ERC-20 transfer calldata
   const erc20Abi = [{
@@ -221,15 +237,15 @@ export async function sendViaSession(userId, to, amount, token = 'USDC') {
     outputs: [{ name: '', type: 'bool' }],
   }]
 
-  // Arc USDC uses 6 decimals for ERC-20 interface
-  const amountBigInt = BigInt(Math.floor(Number(amount) * 1e6))
+  const decimals = token === 'USDC' || token === 'EURC' ? 6 : 18
+  const amountBigInt = BigInt(Math.floor(Number(amount) * 10 ** decimals))
 
   return executeViaSession(userId, [{
-    to: USDC_ADDRESS,
+    to: tokenAddress,
     abi: erc20Abi,
     functionName: 'transfer',
     args: [getAddress(to), amountBigInt],
-  }], { paymaster: true })
+  }], { paymaster: true, chainKey })
 }
 
 /**
@@ -241,16 +257,18 @@ export async function sendViaSession(userId, to, amount, token = 'USDC') {
  * treasury. Full AMM routing via MSCA needs the swap router calldata. Upgrade
  * by passing prepared calldata from /api/eoa-swap-prepare.
  */
-export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, preparedCalldata }) {
+export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, preparedCalldata, chainKey }) {
   const gate = canExecuteViaSession(userId, amountIn)
   if (!gate.ok) return { status: 'denied', reason: gate.reason }
+
+  const chain = chainKey || gate.entry?.chain || 'arc-testnet'
 
   if (preparedCalldata?.to && preparedCalldata?.data) {
     return executeViaSession(userId, [{
       to: preparedCalldata.to,
       data: preparedCalldata.data,
       value: preparedCalldata.value || 0n,
-    }], { paymaster: true })
+    }], { paymaster: true, chainKey: chain })
   }
 
   // Fallback: simple USDC transfer (for send-as-swap without router)
@@ -259,14 +277,15 @@ export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, prep
     inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }],
     outputs: [{ name: '', type: 'bool' }],
   }]
+  const tokenAddr = CHAINS[chain]?.tokens?.USDC || CHAINS[chain]?.tokens?.[tokenIn]
   const amountBigInt = BigInt(Math.floor(Number(amountIn) * 1e6))
 
   return executeViaSession(userId, [{
-    to: USDC_ADDRESS,
+    to: tokenAddr,
     abi: erc20Abi,
     functionName: 'transfer',
-    args: [getAddress(gate.limits.treasury || USDC_ADDRESS), amountBigInt],
-  }], { paymaster: true })
+    args: [getAddress(gate.limits.treasury || tokenAddr), amountBigInt],
+  }], { paymaster: true, chainKey: chain })
 }
 
 /**

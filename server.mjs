@@ -1641,6 +1641,25 @@ app.all('/api/unified-balance/gateway-proxy', apiLimiter, requireAuth, async (re
   }
 })
 
+// ── Multi-chain balances (MSCA Agent Wallet dashboard) ──
+app.get('/api/multi-balance/:address', apiLimiter, async (req, res) => {
+  try {
+    const address = normalizeAddress(req.params.address, 'address')
+    const { fetchAllChainBalances } = await import('./src/services/multiChainBalance.mjs')
+    const balances = await fetchAllChainBalances(address)
+    res.json({ address, balances })
+  } catch (e) {
+    res.status(500).json({ error: e?.message || 'Multi-chain balance fetch failed' })
+  }
+})
+
+// ── Supported chains list ──
+app.get('/api/chains', (_req, res) => {
+  import('./src/services/chains.mjs').then(({ CHAIN_LIST }) => {
+    res.json({ chains: CHAIN_LIST })
+  }).catch(e => res.status(500).json({ error: e?.message }))
+})
+
 app.post('/api/unified-balance/balances', apiLimiter, async (req, res) => {
   try {
     const address = normalizeAddress(req.body?.address, 'address')
