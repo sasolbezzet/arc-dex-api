@@ -60,11 +60,23 @@ function saveStore(data) {
 export function getSessionKey(userId) {
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
-  let entry = store.users[key]
+  let entry = null
+  // 1) Exact owner match
+  if (store.users[key]) entry = store.users[key]
+  // 2) Explicit EOA alias -> MSCA walletAddress
   if (!entry) {
-    // Resolve EOA alias -> walletAddress(MSCA)
     const walletAddr = store.aliases?.[key]
     if (walletAddr && store.users[walletAddr.toLowerCase()]) entry = store.users[walletAddr.toLowerCase()]
+  }
+  // 3) Auto-detect: EOA identity (not itself a session owner) with no alias
+  //    resolves to the most recently-created ACTIVE session key. A user may
+  //    register several passkey MSCAs; the latest one they activated is the
+  //    one they intend to use.
+  if (!entry && !store.users[key]) {
+    const newest = Object.values(store.users)
+      .filter(u => u && u.active !== false)
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0]
+    if (newest) entry = newest
   }
   if (!entry) return null
   // Decrypt delegate key for in-memory use only (never written back encrypted twice)
@@ -95,6 +107,16 @@ export function generateSessionKey() {
 export function storeSessionKey(userId, { walletAddress, delegateAddress, delegatePrivateKey, chain = 'arc-testnet', ownerAddress }) {
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
+  // One active session key per identity. If a DIFFERENT MSCA is already active
+  // for the same EOA owner, revoke it so auto-detect is unambiguous.
+  if (ownerAddress) {
+    const ownerKey = String(ownerAddress).toLowerCase()
+    const staleAlias = store.aliases?.[ownerKey]
+    if (staleAlias && staleAlias.toLowerCase() !== getAddress(walletAddress).toLowerCase()) {
+      const old = store.users[staleAlias.toLowerCase()]
+      if (old && old.active !== false) { old.active = false; old.revokedAt = Date.now(); old.replacedBy = getAddress(walletAddress) }
+    }
+  }
   store.users[key] = {
     walletAddress: getAddress(walletAddress),
     delegateAddress: getAddress(delegateAddress),
