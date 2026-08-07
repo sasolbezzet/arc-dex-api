@@ -156,14 +156,17 @@ app.post('/api/session/generate-key', apiLimiter, requireAuth, async (req, res) 
 
 app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { walletAddress, delegateAddress, delegatePrivateKey } = req.body
+    const { walletAddress, delegateAddress, delegatePrivateKey, ownerAddress } = req.body
     if (!walletAddress || !delegateAddress || !delegatePrivateKey) {
       return res.status(400).json({ error: 'walletAddress, delegateAddress, delegatePrivateKey required' })
     }
     const { storeSessionKey } = await import('./src/services/sessionKeyService.mjs')
     const { setSessionKeyInfo } = await import('./src/services/vaultStore.mjs')
-    const entry = storeSessionKey(req.owner, { walletAddress, delegateAddress, delegatePrivateKey })
-    setSessionKeyInfo(req.owner, { walletAddress, delegateAddress, active: true, createdAt: entry.createdAt })
+    // req.owner = auth token subject (MSCA during passkey setup, or EOA).
+    // ownerAddress is the OAuth/SIWE identity (usually EOA) that must resolve to this session.
+    const entry = storeSessionKey(req.owner, { walletAddress, delegateAddress, delegatePrivateKey, ownerAddress })
+    const infoOwner = ownerAddress ? String(ownerAddress).toLowerCase() : req.owner
+    setSessionKeyInfo(infoOwner, { walletAddress, delegateAddress, active: true, createdAt: entry.createdAt })
     res.json({ success: true, walletAddress, delegateAddress, active: true })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
@@ -171,7 +174,7 @@ app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
 app.get('/api/session/status', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { getSessionKeyInfo } = await import('./src/services/vaultStore.mjs')
-    const info = getSessionKeyInfo(req.owner)
+    const info = await getSessionKeyInfo(req.owner)
     res.json({ success: true, session: info })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })

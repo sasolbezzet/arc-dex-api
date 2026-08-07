@@ -52,10 +52,20 @@ function saveStore(data) {
  * Get session key info for a user.
  * Returns { walletAddress, delegateAddress, delegatePrivateKey, createdAt, active }
  * delegatePrivateKey is decrypted from vault storage.
+ *
+ * The key lookup resolves aliases: a user may authenticate as EOA (OAuth/SIWE
+ * wallet identity) while the session key is stored against the MSCA address.
+ * setup stores an `ownerAddress` alias so getSessionKey(EOA) finds the MSCA entry.
  */
 export function getSessionKey(userId) {
   const store = loadStore()
-  const entry = store.users[userId.toLowerCase()]
+  const key = String(userId || '').toLowerCase()
+  let entry = store.users[key]
+  if (!entry) {
+    // Resolve EOA alias -> walletAddress(MSCA)
+    const walletAddr = store.aliases?.[key]
+    if (walletAddr && store.users[walletAddr.toLowerCase()]) entry = store.users[walletAddr.toLowerCase()]
+  }
   if (!entry) return null
   // Decrypt delegate key for in-memory use only (never written back encrypted twice)
   if (entry.delegatePrivateKey && !entry._decrypted) {
@@ -82,9 +92,10 @@ export function generateSessionKey() {
  * delegatePrivateKey is encrypted at rest using SESSION_KEY_ENCRYPTION_KEY.
  * @param options.chain — chain key (e.g., 'arc-testnet', 'ethereum-sepolia')
  */
-export function storeSessionKey(userId, { walletAddress, delegateAddress, delegatePrivateKey, chain = 'arc-testnet' }) {
+export function storeSessionKey(userId, { walletAddress, delegateAddress, delegatePrivateKey, chain = 'arc-testnet', ownerAddress }) {
   const store = loadStore()
-  store.users[userId.toLowerCase()] = {
+  const key = String(userId || '').toLowerCase()
+  store.users[key] = {
     walletAddress: getAddress(walletAddress),
     delegateAddress: getAddress(delegateAddress),
     delegatePrivateKey: encrypt(delegatePrivateKey),
@@ -92,8 +103,16 @@ export function storeSessionKey(userId, { walletAddress, delegateAddress, delega
     createdAt: Date.now(),
     active: true,
   }
+  // Alias mapping: EOA (OAuth identity) -> MSCA walletAddress. Lets MCP sessions
+  // authenticated as the EOA resolve the MSCA-owned session key.
+  if (ownerAddress) {
+    if (!store.aliases) store.aliases = {}
+    store.aliases[String(ownerAddress).toLowerCase()] = getAddress(walletAddress)
+    // Also normalize the reverse (userId -> MSCA) if it differs
+    store.aliases[key] = getAddress(walletAddress)
+  }
   saveStore(store)
-  return store.users[userId.toLowerCase()]
+  return store.users[key]
 }
 
 /**
@@ -101,8 +120,14 @@ export function storeSessionKey(userId, { walletAddress, delegateAddress, delega
  */
 export function revokeSessionKey(userId) {
   const store = loadStore()
-  const entry = store.users[userId.toLowerCase()]
-  if (!entry) return null
+  const key = String(userId || '').toLowerCase()
+  const entry = store.users[key]
+  if (!entry) {
+    // Revoke via EOA alias -> MSCA entry
+    const walletAddr = store.aliases?.[key]
+    if (walletAddr && store.users[walletAddr.toLowerCase()]) return store.users[walletAddr.toLowerCase()]
+    return null
+  }
   entry.active = false
   entry.revokedAt = Date.now()
   saveStore(store)

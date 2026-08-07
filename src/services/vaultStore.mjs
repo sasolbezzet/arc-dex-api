@@ -232,9 +232,19 @@ export function updateApprovalStatus(owner, id, status, extra = {}) {
 // ── Session key info (lightweight, stored in vault) ──
 // Full delegate private key stored in sessionKeyService (separate file).
 // This stores only the public address + wallet address for the vault UI.
-export function getSessionKeyInfo(owner) {
+export async function getSessionKeyInfo(owner) {
   const v = loadVault()
-  return v.sessionKeys?.[owner] || null
+  const key = String(owner || '').toLowerCase()
+  let info = v.sessionKeys?.[key] || null
+  if (!info) {
+    // Resolve EOA alias -> MSCA entry stored in session-key store.
+    try {
+      const { getSessionKey } = await import('./sessionKeyService.mjs')
+      const entry = getSessionKey(key)
+      if (entry) info = { walletAddress: entry.walletAddress, delegateAddress: entry.delegateAddress, active: entry.active }
+    } catch { /* ignore */ }
+  }
+  return info
 }
 
 export function setSessionKeyInfo(owner, info) {
