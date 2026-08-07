@@ -225,11 +225,28 @@ export function canExecuteViaSession(userId, amount) {
   // Record real usage so auto-detect picks the MSCA most recently used.
   try { touchSessionKey(userId) } catch { /* non-fatal */ }
   const limits = getLimits(userId)
-  const amt = Number(amount)
-  if (!Number.isFinite(amt) || amt <= 0) return { ok: false, reason: 'bad_amount' }
+  // Tolerant parse: Claude/agent may pass "1.5 USDC", "$10", or "1e3".
+  const parsed = parseHumanAmount(amount)
+  if (parsed === null || parsed <= 0) return { ok: false, reason: 'bad_amount', message: `Amount tidak valid: \"${amount}\". Gunakan angka saja, contoh \"1.5\".` }
+  const amt = parsed
   if (limits.autoApprove === false) return { ok: false, reason: 'auto_off' }
   if (amt > Number(limits.maxPerTx)) return { ok: false, reason: 'over_limit', limit: limits.maxPerTx }
   return { ok: true, entry, limits }
+}
+
+// Extract a positive number from a human amount string. Accepted: "1.5",
+// "1,5", "$10", "0.01 USDC", "1e3", " 2 ". Returns null when unparseable.
+function parseHumanAmount(value) {
+  if (value === null || value === undefined) return null
+  const raw = String(value).trim()
+  if (!raw) return null
+  // Strip commas used as thousands separators (10,000 -> 10000) but not decimals.
+  const cleaned = raw.replace(/,/g, '.')
+  const m = cleaned.match(/[+-]?\d+(\.\d+)?([eE][+-]?\d+)?/)
+  if (!m) return null
+  const n = Number(m[0])
+  if (!Number.isFinite(n)) return null
+  return n
 }
 
 /**
@@ -347,7 +364,9 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
   }]
 
   const decimals = token === 'USDC' || token === 'EURC' ? 6 : 18
-  const amountBigInt = BigInt(Math.floor(Number(amount) * 10 ** decimals))
+  const parsedAmount = parseHumanAmount(amount)
+  if (parsedAmount === null) return { status: 'denied', reason: 'bad_amount' }
+  const amountBigInt = BigInt(Math.floor(parsedAmount * 10 ** decimals))
 
   return executeViaSession(userId, [{
     to: tokenAddress,
@@ -387,7 +406,9 @@ export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, prep
     outputs: [{ name: '', type: 'bool' }],
   }]
   const tokenAddr = CHAINS[chain]?.tokens?.USDC || CHAINS[chain]?.tokens?.[tokenIn]
-  const amountBigInt = BigInt(Math.floor(Number(amountIn) * 1e6))
+  const parsedAmount = parseHumanAmount(amountIn)
+  if (parsedAmount === null) return { status: 'denied', reason: 'bad_amount' }
+  const amountBigInt = BigInt(Math.floor(parsedAmount * 1e6))
 
   return executeViaSession(userId, [{
     to: tokenAddr,

@@ -69,3 +69,30 @@ test('listRelatedAddresses clusters EOA and MSCA bidirectionally', async () => {
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('canExecuteViaSession parses human amounts tolerantly and rejects bad ones', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
+  const path = join(dir, 'session-keys.json')
+  const A = '0x1111111111111111111111111111111111111111'
+  await writeFile(path, JSON.stringify({
+    users: { [A]: { walletAddress: A, delegateAddress: A, delegatePrivateKey: 'ZGVuZw==', chain: 'arc-testnet', createdAt: 1, active: true } },
+    aliases: {},
+  }))
+  const prev = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  process.env.SESSION_KEY_ENCRYPTION_KEY = 'test'
+  try {
+    const mod = await import('../src/services/sessionKeyService.mjs?a=' + Date.now())
+    assert.ok(mod.canExecuteViaSession(A, '1.5').ok, 'plain decimal ok')
+    assert.ok(mod.canExecuteViaSession(A, '1.5 USDC').ok, 'with unit ok')
+    assert.ok(mod.canExecuteViaSession(A, '$10').ok, 'dollar ok')
+    assert.ok(mod.canExecuteViaSession(A, '2 USDC swap').ok, 'phrase ok')
+    assert.equal(mod.canExecuteViaSession(A, 'abc').reason, 'bad_amount', 'text rejected')
+    assert.equal(mod.canExecuteViaSession(A, '').reason, 'bad_amount', 'empty rejected')
+    assert.equal(mod.canExecuteViaSession(A, '0').reason, 'bad_amount', 'zero rejected')
+  } finally {
+    if (prev === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = prev
+    await rm(dir, { recursive: true, force: true })
+  }
+})
