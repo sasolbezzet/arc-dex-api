@@ -357,7 +357,7 @@ async function previewX402Pay(userId, invoiceId) {
   }
   if (invoice.asset !== 'USDC') throw new Error('Hanya invoice USDC yang didukung x402.')
   const { getSessionKeyInfo } = await import('./vaultStore.mjs')
-  const info = getSessionKeyInfo(userId)
+  const info = await getSessionKeyInfo(userId)
   if (!info || !info.active) {
     return { status: 'session_required', message: 'Session key MSCA belum aktif. User harus setup Agent Wallet + session key dulu di Plugin page.' }
   }
@@ -534,7 +534,7 @@ export function createMcpServer(userId) {
       return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote bridge hanya untuk source=session.' }) }] }
     }
     const { getSessionKeyInfo } = await import('./vaultStore.mjs')
-    const info = getSessionKeyInfo(userId)
+    const info = await getSessionKeyInfo(userId)
     const wallet = info?.active ? info.walletAddress : null
     return { content: [{ type: 'text', text: JSON.stringify({
       preview: true,
@@ -691,7 +691,15 @@ export function createMcpServer(userId) {
   // ── SESSION KEY STATUS ──
   server.tool('arcox_session_status', 'Check if Agent Session Key (MSCA) is active for the user. Returns wallet address, delegate address, and whether session signing is available.', {}, async () => {
     const { getSessionKeyInfo } = await import('./vaultStore.mjs')
-    const info = getSessionKeyInfo(userId)
+    const info = await getSessionKeyInfo(userId)
+    // Recording connection time here lets auto-detect choose the MSCA this user
+    // most recently connected via Claude/agent — no hardcoded wallet.
+    if (info && info.active) {
+      try {
+        const { touchSessionKey } = await import('./sessionKeyService.mjs')
+        touchSessionKey(userId)
+      } catch { /* non-fatal */ }
+    }
     if (!info || !info.active) {
       return { content: [{ type: 'text', text: JSON.stringify({ active: false, message: 'Session key belum diaktifkan. User harus setup di Plugin page (passkey required).' }) }] }
     }

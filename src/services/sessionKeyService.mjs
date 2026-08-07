@@ -69,13 +69,14 @@ export function getSessionKey(userId) {
     if (walletAddr && store.users[walletAddr.toLowerCase()]) entry = store.users[walletAddr.toLowerCase()]
   }
   // 3) Auto-detect: EOA identity (not itself a session owner) with no alias
-  //    resolves to the most recently-created ACTIVE session key. A user may
-  //    register several passkey MSCAs; the latest one they activated is the
-  //    one they intend to use.
+  //    resolves to the most recently-USED ACTIVE session key. A user may
+  //    register several passkey MSCAs; the one they last used (via Claude /
+  //    MCP / execute) is the intended one. Sort by lastUsedAt desc (falling
+  //    back to createdAt) — no hardcoding of a specific wallet.
   if (!entry && !store.users[key]) {
-    const newest = Object.values(store.users)
-      .filter(u => u && u.active !== false)
-      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0]
+    const countActive = Object.values(store.users).filter(u => u && u.active !== false)
+    const newest = countActive
+      .sort((a, b) => ((b.lastUsedAt || b.createdAt || 0)) - ((a.lastUsedAt || a.createdAt || 0)))[0]
     if (newest) entry = newest
   }
   if (!entry) return null
@@ -97,6 +98,30 @@ export function generateSessionKey() {
   const pk = generatePrivateKey()
   const account = privateKeyToAccount(pk)
   return { address: account.address, privateKey: pk }
+}
+
+/**
+ * Mark a session key as used now (updates lastUsedAt). Persisted so the
+ * auto-detect resolver picks the MSCA the user most recently connected via
+ * Claude / MCP / execution — not a hardcoded wallet.
+ */
+export function touchSessionKey(userId) {
+  const store = loadStore()
+  const key = String(userId || '').toLowerCase()
+  let entry = store.users[key]
+  // Resolve through alias / auto-detect the same way getSessionKey does.
+  if (!entry) {
+    const walletAddr = store.aliases?.[key]
+    if (walletAddr && store.users[walletAddr.toLowerCase()]) entry = store.users[walletAddr.toLowerCase()]
+  }
+  if (!entry) {
+    const active = Object.values(store.users).filter(u => u && u.active !== false)
+    entry = active.sort((a, b) => ((b.lastUsedAt || b.createdAt || 0)) - ((a.lastUsedAt || a.createdAt || 0)))[0]
+  }
+  if (!entry) return null
+  entry.lastUsedAt = Date.now()
+  saveStore(store)
+  return entry
 }
 
 /**
@@ -162,6 +187,8 @@ export function revokeSessionKey(userId) {
 export function canExecuteViaSession(userId, amount) {
   const entry = getSessionKey(userId)
   if (!entry || !entry.active) return { ok: false, reason: 'no_session' }
+  // Record real usage so auto-detect picks the MSCA most recently used.
+  try { touchSessionKey(userId) } catch { /* non-fatal */ }
   const limits = getLimits(userId)
   const amt = Number(amount)
   if (!Number.isFinite(amt) || amt <= 0) return { ok: false, reason: 'bad_amount' }
