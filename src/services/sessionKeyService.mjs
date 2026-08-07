@@ -227,7 +227,7 @@ export function canExecuteViaSession(userId, amount) {
   const limits = getLimits(userId)
   // Tolerant parse: Claude/agent may pass "1.5 USDC", "$10", or "1e3".
   const parsed = parseHumanAmount(amount)
-  if (parsed === null || parsed <= 0) return { ok: false, reason: 'bad_amount', message: `Amount tidak valid: \"${amount}\". Gunakan angka saja, contoh \"1.5\".` }
+  if (parsed === null || parsed <= 0) return { ok: false, reason: 'bad_amount', message: `Amount tidak valid: "${amount}". Gunakan angka saja, contoh "1.5".` }
   const amt = parsed
   if (limits.autoApprove === false) return { ok: false, reason: 'auto_off' }
   if (amt > Number(limits.maxPerTx)) return { ok: false, reason: 'over_limit', limit: limits.maxPerTx }
@@ -292,10 +292,11 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
  * @param options — { paymaster: true/false, chainKey: string }
  */
 export async function executeViaSession(userId, calls, options = {}) {
-  const gate = canExecuteViaSession(userId, 0) // amount check done by caller
-  if (!gate.ok) throw new Error(`Session not available: ${gate.reason}`)
+  const entry = getSessionKey(userId)
+  if (!entry || !entry.active) throw new Error('Session not available: no_session')
+  // Record usage for auto-detect. Caller already validated amount — no re-check here.
+  try { touchSessionKey(userId) } catch { /* non-fatal */ }
 
-  const { entry } = gate
   const chainKey = options.chainKey || entry.chain || 'arc-testnet'
   const { smartAccount } = await buildSmartAccountClient(entry.walletAddress, entry.delegatePrivateKey, chainKey)
 
