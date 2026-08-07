@@ -45,14 +45,24 @@ test('Gateway transfer with a mismatched amount does not settle an x402 invoice'
   const transferId = '12345678-1234-4234-8234-123456789abc'
   const recipient = `0x${'34'.repeat(20)}`
   const originalFetch = globalThis.fetch
-  globalThis.fetch = async () => new Response(JSON.stringify({
-    destinationDomain: 26,
-    status: 'finalized',
-    transactionHash: txHash,
-    destinationAddress: recipient,
-    amount: '0.009999',
-    token: 'USDC',
-  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  globalThis.fetch = async (url) => {
+    // Only the Gateway transfer endpoint returns a transfer record. Any other
+    // request (e.g. RPC getLogs/getBlockNumber) returns a valid JSON-RPC error
+    // so reconcile stops cleanly instead of choking on a mismatched body.
+    if (String(url).includes('/v1/transfer/')) {
+      return new Response(JSON.stringify({
+        destinationDomain: 26,
+        status: 'finalized',
+        transactionHash: txHash,
+        destinationAddress: recipient,
+        amount: '0.009999',
+        token: 'USDC',
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return new Response(JSON.stringify({
+      jsonrpc: '2.0', id: 1, error: { code: -32603, message: 'mock: internal error' },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
   process.env.X402_INVOICE_DB = join(directory, 'invoices.json')
   process.env.CIRCLE_GATEWAY_BASE_URL = 'https://gateway.test'
   process.env.X402_RECIPIENT_ADDRESS = recipient

@@ -89,9 +89,16 @@ export function x402Config() {
 }
 
 function normalizeAmount(value) {
-  const n = Number(value)
-  if (!Number.isFinite(n) || n <= 0) throw new Error('Invalid x402 amount')
-  return n.toFixed(6)
+  const raw = String(value ?? '').trim()
+  if (!/^\d+(?:\.\d{1,6})?$/.test(raw)) throw new Error('Invalid x402 amount')
+  const [whole, fraction = ''] = raw.split('.')
+  const baseUnits = BigInt(whole) * 1_000_000n + BigInt((fraction + '000000').slice(0, 6))
+  if (baseUnits <= 0n) throw new Error('Invalid x402 amount')
+  return `${baseUnits / 1_000_000n}.${String(baseUnits % 1_000_000n).padStart(6, '0')}`
+}
+
+function safeNormalizeAmount(value) {
+  try { return normalizeAmount(value) } catch { return null }
 }
 
 function nextUniqueAmount(baseAmount) {
@@ -244,9 +251,12 @@ export async function reconcileX402Invoice(id) {
         fromBlock: chunkStart,
         toBlock: chunkEnd,
       }).catch(() => [])
-      const amountMatches = logs
-        .filter(log => formatUnits(log.args.value || 0n, 6) === normalizeAmount(invoice.uniqueAmount))
-        .sort((a, b) => Number((b.blockNumber || 0n) - (a.blockNumber || 0n)))
+      const expectedAmount = safeNormalizeAmount(invoice.uniqueAmount)
+      const amountMatches = expectedAmount
+        ? logs
+          .filter(log => formatUnits(log.args.value || 0n, 6) === expectedAmount)
+          .sort((a, b) => Number((b.blockNumber || 0n) - (a.blockNumber || 0n)))
+        : []
       for (const log of amountMatches) {
         if (Number.isFinite(invoiceCreatedAt) && log.blockNumber) {
           const block = await client.getBlock({ blockNumber: log.blockNumber }).catch(() => null)
@@ -327,8 +337,9 @@ export function publicInvoice(invoice) {
 
 async function findMemoPayment(client, invoice, fromBlock, toBlock) {
   if (!invoice.memoId || !/^0x[0-9a-fA-F]{64}$/.test(invoice.memoId)) return null
-  const expectedAmount = normalizeAmount(invoice.uniqueAmount)
+  const expectedAmount = safeNormalizeAmount(invoice.uniqueAmount)
   const expectedTo = normalizeAddress(invoice.recipient)
+  if (!expectedAmount || !expectedTo) return null
   const chunkSize = 8_000n
   let allMemoLogs = []
   for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += chunkSize) {
@@ -608,7 +619,9 @@ async function findFinalizedGatewayTransfer(invoice) {
   if (normalizeAddress(transfer.transactionHash) !== normalizeAddress(invoice.spendTxHash)) return null
   if (normalizeAddress(transfer.destinationAddress) !== normalizeAddress(invoice.recipient)) return null
   if (normalizeAsset(transfer.token || transfer.asset) !== normalizeAsset(invoice.asset)) return null
-  if (normalizeAmount(transfer.amount) !== normalizeAmount(invoice.uniqueAmount)) return null
+  const expectedAmount = safeNormalizeAmount(invoice.uniqueAmount)
+  if (!expectedAmount) return null
+  if (normalizeAmount(transfer.amount) !== expectedAmount) return null
   return transfer
 }
 

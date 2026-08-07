@@ -634,16 +634,26 @@ function verifyAuthToken(token) {
   }
 }
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const header = req.headers.authorization || ''
   const token = header.startsWith('Bearer ') ? header.slice(7) : ''
-  const authAddress = verifyAuthToken(token)
+  // Accept BOTH token schemes for money routes:
+  //   1) vault session token (arx_vs_*) issued by passkey-login or SIWE verify
+  //   2) HMAC owner token (mintOwnerToken / SIWE) used by MCP auto-exec
+  let authAddress = verifyAuthToken(token)
+  if (!authAddress && token.startsWith('arx_vs_')) {
+    try {
+      const vault = await import('./src/services/vaultStore.mjs')
+      authAddress = vault.validateSession(token)
+    } catch { authAddress = null }
+  }
   if (!authAddress) return res.status(401).json({ error: 'Wallet authentication required' })
   const bodyAddress = req.body?.metamaskAddress || req.body?.address
   if (bodyAddress && (!isAddress(bodyAddress) || getAddress(bodyAddress).toLowerCase() !== authAddress)) {
     return res.status(403).json({ error: 'Authenticated wallet does not match request address' })
   }
   req.authAddress = authAddress
+  req.owner = authAddress
   next()
 }
 

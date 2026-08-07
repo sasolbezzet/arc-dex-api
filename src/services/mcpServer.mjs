@@ -263,28 +263,18 @@ function chainKey(slug) {
 }
 
 // Decide whether an agent-initiated action can auto-execute server-side.
-// Only Circle-source actions within the per-tx limit qualify — EOA needs a
-// browser signature and over-limit needs explicit web approval.
+// MCP server is MSCA-ONLY: only session-key (MSCA) auto-executes. Circle proxy
+// wallet and EOA are explicitly NOT available to remote ChatGPT/Claude, per
+// security policy (remote agents must only use the locked passkey MSCA).
 async function canAutoExecute(userId, source, amount) {
-  // Session key (MSCA) — delegate EOA signing via Circle Modular Wallet
-  if (source === 'session') {
-    try {
-      const { canExecuteViaSession } = await import('./sessionKeyService.mjs')
-      const gate = canExecuteViaSession(userId, amount)
-      return gate
-    } catch { return { ok: false, reason: 'session_error' } }
+  if (source !== 'session') {
+    return { ok: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Circle proxy dan EOA tidak diizinkan untuk agent remote.' }
   }
-  // Circle proxy wallet — server-side signing via Circle API
-  if ((source || 'circle') !== 'circle') return { ok: false, reason: 'eoa' }
   try {
-    const { getLimits } = await import('./vaultStore.mjs')
-    const limits = getLimits(userId)
-    const amt = Number(amount)
-    if (!Number.isFinite(amt) || amt <= 0) return { ok: false, reason: 'bad_amount' }
-    if (limits.autoApprove === false) return { ok: false, reason: 'auto_off' }
-    if (amt > Number(limits.maxPerTx)) return { ok: false, reason: 'over_limit', limit: limits.maxPerTx }
-    return { ok: true, limits }
-  } catch { return { ok: false, reason: 'limits_error' } }
+    const { canExecuteViaSession } = await import('./sessionKeyService.mjs')
+    const gate = canExecuteViaSession(userId, amount)
+    return gate
+  } catch { return { ok: false, reason: 'session_error' } }
 }
 
 // Record an auto-executed action into the vault as an approved entry (for the
@@ -306,6 +296,137 @@ function resolveAgentForUser(userId) {
 }
 let mcpSessionsRef = null
 
+// ── x402 via MSCA (session key) ──
+// Pays an ARCOX x402 invoice from the Agent Wallet (MSCA) by calling the Arc
+// memo contract: memo(ARC_USDC, transfer(recipient, amount), memoId, memoData).
+// Then polls invoice status until paid, and retries the Intel resource if paid.
+import { encodeFunctionData, getAddress, keccak256, toHex } from 'viem'
+
+const X402_ARC_USDC = process.env.X402_USDC_ADDRESS || '0x3600000000000000000000000000000000000000'
+const X402_MEMO_CONTRACT = process.env.ARC_MEMO_CONTRACT || '0x5294E9927c3306DcBaDb03fe70b92e01cCede505'
+const X402_TRANSFER_ABI = [{ type: 'function', name: 'transfer', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
+const X402_MEMO_ABI = [{ type: 'function', name: 'memo', stateMutability: 'nonpayable', inputs: [{ name: 'target', type: 'address' }, { name: 'data', type: 'bytes' }, { name: 'memoId', type: 'bytes32' }, { name: 'memoData', type: 'bytes' }], outputs: [] }]
+
+async function getX402Invoice(invoiceId) {
+  const r = await fetch(`${BACKEND_URL}/api/x402/invoices/${encodeURIComponent(invoiceId)}/status`)
+  if (!r.ok) return null
+  const data = await r.json()
+  return data?.x402 || data?.invoice || null
+}
+
+function invoiceAmountUnits(invoice) {
+  const raw = invoice?.amountBaseUnits
+  if (typeof raw === 'string' && /^\d+$/.test(raw)) return BigInt(raw)
+  if (typeof raw === 'bigint') return raw
+  const value = String(invoice?.uniqueAmount || invoice?.amount || '')
+  if (!/^\d+(?:\.\d{1,6})?$/.test(value)) throw new Error('Jumlah invoice x402 tidak valid')
+  const [whole, fraction = ''] = value.split('.')
+  return BigInt(whole) * 1_000_000n + BigInt((fraction + '000000').slice(0, 6))
+}
+
+function x402MemoData(invoice) {
+  const memo = invoice?.memoData
+  if (typeof memo === 'string' && /^0x(?:[0-9a-fA-F]{2})*$/.test(memo)) return memo
+  return toHex(JSON.stringify({ app: 'arcox', type: 'x402', invoiceId: invoice?.invoiceId, paymentId: invoice?.paymentId, resource: invoice?.resource }))
+}
+
+async function unlockX402Resource(userId, invoice) {
+  const resourcePath = String(invoice.resource || '')
+  if (!resourcePath.startsWith('/api/')) return null
+  if (!invoice.paymentId) return null
+  try {
+    const r = await fetch(`${BACKEND_URL}${resourcePath}`, {
+      headers: { 'X-Payment-Id': invoice.paymentId },
+    })
+    if (!r.ok) return null
+    const data = await r.json()
+    return data
+  } catch { return null }
+}
+
+// Estimate amount + build memo calldata. Preview only — no funds moved.
+async function previewX402Pay(userId, invoiceId) {
+  let invoice = await getX402Invoice(invoiceId)
+  if (!invoice) throw new Error('x402 invoice not found')
+  if (invoice.status === 'paid') {
+    const unlocked = await unlockX402Resource(userId, invoice)
+    return { status: 'paid', invoice, alreadyPaid: true, unlockedResult: unlocked }
+  }
+  if (invoice.status === 'expired') {
+    return { status: 'expired', requiresNewInvoice: true, invoice }
+  }
+  if (invoice.asset !== 'USDC') throw new Error('Hanya invoice USDC yang didukung x402.')
+  const { getSessionKeyInfo } = await import('./vaultStore.mjs')
+  const info = getSessionKeyInfo(userId)
+  if (!info || !info.active) {
+    return { status: 'session_required', message: 'Session key MSCA belum aktif. User harus setup Agent Wallet + session key dulu di Plugin page.' }
+  }
+  return {
+    status: 'preview',
+    requiresUserConfirmation: true,
+    invoice,
+    payer: info.walletAddress,
+    amount: invoice.uniqueAmount,
+    token: 'USDC',
+    recipient: invoice.recipient,
+    memoContract: invoice.memoContract || X402_MEMO_CONTRACT,
+    memoId: invoice.memoId,
+    instruction: `Konfirmasi untuk membayar ${invoice.uniqueAmount} USDC dari Agent Wallet (MSCA ${info.walletAddress}) ke ${invoice.recipient} untuk ${invoice.invoiceId} via memo kontrak Arc.`,
+  }
+}
+
+// Execute a confirmed x402 payment from the MSCA. Moves funds.
+async function executeX402Pay(userId, invoiceId) {
+  const invoice = await getX402Invoice(invoiceId)
+  if (!invoice) throw new Error('x402 invoice not found')
+  if (invoice.status === 'paid') {
+    const unlocked = await unlockX402Resource(userId, invoice)
+    return { status: 'paid', invoice, alreadyPaid: true, unlockedResult: unlocked }
+  }
+  if (invoice.asset !== 'USDC') throw new Error('Hanya invoice USDC yang didukung x402.')
+  const amountUnits = invoiceAmountUnits(invoice)
+  const transferData = encodeFunctionData({
+    abi: X402_TRANSFER_ABI,
+    functionName: 'transfer',
+    args: [getAddress(invoice.recipient), amountUnits],
+  })
+  const memoId = (invoice.memoId && /^0x[0-9a-fA-F]{64}$/.test(invoice.memoId)) ? invoice.memoId : keccak256(toHex(String(invoice.paymentId || invoice.invoiceId)))
+  const memoData = x402MemoData(invoice)
+
+  const { executeViaSession } = await import('./sessionKeyService.mjs')
+  const result = await executeViaSession(userId, [{
+    to: invoice.memoContract || X402_MEMO_CONTRACT,
+    abi: X402_MEMO_ABI,
+    functionName: 'memo',
+    args: [X402_ARC_USDC, transferData, memoId, memoData],
+  }], { paymaster: true, chainKey: 'arc-testnet' })
+
+  if (result.status !== 'success') {
+    return { status: result.status, executed: false, error: result.reason || 'x402 payment via MSCA gagal', userOpHash: result.userOpHash }
+  }
+
+  let latest = invoice
+  for (let i = 0; i < 20; i++) {
+    const next = await getX402Invoice(invoiceId)
+    if (!next) break
+    latest = next
+    if (latest.status === 'paid' || latest.status === 'expired') break
+    await new Promise(res => setTimeout(res, 2000))
+  }
+  const unlocked = (latest.status === 'paid')
+    ? await unlockX402Resource(userId, latest).catch(() => null)
+    : null
+  return {
+    status: latest.status === 'paid' ? 'paid' : 'settlement_pending',
+    invoice: latest,
+    txHash: result.txHash,
+    explorerUrl: result.explorerUrl,
+    memoId,
+    memoContract: invoice.memoContract || X402_MEMO_CONTRACT,
+    unlockedResult: unlocked,
+  }
+}
+
 
 
 // ── MCP Server factory ──
@@ -317,7 +438,7 @@ export function createMcpServer(userId) {
 
   // ── READ-ONLY TOOLS ──
 
-  server.tool('arcox_wallet_balances', 'Show all wallet balances (EOA Arc, Circle proxy, Solana Devnet USDC)', {}, async () => {
+  server.tool('arcox_wallet_balances', 'Show Agent Wallet (MSCA) balances on Arc', {}, async () => {
     const data = await apiGet(`/api/balance/${userId}`, userId)
     return { content: [{ type: 'text', text: JSON.stringify(data) }] }
   })
@@ -332,7 +453,7 @@ export function createMcpServer(userId) {
     fromChain: z.string().optional().describe('Source chain'),
     toChain: z.string().optional().describe('Destination chain'),
     token: z.string().optional().describe('Token symbol (USDC, EURC, cirBTC)'),
-    source: z.string().optional().describe('eoa or circle'),
+    source: z.string().optional().describe('session (MSCA)'),
   }, async (params) => {
     // Return supported routes info
     return { content: [{ type: 'text', text: JSON.stringify({
@@ -340,8 +461,8 @@ export function createMcpServer(userId) {
       action: params.action,
       chains: { 'arc-testnet': 5042002, 'ethereum-sepolia': 11155111, 'base-sepolia': 84532, 'arbitrum-sepolia': 421614, 'solana-devnet': 'solana' },
       tokens: ['USDC', 'EURC', 'cirBTC'],
-      sources: ['eoa', 'circle'],
-      note: 'Call arcox_quote_swap or arcox_quote_bridge for a preview',
+      sources: ['session'],
+      note: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Call arcox_quote_swap or arcox_quote_bridge for a preview.',
     }) }] }
   })
 
@@ -351,89 +472,49 @@ export function createMcpServer(userId) {
     tokenIn: z.string().describe('Input token symbol (USDC, EURC, cirBTC)'),
     tokenOut: z.string().describe('Output token symbol'),
     amountIn: z.string().describe('Amount in human readable (e.g. "1")'),
-    source: z.string().optional().describe('eoa or circle. Default eoa'),
+    source: z.string().optional().describe('session (MSCA)'),
   }, async (params) => {
+    const src = params.source || 'session'
+    if (src !== 'session') {
+      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote swap hanya untuk source=session.' }) }] }
+    }
     const data = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: userId }, userId)
     return { content: [{ type: 'text', text: JSON.stringify(data) }] }
   })
 
-  server.tool('arcox_execute_swap', 'Execute a confirmed swap. Requires previewId from arcox_quote_swap and user confirmation. This triggers MetaMask signing via the frontend Plugin approval flow.', {
+  server.tool('arcox_execute_swap', 'Execute a confirmed swap via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_swap and user confirmation.', {
     tokenIn: z.string().describe('Input token symbol'),
     tokenOut: z.string().describe('Output token symbol'),
     amountIn: z.string().describe('Exact amount from quote'),
-    source: z.string().optional().describe('eoa or circle'),
+    source: z.string().optional().describe('session (MSCA)'),
     previewId: z.string().describe('Preview ID from arcox_quote_swap'),
     confirmed: z.boolean().describe('Must be true to execute'),
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
     if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
-    const source = params.source || 'circle'
-    // AUTO-EXECUTE: Circle-source within limit → sign server-side, no browser needed.
+    const source = params.source || 'session'
+    if (source !== 'session') {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
+    }
     const gate = await canAutoExecute(userId, source, params.amountIn)
-    if (gate.ok) {
-      // Session key path: sign via MSCA delegate EOA (Circle Modular Wallet)
-      if (source === 'session') {
-        // Session key path: swap via MSCA delegate EOA
-        try {
-          const { swapViaSession } = await import('./sessionKeyService.mjs')
-          const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn })
-          if (result.status === 'success') {
-            await recordAutoExec(userId, {
-              agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
-              source: 'session', details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
-              txHash: result.txHash, explorerUrl: result.explorerUrl,
-            })
-            return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Swap ${params.amountIn} ${params.tokenIn} → ${params.tokenOut} berhasil via MSCA (session key).` }) }] }
-          }
-          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session swap gagal', safeNextStep: 'Gunakan source=eoa dan tanda tangani via Plugin.' }) }] }
-        } catch (e) {
-          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e?.message || 'Session error', safeNextStep: 'Gunakan source=eoa dan tanda tangani via Plugin.' }) }] }
-        }
-      }
-      // Circle path: server-side signing via Circle API
-      const data = await apiPost('/api/swap', {
-        metamaskAddress: userId,
-        tokenIn: params.tokenIn,
-        tokenOut: params.tokenOut,
-        amountIn: params.amountIn,
-        source: 'circle',
-      }, userId)
-      if (data && data.success) {
-        const txHash = data.result?.txHash || data.txHash
-        const explorerUrl = data.result?.explorerUrl || data.explorerUrl
+    if (!gate.ok) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
+    }
+    try {
+      const { swapViaSession } = await import('./sessionKeyService.mjs')
+      const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn })
+      if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
-          source: 'circle', details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
-          txHash, explorerUrl,
+          source: 'session', details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
+          txHash: result.txHash, explorerUrl: result.explorerUrl,
         })
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash, explorerUrl, result: data.result || data, message: `Swap ${params.amountIn} ${params.tokenIn} → ${params.tokenOut} berhasil dieksekusi via Circle Wallet.` }) }] }
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Swap ${params.amountIn} ${params.tokenIn} → ${params.tokenOut} berhasil via MSCA (session key).` }) }] }
       }
-      // Circle route unavailable / failed → fall through to approval path.
-      const reason = data?.error || 'Circle swap gagal'
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, safeNextStep: `Circle route tidak tersedia (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/arc-dex/plugin?tab=approvals` }) }] }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session swap gagal' }) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e?.message || 'Session error' }) }] }
     }
-    // FALLBACK: EOA or over-limit → create pending approval for browser signing.
-    const { createApproval } = await import('./vaultStore.mjs')
-    const approval = createApproval(userId, {
-      agent: resolveAgentForUser(userId),
-      action: 'swap',
-      amount: params.amountIn,
-      token: params.tokenIn,
-      source,
-      details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
-      forcePending: true,
-    })
-    return { content: [{ type: 'text', text: JSON.stringify({
-      status: 'approval_created',
-      executed: false,
-      reason: gate.reason,
-      approval,
-      approvalUrl: `${SERVER_URL}/arc-dex/plugin?tab=approvals&approval=${approval.id}`,
-      message: gate.reason === 'over_limit'
-        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/arc-dex/plugin?tab=approvals`
-        : `Permintaan swap dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/arc-dex/plugin?tab=approvals`,
-      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/arc-dex/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
-    }) }] }
   })
 
   // ── BRIDGE TOOLS (route → quote → confirm → execute) ──
@@ -443,89 +524,51 @@ export function createMcpServer(userId) {
     toChain: z.string().describe('Destination chain'),
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol. Default USDC'),
-    source: z.string().optional().describe('eoa or circle. Default eoa'),
+    source: z.string().optional().describe('session (MSCA)'),
   }, async (params) => {
-    // NOTE: /api/prepare-bridge actually performs a Circle→EOA transfer (moves
-    // funds); it is NOT a read-only quote. So a quote tool must NOT call it.
-    // Return an informational preview instead. Real execution happens via
-    // arcox_execute_bridge → vault approval → frontend MetaMask signing.
+    // CCTP bridge via Agent Wallet (MSCA). Quote is informational; actual CCTP
+    // completion through MSCA menunggu implementasi bridgeViaSession.
     const token = params.token || 'USDC'
-    const src = params.source || 'eoa'
+    const src = params.source || 'session'
+    if (src !== 'session') {
+      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote bridge hanya untuk source=session.' }) }] }
+    }
+    const { getSessionKeyInfo } = await import('./vaultStore.mjs')
+    const info = getSessionKeyInfo(userId)
+    const wallet = info?.active ? info.walletAddress : null
     return { content: [{ type: 'text', text: JSON.stringify({
       preview: true,
       route: `${params.fromChain} → ${params.toChain}`,
       amountIn: params.amount,
       token,
-      source: src,
+      source: 'session',
+      destinationWallet: wallet,
       estimatedReceive: `~${params.amount} ${token}`,
-      note: 'CCTP bridge: burn on source, mint on destination. Native (non-USDC) tokens to Arc are auto-swapped to USDC. Actual on-chain amounts and gas are finalized at signing.',
+      note: wallet ? 'MSCA → MSCA (destination = Agent Wallet yang sama).' : 'Eksekusi bridge MSCA belum tersedia; rute hanya bisa di-quote. Setup Agent Wallet + session key dulu di Plugin page.',
       previewId: `bridge_${Date.now()}`,
-      safeNextStep: 'Show this preview to the user. On confirmation, call arcox_execute_bridge — the user approves and signs via the Plugin page (MetaMask).',
+      safeNextStep: 'Tampilkan preview ini ke user. Catatan: eksekusi bridge MSCA menunggu implementasi CCTP via Agent Wallet diverifikasi.',
     }) }] }
   })
 
-  server.tool('arcox_execute_bridge', 'Execute a confirmed bridge. Requires previewId from arcox_quote_bridge and user confirmation. Triggers MetaMask signing via frontend Plugin approval flow.', {
+  server.tool('arcox_execute_bridge', 'Execute a confirmed bridge via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_bridge and user confirmation.', {
     fromChain: z.string().describe('Source chain'),
     toChain: z.string().describe('Destination chain'),
     amount: z.string().describe('Exact amount from quote'),
     token: z.string().optional().describe('Token symbol'),
-    source: z.string().optional().describe('eoa or circle'),
+    source: z.string().optional().describe('session (MSCA)'),
     previewId: z.string().describe('Preview ID from arcox_quote_bridge'),
     confirmed: z.boolean().describe('Must be true to execute'),
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
     if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
-    const source = params.source || 'circle'
-    const token = params.token || 'USDC'
-    const fromKey = chainKey(params.fromChain)
-    const toKey = chainKey(params.toChain)
-    // AUTO-EXECUTE: Circle-source USDC within limit → server-signed CCTP bridge.
-    const gate = await canAutoExecute(userId, source, params.amount)
-    if (gate.ok && token === 'USDC') {
-      const data = await apiPost('/api/bridge', {
-        metamaskAddress: userId,
-        fromChain: fromKey,
-        toChain: toKey,
-        amount: params.amount,
-        token: 'USDC',
-        source: 'circle',
-      }, userId)
-      if (data && data.success) {
-        const txHash = data.txHash
-        const explorerUrl = data.explorerUrl
-        await recordAutoExec(userId, {
-          agent: resolveAgentForUser(userId), action: 'bridge', amount: params.amount, token: 'USDC',
-          source: 'circle', to: toKey, details: JSON.stringify({ fromChain: fromKey, toChain: toKey, burnTxHash: data.burnTxHash, mintTxHash: data.mintTxHash, previewId: params.previewId }),
-          txHash, explorerUrl,
-        })
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash, burnTxHash: data.burnTxHash, mintTxHash: data.mintTxHash, explorerUrl, message: `Bridge ${params.amount} USDC ${fromKey} → ${toKey} berhasil via Circle Wallet.` }) }] }
-      }
-      const reason = data?.error || 'Circle bridge gagal'
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, state: data?.state, safeNextStep: `Circle bridge tidak selesai (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/arc-dex/plugin?tab=approvals` }) }] }
+    const source = params.source || 'session'
+    if (source !== 'session') {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Circle proxy dan EOA tidak diizinkan untuk agent remote.' }) }] }
     }
-    // FALLBACK: EOA / non-USDC / over-limit → pending approval for browser signing.
-    const { createApproval } = await import('./vaultStore.mjs')
-    const approval = createApproval(userId, {
-      agent: resolveAgentForUser(userId),
-      action: 'bridge',
-      amount: params.amount,
-      token,
-      source,
-      to: toKey,
-      details: JSON.stringify({ fromChain: fromKey, toChain: toKey, previewId: params.previewId }),
-      forcePending: true,
-    })
-    return { content: [{ type: 'text', text: JSON.stringify({
-      status: 'approval_created',
-      executed: false,
-      reason: gate.ok ? 'non_usdc' : gate.reason,
-      approval,
-      approvalUrl: `${SERVER_URL}/arc-dex/plugin?tab=approvals&approval=${approval.id}`,
-      message: (!gate.ok && gate.reason === 'over_limit')
-        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/arc-dex/plugin?tab=approvals`
-        : `Permintaan bridge dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/arc-dex/plugin?tab=approvals`,
-      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/arc-dex/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
-    }) }] }
+    // MSCA bridge belum diimplementasikan (bridgeViaSession belum ada; CCTP
+    // through MSCA belum terbukti end-to-end). JANGAN fallback ke Circle proxy
+    // atau approval EOA — tolak jelas sampai jalur MSCA→MSCA selesai.
+    return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'bridge_msca_unavailable', message: 'Bridge via Agent Wallet (MSCA) belum tersedia. Rute hanya bisa di-quote dulu; eksekusi bridge MSCA menunggu implementasi CCTP melalui MSCA diverifikasi.' }) }] }
   })
 
   // ── SEND TOOLS (quote → confirm → execute) ──
@@ -534,113 +577,61 @@ export function createMcpServer(userId) {
     to: z.string().describe('Recipient address'),
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol. Default USDC'),
-    source: z.string().optional().describe('eoa or circle. Default eoa'),
+    source: z.string().optional().describe('session'),
   }, async (params) => {
     const token = params.token || 'USDC'
-    const src = params.source || 'eoa'
-    // /api/send-estimate only supports Circle source (EOA is estimated in the
-    // browser wallet). Map param names to what the backend expects.
-    if (src === 'circle') {
-      const data = await apiPost('/api/send-estimate', {
-        toAddress: params.to,
-        amount: params.amount,
-        token,
-        source: 'circle',
-        metamaskAddress: userId,
-      }, userId)
-      return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+    const src = params.source || 'session'
+    if (src !== 'session') {
+      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote send hanya untuk source=session.' }) }] }
     }
-    // EOA preview (gas is estimated at signing in the browser)
+    // MSCA send quote (gas paid via paymaster; 30bps platform fee applies)
     return { content: [{ type: 'text', text: JSON.stringify({
       preview: true,
       action: 'send',
       to: params.to,
       amount: params.amount,
       token,
-      source: 'eoa',
-      note: 'EOA send: gas estimated by the wallet at signing time. A 30bps platform fee applies.',
+      source: 'session',
+      note: 'Send via Agent Wallet (MSCA/session key): gas dibayar paymaster, 30bps platform fee berlaku.',
       previewId: `send_${Date.now()}`,
-      safeNextStep: 'Show this preview to the user. On confirmation, call arcox_execute_send — the user approves and signs via the Plugin page (MetaMask).',
+      safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_send dengan source=session dan confirmed=true.',
     }) }] }
   })
 
-  server.tool('arcox_execute_send', 'Execute a confirmed token send. Requires previewId from arcox_quote_send and user confirmation. Triggers MetaMask signing via frontend Plugin approval flow.', {
+  server.tool('arcox_execute_send', 'Execute a confirmed send via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_send and user confirmation.', {
     to: z.string().describe('Recipient address'),
     amount: z.string().describe('Exact amount from quote'),
     token: z.string().optional().describe('Token symbol'),
-    source: z.string().optional().describe('eoa or circle'),
+    source: z.string().optional().describe('session (MSCA)'),
     previewId: z.string().describe('Preview ID from arcox_quote_send'),
     confirmed: z.boolean().describe('Must be true to execute'),
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
     if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
-    const source = params.source || 'circle'
+    const source = params.source || 'session'
     const token = params.token || 'USDC'
-    // AUTO-EXECUTE: Circle-source within limit → sign server-side.
+    if (source !== 'session') {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
+    }
     const gate = await canAutoExecute(userId, source, params.amount)
-    if (gate.ok) {
-      // Session key path: send via MSCA delegate EOA
-      if (source === 'session') {
-        try {
-          const { sendViaSession } = await import('./sessionKeyService.mjs')
-          const result = await sendViaSession(userId, params.to, params.amount, token)
-          if (result.status === 'success') {
-            await recordAutoExec(userId, {
-              agent: resolveAgentForUser(userId), action: 'send', amount: params.amount, token,
-              source: 'session', to: params.to, details: JSON.stringify({ previewId: params.previewId }),
-              txHash: result.txHash, explorerUrl: result.explorerUrl,
-            })
-            return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Kirim ${params.amount} ${token} ke ${params.to} berhasil via MSCA (session key).` }) }] }
-          }
-          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session send gagal', safeNextStep: 'Gunakan source=eoa dan tanda tangani via Plugin.' }) }] }
-        } catch (e) {
-          return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e?.message || 'Session error', safeNextStep: 'Gunakan source=eoa dan tanda tangani via Plugin.' }) }] }
-        }
-      }
-      // Circle path: server-side signing via Circle API
-      const data = await apiPost('/api/send', {
-        metamaskAddress: userId,
-        toAddress: params.to,
-        amount: params.amount,
-        token,
-        source: 'circle',
-      }, userId)
-      if (data && data.success) {
-        const txHash = data.result?.txHash || data.txHash
-        const explorerUrl = data.result?.explorerUrl || data.explorerUrl
+    if (!gate.ok) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
+    }
+    try {
+      const { sendViaSession } = await import('./sessionKeyService.mjs')
+      const result = await sendViaSession(userId, params.to, params.amount, token)
+      if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: resolveAgentForUser(userId), action: 'send', amount: params.amount, token,
-          source: 'circle', to: params.to, details: JSON.stringify({ previewId: params.previewId }),
-          txHash, explorerUrl,
+          source: 'session', to: params.to, details: JSON.stringify({ previewId: params.previewId }),
+          txHash: result.txHash, explorerUrl: result.explorerUrl,
         })
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash, explorerUrl, result: data.result || data, message: `Kirim ${params.amount} ${token} ke ${params.to} berhasil via Circle Wallet.` }) }] }
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Kirim ${params.amount} ${token} ke ${params.to} berhasil via MSCA (session key).` }) }] }
       }
-      const reason = data?.error || 'Circle send gagal'
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'circle_failed', executed: false, error: reason, safeNextStep: `Circle route tidak tersedia (${reason}). Gunakan source=eoa dan tanda tangani via Plugin: ${SERVER_URL}/arc-dex/plugin?tab=approvals` }) }] }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session send gagal' }) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e?.message || 'Session error' }) }] }
     }
-    // FALLBACK: EOA or over-limit → pending approval for browser signing.
-    const { createApproval } = await import('./vaultStore.mjs')
-    const approval = createApproval(userId, {
-      agent: resolveAgentForUser(userId),
-      action: 'send',
-      amount: params.amount,
-      token,
-      source,
-      to: params.to,
-      details: JSON.stringify({ previewId: params.previewId }),
-      forcePending: true,
-    })
-    return { content: [{ type: 'text', text: JSON.stringify({
-      status: 'approval_created',
-      executed: false,
-      reason: gate.reason,
-      approval,
-      approvalUrl: `${SERVER_URL}/arc-dex/plugin?tab=approvals&approval=${approval.id}`,
-      message: gate.reason === 'over_limit'
-        ? `Jumlah melebihi batas auto (${gate.limit}). Buka Plugin untuk approve manual: ${SERVER_URL}/arc-dex/plugin?tab=approvals`
-        : `Permintaan send dibuat. Buka halaman Plugin untuk tanda tangan MetaMask: ${SERVER_URL}/arc-dex/plugin?tab=approvals`,
-      safeNextStep: `Beri tahu user untuk membuka ${SERVER_URL}/arc-dex/plugin?tab=approvals lalu klik Approve dan tanda tangani di MetaMask.`,
-    }) }] }
   })
 
   // ── VAULT TOOLS ──
@@ -655,7 +646,7 @@ export function createMcpServer(userId) {
     action: z.string().describe('swap, bridge, send'),
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol (USDC, EURC, etc)'),
-    source: z.string().optional().describe('eoa or circle'),
+    source: z.string().optional().describe('session (MSCA)'),
     to: z.string().optional().describe('Destination address'),
   }, async (params) => {
     const { createApproval } = await import('./vaultStore.mjs')
@@ -680,17 +671,16 @@ export function createMcpServer(userId) {
           version: '1.1.0',
           url: SERVER_URL,
           userId,
-          services: ['wallet_balances', 'swap', 'bridge', 'send', 'vault', 'transaction_history', 'route_status', 'session_key', 'get_request'],
+          services: ['wallet_balances', 'swap', 'bridge', 'send', 'intel', 'x402', 'vault', 'transaction_history', 'route_status', 'session_key', 'get_request'],
           sources: {
-            circle: 'Circle proxy wallet — server-side signed, within limits',
-            session: 'Agent Session Key (MSCA) — passkey-gated setup, gasless, within limits',
-            eoa: 'EOA wallet — requires browser MetaMask signing',
+            session: 'Agent Session Key (MSCA) — passkey-gated setup, gasless, within limits. SATU-SATUNYA sumber untuk agent remote.',
           },
-          safety: 'All value-moving actions require quote preview + user confirmation. Flow: quote → show preview → user says yes → execute with previewId + confirmed=true.',
+          safety: 'MCP server MSCA-ONLY. Circle proxy dan EOA TIDAK tersedia untuk ChatGPT/Claude. All value-moving actions require quote preview + user confirmation. Flow: quote → show preview → user says ya → execute with previewId + confirmed=true.',
           execution_guide: {
-            swap: ['arcox_quote_swap → show preview → user yes → arcox_execute_swap (source=session|circle|eoa)'],
-            bridge: ['arcox_route_status → arcox_quote_bridge → show preview → user yes → arcox_execute_bridge'],
-            send: ['arcox_quote_send → show preview → user yes → arcox_execute_send'],
+            swap: ['arcox_quote_swap → show preview → user ya → arcox_execute_swap (source=session)'],
+            bridge: ['arcox_quote_bridge → show preview → user ya → arcox_execute_bridge. Catatan: eksekusi bridge MSCA belum aktif; hanya quote.'],
+            send: ['arcox_quote_send → show preview → user ya → arcox_execute_send (source=session)'],
+            intel_x402: ['arcox_intel_get_* → jika paymentRequired → arcox_x402_pay_invoice (tanpa confirmed) preview → user ya → confirmed=true → retry intel tool dengan paymentId yang sama'],
             poll: ['After execute returns pending_* → arcox_get_request(approvalId) → poll until success/error'],
           },
         })
@@ -755,6 +745,90 @@ export function createMcpServer(userId) {
     }
 
     return { content: [{ type: 'text', text: JSON.stringify(response) }] }
+  })
+
+  // ── INTEL (x402-paid, read-only, via MSCA payment) ──
+  // Endpoint ini return invoice (paymentRequired) saat belum dibayar. Setelah
+  // arcox_x402_pay_invoice (MSCA), retry dengan paymentId → unlockedResult.
+
+  const intelTool = (name, desc, pathFromId, schema) => server.tool(name, desc, schema, async (params) => {
+    const path = pathFromId(params)
+    const headers = { 'X-Payment-Id': params.paymentId || '' }
+    const r = await fetch(`${BACKEND_URL}/api/intel${path}`, { headers })
+    const data = await r.json()
+    if (r.status === 402 || data?.paymentRequired) {
+      return { content: [{ type: 'text', text: JSON.stringify({ paymentRequired: true, ...data, safeNextStep: 'Invoice x402 dibuat. Call arcox_x402_pay_invoice (tanpa confirmed) untuk preview. Setelah user setuju dan bayar, retry intel tool dengan paymentId yang sama.' }) }] }
+    }
+    if (data?.unlockedResult) {
+      return { content: [{ type: 'text', text: JSON.stringify({ intelPresentation: data.intelPresentation, result: data.unlockedResult, x402Payment: data.x402Payment }) }] }
+    }
+    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+  })
+
+  intelTool('arcox_intel_get_address', 'Get address intelligence via ARCOX Intel (may require x402 payment).', p => `/address/${encodeURIComponent(p.address)}/all`, {
+    address: z.string().describe('EVM address (0x...)'),
+    paymentId: z.string().optional().describe('x402 paymentId if already paid'),
+  })
+  intelTool('arcox_intel_get_contract', 'Get contract intelligence.', p => `/contract/${encodeURIComponent(p.chain)}/${encodeURIComponent(p.address)}`, {
+    chain: z.string().describe('Chain (ethereum, base, arbitrum)'),
+    address: z.string().describe('Contract address'),
+    paymentId: z.string().optional(),
+  })
+  intelTool('arcox_intel_get_entity', 'Get entity intelligence.', p => `/entity/${encodeURIComponent(p.entity)}`, {
+    entity: z.string().describe('Entity name/organization'),
+    paymentId: z.string().optional(),
+  })
+  intelTool('arcox_intel_get_token', 'Get token intelligence.', p => (p.address ? `/token/${encodeURIComponent(p.chain)}/${encodeURIComponent(p.address)}` : `/token/${encodeURIComponent(p.id)}`), {
+    id: z.string().optional().describe('Token id/symbol'),
+    chain: z.string().optional(),
+    address: z.string().optional(),
+    paymentId: z.string().optional(),
+  })
+  intelTool('arcox_intel_get_tx', 'Get transaction intelligence.', p => `/tx/${encodeURIComponent(p.hash)}`, {
+    hash: z.string().describe('Transaction hash'),
+    paymentId: z.string().optional(),
+  })
+  intelTool('arcox_intel_search', 'Search / intel via Arkham search.', p => { const params = new URLSearchParams({ query: p.query }); return `/search?${params.toString()}` }, {
+    query: z.string().describe('Search query'),
+    paymentId: z.string().optional(),
+  })
+
+  // ── x402 PAYMENT TOOLS (MSCA session-key only) ──
+
+  server.tool('arcox_x402_pay_invoice', 'Pay an ARCOX x402 invoice from the Agent Wallet (MSCA via session key). Call WITHOUT confirmed to get a preview; show it to user; then call with confirmed=true + previewId + confirmationText.', {
+    invoiceId: z.string().describe('ARCOX x402 invoiceId from an Intel tool'),
+    confirmed: z.boolean().optional().describe('Must be true to execute payment'),
+    confirmationText: z.string().optional().describe('User confirmation text (yes/ya)'),
+  }, async (params) => {
+    if (!params.confirmed) {
+      try {
+        const preview = await previewX402Pay(userId, params.invoiceId)
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'preview', requiresUserConfirmation: true, amount: preview.amount, token: preview.token, recipient: preview.recipient, payer: preview.payer, invoiceId: params.invoiceId, instruction: preview.instruction, safeNextStep: 'Tampilkan preview ini ke user. Setelah user bilang yes/ya, panggil arcox_x402_pay_invoice dengan confirmed=true dan confirmationText.' }) }] }
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: e?.message || 'preview error' }) }] }
+      }
+    }
+    if (String(params.confirmationText || '').trim().toLowerCase() !== 'yes' && String(params.confirmationText || '').trim().toLowerCase() !== 'ya') {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'confirmation_required', reason: 'Konfirmasi eksplisit (ya/yes) wajib sebelum bayar x402.' }) }] }
+    }
+    try {
+      const result = await executeX402Pay(userId, params.invoiceId)
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', executed: false, error: e?.message || 'x402 payment error' }) }] }
+    }
+  })
+
+  server.tool('arcox_x402_invoice_status', 'Check status of an ARCO x402 invoice (pending → paid).', {
+    invoiceId: z.string().describe('ARCO x402 invoice ID or paymentId'),
+  }, async (params) => {
+    try {
+      const invoice = await getX402Invoice(params.invoiceId)
+      if (!invoice) return { content: [{ type: 'text', text: JSON.stringify({ status: 'not_found' }) }] }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: invoice.status, invoice }) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: e?.message || 'status error' }) }] }
+    }
   })
 
   return server
