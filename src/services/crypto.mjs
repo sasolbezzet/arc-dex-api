@@ -10,8 +10,11 @@ const TAG_LEN = 16
 const SALT_LEN = 16
 
 // Derive a 32-byte key from the env passphrase + salt.
+// N=2^15, r=8 requires 128*N*r = 32 MiB; OpenSSL 3 caps scrypt at 32 MiB
+// by default, so raise maxmem explicitly to avoid "memory limit exceeded".
+const SCRYPT_MAXMEM = 64 * 1024 * 1024
 function deriveKey(passphrase, salt) {
-  return scryptSync(passphrase, salt, KEY_LEN, { N: 2 ** 15, r: 8, p: 1 })
+  return scryptSync(passphrase, salt, KEY_LEN, { N: 2 ** 15, r: 8, p: 1, maxmem: SCRYPT_MAXMEM })
 }
 
 /**
