@@ -1,3 +1,5 @@
+// Node.js polyfill for Circle SDK's nested viem@2.45.3 window reference
+import './src/polyfill-node.mjs'
 import 'dotenv/config'
 import express from 'express'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'fs'

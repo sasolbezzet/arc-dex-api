@@ -13,6 +13,9 @@
 // ponytail: no on-chain spend limit enforcement yet — limits checked in
 // backend (vaultStore). Upgrade to ERC-6900 session key module for on-chain
 // enforcement when Circle ships the module SDK.
+// Node.js polyfill: Circle SDK's nested viem@2.45.3 references `window` in
+// its HTTP transport retry logic.  Must run before any @circle-fin import.
+import '../polyfill-node.mjs'
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
 import { createPublicClient, http, encodeFunctionData, getAddress, defineChain } from 'viem'
 import { toModularTransport, toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
