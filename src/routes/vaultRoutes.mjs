@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { listCredentials, addCredential, revealCredential, deleteCredential, getLimits, setLimits, listApprovals, createApproval, approveRequest, rejectRequest, listActivity, createChallenge, consumeChallenge, createSession, validateSession, listMcpSessions } from '../services/vaultStore.mjs'
+import { listRelatedAddresses } from '../services/sessionKeyService.mjs'
 import { verifyMessage } from 'viem'
 
 const vault = Router()
@@ -57,8 +58,20 @@ vault.post('/verify', async (req, res) => {
 })
 
 // ── MCP sessions (connection status) ──
-vault.get('/sessions', requireAuth, (req, res) => {
-  res.json({ sessions: listMcpSessions(req.owner) })
+vault.get('/sessions', requireAuth, async (req, res) => {
+  // Aggregate sessions across the whole user cluster (EOA + MSCA addresses) so
+  // a Claude/ChatGPT MCP connection registered under the SIWE/EOA identity is
+  // visible even when the Plugin page authenticates with the MSCA token.
+  const related = listRelatedAddresses(req.owner)
+  const seen = new Map()
+  for (const addr of related) {
+    for (const s of listMcpSessions(addr)) {
+      const k = `${s.clientId}:${s.agent}`
+      if (!seen.has(k) || seen.get(k).lastActivity < s.lastActivity) seen.set(k, s)
+    }
+  }
+  const merged = [...seen.values()].sort((a, b) => (b.lastActivity || 0) - (a.lastActivity || 0))
+  res.json({ sessions: merged })
 })
 
 // ── Credentials ──

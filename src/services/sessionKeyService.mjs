@@ -101,6 +101,41 @@ export function generateSessionKey() {
 }
 
 /**
+ * All addresses belonging to the same user cluster: the given identity plus
+ * every MSCA session key this user owns. Lets MCP-connection queries aggregate
+ * sessions across the EOA (OAuth/SIWE identity) and any MSCA wallet addresses.
+ */
+export function listRelatedAddresses(userId) {
+  const store = loadStore()
+  const key = String(userId || '').toLowerCase()
+  const set = new Set([key])
+  const users = Object.entries(store.users || {})
+  const aliases = Object.entries(store.aliases || {})
+  // Forward and reverse alias links (EOA <-> MSCA)
+  const aliasWallet = store.aliases?.[key]
+  if (aliasWallet) set.add(aliasWallet.toLowerCase())
+  // Single-pass transitive closure over owner <-> walletAddress and alias links.
+  let grew = true
+  while (grew) {
+    grew = false
+    for (const [aliasOwner, wallet] of aliases) {
+      const ownerK = aliasOwner.toLowerCase()
+      const walletK = String(wallet || '').toLowerCase()
+      if (set.has(ownerK) && !set.has(walletK)) { set.add(walletK); grew = true }
+      if (set.has(walletK) && !set.has(ownerK)) { set.add(ownerK); grew = true }
+    }
+    for (const [owner, entry] of users) {
+      if (!entry) continue
+      const ownerK = owner.toLowerCase()
+      const walletK = entry.walletAddress ? String(entry.walletAddress).toLowerCase() : null
+      if (set.has(ownerK) && walletK && !set.has(walletK)) { set.add(walletK); grew = true }
+      if (walletK && set.has(walletK) && !set.has(ownerK)) { set.add(ownerK); grew = true }
+    }
+  }
+  return [...set]
+}
+
+/**
  * Mark a session key as used now (updates lastUsedAt). Persisted so the
  * auto-detect resolver picks the MSCA the user most recently connected via
  * Claude / MCP / execution — not a hardcoded wallet.
