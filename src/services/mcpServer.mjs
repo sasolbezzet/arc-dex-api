@@ -243,9 +243,29 @@ const BACKEND_URL = process.env.ARCOX_BACKEND_URL || 'http://localhost:3001'
 
 import { mintOwnerToken } from './authToken.mjs'
 
-// The MCP userId IS the SIWE-verified wallet address. Mint a backend auth token
-// for it so the protected money endpoints (requireAuth) accept read-only quote
-// calls. This does NOT move funds — execute tools still go through vault approval.
+// The MCP userId is the SIWE-verified EOA used only as the tenant/auth identity.
+// On-chain reads, quotes, and execution must use the explicitly mapped Agent
+// Wallet MSCA returned by the active session key. Never use userId as payer.
+export async function resolveActiveMsca(userId) {
+  try {
+    const { getSessionKeyInfo } = await import('./vaultStore.mjs')
+    const info = await getSessionKeyInfo(userId)
+    if (!info?.active || !info.walletAddress) return null
+    return info
+  } catch {
+    return null
+  }
+}
+
+function mscaRequiredResult() {
+  return {
+    preview: false,
+    rejected: true,
+    reason: 'no_session',
+    message: 'Agent Wallet MSCA/session key belum aktif. Hubungkan atau aktifkan Agent Wallet di Plugin page terlebih dahulu.',
+  }
+}
+
 async function apiGet(path, ownerAddress) {
   const bearer = mintOwnerToken(ownerAddress)
   const r = await fetch(`${BACKEND_URL}${path}`, {
@@ -323,7 +343,7 @@ function createExecutionQuote(userId, action, params) {
 function consumeExecutionQuote(userId, action, previewId, params) {
   const quote = executionQuotes.get(String(previewId || ''))
   if (!quote || quote.userId !== userId || quote.action !== action || Date.now() > quote.expires) return { ok: false, reason: 'invalid_or_expired_quote' }
-  const fields = ['to', 'amount', 'token', 'tokenIn', 'tokenOut', 'amountIn', 'walletAddress']
+  const fields = ['to', 'amount', 'token', 'tokenIn', 'tokenOut', 'amountIn', 'fromChain', 'toChain', 'walletAddress']
   for (const field of fields) {
     if (quote.params[field] !== undefined && String(quote.params[field]) !== String(params[field])) return { ok: false, reason: 'quote_parameters_mismatch' }
   }
@@ -460,11 +480,24 @@ async function previewX402Pay(userId, invoiceId) {
   if (!info || !info.active) {
     return { status: 'session_required', message: 'Session key MSCA belum aktif. User harus setup Agent Wallet + session key dulu di Plugin page.' }
   }
+  const payerMatchesInvoice = String(invoice.ownerWallet || '').toLowerCase() === String(info.walletAddress || '').toLowerCase()
+  // Do not present a payment preview that can never be settled by this MSCA.
+  // An invoice without an exact owner binding is not safe for an agent quote.
+  if (!payerMatchesInvoice) {
+    return {
+      status: 'rejected',
+      requiresUserConfirmation: false,
+      reason: 'x402_payer_mismatch',
+      payer: info.walletAddress,
+      invoiceOwner: invoice.ownerWallet || null,
+      message: 'Invoice x402 tidak terikat ke Agent Wallet MSCA yang aktif.',
+    }
+  }
   return {      status: 'preview',
       requiresUserConfirmation: true,
       invoice,
       payer: info.walletAddress,
-      payerMatchesInvoice: String(invoice.ownerWallet || '').toLowerCase() === String(info.walletAddress || '').toLowerCase(),
+      payerMatchesInvoice: true,
 
     amount: invoice.uniqueAmount,
     token: 'USDC',
@@ -535,13 +568,17 @@ export function createMcpServer(userId) {
   // ── READ-ONLY TOOLS ──
 
   server.tool('arcox_wallet_balances', 'Show Agent Wallet (MSCA) balances on Arc', {}, async () => {
-    const data = await apiGet(`/api/balance/${userId}`, userId)
-    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+    const msca = await resolveActiveMsca(userId)
+    if (!msca) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    const data = await apiGet(`/api/balance/${encodeURIComponent(msca.walletAddress)}`, msca.walletAddress)
+    return { content: [{ type: 'text', text: JSON.stringify({ ...data, walletAddress: msca.walletAddress, walletType: 'MSCA' }) }] }
   })
 
   server.tool('arcox_transaction_history', 'Check transaction history and auto-mint worker status', {}, async () => {
-    const data = await apiGet(`/api/tx-history?address=${userId}`, userId)
-    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+    const msca = await resolveActiveMsca(userId)
+    if (!msca) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    const data = await apiGet(`/api/tx-history?address=${encodeURIComponent(msca.walletAddress)}`, msca.walletAddress)
+    return { content: [{ type: 'text', text: JSON.stringify({ ...data, walletAddress: msca.walletAddress, walletType: 'MSCA' }) }] }
   })
 
   server.tool('arcox_route_status', 'Check if a swap/bridge/send route is supported', {
@@ -549,16 +586,42 @@ export function createMcpServer(userId) {
     fromChain: z.string().optional().describe('Source chain'),
     toChain: z.string().optional().describe('Destination chain'),
     token: z.string().optional().describe('Token symbol (USDC, EURC, cirBTC)'),
+    tokenIn: z.string().optional().describe('Swap input token'),
+    tokenOut: z.string().optional().describe('Swap output token'),
     source: z.string().optional().describe('session (MSCA)'),
   }, async (params) => {
-    // Return supported routes info
+    const action = String(params.action || '').toLowerCase()
+    const source = params.source || 'session'
+    const tokens = [params.token, params.tokenIn, params.tokenOut]
+      .filter(Boolean)
+      .map(token => String(token).toUpperCase())
+    const hasUnsupportedSwapToken = action === 'swap' && tokens.some(token => token === 'CIRBTC' || token === 'USYC')
+    const knownAction = ['swap', 'send', 'bridge'].includes(action)
+    const session = await resolveActiveMsca(userId)
+    const mscaSupported = Boolean(session) && source === 'session' && knownAction && action !== 'bridge' && !hasUnsupportedSwapToken
+    const reason = !session
+      ? 'no_session'
+      : source !== 'session'
+        ? 'msca_only'
+        : !knownAction
+          ? 'unknown_action'
+          : action === 'bridge'
+            ? 'bridge_msca_unavailable'
+            : hasUnsupportedSwapToken
+              ? 'swap_route_not_supported_for_msca'
+              : null
     return { content: [{ type: 'text', text: JSON.stringify({
-      supported: true,
+      supported: mscaSupported,
+      executionSupported: mscaSupported,
       action: params.action,
+      source,
+      walletAddress: session?.walletAddress || null,
+      walletType: session ? 'MSCA' : null,
       chains: { 'arc-testnet': 5042002, 'ethereum-sepolia': 11155111, 'base-sepolia': 84532, 'arbitrum-sepolia': 421614, 'solana-devnet': 'solana' },
       tokens: ['USDC', 'EURC', 'cirBTC'],
       sources: ['session'],
-      note: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Call arcox_quote_swap or arcox_quote_bridge for a preview.',
+      reason,
+      note: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote tetap wajib sebelum eksekusi.',
     }) }] }
   })
 
@@ -574,18 +637,20 @@ export function createMcpServer(userId) {
     if (src !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote swap hanya untuk source=session.' }) }] }
     }
-    const { getSessionKeyInfo } = await import('./vaultStore.mjs')
-    const session = await getSessionKeyInfo(userId)
-    if (!session?.active || !session.walletAddress) {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'no_session', message: 'Session key MSCA belum aktif.' }) }] }
+    const session = await resolveActiveMsca(userId)
+    if (!session) {
+      return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
     }
     const quoteData = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: session.walletAddress }, session.walletAddress)
-    if (!quoteData?.available && quoteData?.success === false) {
-      return { content: [{ type: 'text', text: JSON.stringify(quoteData) }] }
+    if (quoteData?.available !== true) {
+      return { content: [{ type: 'text', text: JSON.stringify({ ...quoteData, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
     }
     // Prepare immutable calldata at preview time. Execution must use this exact
     // payload, not re-quote later with potentially different routing/slippage.
     const prepared = await apiPost('/api/eoa-swap-prepare', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: session.walletAddress }, session.walletAddress)
+    if (prepared?.success === false || prepared?.available === false || typeof prepared !== 'object' || !prepared) {
+      return { content: [{ type: 'text', text: JSON.stringify({ ...prepared, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
+    }
     const quote = createExecutionQuote(userId, 'swap', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, walletAddress: session.walletAddress, quote: quoteData, prepared })
     return { content: [{ type: 'text', text: JSON.stringify({ ...quoteData, previewId: quote.previewId, expiresAt: new Date(quote.expires).toISOString(), source: 'session', walletAddress: session.walletAddress, prepared: { source: prepared.source, route: prepared.route, amountOut: prepared.amountOut } }) }] }
   })
@@ -604,13 +669,13 @@ export function createMcpServer(userId) {
     if (source !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
     }
-    const { getSessionKeyInfo } = await import('./vaultStore.mjs')
-    const activeSession = await getSessionKeyInfo(userId)
+    const activeSession = await resolveActiveMsca(userId)
+    if (!activeSession) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
     const quoteCheck = consumeExecutionQuote(userId, 'swap', params.previewId, {
       tokenIn: params.tokenIn,
       tokenOut: params.tokenOut,
       amountIn: params.amountIn,
-      walletAddress: activeSession?.walletAddress || '',
+      walletAddress: activeSession.walletAddress,
     })
     if (!quoteCheck.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     const gate = await canAutoExecute(userId, source, params.amountIn)
@@ -622,7 +687,7 @@ export function createMcpServer(userId) {
       if (!preparedPayload || preparedPayload.source !== 'stablecoin-service' || !preparedPayload.adapterContract) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'swap_route_not_supported_for_msca', message: 'Route ini belum aman untuk eksekusi MSCA.' }) }] }
       }
-      const preparedResult = buildPreparedSwapCalls(preparedPayload, { tokenIn: params.tokenIn, tokenOut: params.tokenOut })
+        const preparedResult = buildPreparedSwapCalls(preparedPayload, { tokenIn: params.tokenIn, tokenOut: params.tokenOut })
       if (!preparedResult.calls) {
         const message = preparedResult.reason === 'adapter_not_allowlisted'
           ? 'Server belum mengonfigurasi ARCOX_SWAP_ADAPTER untuk eksekusi MSCA.'
@@ -665,20 +730,29 @@ export function createMcpServer(userId) {
     if (src !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote bridge hanya untuk source=session.' }) }] }
     }
-    const { getSessionKeyInfo } = await import('./vaultStore.mjs')
-    const info = await getSessionKeyInfo(userId)
-    const wallet = info?.active ? info.walletAddress : null
+    const info = await resolveActiveMsca(userId)
+    if (!info) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    const quote = createExecutionQuote(userId, 'bridge', {
+      fromChain: params.fromChain,
+      toChain: params.toChain,
+      amount: params.amount,
+      token,
+      walletAddress: info.walletAddress,
+    })
     return { content: [{ type: 'text', text: JSON.stringify({
       preview: true,
       route: `${params.fromChain} → ${params.toChain}`,
       amountIn: params.amount,
       token,
       source: 'session',
-      destinationWallet: wallet,
+      walletAddress: info.walletAddress,
+      walletType: 'MSCA',
+      destinationWallet: info.walletAddress,
       estimatedReceive: `~${params.amount} ${token}`,
-      note: wallet ? 'MSCA → MSCA (destination = Agent Wallet yang sama).' : 'Eksekusi bridge MSCA belum tersedia; rute hanya bisa di-quote. Setup Agent Wallet + session key dulu di Plugin page.',
-      previewId: `bridge_${Date.now()}`,
-      safeNextStep: 'Tampilkan preview ini ke user. Catatan: eksekusi bridge MSCA menunggu implementasi CCTP via Agent Wallet diverifikasi.',
+      note: 'MSCA → MSCA (destination = Agent Wallet yang sama). Eksekusi bridge MSCA belum tersedia; quote ini tidak mengizinkan fallback ke EOA/Circle proxy.',
+      previewId: quote.previewId,
+      expiresAt: new Date(quote.expires).toISOString(),
+      safeNextStep: 'Tampilkan preview ini ke user. Eksekusi bridge MSCA tetap ditolak sampai CCTP melalui MSCA diverifikasi.',
     }) }] }
   })
 
@@ -697,10 +771,20 @@ export function createMcpServer(userId) {
     if (source !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Circle proxy dan EOA tidak diizinkan untuk agent remote.' }) }] }
     }
+    const info = await resolveActiveMsca(userId)
+    if (!info) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
+    const quoteCheck = consumeExecutionQuote(userId, 'bridge', params.previewId, {
+      fromChain: params.fromChain,
+      toChain: params.toChain,
+      amount: params.amount,
+      token: params.token || 'USDC',
+      walletAddress: info.walletAddress,
+    })
+    if (!quoteCheck.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     // MSCA bridge belum diimplementasikan (bridgeViaSession belum ada; CCTP
     // through MSCA belum terbukti end-to-end). JANGAN fallback ke Circle proxy
     // atau approval EOA — tolak jelas sampai jalur MSCA→MSCA selesai.
-    return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'bridge_msca_unavailable', message: 'Bridge via Agent Wallet (MSCA) belum tersedia. Rute hanya bisa di-quote dulu; eksekusi bridge MSCA menunggu implementasi CCTP melalui MSCA diverifikasi.' }) }] }
+    return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'bridge_msca_unavailable', walletAddress: info.walletAddress, message: 'Bridge via Agent Wallet (MSCA) belum tersedia. Rute hanya bisa di-quote dulu; eksekusi bridge MSCA menunggu implementasi CCTP melalui MSCA diverifikasi.' }) }] }
   })
 
   // ── SEND TOOLS (quote → confirm → execute) ──
@@ -716,7 +800,11 @@ export function createMcpServer(userId) {
     if (src !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote send hanya untuk source=session.' }) }] }
     }
-    // MSCA send quote (gas paid via paymaster; 30bps platform fee applies)
+    const info = await resolveActiveMsca(userId)
+    if (!info) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    // MSCA send quote is bound to the active wallet. A later MSCA switch makes
+    // the preview unusable instead of silently sending from another wallet.
+    const q = createExecutionQuote(userId, 'send', { to: params.to, amount: params.amount, token, walletAddress: info.walletAddress })
     return { content: [{ type: 'text', text: JSON.stringify({
       preview: true,
       action: 'send',
@@ -724,8 +812,12 @@ export function createMcpServer(userId) {
       amount: params.amount,
       token,
       source: 'session',
+      walletAddress: info.walletAddress,
+      walletType: 'MSCA',
+      payer: info.walletAddress,
       note: 'Send via Agent Wallet (MSCA/session key): gas dibayar paymaster, 30bps platform fee berlaku.',
-      ...(() => { const q = createExecutionQuote(userId, 'send', { to: params.to, amount: params.amount, token }); return { previewId: q.previewId, expiresAt: new Date(q.expires).toISOString() } })(),
+      previewId: q.previewId,
+      expiresAt: new Date(q.expires).toISOString(),
       safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_send dengan source=session dan confirmed=true.',
     }) }] }
   })
@@ -742,11 +834,13 @@ export function createMcpServer(userId) {
     if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
     const source = params.source || 'session'
     const token = params.token || 'USDC'
-    const quoteCheck = consumeExecutionQuote(userId, 'send', params.previewId, { to: params.to, amount: params.amount, token })
-    if (!quoteCheck.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     if (source !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
     }
+    const activeSession = await resolveActiveMsca(userId)
+    if (!activeSession) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
+    const quoteCheck = consumeExecutionQuote(userId, 'send', params.previewId, { to: params.to, amount: params.amount, token, walletAddress: activeSession.walletAddress })
+    if (!quoteCheck.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     const gate = await canAutoExecute(userId, source, params.amount)
     if (!gate.ok) {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
@@ -950,6 +1044,9 @@ export function createMcpServer(userId) {
     if (!params.confirmed) {
       try {
         const preview = await previewX402Pay(userId, params.invoiceId)
+        if (preview.status !== 'preview') {
+          return { content: [{ type: 'text', text: JSON.stringify({ ...preview, invoiceId: params.invoiceId }) }] }
+        }
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'preview', requiresUserConfirmation: true, amount: preview.amount, token: preview.token, recipient: preview.recipient, payer: preview.payer, invoiceId: params.invoiceId, instruction: preview.instruction, safeNextStep: 'Tampilkan preview ini ke user. Setelah user bilang yes/ya, panggil arcox_x402_pay_invoice dengan confirmed=true dan confirmationText.' }) }] }
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: e?.message || 'preview error' }) }] }
