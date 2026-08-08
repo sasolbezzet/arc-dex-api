@@ -204,6 +204,62 @@ app.post('/api/session/revoke', apiLimiter, requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
+// Verify a passkey-signed delegate authorization on a destination chain.
+// The hash is never trusted by itself: sessionKeyService queries the chain's
+// bundler, receipt, sender, and exact addOwners calldata before recording it.
+const DESTINATION_CHAIN_CONFIG = {
+  'base-sepolia': { id: 84532, rpcUrl: process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org' },
+  'arbitrum-sepolia': { id: 421614, rpcUrl: process.env.ARB_SEPOLIA_RPC_URL || 'https://sepolia-rollup.arbitrum.io/rpc' },
+}
+
+app.get('/api/session/destination-status', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const chainKey = String(req.query.chainKey || '')
+    const config = DESTINATION_CHAIN_CONFIG[chainKey]
+    if (!config) return res.status(400).json({ error: 'Unsupported destination chain' })
+    const requestedWallet = req.query.walletAddress
+    if (!requestedWallet || !isAddress(requestedWallet)) return res.status(400).json({ error: 'Valid walletAddress required' })
+    if (getAddress(requestedWallet).toLowerCase() !== String(req.owner).toLowerCase()) return res.status(403).json({ error: 'walletAddress must match authenticated MSCA' })
+    const walletAddress = getAddress(requestedWallet)
+    const { createPublicClient, defineChain, http } = await import('viem')
+    const client = createPublicClient({
+      chain: defineChain({ id: config.id, name: chainKey, nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [config.rpcUrl] } } }),
+      transport: http(config.rpcUrl),
+    })
+    const code = await client.getBytecode({ address: walletAddress }).catch(() => undefined)
+    const { isSessionAuthorizedForChain } = await import('./src/services/sessionKeyService.mjs')
+    res.json({ success: true, walletAddress, chainKey, deployed: Boolean(code && code !== '0x'), authorized: isSessionAuthorizedForChain(walletAddress, chainKey) })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/session/authorize-chain', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { walletAddress, delegateAddress, chainKey, authorizationUserOpHash } = req.body || {}
+    const allowedDestinationChains = new Set(Object.keys(DESTINATION_CHAIN_CONFIG))
+    if (!allowedDestinationChains.has(String(chainKey))) return res.status(400).json({ error: 'Unsupported destination chain' })
+    if (!walletAddress || !delegateAddress || !isAddress(walletAddress) || !isAddress(delegateAddress)) {
+      return res.status(400).json({ error: 'Valid walletAddress and delegateAddress required' })
+    }
+    if (getAddress(walletAddress).toLowerCase() !== req.owner) {
+      return res.status(403).json({ error: 'walletAddress must match the authenticated MSCA' })
+    }
+    const { getSessionKey } = await import('./src/services/sessionKeyService.mjs')
+    const entry = getSessionKey(walletAddress)
+    if (!entry?.active || getAddress(entry.delegateAddress) !== getAddress(delegateAddress)) {
+      return res.status(409).json({ error: 'Active delegate session is not bound to this MSCA' })
+    }
+    const { verifySessionAuthorization, recordSessionChainAuthorization } = await import('./src/services/sessionKeyService.mjs')
+    const verified = await verifySessionAuthorization(req.owner, {
+      walletAddress,
+      delegateAddress,
+      authorizationUserOpHash,
+      chainKey,
+    })
+    recordSessionChainAuthorization(req.owner, { walletAddress, chainKey, authorizationUserOpHash: verified.userOpHash })
+    res.json({ success: true, walletAddress, delegateAddress, chainKey, authorizationUserOpHash: verified.userOpHash })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
 // ── Pending transactions (passkey-signed from browser) ──
 app.get('/api/pending-txs', apiLimiter, requireAuth, async (req, res) => {
   try {

@@ -123,6 +123,30 @@ export function getSessionKey(userId) {
   return entry
 }
 
+/** Return whether the active delegate was explicitly authorized on a chain. */
+export function isSessionAuthorizedForChain(userId, chainKey = 'arc-testnet') {
+  const entry = getSessionKey(userId)
+  if (!entry?.active) return false
+  const key = String(chainKey)
+  if (key === 'arc-testnet') return /^0x[0-9a-fA-F]{64}$/.test(String(entry.authorizationUserOpHashes?.[key] || entry.authorizationUserOpHash || ''))
+  return /^0x[0-9a-fA-F]{64}$/.test(String(entry.authorizationUserOpHashes?.[key] || ''))
+}
+
+/** Record a passkey-confirmed authorization for an additional destination chain. */
+export function recordSessionChainAuthorization(userId, { walletAddress, chainKey, authorizationUserOpHash } = {}) {
+  const store = loadStore()
+  const wallet = getAddress(walletAddress)
+  const entry = store.users[wallet.toLowerCase()]
+  if (!entry?.active) throw new Error('Active session key required')
+  if (getAddress(entry.walletAddress) !== wallet) throw new Error('Session wallet mismatch')
+  if (!CHAINS[chainKey]) throw new Error(`Unknown chain: ${chainKey}`)
+  if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
+  entry.authorizationUserOpHashes = { ...(entry.authorizationUserOpHashes || {}), [chainKey]: authorizationUserOpHash }
+  entry.lastAuthorizedChainAt = Date.now()
+  saveStore(store)
+  return entry
+}
+
 /**
  * Generate a new EOA keypair for use as a session/delegate key.
  * Returns { address, privateKey } — caller must persist.
@@ -200,7 +224,7 @@ export async function verifySessionAuthorization(userId, { walletAddress, delega
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
   const store = loadStore()
   const entry = store.users[wallet.toLowerCase()]
-  if (!entry?.pendingAuthorization) throw new Error('No pending automation signer reservation')
+  if (!entry || (!entry.pendingAuthorization && !entry.active)) throw new Error('No active automation signer reservation')
   if (getAddress(entry.delegateAddress) !== delegate) throw new Error('Automation signer mismatch')
   const chain = CHAINS[chainKey]
   if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
@@ -241,6 +265,7 @@ export function activateReservedSessionKey(userId, { walletAddress, delegateAddr
   entry.active = true
   entry.pendingAuthorization = false
   entry.authorizationUserOpHash = authorizationUserOpHash
+  entry.authorizationUserOpHashes = { ...(entry.authorizationUserOpHashes || {}), [entry.chain || 'arc-testnet']: authorizationUserOpHash }
   entry.activatedAt = Date.now()
   saveStore(store)
   return entry
@@ -332,6 +357,7 @@ export function storeSessionKey(userId, { walletAddress, delegateAddress, delega
     createdAt: Date.now(),
     active: true,
     authorizationUserOpHash: '',
+    authorizationUserOpHashes: {},
   }
   // Alias mapping: EOA (OAuth identity) -> MSCA walletAddress. Lets MCP sessions
   // authenticated as the EOA resolve the MSCA-owned session key.

@@ -312,15 +312,24 @@ const BRIDGE_CCTP = {
     router: process.env.ARCOX_FEE_ROUTER_ADDRESS || '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
   },
   Ethereum_Sepolia: { domain: 0, explorer: 'https://sepolia.etherscan.io/tx/' },
-  Base_Sepolia: { domain: 6, explorer: 'https://sepolia.basescan.org/tx/' },
-  Arbitrum_Sepolia: { domain: 3, explorer: 'https://sepolia.arbiscan.io/tx/' },
+  Base_Sepolia: {
+    domain: 6,
+    explorer: 'https://sepolia.basescan.org/tx/',
+    rpcUrl: process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org',
+    messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
+  },
+  Arbitrum_Sepolia: {
+    domain: 3,
+    explorer: 'https://sepolia.arbiscan.io/tx/',
+    rpcUrl: process.env.ARB_SEPOLIA_RPC_URL || 'https://sepolia-rollup.arbitrum.io/rpc',
+    messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
+  },
   HyperEVM_Testnet: { domain: 19, explorer: 'https://app.hyperliquid-testnet.xyz/explorer/tx/' },
 }
 // The route is explicit opt-in so a deployment cannot start moving funds just
 // because code was updated. Enable it only after the router and destination
 // mint relayer have been configured and a small testnet transfer is approved.
 const ENABLE_MSCA_CCTP_BRIDGE = process.env.ENABLE_MSCA_CCTP_BRIDGE === 'true'
-const ENABLE_SERVER_SIGNED_MINT = process.env.ENABLE_SERVER_SIGNED_MINT === 'true'
 const BRIDGE_ZERO_BYTES32 = `0x${'0'.repeat(64)}`
 const BRIDGE_MAX_FEE = BigInt(process.env.CCTP_MAX_FEE_BASE_UNITS || '10')
 const BRIDGE_MIN_FINALITY_THRESHOLD = Number(process.env.CCTP_MIN_FINALITY_THRESHOLD || '1000')
@@ -475,18 +484,49 @@ async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain
   }
 }
 
-async function mintDestinationViaBackend({ burnTxHash, fromChain, toChain, walletAddress, amount }) {
-  const result = await apiPost('/api/mint-direct', {
-    burnTxHash,
-    fromChain,
-    toChain,
-    toAddress: walletAddress,
-    amount,
-  }, walletAddress)
-  if (result?.success !== true || !result.txHash) {
-    return { success: false, error: result?.error || 'Destination receiveMessage belum tersedia' }
+const RECEIVE_MESSAGE_ABI = [{
+  type: 'function', name: 'receiveMessage', stateMutability: 'nonpayable',
+  inputs: [{ name: 'message', type: 'bytes' }, { name: 'attestation', type: 'bytes' }],
+  outputs: [{ name: 'success', type: 'bool' }],
+}]
+
+async function destinationMscaPreflight({ route, walletAddress, requireAuthorization = true }) {
+  const destinationInfo = {
+    Base_Sepolia: { id: 84532, chainKey: 'base-sepolia' },
+    Arbitrum_Sepolia: { id: 421614, chainKey: 'arbitrum-sepolia' },
+  }[route?.toKey]
+  if (!destinationInfo) return { ok: false, reason: 'destination_msca_route_not_supported', message: 'Destination MSCA UserOperation hanya mendukung Base Sepolia atau Arbitrum Sepolia.' }
+  if (!route?.destination?.rpcUrl || !route.destination.messageTransmitter) return { ok: false, reason: 'destination_chain_not_configured' }
+  const { createPublicClient } = await import('viem')
+  const client = createPublicClient({
+    chain: defineChain({ id: destinationInfo.id, name: route.toKey, nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [route.destination.rpcUrl] } } }),
+    transport: http(route.destination.rpcUrl),
+  })
+  const code = await client.getBytecode({ address: getAddress(walletAddress) }).catch(() => undefined)
+  if (!code || code === '0x') return { ok: false, reason: 'destination_msca_not_deployed', message: `MSCA ${walletAddress} belum deployed di ${route.toKey}. Deploy MSCA via Plugin passkey sebelum bridge.` }
+  if (requireAuthorization) {
+    const { isSessionAuthorizedForChain } = await import('./sessionKeyService.mjs')
+    if (!isSessionAuthorizedForChain(walletAddress, destinationInfo.chainKey)) {
+      return { ok: false, reason: 'destination_msca_session_not_authorized', message: `Delegate session belum diotorisasi di ${route.toKey}. Jalankan setup destination chain via Plugin passkey.` }
+    }
   }
-  return { success: true, txHash: result.txHash, explorerUrl: result.explorerUrl || null }
+  return { ok: true, client }
+}
+
+async function mintDestinationViaMsca({ status, route, walletAddress }) {
+  if (!status?.verified || !status.message || !status.attestation) return { success: false, error: 'Attestation belum ready' }
+  const destinationKey = route.toKey === 'Base_Sepolia' ? 'base-sepolia' : route.toKey === 'Arbitrum_Sepolia' ? 'arbitrum-sepolia' : null
+  if (!destinationKey) return { success: false, error: 'destination_msca_route_not_supported' }
+  const preflight = await destinationMscaPreflight({ route, walletAddress })
+  if (!preflight.ok) return { success: false, error: preflight.message || preflight.reason }
+  const { executeViaSession } = await import('./sessionKeyService.mjs')
+  const result = await executeViaSession(walletAddress, [{
+    to: route.destination.messageTransmitter,
+    value: 0n,
+    data: encodeFunctionData({ abi: RECEIVE_MESSAGE_ABI, functionName: 'receiveMessage', args: [status.message, status.attestation] }),
+  }], { paymaster: false, chainKey: destinationKey, requireTransactionHash: true })
+  if (result.status !== 'success') return { success: false, error: result.reason || 'Destination MSCA UserOperation failed', userOpHash: result.userOpHash }
+  return { success: true, txHash: result.txHash, userOpHash: result.userOpHash, explorerUrl: `${route.destination.explorer}${result.txHash}` }
 }
 
 // Decide whether an agent-initiated action can auto-execute server-side.
@@ -531,15 +571,15 @@ function createExecutionQuote(userId, action, params) {
 }
 
 function destinationMintDisabledReason() {
-  if (!ENABLE_SERVER_SIGNED_MINT) return 'destination_mint_relayer_not_configured'
-  if (!/^0x[0-9a-fA-F]{64}$/.test(String(process.env.OWNER_PRIVATE_KEY || ''))) return 'destination_mint_signer_not_configured'
-  if (!String(process.env.AUTH_SECRET || '')) return 'destination_mint_auth_not_configured'
+  // Destination settlement is executed by the same MSCA UserOperation.
+  // Server-signed mint and OWNER_PRIVATE_KEY are intentionally not required.
   return null
 }
 
 function bridgeConfigDisabledReason(route) {
   if (!ENABLE_MSCA_CCTP_BRIDGE) return 'msca_bridge_disabled_until_router_validation'
   if (!route?.source?.router) return 'bridge_router_not_configured'
+  if (!route.destination?.rpcUrl || !route.destination?.messageTransmitter) return 'destination_chain_not_configured'
   return destinationMintDisabledReason()
 }
 
@@ -808,11 +848,16 @@ export function createMcpServer(userId) {
       .map(token => String(token).toUpperCase())
     const hasUnsupportedSwapToken = action === 'swap' && tokens.some(token => token === 'CIRBTC' || token === 'USYC')
     const knownAction = ['swap', 'send', 'bridge'].includes(action)
-    const bridgeIsSupported = action === 'bridge' && ENABLE_MSCA_CCTP_BRIDGE && ENABLE_SERVER_SIGNED_MINT && String(params.token || 'USDC').toUpperCase() === 'USDC' && Boolean(bridgeConfig(params.fromChain, params.toChain))
-    const session = await resolveActiveMsca(userId)
-    const mscaSupported = Boolean(session) && source === 'session' && knownAction && (action === 'bridge' ? bridgeIsSupported : !hasUnsupportedSwapToken)
     const route = action === 'bridge' ? bridgeConfig(params.fromChain, params.toChain) : null
+    const bridgeIsSupported = action === 'bridge' && ENABLE_MSCA_CCTP_BRIDGE && String(params.token || 'USDC').toUpperCase() === 'USDC' && Boolean(route?.fromKey === 'Arc_Testnet')
+    const session = await resolveActiveMsca(userId)
     const disabledReason = action === 'bridge' ? bridgeConfigDisabledReason(route) : null
+    let destinationReadiness = null
+    if (bridgeIsSupported && session && !disabledReason) {
+      destinationReadiness = await destinationMscaPreflight({ route, walletAddress: session.walletAddress }).catch(error => ({ ok: false, reason: 'destination_msca_preflight_failed', message: error?.message || 'Destination MSCA preflight gagal' }))
+    }
+    const bridgeReady = bridgeIsSupported && !disabledReason && destinationReadiness?.ok === true
+    const mscaSupported = Boolean(session) && source === 'session' && knownAction && (action === 'bridge' ? bridgeReady : !hasUnsupportedSwapToken)
     const reason = !session
       ? 'no_session'
       : source !== 'session'
@@ -823,6 +868,8 @@ export function createMcpServer(userId) {
             ? disabledReason
             : action === 'bridge' && !bridgeIsSupported
               ? 'bridge_route_not_supported_for_msca'
+              : action === 'bridge' && !destinationReadiness?.ok
+                ? (destinationReadiness?.reason || 'destination_msca_not_ready')
               : hasUnsupportedSwapToken
               ? 'swap_route_not_supported_for_msca'
               : null
@@ -837,6 +884,7 @@ export function createMcpServer(userId) {
       tokens: ['USDC', 'EURC', 'cirBTC'],
       sources: ['session'],
       reason,
+      destinationReady: action === 'bridge' ? Boolean(destinationReadiness?.ok) : undefined,
       note: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote tetap wajib sebelum eksekusi.',
     }) }] }
   })
@@ -949,12 +997,16 @@ export function createMcpServer(userId) {
     const info = await resolveActiveMsca(userId)
     if (!info) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
+    if (!route || route.fromKey !== 'Arc_Testnet' || token.toUpperCase() !== 'USDC') {
+      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke Base Sepolia atau Arbitrum Sepolia.' }) }] }
+    }
     const disabledReason = bridgeConfigDisabledReason(route)
     if (disabledReason) {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: disabledReason, message: disabledReason === 'destination_mint_relayer_not_configured' ? 'Destination mint relayer belum dikonfigurasi.' : 'Bridge MSCA belum diaktifkan.' }) }] }
+      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: disabledReason, message: disabledReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi.' : 'Bridge MSCA belum diaktifkan.' }) }] }
     }
-    if (!route || route.fromKey !== 'Arc_Testnet' || token.toUpperCase() !== 'USDC') {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke chain EVM CCTP yang didukung.' }) }] }
+    const destinationPreflight = await destinationMscaPreflight({ route, walletAddress: info.walletAddress })
+    if (!destinationPreflight.ok) {
+      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: destinationPreflight.reason, message: destinationPreflight.message || 'Destination MSCA belum siap. Deploy MSCA terlebih dahulu; source burn belum dilakukan.' }) }] }
     }
     try {
       const amount = parseUnits(String(params.amount).trim(), 6)
@@ -1013,12 +1065,16 @@ export function createMcpServer(userId) {
     const info = await resolveActiveMsca(userId)
     if (!info) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
+    if (!route || route.fromKey !== 'Arc_Testnet' || String(params.token || 'USDC').toUpperCase() !== 'USDC') {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke Base Sepolia atau Arbitrum Sepolia.' }) }] }
+    }
     const disabledReason = bridgeConfigDisabledReason(route)
     if (disabledReason) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: disabledReason, message: disabledReason === 'destination_mint_relayer_not_configured' ? 'Destination mint relayer belum dikonfigurasi. Tidak ada UserOperation yang dikirim.' : 'Bridge MSCA belum diaktifkan. Tidak ada UserOperation yang dikirim.' }) }] }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: disabledReason, message: disabledReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi. Tidak ada UserOperation yang dikirim.' : 'Bridge MSCA belum diaktifkan. Tidak ada UserOperation yang dikirim.' }) }] }
     }
-    if (!route || route.fromKey !== 'Arc_Testnet' || String(params.token || 'USDC').toUpperCase() !== 'USDC') {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke chain EVM CCTP yang didukung.' }) }] }
+    const destinationPreflight = await destinationMscaPreflight({ route, walletAddress: info.walletAddress })
+    if (!destinationPreflight.ok) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: destinationPreflight.reason, message: destinationPreflight.message || 'Destination MSCA belum siap. Tidak ada source burn.' }) }] }
     }
     const gate = await canAutoExecute(userId, source, params.amount)
     if (!gate.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: gate.reason, message: gate.message || 'Session key MSCA tidak dapat mengeksekusi bridge.' }) }] }
@@ -1048,7 +1104,7 @@ export function createMcpServer(userId) {
       if (!burnProof.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'burn_submitted', executed: true, verified: false, burnTxHash: result.txHash, userOpHash: result.userOpHash, reason: burnProof.reason, message: 'Source UserOperation berhasil tetapi bukti event router belum terverifikasi. Jangan ulangi burn; periksa transaksi ini secara read-only.' }) }] }
       const bridgeStatus = await getCctpBridgeStatus({ burnTxHash: result.txHash, sourceDomain: route.source.domain, destinationDomain: route.destination.domain, walletAddress: info.walletAddress })
       const mint = bridgeStatus.verified
-        ? await mintDestinationViaBackend({ burnTxHash: result.txHash, fromChain: route.fromKey, toChain: route.toKey, walletAddress: info.walletAddress, amount: params.amount }).catch(error => ({ success: false, error: error?.message || 'Destination mint request failed' }))
+        ? await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress }).catch(error => ({ success: false, error: error?.message || 'Destination MSCA mint request failed' }))
         : { success: false, error: 'Attestation belum ready' }
       let auditPending = false
       try {
@@ -1140,8 +1196,8 @@ export function createMcpServer(userId) {
       if (!proof.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: proof.reason, message: 'Burn ini tidak terbukti berasal dari ArcoxRouter untuk MSCA aktif.' }) }] }
       const status = await getCctpBridgeStatus({ burnTxHash: params.burnTxHash, sourceDomain: route.source.domain, destinationDomain: route.destination.domain, walletAddress: info.walletAddress })
       if (!status.verified) return { content: [{ type: 'text', text: JSON.stringify({ status: 'settlement_pending', executed: false, burnTxHash: params.burnTxHash, messageStatus: status.messageStatus || 'pending', message: 'Attestation belum tersedia. Tidak ada transaksi destination yang dikirim.' }) }] }
-      const mint = await mintDestinationViaBackend({ burnTxHash: params.burnTxHash, fromChain: route.fromKey, toChain: route.toKey, walletAddress: info.walletAddress, amount: undefined })
-      return { content: [{ type: 'text', text: JSON.stringify({ status: mint.success ? 'minted' : 'mint_failed', executed: mint.success, burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationExplorerUrl: mint.explorerUrl || null, error: mint.success ? null : mint.error, message: mint.success ? 'Destination mint berhasil ke MSCA.' : 'Destination mint gagal; cek error dan ulangi retry setelah memastikan relayer siap.' }) }] }
+      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress })
+      return { content: [{ type: 'text', text: JSON.stringify({ status: mint.success ? 'minted' : 'mint_failed', executed: mint.success, burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, error: mint.success ? null : mint.error, message: mint.success ? 'Destination receiveMessage berhasil via MSCA UserOperation.' : 'Destination mint gagal; pastikan MSCA deployed dan session destination chain telah diotorisasi.' }) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'retry_error', executed: false, burnTxHash: params.burnTxHash, error: e?.message || 'Retry mint gagal' }) }] }
     }
