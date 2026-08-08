@@ -308,7 +308,7 @@ export function canExecuteViaSession(userId, amount) {
 
 // Extract a positive number from a human amount string. Accepted: "1.5",
 // "1,5", "$10", "0.01 USDC", "1e3", " 2 ". Returns null when unparseable.
-function parseHumanAmount(value) {
+export function parseHumanAmount(value) {
   if (value === null || value === undefined) return null
   const raw = String(value).trim()
   if (!raw) return null
