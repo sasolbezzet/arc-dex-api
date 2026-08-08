@@ -379,14 +379,16 @@ function buildPreparedSwapCalls(prepared, expected = {}) {
   // Never execute opaque adapter calldata without an explicit production
   // allowlist. This keeps MCP swaps fail-closed until the deployment config
   // names the exact audited adapter contract.
-  if (!allowedAdapter || !prepared?.adapterContract || !Array.isArray(prepared.legs) || prepared.legs.length === 0) return null
-  if (String(prepared.adapterContract).toLowerCase() !== allowedAdapter) return null
-  if (expected.tokenIn && String(prepared.tokenIn || '').toUpperCase() !== String(expected.tokenIn).toUpperCase()) return null
-  if (expected.tokenOut && String(prepared.tokenOut || '').toUpperCase() !== String(expected.tokenOut).toUpperCase()) return null
+  if (!allowedAdapter) return { calls: null, reason: 'adapter_not_allowlisted' }
+  if (!prepared?.adapterContract || !Array.isArray(prepared.legs) || prepared.legs.length === 0) return { calls: null, reason: 'prepared_route_incomplete' }
+  if (String(prepared.adapterContract).toLowerCase() !== allowedAdapter) return { calls: null, reason: 'adapter_mismatch' }
+  if (expected.tokenIn && String(prepared.tokenIn || '').toUpperCase() !== String(expected.tokenIn).toUpperCase()) return { calls: null, reason: 'quote_token_in_mismatch' }
+  if (expected.tokenOut && String(prepared.tokenOut || '').toUpperCase() !== String(expected.tokenOut).toUpperCase()) return { calls: null, reason: 'quote_token_out_mismatch' }
+  const calls = []
   for (const leg of prepared.legs) {
-    if (!leg?.executionParams || !leg.signature || !leg.tokenInAddress || !leg.amountBaseUnits) return null
+    if (!leg?.executionParams || !leg.signature || !leg.tokenInAddress || !leg.amountBaseUnits) return { calls: null, reason: 'prepared_leg_incomplete' }
     const executionParams = normalizePreparedExecution(leg.executionParams)
-    if (!executionParams) return null
+    if (!executionParams) return { calls: null, reason: 'prepared_execution_params_invalid' }
     const amount = BigInt(leg.amountBaseUnits)
     calls.push({
       to: getAddress(leg.tokenInAddress),
@@ -403,7 +405,7 @@ function buildPreparedSwapCalls(prepared, expected = {}) {
       }),
     })
   }
-  return calls
+  return { calls, reason: null }
 }
 
 async function getX402Invoice(invoiceId) {
@@ -620,12 +622,19 @@ export function createMcpServer(userId) {
       if (!preparedPayload || preparedPayload.source !== 'stablecoin-service' || !preparedPayload.adapterContract) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'swap_route_not_supported_for_msca', message: 'Route ini belum aman untuk eksekusi MSCA.' }) }] }
       }
-        const preparedCalls = buildPreparedSwapCalls(preparedPayload, { tokenIn: params.tokenIn, tokenOut: params.tokenOut })
-      if (!preparedCalls) {
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'swap_calldata_unavailable', message: 'Quote swap ini belum menghasilkan calldata MSCA yang aman untuk dieksekusi.' }) }] }
+      const preparedResult = buildPreparedSwapCalls(preparedPayload, { tokenIn: params.tokenIn, tokenOut: params.tokenOut })
+      if (!preparedResult.calls) {
+        const message = preparedResult.reason === 'adapter_not_allowlisted'
+          ? 'Server belum mengonfigurasi ARCOX_SWAP_ADAPTER untuk eksekusi MSCA.'
+          : preparedResult.reason === 'prepared_leg_incomplete'
+            ? 'Circle tidak mengembalikan executionParams/signature lengkap untuk route ini. Coba pasangan stablecoin yang didukung.'
+            : preparedResult.reason === 'adapter_mismatch'
+              ? 'Adapter swap dari quote tidak cocok dengan adapter yang diizinkan server.'
+              : 'Quote swap ini belum menghasilkan calldata MSCA yang aman untuk dieksekusi.'
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: preparedResult.reason || 'swap_calldata_unavailable', message }) }] }
       }
       const { swapViaSession } = await import('./sessionKeyService.mjs')
-      const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls, chainKey: 'arc-testnet' })
+      const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: 'arc-testnet' })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
