@@ -301,7 +301,15 @@ export async function executeViaSession(userId, calls, options = {}) {
   try { touchSessionKey(userId) } catch { /* non-fatal */ }
 
   const chainKey = options.chainKey || entry.chain || 'arc-testnet'
-  const { smartAccount } = await buildSmartAccountClient(entry.walletAddress, entry.delegatePrivateKey, chainKey)
+  const { smartAccount, modularClient } = await buildSmartAccountClient(entry.walletAddress, entry.delegatePrivateKey, chainKey)
+
+  // Override: skip factory initCode when wallet is not yet deployed on-chain.
+  // The backend doesn't have the original passkey owner data needed to generate
+  // the correct CREATE2 initCode.  Without this override, the SDK sends factory
+  // data based on the delegate key alone, which produces a different address
+  // and the entry point rejects it ("does not return the expected sender").
+  // The wallet must be deployed via the Plugin page (frontend) first.
+  smartAccount.getFactoryArgs = async () => ({ factory: undefined, factoryData: undefined })
 
   // Normalize calls to { to, value, data }
   const normalizedCalls = calls.map(c => {
@@ -325,10 +333,10 @@ export async function executeViaSession(userId, calls, options = {}) {
     userOpParams.paymaster = true
   }
 
-  const userOpHash = await sendUserOperation(userOpParams)
+  const userOpHash = await sendUserOperation(modularClient, userOpParams)
 
   // Wait for receipt — Arc has sub-second finality so this is fast
-  const receipt = await waitForUserOperationReceipt({ hash: userOpHash })
+  const receipt = await waitForUserOperationReceipt(modularClient, { hash: userOpHash })
 
   const txHash = receipt?.receipt?.transactionHash || userOpHash
   const explorerUrl = `https://testnet.arcscan.app/tx/${txHash}`
