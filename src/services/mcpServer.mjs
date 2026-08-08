@@ -517,19 +517,17 @@ export function createMcpServer(userId) {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
     }
     try {
-      // Build unsigned UserOp calls — frontend signs via passkey, backend relays
-      const { CHAINS } = await import('./chains.mjs')
-      const chain = CHAINS[gate.entry.chain || 'arc-testnet']
-      const tokenAddr = chain.tokens[params.tokenIn] || chain.tokens.USDC
-      if (!tokenAddr) return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: `Token ${params.tokenIn} not supported on ${gate.entry.chain}` }) }] }
-      const { parseHumanAmount } = await import('./sessionKeyService.mjs')
-      const parsed = parseHumanAmount(params.amountIn)
-      if (!parsed) return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'Invalid amount' }) }] }
-      const amountBigInt = BigInt(Math.floor(parsed * 1e6))
-      const calls = [{ to: tokenAddr, data: '0xa9059cbb' + '000000000000000000000000' + (gate.limits.treasury || tokenAddr).slice(2).toLowerCase() + amountBigInt.toString(16).padStart(64, '0'), value: '0x0' }]
-      const { createPendingTx } = await import('./sessionKeyService.mjs')
-      const pending = createPendingTx(userId, { walletAddress: gate.entry.walletAddress, calls, chainKey: gate.entry.chain || 'arc-testnet', paymaster: true })
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'pending', txId: pending.txId, walletAddress: gate.entry.walletAddress, message: `Swap ${params.amountIn} ${params.tokenIn} → ${params.tokenOut} menunggu konfirmasi passkey di Plugin page. Buka Plugin → tab Transaksi → Approve.` }) }] }
+      const { swapViaSession } = await import('./sessionKeyService.mjs')
+      const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn })
+      if (result.status === 'success') {
+        await recordAutoExec(userId, {
+          agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
+          source: 'session', details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
+          txHash: result.txHash, explorerUrl: result.explorerUrl,
+        })
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Swap ${params.amountIn} ${params.tokenIn} → ${params.tokenOut} berhasil via MSCA (session key).` }) }] }
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session swap gagal' }) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e?.message || 'Session error' }) }] }
     }
@@ -636,20 +634,17 @@ export function createMcpServer(userId) {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
     }
     try {
-      // Build unsigned UserOp calls — frontend signs via passkey, backend relays
-      const { CHAINS } = await import('./chains.mjs')
-      const chain = CHAINS[gate.entry.chain || 'arc-testnet']
-      const tokenAddr = chain.tokens[token] || chain.tokens.USDC
-      if (!tokenAddr) return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: `Token ${token} not supported on ${gate.entry.chain}` }) }] }
-      const { parseHumanAmount } = await import('./sessionKeyService.mjs')
-      const parsed = parseHumanAmount(params.amount)
-      if (!parsed) return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: 'Invalid amount' }) }] }
-      const decimals = token === 'USDC' || token === 'EURC' ? 6 : 18
-      const amountBigInt = BigInt(Math.floor(parsed * 10 ** decimals))
-      const calls = [{ to: tokenAddr, data: '0xa9059cbb' + '000000000000000000000000' + getAddress(params.to).slice(2).toLowerCase() + amountBigInt.toString(16).padStart(64, '0'), value: '0x0' }]
-      const { createPendingTx } = await import('./sessionKeyService.mjs')
-      const pending = createPendingTx(userId, { walletAddress: gate.entry.walletAddress, calls, chainKey: gate.entry.chain || 'arc-testnet', paymaster: true })
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'pending', txId: pending.txId, walletAddress: gate.entry.walletAddress, message: `Kirim ${params.amount} ${token} ke ${params.to} menunggu konfirmasi passkey di Plugin page. Buka Plugin → tab Transaksi → Approve.` }) }] }
+      const { sendViaSession } = await import('./sessionKeyService.mjs')
+      const result = await sendViaSession(userId, params.to, params.amount, token)
+      if (result.status === 'success') {
+        await recordAutoExec(userId, {
+          agent: resolveAgentForUser(userId), action: 'send', amount: params.amount, token,
+          source: 'session', to: params.to, details: JSON.stringify({ previewId: params.previewId }),
+          txHash: result.txHash, explorerUrl: result.explorerUrl,
+        })
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Kirim ${params.amount} ${token} ke ${params.to} berhasil via MSCA (session key).` }) }] }
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session send gagal' }) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e?.message || 'Session error' }) }] }
     }
