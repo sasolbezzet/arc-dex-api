@@ -183,7 +183,7 @@ export function siweMessageHandler(req, res) {
 }
 
 // ── SIWE verify + issue auth code ──
-import { verifyMessage } from 'viem'
+import { createPublicClient, decodeEventLog, defineChain, encodeFunctionData, formatUnits, getAddress, http, parseUnits, verifyMessage } from 'viem'
 export async function siweVerifyHandler(req, res) {
   const { address, message, signature, clientId, redirectUri, state, codeChallenge } = req.body || {}
   if (!address || !message || !clientId) return res.status(400).json({ error: 'missing fields' })
@@ -299,88 +299,194 @@ function chainKey(slug) {
   return CHAIN_SLUG_TO_KEY[s] || slug
 }
 
-// CCTP V2 bridge support for the MCP Agent Wallet. The source path is limited
-// to Arc Testnet so the active MSCA session key is authorized on the source
-// chain. Destination mint is delegated to Circle Forwarding Service, which
-// calls receiveMessage for the same MSCA recipient; no EOA private key is used.
+// CCTP bridge support for the MCP Agent Wallet. The source path is limited to
+// Arc Testnet and reuses the verified ArcoxRouter flow used by the frontend and
+// local ARCOX MCP. The router sees the MSCA as msg.sender when called inside a
+// UserOperation, so the user's EOA is never a payer or signer.
 const BRIDGE_CCTP = {
   Arc_Testnet: {
     domain: 26,
     usdc: '0x3600000000000000000000000000000000000000',
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
+    // The same verified ArcoxRouter used by the frontend/local ARCOX MCP.
+    router: process.env.ARCOX_FEE_ROUTER_ADDRESS || '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
   },
   Ethereum_Sepolia: { domain: 0, explorer: 'https://sepolia.etherscan.io/tx/' },
   Base_Sepolia: { domain: 6, explorer: 'https://sepolia.basescan.org/tx/' },
   Arbitrum_Sepolia: { domain: 3, explorer: 'https://sepolia.arbiscan.io/tx/' },
   HyperEVM_Testnet: { domain: 19, explorer: 'https://app.hyperliquid-testnet.xyz/explorer/tx/' },
 }
-// Explicit opt-in: Arc/Circle docs establish the CCTP primitives, but do not
-// provide an end-to-end MSCA + Arc-source Forwarding Service example. Keep the
-// value-moving path disabled until the deployed TokenMessenger ABI and one
-// controlled testnet transfer are verified. Read-only route/status checks remain
-// available while this is false.
+// The route is explicit opt-in so a deployment cannot start moving funds just
+// because code was updated. Enable it only after the router and destination
+// mint relayer have been configured and a small testnet transfer is approved.
 const ENABLE_MSCA_CCTP_BRIDGE = process.env.ENABLE_MSCA_CCTP_BRIDGE === 'true'
-const BRIDGE_FORWARD_HOOK = '0x636374702d666f72776172640000000000000000000000000000000000000000'
+const ENABLE_SERVER_SIGNED_MINT = process.env.ENABLE_SERVER_SIGNED_MINT === 'true'
 const BRIDGE_ZERO_BYTES32 = `0x${'0'.repeat(64)}`
+const BRIDGE_MAX_FEE = BigInt(process.env.CCTP_MAX_FEE_BASE_UNITS || '10')
+const BRIDGE_MIN_FINALITY_THRESHOLD = Number(process.env.CCTP_MIN_FINALITY_THRESHOLD || '1000')
 const BRIDGE_APPROVE_ABI = [{
   type: 'function', name: 'approve', stateMutability: 'nonpayable',
   inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }],
   outputs: [{ name: '', type: 'bool' }],
 }]
-const BRIDGE_DEPOSIT_WITH_HOOK_ABI = [{
-  type: 'function', name: 'depositForBurnWithHook', stateMutability: 'nonpayable',
+const BRIDGE_EVENT_ABI = [{
+  type: 'event', name: 'BridgeWithFee', anonymous: false,
   inputs: [
-    { name: 'amount', type: 'uint256' }, { name: 'destinationDomain', type: 'uint32' },
-    { name: 'mintRecipient', type: 'bytes32' }, { name: 'burnToken', type: 'address' },
-    { name: 'destinationCaller', type: 'bytes32' }, { name: 'maxFee', type: 'uint256' },
-    { name: 'minFinalityThreshold', type: 'uint32' }, { name: 'hookData', type: 'bytes' },
-  ], outputs: [],
+    { name: 'payer', type: 'address', indexed: true },
+    { name: 'destinationDomain', type: 'uint32', indexed: true },
+    { name: 'mintRecipient', type: 'bytes32', indexed: false },
+    { name: 'amount', type: 'uint256', indexed: false },
+    { name: 'fee', type: 'uint256', indexed: false },
+  ],
 }]
+const BRIDGE_ROUTER_ABI = [
+  {
+    type: 'function', name: 'quoteFee', stateMutability: 'view',
+    inputs: [{ name: 'amount', type: 'uint256' }],
+    outputs: [{ name: 'fee', type: 'uint256' }, { name: 'netAmount', type: 'uint256' }],
+  },
+  {
+    type: 'function', name: 'bridgeUsdcWithFee', stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'amount', type: 'uint256' }, { name: 'destinationDomain', type: 'uint32' },
+      { name: 'mintRecipient', type: 'bytes32' }, { name: 'destinationCaller', type: 'bytes32' },
+      { name: 'maxFee', type: 'uint256' }, { name: 'minFinalityThreshold', type: 'uint32' },
+    ], outputs: [{ name: 'fee', type: 'uint256' }, { name: 'netAmount', type: 'uint256' }],
+  },
+]
+const ARC_BRIDGE_CHAIN = defineChain({
+  id: 5042002,
+  name: 'Arc Testnet',
+  nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
+  rpcUrls: { default: { http: [process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network'] } },
+})
 
 function bridgeConfig(fromChain, toChain) {
   const source = BRIDGE_CCTP[chainKey(fromChain)]
   const destination = BRIDGE_CCTP[chainKey(toChain)]
   if (!source || !destination || source.domain === destination.domain) return null
+  if (!source.router) return null
   return { fromKey: chainKey(fromChain), toKey: chainKey(toChain), source, destination }
 }
 
-async function getForwardingFeeQuote(sourceDomain, destinationDomain, amount) {
-  const url = `https://iris-api-sandbox.circle.com/v2/burn/USDC/fees/${sourceDomain}/${destinationDomain}?forward=true`
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 15_000)
-  try {
-    const response = await fetch(url, { headers: { Accept: 'application/json' }, signal: controller.signal })
-    if (!response.ok) throw new Error(`CCTP forwarding fee HTTP ${response.status}`)
-    const fees = await response.json()
-    const fee = Array.isArray(fees) ? fees.find(item => Number(item?.finalityThreshold) === 1000) : null
-    const forwardFee = BigInt(String(fee?.forwardFee?.med ?? fee?.forwardFee ?? '0'))
-    const minimumFee = Number(fee?.minimumFee || 0)
-    if (!fee || !Number.isFinite(minimumFee) || forwardFee < 0n) throw new Error('CCTP forwarding fee unavailable')
-    // Circle's CCTP quickstart expresses minimumFee in percentage points.
-    const protocolFee = (amount * BigInt(Math.round(minimumFee * 100))) / 1_000_000n
-    const maxFee = forwardFee + protocolFee
-    if (maxFee <= 0n) throw new Error('CCTP forwarding route is not available for this domain pair')
-    return { maxFee, totalAmount: amount + maxFee, finalityThreshold: 1000, minimumFee, forwardFee }
-  } catch (error) {
-    if (error?.name === 'AbortError') throw new Error('CCTP forwarding fee request timeout')
-    throw error
-  } finally {
-    clearTimeout(timer)
+async function getRouterFeeQuote(route, amount) {
+  const client = createPublicClient({ chain: ARC_BRIDGE_CHAIN, transport: http(ARC_BRIDGE_CHAIN.rpcUrls.default.http[0]) })
+  const result = await client.readContract({
+    address: getAddress(route.source.router),
+    abi: BRIDGE_ROUTER_ABI,
+    functionName: 'quoteFee',
+    args: [amount],
+  })
+  const fee = BigInt(result?.[0] ?? 0)
+  const netAmount = BigInt(result?.[1] ?? 0)
+  if (fee < 0n || netAmount <= 0n || netAmount > amount) throw new Error('ArcoxRouter returned an invalid bridge fee quote')
+  return { fee, netAmount }
+}
+
+// Pure calldata builder shared by execution and regression tests. The router
+// pulls the gross amount from msg.sender (the MSCA), sends its platform fee to
+// treasury, and burns the remaining netAmount through standard CCTP V2.
+export function buildMscaRouterBridgeCalls({ route, amount, mintRecipient, maxFee = BRIDGE_MAX_FEE, minFinalityThreshold = BRIDGE_MIN_FINALITY_THRESHOLD }) {
+  if (!route?.source?.router || !route?.source?.usdc || route?.destination?.domain === undefined) throw new Error('Invalid ArcoxRouter bridge route')
+  const grossAmount = BigInt(amount)
+  if (grossAmount <= 0n) throw new Error('Bridge amount must be positive')
+  const recipient = getAddress(mintRecipient)
+  const recipientBytes32 = `0x${recipient.slice(2).toLowerCase().padStart(64, '0')}`
+  return [
+    {
+      to: getAddress(route.source.usdc), value: 0n,
+      data: encodeFunctionData({ abi: BRIDGE_APPROVE_ABI, functionName: 'approve', args: [getAddress(route.source.router), grossAmount] }),
+    },
+    {
+      to: getAddress(route.source.router), value: 0n,
+      data: encodeFunctionData({
+        abi: BRIDGE_ROUTER_ABI,
+        functionName: 'bridgeUsdcWithFee',
+        args: [grossAmount, route.destination.domain, recipientBytes32, BRIDGE_ZERO_BYTES32, BigInt(maxFee), Number(minFinalityThreshold)],
+      }),
+    },
+  ]
+}
+
+async function verifyBridgeBurn({ burnTxHash, route, walletAddress, amount }) {
+  const client = createPublicClient({ chain: ARC_BRIDGE_CHAIN, transport: http(ARC_BRIDGE_CHAIN.rpcUrls.default.http[0]) })
+  const receipt = await client.getTransactionReceipt({ hash: burnTxHash })
+  const expectedPayer = getAddress(walletAddress).toLowerCase()
+  const expectedAmount = amount === undefined || amount === null ? null : BigInt(amount)
+  for (const log of receipt.logs) {
+    if (String(log.address).toLowerCase() !== String(route.source.router).toLowerCase()) continue
+    try {
+      const decoded = decodeEventLog({ abi: BRIDGE_EVENT_ABI, data: log.data, topics: log.topics })
+      const args = decoded.args || {}
+      const payer = getAddress(args.payer).toLowerCase()
+      const recipient = String(args.mintRecipient).toLowerCase()
+      const expectedRecipient = `0x${expectedPayer.slice(2).padStart(64, '0')}`
+      if (payer !== expectedPayer || Number(args.destinationDomain) !== Number(route.destination.domain) || recipient !== expectedRecipient || (expectedAmount !== null && BigInt(args.amount) !== expectedAmount)) continue
+      return { ok: true, receipt, args }
+    } catch { /* inspect the next router log */ }
+  }
+  return { ok: false, reason: 'bridge_burn_proof_mismatch' }
+}
+
+function decodeCctpMessageHeader(message) {
+  const raw = String(message || '').replace(/^0x/i, '')
+  // Circle MessageV2: version/source/destination (uint32), nonce (uint64),
+  // sender/recipient/destinationCaller (bytes32), then finality fields.
+  if (raw.length < 256) return null
+  return {
+    version: Number(BigInt(`0x${raw.slice(0, 8)}`)),
+    sourceDomain: Number(BigInt(`0x${raw.slice(8, 16)}`)),
+    destinationDomain: Number(BigInt(`0x${raw.slice(16, 24)}`)),
+    recipient: `0x${raw.slice(104, 168).slice(24)}`.toLowerCase(),
   }
 }
 
-async function getForwardedBridgeStatus({ burnTxHash, sourceDomain }) {
+async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain, walletAddress }) {
   const url = `https://iris-api-sandbox.circle.com/v2/messages/${sourceDomain}?transactionHash=${encodeURIComponent(burnTxHash)}`
   try {
     const response = await fetch(url, { headers: { Accept: 'application/json' } })
-    if (!response.ok) return { status: 'pending', burnTxHash }
+    if (!response.ok) return { status: 'pending', burnTxHash, verified: false }
     const data = await response.json()
     const message = data?.messages?.[0]
-    if (message?.forwardTxHash) return { status: 'success', burnTxHash, forwardTxHash: message.forwardTxHash, messageStatus: message.status || 'complete' }
-    return { status: message?.status === 'complete' ? 'attestation_ready' : 'pending', burnTxHash, messageStatus: message?.status || 'pending' }
+    if (!message) return { status: 'pending', burnTxHash, verified: false }
+    const header = decodeCctpMessageHeader(message.message)
+    if (!header || header.sourceDomain !== Number(sourceDomain) || header.destinationDomain !== Number(destinationDomain)) {
+      return { status: 'rejected', burnTxHash, verified: false, reason: 'cctp_message_route_unverified' }
+    }
+    const expectedRecipient = String(walletAddress).toLowerCase()
+    if (header.recipient !== expectedRecipient) {
+      return { status: 'rejected', burnTxHash, verified: false, reason: 'cctp_message_recipient_unverified', messageHeader: header }
+    }
+    const hasAttestation = Boolean(message.attestation && message.message)
+    return {
+      status: hasAttestation ? 'attestation_ready' : message.status === 'complete' ? 'attestation_ready' : 'pending',
+      burnTxHash,
+      verified: hasAttestation,
+      walletAddress,
+      message: message.message || null,
+      attestation: message.attestation || null,
+      messageStatus: message.status || 'pending',
+      sourceDomain,
+      destinationDomain,
+      messageHeader: header,
+    }
   } catch {
-    return { status: 'pending', burnTxHash }
+    return { status: 'pending', burnTxHash, verified: false }
   }
+}
+
+async function mintDestinationViaBackend({ burnTxHash, fromChain, toChain, walletAddress, amount }) {
+  const result = await apiPost('/api/mint-direct', {
+    burnTxHash,
+    fromChain,
+    toChain,
+    toAddress: walletAddress,
+    amount,
+  }, walletAddress)
+  if (result?.success !== true || !result.txHash) {
+    return { success: false, error: result?.error || 'Destination receiveMessage belum tersedia' }
+  }
+  return { success: true, txHash: result.txHash, explorerUrl: result.explorerUrl || null }
 }
 
 // Decide whether an agent-initiated action can auto-execute server-side.
@@ -424,23 +530,44 @@ function createExecutionQuote(userId, action, params) {
   return quote
 }
 
-function consumeExecutionQuote(userId, action, previewId, params) {
+function destinationMintDisabledReason() {
+  if (!ENABLE_SERVER_SIGNED_MINT) return 'destination_mint_relayer_not_configured'
+  if (!/^0x[0-9a-fA-F]{64}$/.test(String(process.env.OWNER_PRIVATE_KEY || ''))) return 'destination_mint_signer_not_configured'
+  if (!String(process.env.AUTH_SECRET || '')) return 'destination_mint_auth_not_configured'
+  return null
+}
+
+function bridgeConfigDisabledReason(route) {
+  if (!ENABLE_MSCA_CCTP_BRIDGE) return 'msca_bridge_disabled_until_router_validation'
+  if (!route?.source?.router) return 'bridge_router_not_configured'
+  return destinationMintDisabledReason()
+}
+
+function validConfirmationText(value) {
+  const text = String(value || '').trim().toLowerCase()
+  return text === 'yes' || text === 'ya'
+}
+
+function inspectExecutionQuote(userId, action, previewId, params) {
   const quote = executionQuotes.get(String(previewId || ''))
   if (!quote || quote.userId !== userId || quote.action !== action || Date.now() > quote.expires) return { ok: false, reason: 'invalid_or_expired_quote' }
   const fields = ['to', 'amount', 'token', 'tokenIn', 'tokenOut', 'amountIn', 'fromChain', 'toChain', 'walletAddress']
   for (const field of fields) {
     if (quote.params[field] !== undefined && String(quote.params[field]) !== String(params[field])) return { ok: false, reason: 'quote_parameters_mismatch' }
   }
-  executionQuotes.delete(quote.previewId)
   return { ok: true, quote }
+}
+
+function consumeExecutionQuote(userId, action, previewId, params) {
+  const result = inspectExecutionQuote(userId, action, previewId, params)
+  if (result.ok) executionQuotes.delete(result.quote.previewId)
+  return result
 }
 
 // ── x402 via MSCA (session key) ──
 // Arc Memo must be called directly by an EOA. An ERC-4337 MSCA therefore pays
 // x402 with a plain USDC transfer from the MSCA. The invoice is bound to the
 // exact MSCA payer and reconciled from the resulting Transfer event.
-import { encodeFunctionData, getAddress, parseUnits } from 'viem'
-
 const X402_ARC_USDC = process.env.X402_USDC_ADDRESS || '0x3600000000000000000000000000000000000000'
 const X402_TRANSFER_ABI = [{ type: 'function', name: 'transfer', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
 const X402_APPROVE_ABI = [{ type: 'function', name: 'approve', stateMutability: 'nonpayable', inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
@@ -681,17 +808,19 @@ export function createMcpServer(userId) {
       .map(token => String(token).toUpperCase())
     const hasUnsupportedSwapToken = action === 'swap' && tokens.some(token => token === 'CIRBTC' || token === 'USYC')
     const knownAction = ['swap', 'send', 'bridge'].includes(action)
-    const bridgeIsSupported = action === 'bridge' && ENABLE_MSCA_CCTP_BRIDGE && Boolean(bridgeConfig(params.fromChain, params.toChain))
+    const bridgeIsSupported = action === 'bridge' && ENABLE_MSCA_CCTP_BRIDGE && ENABLE_SERVER_SIGNED_MINT && String(params.token || 'USDC').toUpperCase() === 'USDC' && Boolean(bridgeConfig(params.fromChain, params.toChain))
     const session = await resolveActiveMsca(userId)
     const mscaSupported = Boolean(session) && source === 'session' && knownAction && (action === 'bridge' ? bridgeIsSupported : !hasUnsupportedSwapToken)
+    const route = action === 'bridge' ? bridgeConfig(params.fromChain, params.toChain) : null
+    const disabledReason = action === 'bridge' ? bridgeConfigDisabledReason(route) : null
     const reason = !session
       ? 'no_session'
       : source !== 'session'
         ? 'msca_only'
         : !knownAction
           ? 'unknown_action'
-          : action === 'bridge' && !ENABLE_MSCA_CCTP_BRIDGE
-            ? 'msca_bridge_disabled_until_abi_verification'
+          : disabledReason
+            ? disabledReason
             : action === 'bridge' && !bridgeIsSupported
               ? 'bridge_route_not_supported_for_msca'
               : hasUnsupportedSwapToken
@@ -751,7 +880,7 @@ export function createMcpServer(userId) {
     confirmed: z.boolean().describe('Must be true to execute'),
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
-    if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
+    if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
     const source = params.source || 'session'
     if (source !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
@@ -810,8 +939,8 @@ export function createMcpServer(userId) {
     token: z.string().optional().describe('Token symbol. Default USDC'),
     source: z.string().optional().describe('session (MSCA)'),
   }, async (params) => {
-    // CCTP bridge via Agent Wallet (MSCA). The source burn is a UserOperation;
-    // Circle Forwarding Service completes the destination mint to the same MSCA.
+      // CCTP bridge via Agent Wallet (MSCA). The source burn is a UserOperation;
+    // Circle attestation plus the configured destination relayer completes mint to the same MSCA.
     const token = params.token || 'USDC'
     const src = params.source || 'session'
     if (src !== 'session') {
@@ -820,35 +949,50 @@ export function createMcpServer(userId) {
     const info = await resolveActiveMsca(userId)
     if (!info) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
-    if (!ENABLE_MSCA_CCTP_BRIDGE) {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_bridge_disabled_until_abi_verification', message: 'Bridge MSCA belum diaktifkan: ABI TokenMessenger Arc dan Forwarding Service source Arc harus diverifikasi dengan satu transfer testnet terkontrol terlebih dahulu.' }) }] }
+    const disabledReason = bridgeConfigDisabledReason(route)
+    if (disabledReason) {
+      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: disabledReason, message: disabledReason === 'destination_mint_relayer_not_configured' ? 'Destination mint relayer belum dikonfigurasi.' : 'Bridge MSCA belum diaktifkan.' }) }] }
     }
     if (!route || route.fromKey !== 'Arc_Testnet' || token.toUpperCase() !== 'USDC') {
       return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke chain EVM CCTP yang didukung.' }) }] }
     }
-    const quote = createExecutionQuote(userId, 'bridge', {
-      fromChain: params.fromChain,
-      toChain: params.toChain,
-      amount: params.amount,
-      token,
-      walletAddress: info.walletAddress,
-    })
-    return { content: [{ type: 'text', text: JSON.stringify({
-      preview: true,
-      route: `${params.fromChain} → ${params.toChain}`,
-      amountIn: params.amount,
-      token: 'USDC',
-      source: 'session',
-      walletAddress: info.walletAddress,
-      walletType: 'MSCA',
-      destinationWallet: info.walletAddress,
-      estimatedReceive: `~${params.amount} ${token}`,
-      note: 'MSCA → MSCA melalui CCTP V2 Forwarding Service. Source UserOperation membakar USDC dari MSCA; Circle merelay mint di destination. Tidak ada fallback ke EOA/Circle proxy.',
-      previewId: quote.previewId,
-      expiresAt: new Date(quote.expires).toISOString(),
-      execution: 'approve USDC → depositForBurnWithHook → Circle forwarding mint',
-      safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_bridge dengan confirmed=true.',
-    }) }] }
+    try {
+      const amount = parseUnits(String(params.amount).trim(), 6)
+      if (amount <= 0n) throw new Error('Amount bridge tidak valid')
+      const fee = await getRouterFeeQuote(route, amount)
+      const quote = createExecutionQuote(userId, 'bridge', {
+        fromChain: route.fromKey,
+        toChain: route.toKey,
+        amount: params.amount,
+        token: 'USDC',
+        walletAddress: info.walletAddress,
+        platformFeeBaseUnits: fee.fee.toString(),
+        netBurnBaseUnits: fee.netAmount.toString(),
+        router: route.source.router,
+        maxFeeBaseUnits: BRIDGE_MAX_FEE.toString(),
+        minFinalityThreshold: BRIDGE_MIN_FINALITY_THRESHOLD,
+      })
+      return { content: [{ type: 'text', text: JSON.stringify({
+        preview: true,
+        route: `${params.fromChain} → ${params.toChain}`,
+        amountIn: params.amount,
+        token: 'USDC',
+        source: 'session',
+        walletAddress: info.walletAddress,
+        walletType: 'MSCA',
+        destinationWallet: info.walletAddress,
+        platformFee: formatUnits(fee.fee, 6),
+        estimatedReceive: formatUnits(fee.netAmount, 6),
+        router: route.source.router,
+        note: 'MSCA → MSCA melalui ArcoxRouter.bridgeUsdcWithFee → CCTP depositForBurn. Router menarik gross USDC dari MSCA; destination recipient tetap MSCA. Tidak ada fallback ke EOA/Circle proxy.',
+        previewId: quote.previewId,
+        expiresAt: new Date(quote.expires).toISOString(),
+        execution: 'approve USDC → ArcoxRouter.bridgeUsdcWithFee → CCTP attestation → receiveMessage destination',
+        safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_bridge dengan confirmed=true.',
+      }) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'bridge_quote_unavailable', message: e?.message || 'ArcoxRouter quote tidak tersedia' }) }] }
+    }
   })
 
   server.tool('arcox_execute_bridge', 'Execute a confirmed bridge via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_bridge and user confirmation.', {
@@ -861,7 +1005,7 @@ export function createMcpServer(userId) {
     confirmed: z.boolean().describe('Must be true to execute'),
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
-    if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
+    if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
     const source = params.source || 'session'
     if (source !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Circle proxy dan EOA tidak diizinkan untuk agent remote.' }) }] }
@@ -869,8 +1013,9 @@ export function createMcpServer(userId) {
     const info = await resolveActiveMsca(userId)
     if (!info) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
-    if (!ENABLE_MSCA_CCTP_BRIDGE) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_bridge_disabled_until_abi_verification', message: 'Bridge MSCA belum diaktifkan karena ABI TokenMessenger/Forwarding Service belum diverifikasi untuk eksekusi aman.' }) }] }
+    const disabledReason = bridgeConfigDisabledReason(route)
+    if (disabledReason) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: disabledReason, message: disabledReason === 'destination_mint_relayer_not_configured' ? 'Destination mint relayer belum dikonfigurasi. Tidak ada UserOperation yang dikirim.' : 'Bridge MSCA belum diaktifkan. Tidak ada UserOperation yang dikirim.' }) }] }
     }
     if (!route || route.fromKey !== 'Arc_Testnet' || String(params.token || 'USDC').toUpperCase() !== 'USDC') {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke chain EVM CCTP yang didukung.' }) }] }
@@ -880,42 +1025,46 @@ export function createMcpServer(userId) {
     try {
       const amount = parseUnits(String(params.amount).trim(), 6)
       if (amount <= 0n) throw new Error('Amount bridge tidak valid')
-      const fee = await getForwardingFeeQuote(route.source.domain, route.destination.domain, amount)
-      const quoteCheck = consumeExecutionQuote(userId, 'bridge', params.previewId, {
-        fromChain: params.fromChain,
-        toChain: params.toChain,
+      const fee = await getRouterFeeQuote(route, amount)
+      const quoteCheck = inspectExecutionQuote(userId, 'bridge', params.previewId, {
+        fromChain: route.fromKey,
+        toChain: route.toKey,
         amount: params.amount,
         token: 'USDC',
         walletAddress: info.walletAddress,
       })
       if (!quoteCheck.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
-      const mintRecipient = `0x${info.walletAddress.slice(2).toLowerCase().padStart(64, '0')}`
-      const calls = [
-        {
-          to: getAddress(route.source.usdc), value: 0n,
-          data: encodeFunctionData({ abi: BRIDGE_APPROVE_ABI, functionName: 'approve', args: [getAddress(route.source.tokenMessenger), fee.totalAmount] }),
-        },
-        {
-          to: getAddress(route.source.tokenMessenger), value: 0n,
-          data: encodeFunctionData({
-            abi: BRIDGE_DEPOSIT_WITH_HOOK_ABI,
-            functionName: 'depositForBurnWithHook',
-            args: [fee.totalAmount, route.destination.domain, mintRecipient, getAddress(route.source.usdc), BRIDGE_ZERO_BYTES32, fee.maxFee, fee.finalityThreshold, BRIDGE_FORWARD_HOOK],
-          }),
-        },
-      ]
+      const quotedFee = quoteCheck.quote.params.platformFeeBaseUnits
+      const quotedNet = quoteCheck.quote.params.netBurnBaseUnits
+      if (quoteCheck.quote.params.router !== route.source.router || quoteCheck.quote.params.maxFeeBaseUnits !== BRIDGE_MAX_FEE.toString() || Number(quoteCheck.quote.params.minFinalityThreshold) !== BRIDGE_MIN_FINALITY_THRESHOLD || quotedFee !== fee.fee.toString() || quotedNet !== fee.netAmount.toString()) {
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'quote_fee_changed', message: 'Router fee berubah setelah preview. Buat quote bridge baru.' }) }] }
+      }
+      executionQuotes.delete(quoteCheck.quote.previewId)
+      const calls = buildMscaRouterBridgeCalls({ route, amount, mintRecipient: info.walletAddress })
       const { executeViaSession } = await import('./sessionKeyService.mjs')
-      const result = await executeViaSession(userId, calls, { paymaster: true, chainKey: 'arc-testnet' })
+      const result = await executeViaSession(userId, calls, { paymaster: true, chainKey: 'arc-testnet', requireTransactionHash: true })
       if (result.status !== 'success') return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Bridge UserOperation gagal', userOpHash: result.userOpHash }) }] }
-      const bridgeStatus = await getForwardedBridgeStatus({ burnTxHash: result.txHash, sourceDomain: route.source.domain })
-      await recordAutoExec(userId, {
-        agent: resolveAgentForUser(userId), action: 'bridge', amount: params.amount, token: 'USDC',
-        source: 'session', details: JSON.stringify({ fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId }),
-        txHash: result.txHash, explorerUrl: result.explorerUrl,
-      }).catch(() => null)
+      const burnProof = await verifyBridgeBurn({ burnTxHash: result.txHash, route, walletAddress: info.walletAddress, amount })
+      if (!burnProof.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'burn_submitted', executed: true, verified: false, burnTxHash: result.txHash, userOpHash: result.userOpHash, reason: burnProof.reason, message: 'Source UserOperation berhasil tetapi bukti event router belum terverifikasi. Jangan ulangi burn; periksa transaksi ini secara read-only.' }) }] }
+      const bridgeStatus = await getCctpBridgeStatus({ burnTxHash: result.txHash, sourceDomain: route.source.domain, destinationDomain: route.destination.domain, walletAddress: info.walletAddress })
+      const mint = bridgeStatus.verified
+        ? await mintDestinationViaBackend({ burnTxHash: result.txHash, fromChain: route.fromKey, toChain: route.toKey, walletAddress: info.walletAddress, amount: params.amount }).catch(error => ({ success: false, error: error?.message || 'Destination mint request failed' }))
+        : { success: false, error: 'Attestation belum ready' }
+      let auditPending = false
+      try {
+        await recordAutoExec(userId, {
+          agent: resolveAgentForUser(userId), action: 'bridge', amount: params.amount, token: 'USDC',
+          source: 'session', details: JSON.stringify({ fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId, destinationMint: mint.success }),
+          txHash: result.txHash, explorerUrl: result.explorerUrl,
+        })
+      } catch (auditError) {
+        auditPending = true
+        console.error('[mcp-bridge] audit record failed after burn:', auditError?.message || auditError)
+      }
       return { content: [{ type: 'text', text: JSON.stringify({
-        status: bridgeStatus.status === 'success' ? 'executed' : 'settlement_pending',
+        status: mint.success ? 'executed' : 'settlement_pending',
         executed: true,
+        auditPending,
         walletAddress: info.walletAddress,
         walletType: 'MSCA',
         fromChain: route.fromKey,
@@ -924,25 +1073,26 @@ export function createMcpServer(userId) {
         token: 'USDC',
         burnTxHash: result.txHash,
         userOpHash: result.userOpHash,
-        forwardTxHash: bridgeStatus.forwardTxHash || null,
         messageStatus: bridgeStatus.messageStatus || null,
         explorerUrl: result.explorerUrl,
-        destinationExplorerUrl: bridgeStatus.forwardTxHash && route.destination.explorer ? `${route.destination.explorer}${bridgeStatus.forwardTxHash}` : null,
-        fee: { maxFeeBaseUnits: fee.maxFee.toString(), forwardingFeeBaseUnits: fee.forwardFee.toString(), protocolFeeBaseUnits: (fee.maxFee - fee.forwardFee).toString(), totalDebitBaseUnits: fee.totalAmount.toString() },
-        message: bridgeStatus.status === 'success' ? 'Bridge MSCA berhasil dan Circle sudah menyelesaikan mint destination.' : 'Burn MSCA berhasil. Circle sedang menyelesaikan mint destination; gunakan arcox_bridge_status untuk polling.',
+        mintTxHash: mint.txHash || null,
+        destinationExplorerUrl: mint.explorerUrl || null,
+        mintError: mint.success ? null : mint.error,
+        fee: { platformFeeBaseUnits: fee.fee.toString(), netBurnBaseUnits: fee.netAmount.toString(), totalDebitBaseUnits: amount.toString(), cctpMaxFeeBaseUnits: BRIDGE_MAX_FEE.toString() },
+        message: mint.success ? 'Bridge MSCA berhasil sampai destination.' : 'Burn MSCA berhasil; destination mint masih pending. Jalankan arcox_bridge_status lalu retry setelah attestation siap.',
       }) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'bridge_error', executed: false, error: e?.message || 'MSCA bridge gagal' }) }] }
     }
   })
 
-  server.tool('arcox_bridge_status', 'Check the Circle Forwarding Service status for an MSCA bridge burn transaction.', {
+  server.tool('arcox_bridge_status', 'Check attestation and destination mint status for an MSCA bridge burn transaction.', {
     burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Source-chain burn transaction hash'),
     fromChain: z.string().describe('Source chain, currently arc-testnet'),
     toChain: z.string().describe('Destination chain used by the original quote'),
   }, async (params) => {
     if (!ENABLE_MSCA_CCTP_BRIDGE) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'disabled', verified: false, reason: 'msca_bridge_disabled_until_abi_verification', message: 'Bridge MSCA status belum diaktifkan karena jalur Arc-source Forwarding Service belum diverifikasi. Tidak ada transaksi yang dikirim.' }) }] }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'disabled', verified: false, reason: 'msca_bridge_disabled_until_router_validation', message: 'Bridge MSCA status belum diaktifkan karena ArcoxRouter dan destination mint relayer belum tervalidasi. Tidak ada transaksi yang dikirim.' }) }] }
     }
     const info = await resolveActiveMsca(userId)
     if (!info) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
@@ -950,14 +1100,51 @@ export function createMcpServer(userId) {
     if (!route || route.fromKey !== 'Arc_Testnet') {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', reason: 'bridge_route_not_supported_for_msca', message: 'Status bridge MSCA hanya tersedia untuk burn dari Arc Testnet.' }) }] }
     }
-    const status = await getForwardedBridgeStatus({ burnTxHash: params.burnTxHash, sourceDomain: route.source.domain })
+    try {
+      const burnProof = await verifyBridgeBurn({ burnTxHash: params.burnTxHash, route, walletAddress: info.walletAddress })
+      if (!burnProof.ok) {
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', verified: false, reason: burnProof.reason }) }] }
+      }
+    } catch {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', verified: false, reason: 'bridge_burn_not_found' }) }] }
+    }
+    const status = await getCctpBridgeStatus({ burnTxHash: params.burnTxHash, sourceDomain: route.source.domain, destinationDomain: route.destination.domain, walletAddress: info.walletAddress })
+    if (status.status === 'rejected') return { content: [{ type: 'text', text: JSON.stringify(status) }] }
     return { content: [{ type: 'text', text: JSON.stringify({
       ...status,
       walletAddress: info.walletAddress,
       walletType: 'MSCA',
       source: route.fromKey,
-      note: 'Status ini membaca Iris/Circle Forwarding Service dan tidak mengirim transaksi baru.',
+      note: 'Status ini membaca Iris/Circle attestation dan tidak mengirim transaksi baru.',
     }) }] }
+  })
+
+  server.tool('arcox_retry_bridge_mint', 'Retry destination receiveMessage for a confirmed MSCA bridge burn. This never burns again; it only polls attestation and mints the already-bound MSCA recipient.', {
+    burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Previously confirmed Arc router bridge transaction hash'),
+    fromChain: z.string().describe('Original source chain, currently arc-testnet'),
+    toChain: z.string().describe('Original destination chain'),
+    confirmed: z.boolean().describe('Must be true to retry destination mint'),
+    confirmationText: z.string().describe('Must be exactly yes or ya'),
+  }, async (params) => {
+    if (!params.confirmed || !validConfirmationText(params.confirmationText)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'preview_required', executed: false, message: 'Retry mint memerlukan confirmed=true dan confirmationText exactly yes atau ya.' }) }] }
+    }
+    const info = await resolveActiveMsca(userId)
+    if (!info) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    const route = bridgeConfig(params.fromChain, params.toChain)
+    const disabledReason = bridgeConfigDisabledReason(route)
+    if (disabledReason) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: disabledReason }) }] }
+    if (!route || route.fromKey !== 'Arc_Testnet') return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca' }) }] }
+    try {
+      const proof = await verifyBridgeBurn({ burnTxHash: params.burnTxHash, route, walletAddress: info.walletAddress })
+      if (!proof.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: proof.reason, message: 'Burn ini tidak terbukti berasal dari ArcoxRouter untuk MSCA aktif.' }) }] }
+      const status = await getCctpBridgeStatus({ burnTxHash: params.burnTxHash, sourceDomain: route.source.domain, destinationDomain: route.destination.domain, walletAddress: info.walletAddress })
+      if (!status.verified) return { content: [{ type: 'text', text: JSON.stringify({ status: 'settlement_pending', executed: false, burnTxHash: params.burnTxHash, messageStatus: status.messageStatus || 'pending', message: 'Attestation belum tersedia. Tidak ada transaksi destination yang dikirim.' }) }] }
+      const mint = await mintDestinationViaBackend({ burnTxHash: params.burnTxHash, fromChain: route.fromKey, toChain: route.toKey, walletAddress: info.walletAddress, amount: undefined })
+      return { content: [{ type: 'text', text: JSON.stringify({ status: mint.success ? 'minted' : 'mint_failed', executed: mint.success, burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationExplorerUrl: mint.explorerUrl || null, error: mint.success ? null : mint.error, message: mint.success ? 'Destination mint berhasil ke MSCA.' : 'Destination mint gagal; cek error dan ulangi retry setelah memastikan relayer siap.' }) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'retry_error', executed: false, burnTxHash: params.burnTxHash, error: e?.message || 'Retry mint gagal' }) }] }
+    }
   })
 
   // ── SEND TOOLS (quote → confirm → execute) ──
@@ -1004,7 +1191,7 @@ export function createMcpServer(userId) {
     confirmed: z.boolean().describe('Must be true to execute'),
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
-    if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
+    if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
     const source = params.source || 'session'
     const token = params.token || 'USDC'
     if (source !== 'session') {
@@ -1082,7 +1269,7 @@ export function createMcpServer(userId) {
             swap: ['arcox_quote_swap → show preview → user ya → arcox_execute_swap (source=session)'],
             bridge: ENABLE_MSCA_CCTP_BRIDGE
               ? ['arcox_quote_bridge → show preview → user ya → arcox_execute_bridge → jika pending, arcox_bridge_status. Source Arc Testnet USDC, destination EVM CCTP yang didukung.']
-              : ['arcox_route_status(action=bridge) → bridge MSCA masih disabled sampai ABI TokenMessenger Arc dan Forwarding Service diverifikasi. Tidak ada dana yang dipindahkan.'],
+              : ['arcox_route_status(action=bridge) → bridge MSCA masih disabled sampai ArcoxRouter, destination relayer, dan CCTP route tervalidasi. Tidak ada dana yang dipindahkan.'],
             send: ['arcox_quote_send → show preview → user ya → arcox_execute_send (source=session)'],
             intel_x402: ['arcox_intel_get_* → jika paymentRequired → arcox_x402_pay_invoice (tanpa confirmed) preview → user ya → confirmed=true → retry intel tool dengan paymentId yang sama'],
             poll: ['After execute returns pending_* → arcox_get_request(approvalId) → poll until success/error'],

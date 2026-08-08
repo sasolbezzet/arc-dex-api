@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { decodeFunctionData } from 'viem'
 
 const EOA = '0x1111111111111111111111111111111111111111'
 const MSCA = '0x2222222222222222222222222222222222222222'
@@ -57,7 +58,7 @@ test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
       })
       const quoteResult = JSON.parse(quote.content[0].text)
       assert.equal(quoteResult.rejected, true)
-      assert.equal(quoteResult.reason, 'msca_bridge_disabled_until_abi_verification')
+      assert.equal(quoteResult.reason, 'msca_bridge_disabled_until_router_validation')
 
       const status = await server._registeredTools.arcox_route_status.handler({
       action: 'bridge',
@@ -69,7 +70,7 @@ test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
       assert.equal(statusResult.supported, false)
       assert.equal(statusResult.executionSupported, false)
       assert.equal(statusResult.walletAddress, MSCA)
-      assert.equal(statusResult.reason, 'msca_bridge_disabled_until_abi_verification')
+      assert.equal(statusResult.reason, 'msca_bridge_disabled_until_router_validation')
     })
   } finally {
     if (previousBridgeFlag === undefined) delete process.env.ENABLE_MSCA_CCTP_BRIDGE
@@ -97,4 +98,43 @@ test('MSCA-bound quote fields distinguish the active wallet', () => {
   const quote = { walletAddress: MSCA, amount: '1', token: 'USDC' }
   const current = { walletAddress: OTHER, amount: '1', token: 'USDC' }
   assert.notEqual(quote.walletAddress.toLowerCase(), current.walletAddress.toLowerCase())
+})
+
+test('MSCA bridge calldata approves and calls the verified ArcoxRouter', async () => {
+  const { buildMscaRouterBridgeCalls } = await import('../src/services/mcpServer.mjs?bridge-calldata-' + Date.now())
+  const route = {
+    fromKey: 'Arc_Testnet',
+    toKey: 'Base_Sepolia',
+    source: {
+      domain: 26,
+      usdc: '0x3600000000000000000000000000000000000000',
+      router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
+    },
+    destination: { domain: 6 },
+  }
+  const calls = buildMscaRouterBridgeCalls({ route, amount: 1_000_000n, mintRecipient: MSCA })
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].to.toLowerCase(), route.source.usdc.toLowerCase())
+  assert.equal(calls[1].to.toLowerCase(), route.source.router.toLowerCase())
+  assert.equal(calls[0].data.slice(0, 10), '0x095ea7b3')
+  assert.notEqual(calls[1].data, '0x')
+  const routerAbi = [{
+    type: 'function', name: 'bridgeUsdcWithFee', stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'amount', type: 'uint256' }, { name: 'destinationDomain', type: 'uint32' },
+      { name: 'mintRecipient', type: 'bytes32' }, { name: 'destinationCaller', type: 'bytes32' },
+      { name: 'maxFee', type: 'uint256' }, { name: 'minFinalityThreshold', type: 'uint32' },
+    ], outputs: [],
+  }]
+  const decoded = decodeFunctionData({ abi: routerAbi, data: calls[1].data })
+  assert.equal(decoded.functionName, 'bridgeUsdcWithFee')
+  assert.deepEqual(decoded.args, [1_000_000n, 6, `0x${MSCA.slice(2).padStart(64, '0')}`, `0x${'0'.repeat(64)}`, 10n, 1000])
+
+  const approveAbi = [{
+    type: 'function', name: 'approve', stateMutability: 'nonpayable',
+    inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [],
+  }]
+  const approve = decodeFunctionData({ abi: approveAbi, data: calls[0].data })
+  assert.equal(approve.functionName, 'approve')
+  assert.deepEqual(approve.args, [route.source.router, 1_000_000n])
 })

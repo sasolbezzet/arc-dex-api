@@ -537,9 +537,21 @@ export async function executeViaSession(userId, calls, options = {}) {
   // Wait for receipt — Arc has sub-second finality so this is fast
   const receipt = await waitForUserOperationReceipt(modularClient, { hash: userOpHash })
 
-  const txHash = receipt?.receipt?.transactionHash || userOpHash
-  const explorerUrl = `https://testnet.arcscan.app/tx/${txHash}`
+  const receiptTxHash = receipt?.receipt?.transactionHash || null
   const success = receipt?.success === true
+  if (success && options.requireTransactionHash === true && !receiptTxHash) {
+    return {
+      status: 'error',
+      reason: 'transaction_hash_unavailable',
+      userOpHash,
+      receipt,
+    }
+  }
+  // Existing send/swap callers retain the historical userOpHash fallback;
+  // bridge callers opt into requireTransactionHash because they must query the
+  // source receipt and router event before minting on the destination.
+  const txHash = receiptTxHash || userOpHash
+  const explorerUrl = `https://testnet.arcscan.app/tx/${txHash}`
 
   return {
     status: success ? 'success' : 'error',
