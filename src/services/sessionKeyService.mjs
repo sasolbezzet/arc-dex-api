@@ -30,6 +30,10 @@ const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
 
 const SESSION_KEYS_PATH = process.env.SESSION_KEYS_PATH || './data/session-keys.json'
 
+// ── Pending transactions (unsigned UserOps awaiting browser passkey signature) ──
+const PENDING_TX_TTL = 5 * 60 * 1000 // 5 minutes
+const pendingTxs = new Map() // txId -> { userId, walletAddress, calls, chainKey, paymaster, status, signedUserOp, txHash, explorerUrl, error, createdAt }
+
 // ── Build viem chain object from CHAINS config ──
 function buildViemChain(chainKey) {
   const c = CHAINS[chainKey]
@@ -83,6 +87,23 @@ export function getSessionKey(userId) {
     if (newest) entry = newest
   }
   if (!entry) return null
+  // If the found entry is revoked but its wallet has an active entry, prefer that.
+  if (entry && entry.active === false && entry.walletAddress) {
+    const walletKey = entry.walletAddress.toLowerCase()
+    const walletEntry = store.users[walletKey]
+    if (walletEntry && walletEntry.active !== false) entry = walletEntry
+  }
+  // If the found entry's wallet has a NEWER active entry under the wallet key,
+  // prefer that one (newer delegate key from latest loginPasskey/setupSessionKey).
+  if (entry && entry.walletAddress) {
+    const walletKey = entry.walletAddress.toLowerCase()
+    const walletEntry = store.users[walletKey]
+    if (walletEntry && walletEntry.active !== false && walletEntry !== entry) {
+      const entryTime = entry.lastUsedAt || entry.createdAt || 0
+      const walletTime = walletEntry.lastUsedAt || walletEntry.createdAt || 0
+      if (walletTime > entryTime) entry = walletEntry
+    }
+  }
   // Decrypt delegate key for in-memory use only (never written back encrypted twice)
   if (entry.delegatePrivateKey && !entry._decrypted) {
     try {
@@ -179,6 +200,11 @@ export function storeSessionKey(userId, { walletAddress, delegateAddress, delega
       const old = store.users[staleAlias.toLowerCase()]
       if (old && old.active !== false) { old.active = false; old.revokedAt = Date.now(); old.replacedBy = getAddress(walletAddress) }
     }
+    // Also revoke old EOA entry if it exists with a different delegate
+    const oldEoa = store.users[ownerKey]
+    if (oldEoa && oldEoa.active !== false && oldEoa.delegateAddress !== delegateAddress) {
+      oldEoa.active = false; oldEoa.revokedAt = Date.now(); oldEoa.replacedBy = getAddress(walletAddress)
+    }
   }
   store.users[key] = {
     walletAddress: getAddress(walletAddress),
@@ -199,6 +225,49 @@ export function storeSessionKey(userId, { walletAddress, delegateAddress, delega
   saveStore(store)
   return store.users[key]
 }
+
+// ── Pending transaction queue ──
+import { randomUUID } from 'crypto'
+
+export function createPendingTx(userId, { walletAddress, calls, chainKey, paymaster }) {
+  const txId = 'tx_' + randomUUID().slice(0, 12)
+  const tx = { userId, walletAddress, calls, chainKey, paymaster, status: 'pending', createdAt: Date.now() }
+  pendingTxs.set(txId, tx)
+  return { txId, ...tx }
+}
+
+export function getPendingTx(txId) {
+  const tx = pendingTxs.get(txId)
+  if (!tx) return null
+  if (Date.now() - tx.createdAt > PENDING_TX_TTL) { pendingTxs.delete(txId); return null }
+  return tx
+}
+
+export function getPendingTxsForUser(userId) {
+  const now = Date.now()
+  const result = []
+  for (const [txId, tx] of pendingTxs) {
+    if (now - tx.createdAt > PENDING_TX_TTL) { pendingTxs.delete(txId); continue }
+    if (tx.userId === userId) result.push({ txId, ...tx })
+  }
+  return result
+}
+
+export function completePendingTx(txId, { signedUserOp, txHash, explorerUrl, error }) {
+  const tx = pendingTxs.get(txId)
+  if (!tx) return null
+  if (error) { tx.status = 'error'; tx.error = error }
+  else if (txHash) { tx.status = 'submitted'; tx.txHash = txHash; tx.explorerUrl = explorerUrl }
+  else if (signedUserOp) { tx.status = 'signed'; tx.signedUserOp = signedUserOp }
+  return tx
+}
+
+// Sweep expired pending txs
+const _pendingSweep = setInterval(() => {
+  const now = Date.now()
+  for (const [txId, tx] of pendingTxs) if (now - tx.createdAt > PENDING_TX_TTL) pendingTxs.delete(txId)
+}, 60_000)
+if (_pendingSweep.unref) _pendingSweep.unref()
 
 /**
  * Mark session key as revoked (does not delete — keep audit trail).

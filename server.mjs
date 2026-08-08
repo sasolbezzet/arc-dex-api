@@ -191,6 +191,57 @@ app.post('/api/session/revoke', apiLimiter, requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
+// ── Pending transactions (passkey-signed from browser) ──
+app.get('/api/pending-txs', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { getPendingTxsForUser } = await import('./src/services/sessionKeyService.mjs')
+    const txs = getPendingTxsForUser(req.owner)
+    res.json({ txs })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/pending-txs/:txId', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { getPendingTx } = await import('./src/services/sessionKeyService.mjs')
+    const tx = getPendingTx(req.params.txId)
+    if (!tx || tx.userId !== req.owner) return res.status(404).json({ error: 'not found' })
+    res.json(tx)
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/pending-txs/:txId/submit', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { getPendingTx, completePendingTx } = await import('./src/services/sessionKeyService.mjs')
+    const tx = getPendingTx(req.params.txId)
+    if (!tx || tx.userId !== req.owner) return res.status(404).json({ error: 'not found' })
+    if (tx.status !== 'pending') return res.status(409).json({ error: 'already processed' })
+
+    const { signedUserOp } = req.body
+    if (!signedUserOp) return res.status(400).json({ error: 'signedUserOp required' })
+
+    // Relay signed UserOp to chain via Circle RPC
+    const { toModularTransport } = await import('@circle-fin/modular-wallets-core')
+    const { createPublicClient, defineChain } = await import('viem')
+    const CLIENT_URL = process.env.CIRCLE_CLIENT_URL
+    const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY
+    const chainKey = tx.chainKey || 'arc-testnet'
+    const { CHAINS } = await import('./src/services/chains.mjs')
+    const chain = CHAINS[chainKey]
+    const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+    const viemChain = defineChain({ id: chain.id, name: chain.name, nativeCurrency: chain.nativeCurrency, rpcUrls: { default: { http: [chain.rpcUrl] } } })
+    const client = createPublicClient({ chain: viemChain, transport })
+
+    // Submit via eth_sendUserOperation
+    const userOpHash = await client.request({ method: 'eth_sendUserOperation', params: [signedUserOp, '0x0000000071727De22E5E9d8BAf0edAc6f37da032'] })
+
+    const result = completePendingTx(req.params.txId, {
+      txHash: userOpHash,
+      explorerUrl: `https://testnet.arcscan.app/tx/${userOpHash}`,
+    })
+    res.json({ success: true, txHash: userOpHash, explorerUrl: result.explorerUrl })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
 // ── Remote HTTP MCP + OAuth 2.1 ──
 app.get('/.well-known/oauth-authorization-server', oauthMetadataHandler)
 app.get('/.well-known/oauth-authorization-server/mcp', oauthMetadataHandler)
