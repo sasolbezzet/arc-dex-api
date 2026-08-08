@@ -14,6 +14,7 @@ const accessTokens = new Map() // token -> { userId, clientId, expires }
 const SERVER_URL = process.env.SERVER_URL || 'https://arcoxdex.vercel.app'
 const TOKEN_TTL = 3600 * 24 // 24 hours
 const OAUTH_PATH = process.env.OAUTH_PATH || './data/oauth-clients.json'
+const OAUTH_TOKENS_PATH = process.env.OAUTH_TOKENS_PATH || './data/oauth-tokens.json'
 
 // ── Persistent OAuth client store ──
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
@@ -28,6 +29,17 @@ function saveClients(map) {
 }
 
 const oauthClients = loadClients()
+
+function loadTokens() {
+  const d = readJsonFile(OAUTH_TOKENS_PATH, { tokens: {} })
+  return new Map(Object.entries(d.tokens || {}))
+}
+function saveTokens() {
+  atomicWriteJsonFile(OAUTH_TOKENS_PATH, { tokens: Object.fromEntries(accessTokens) })
+}
+for (const [token, auth] of loadTokens()) {
+  if (auth?.expires > Date.now()) accessTokens.set(token, auth)
+}
 
 // ── OAuth helpers ──
 export function registerOAuthClient({ clientName, redirectUris = [] }) {
@@ -62,6 +74,7 @@ export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, 
   authCodes.delete(code)
   const token = 'arx_at_' + randomUUID().replace(/-/g, '')
   accessTokens.set(token, { userId: auth.userId, clientId, expires: Date.now() + TOKEN_TTL * 1000 })
+  saveTokens()
   return {
     access_token: token,
     token_type: 'Bearer',
@@ -75,6 +88,7 @@ export function validateAccessToken(token) {
   if (!auth) return null
   if (Date.now() > auth.expires) {
     accessTokens.delete(token)
+    saveTokens()
     return null
   }
   return auth
@@ -84,8 +98,10 @@ export function validateAccessToken(token) {
 // unbounded and contribute to gradual memory pressure / OOM kills.
 const _authSweep = setInterval(() => {
   const now = Date.now()
+  let changed = false
   for (const [code, v] of authCodes) if (now > v.expires) authCodes.delete(code)
-  for (const [tok, v] of accessTokens) if (now > v.expires) accessTokens.delete(tok)
+  for (const [tok, v] of accessTokens) if (now > v.expires) { accessTokens.delete(tok); changed = true }
+  if (changed) saveTokens()
 }, 10 * 60 * 1000)
 if (_authSweep.unref) _authSweep.unref()
 
