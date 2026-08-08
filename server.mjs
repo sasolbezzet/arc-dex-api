@@ -150,25 +150,38 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
 // UserOperations on behalf of the agent.
 app.post('/api/session/generate-key', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { generateSessionKey } = await import('./src/services/sessionKeyService.mjs')
-    const key = generateSessionKey()
-    res.json({ success: true, delegateAddress: key.address, privateKey: key.privateKey })
+    const { walletAddress, ownerAddress } = req.body || {}
+    if (!walletAddress || !isAddress(walletAddress) || getAddress(walletAddress).toLowerCase() !== req.owner) {
+      return res.status(403).json({ error: 'walletAddress must match the authenticated MSCA' })
+    }
+    const { reserveSessionKey } = await import('./src/services/sessionKeyService.mjs')
+    const key = reserveSessionKey(req.owner, { walletAddress, ownerAddress })
+    res.json({ success: true, delegateAddress: key.address, walletAddress: key.walletAddress, pendingAuthorization: key.pending })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { walletAddress, delegateAddress, delegatePrivateKey, ownerAddress } = req.body
-    if (!walletAddress || !delegateAddress || !delegatePrivateKey) {
-      return res.status(400).json({ error: 'walletAddress, delegateAddress, delegatePrivateKey required' })
+    const { walletAddress, delegateAddress, delegatePrivateKey, ownerAddress, authorizationUserOpHash } = req.body
+    if (!walletAddress || !delegateAddress || !isAddress(walletAddress) || getAddress(walletAddress).toLowerCase() !== req.owner) {
+      return res.status(403).json({ error: 'walletAddress must match the authenticated MSCA' })
     }
-    const { storeSessionKey } = await import('./src/services/sessionKeyService.mjs')
+    const { activateReservedSessionKey, verifySessionAuthorization } = await import('./src/services/sessionKeyService.mjs')
     const { setSessionKeyInfo } = await import('./src/services/vaultStore.mjs')
-    // req.owner = auth token subject (MSCA during passkey setup, or EOA).
-    // ownerAddress is the OAuth/SIWE identity (usually EOA) that must resolve to this session.
-    const entry = storeSessionKey(req.owner, { walletAddress, delegateAddress, delegatePrivateKey, ownerAddress })
+    if (delegatePrivateKey) return res.status(400).json({ error: 'delegatePrivateKey must never be submitted by the client' })
+    const verified = await verifySessionAuthorization(req.owner, {
+      walletAddress,
+      delegateAddress,
+      authorizationUserOpHash,
+      chainKey: 'arc-testnet',
+    })
+    const entry = activateReservedSessionKey(req.owner, {
+      walletAddress,
+      delegateAddress,
+      authorizationUserOpHash: verified.userOpHash,
+    })
     const infoOwner = ownerAddress ? String(ownerAddress).toLowerCase() : req.owner
-    setSessionKeyInfo(infoOwner, { walletAddress, delegateAddress, active: true, createdAt: entry.createdAt })
+    setSessionKeyInfo(infoOwner, { walletAddress, delegateAddress, active: true, createdAt: entry.createdAt, authorizationUserOpHash })
     res.json({ success: true, walletAddress, delegateAddress, active: true })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
@@ -2049,7 +2062,10 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
       })
     }
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
-    const prepared = await prepareEoaSwapRoute({ owner, tokenIn, tokenOut, amount: safeAmount })
+    // Keep quote and preparation bound to the same net swap amount. The gross
+    // amount is displayed separately and the platform fee is not silently
+    // included in the Circle execution payload.
+    const prepared = await prepareEoaSwapRoute({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
     const developerFee = prepared.legs.flatMap(leg => leg.fees?.developer || [])[0]
     const developerFeeToken = developerFee ? tokenSymbolForAddress(developerFee.token) : tokenOut
     const developerFeeAmount = developerFee

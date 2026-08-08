@@ -17,13 +17,27 @@
 // its HTTP transport retry logic.  Must run before any @circle-fin import.
 import '../polyfill-node.mjs'
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
-import { createPublicClient, http, encodeFunctionData, getAddress, defineChain } from 'viem'
+import { createPublicClient, createWalletClient, http, encodeFunctionData, getAddress, defineChain, parseUnits } from 'viem'
 import { toModularTransport, toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
 import { sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
 import { encrypt, decrypt } from './crypto.mjs'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { getLimits } from './vaultStore.mjs'
 import { CHAINS } from './chains.mjs'
+
+const ADD_OWNERS_ABI = [{
+  type: 'function',
+  name: 'addOwners',
+  stateMutability: 'nonpayable',
+  inputs: [
+    { name: 'ownersToAdd', type: 'address[]' },
+    { name: 'weightsToAdd', type: 'uint256[]' },
+    { name: 'publicKeyOwnersToAdd', type: 'tuple[]', components: [{ name: 'x', type: 'uint256' }, { name: 'y', type: 'uint256' }] },
+    { name: 'publicKeyWeightsToAdd', type: 'uint256[]' },
+    { name: 'newThresholdWeight', type: 'uint256' },
+  ],
+  outputs: [],
+}]
 
 const CLIENT_URL = process.env.CIRCLE_CLIENT_URL || ''
 const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
@@ -75,17 +89,6 @@ export function getSessionKey(userId) {
     const walletAddr = store.aliases?.[key]
     if (walletAddr && store.users[walletAddr.toLowerCase()]) entry = store.users[walletAddr.toLowerCase()]
   }
-  // 3) Auto-detect: EOA identity (not itself a session owner) with no alias
-  //    resolves to the most recently-USED ACTIVE session key. A user may
-  //    register several passkey MSCAs; the one they last used (via Claude /
-  //    MCP / execute) is the intended one. Sort by lastUsedAt desc (falling
-  //    back to createdAt) — no hardcoding of a specific wallet.
-  if (!entry && !store.users[key]) {
-    const countActive = Object.values(store.users).filter(u => u && u.active !== false)
-    const newest = countActive
-      .sort((a, b) => ((b.lastUsedAt || b.createdAt || 0)) - ((a.lastUsedAt || a.createdAt || 0)))[0]
-    if (newest) entry = newest
-  }
   if (!entry) return null
   // If the found entry is revoked but its wallet has an active entry, prefer that.
   if (entry && entry.active === false && entry.walletAddress) {
@@ -111,6 +114,12 @@ export function getSessionKey(userId) {
       entry._decrypted = true
     } catch { /* key was stored pre-encryption or corrupted */ }
   }
+  // A signer is executable only after the new setup flow records an
+  // authorization UserOperation hash. Legacy entries remain visible but are
+  // denied until re-authorized through the passkey flow.
+  if (entry.active === true && !/^0x[0-9a-fA-F]{64}$/.test(String(entry.authorizationUserOpHash || ''))) {
+    return { ...entry, active: false, staleAuthorization: true }
+  }
   return entry
 }
 
@@ -122,6 +131,119 @@ export function generateSessionKey() {
   const pk = generatePrivateKey()
   const account = privateKeyToAccount(pk)
   return { address: account.address, privateKey: pk }
+}
+
+/**
+ * Reserve an automation signer server-side before the passkey owner authorizes
+ * it on-chain. The private key never returns to the browser; it is encrypted
+ * at rest and remains inactive until activateReservedSessionKey is called.
+ */
+export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet', ownerAddress } = {}) {
+  const store = loadStore()
+  const wallet = getAddress(walletAddress)
+  const key = wallet.toLowerCase()
+  const existing = store.users[key]
+  if (existing?.active && /^0x[0-9a-fA-F]{64}$/.test(String(existing.authorizationUserOpHash || ''))) {
+    return { address: existing.delegateAddress, walletAddress: wallet, pending: false }
+  }
+  // Keep an in-flight reservation stable. If the browser completed the
+  // on-chain UserOperation but the activation request was interrupted, rotating
+  // the key here would orphan the authorized delegate and make recovery opaque.
+  if (existing?.pendingAuthorization && existing.delegateAddress) {
+    return { address: existing.delegateAddress, walletAddress: wallet, pending: true }
+  }
+  const generated = generateSessionKey()
+  store.users[key] = {
+    walletAddress: wallet,
+    delegateAddress: getAddress(generated.address),
+    delegatePrivateKey: encrypt(generated.privateKey),
+    chain,
+    createdAt: Date.now(),
+    active: false,
+    pendingAuthorization: true,
+  }
+  if (!store.aliases) store.aliases = {}
+  store.aliases[String(userId || '').toLowerCase()] = wallet
+  if (ownerAddress) store.aliases[String(ownerAddress).toLowerCase()] = wallet
+  saveStore(store)
+  return { address: getAddress(generated.address), walletAddress: wallet, pending: true }
+}
+
+/** Activate only the exact reserved signer after passkey authorization. */
+export function validateAuthorizationUserOperation({ walletAddress, delegateAddress, authorizationUserOpHash, receipt, operation } = {}) {
+  const wallet = getAddress(walletAddress)
+  const delegate = getAddress(delegateAddress)
+  if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) return { ok: false, reason: 'authorizationUserOpHash required' }
+  const receiptStatus = receipt?.receipt?.status
+  const successfulReceipt = receipt?.success === true && (receiptStatus === 'success' || receiptStatus === '0x1' || receiptStatus === 1 || receiptStatus === true)
+  if (!successfulReceipt) return { ok: false, reason: 'authorization UserOperation is not finalized successfully' }
+  const receiptSender = receipt.sender || receipt.receipt?.from
+  if (!receiptSender || getAddress(receiptSender) !== wallet) return { ok: false, reason: 'authorization sender mismatch' }
+  const senderInOperation = operation?.userOperation?.sender || operation?.sender
+  if (senderInOperation && getAddress(senderInOperation) !== wallet) return { ok: false, reason: 'indexed authorization sender mismatch' }
+  const callData = String(operation?.userOperation?.callData || operation?.callData || '').toLowerCase()
+  const expectedAddOwners = encodeFunctionData({
+    abi: ADD_OWNERS_ABI,
+    functionName: 'addOwners',
+    args: [[delegate], [1n], [], [], 0n],
+  }).toLowerCase()
+  // The SDK's recovery action submits the plugin addOwners calldata directly.
+  // Fail closed for wrappers or concatenated payloads: without a known wrapper
+  // ABI, substring matching could authorize an unrelated operation.
+  if (!callData || callData !== expectedAddOwners) return { ok: false, reason: 'delegate authorization calldata mismatch' }
+  return { ok: true, walletAddress: wallet, delegateAddress: delegate, userOpHash: authorizationUserOpHash }
+}
+
+export async function verifySessionAuthorization(userId, { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = 'arc-testnet' } = {}) {
+  const wallet = getAddress(walletAddress)
+  const delegate = getAddress(delegateAddress)
+  if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
+  const store = loadStore()
+  const entry = store.users[wallet.toLowerCase()]
+  if (!entry?.pendingAuthorization) throw new Error('No pending automation signer reservation')
+  if (getAddress(entry.delegateAddress) !== delegate) throw new Error('Automation signer mismatch')
+  const chain = CHAINS[chainKey]
+  if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
+  if (!CLIENT_URL || !CLIENT_KEY) throw new Error('Circle bundler verification is not configured')
+
+  // Do not trust a client-supplied hash merely because it has the right shape.
+  // Query Circle's bundler and fail closed unless the operation is finalized,
+  // successful, and was submitted by this exact MSCA.
+  const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+  const client = createPublicClient({ chain: buildViemChain(chainKey), transport })
+  let receipt = null
+  // Circle may expose the UserOperation hash before the receipt is indexed.
+  // Poll briefly rather than activating a signer on a transient null response.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    receipt = await client.request({ method: 'eth_getUserOperationReceipt', params: [authorizationUserOpHash] }).catch(() => null)
+    if (receipt) break
+    await new Promise(resolve => setTimeout(resolve, 500))
+  }
+  if (!receipt || receipt.success !== true || receipt.receipt?.status === 'reverted' || receipt.receipt?.status === '0x0') {
+    throw new Error('MSCA authorization UserOperation is not finalized successfully')
+  }
+  // The bundler's indexed UserOperation is required as a second binding check.
+  // The addOwners selector and reserved delegate must both occur in callData;
+  // a successful unrelated MSCA operation cannot activate this reservation.
+  const operation = await client.request({ method: 'eth_getUserOperationByHash', params: [authorizationUserOpHash] }).catch(() => null)
+  const validation = validateAuthorizationUserOperation({ walletAddress: wallet, delegateAddress: delegate, authorizationUserOpHash, receipt, operation })
+  if (!validation.ok) throw new Error(validation.reason)
+  return { ...validation, receipt }
+}
+
+export function activateReservedSessionKey(userId, { walletAddress, delegateAddress, authorizationUserOpHash } = {}) {
+  const store = loadStore()
+  const wallet = getAddress(walletAddress)
+  const entry = store.users[wallet.toLowerCase()]
+  if (!entry || !entry.pendingAuthorization) throw new Error('No pending automation signer reservation')
+  if (getAddress(entry.delegateAddress) !== getAddress(delegateAddress)) throw new Error('Automation signer mismatch')
+  if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
+  entry.active = true
+  entry.pendingAuthorization = false
+  entry.authorizationUserOpHash = authorizationUserOpHash
+  entry.activatedAt = Date.now()
+  saveStore(store)
+  return entry
 }
 
 /**
@@ -160,9 +282,9 @@ export function listRelatedAddresses(userId) {
 }
 
 /**
- * Mark a session key as used now (updates lastUsedAt). Persisted so the
- * auto-detect resolver picks the MSCA the user most recently connected via
- * Claude / MCP / execution — not a hardcoded wallet.
+ * Mark an explicitly resolved session key as used now (updates lastUsedAt).
+ * There is deliberately no global "latest active wallet" fallback: an OAuth
+ * identity must have an explicit alias to an MSCA before it can execute.
  */
 export function touchSessionKey(userId) {
   const store = loadStore()
@@ -172,10 +294,6 @@ export function touchSessionKey(userId) {
   if (!entry) {
     const walletAddr = store.aliases?.[key]
     if (walletAddr && store.users[walletAddr.toLowerCase()]) entry = store.users[walletAddr.toLowerCase()]
-  }
-  if (!entry) {
-    const active = Object.values(store.users).filter(u => u && u.active !== false)
-    entry = active.sort((a, b) => ((b.lastUsedAt || b.createdAt || 0)) - ((a.lastUsedAt || a.createdAt || 0)))[0]
   }
   if (!entry) return null
   entry.lastUsedAt = Date.now()
@@ -213,6 +331,7 @@ export function storeSessionKey(userId, { walletAddress, delegateAddress, delega
     chain,
     createdAt: Date.now(),
     active: true,
+    authorizationUserOpHash: '',
   }
   // Alias mapping: EOA (OAuth identity) -> MSCA walletAddress. Lets MCP sessions
   // authenticated as the EOA resolve the MSCA-owned session key.
@@ -275,13 +394,12 @@ if (_pendingSweep.unref) _pendingSweep.unref()
 export function revokeSessionKey(userId) {
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
-  const entry = store.users[key]
+  let entry = store.users[key]
   if (!entry) {
-    // Revoke via EOA alias -> MSCA entry
     const walletAddr = store.aliases?.[key]
-    if (walletAddr && store.users[walletAddr.toLowerCase()]) return store.users[walletAddr.toLowerCase()]
-    return null
+    if (walletAddr) entry = store.users[String(walletAddr).toLowerCase()]
   }
+  if (!entry) return null
   entry.active = false
   entry.revokedAt = Date.now()
   saveStore(store)
@@ -324,6 +442,18 @@ export function parseHumanAmount(value) {
 /**
  * Build a viem wallet client for the delegate EOA.
  */
+function amountToUnits(value, decimals) {
+  const raw = String(value ?? '').trim().replace(',', '.')
+  const match = raw.match(/[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/)
+  if (!match) return null
+  try {
+    const units = parseUnits(match[0], decimals)
+    return units > 0n ? units : null
+  } catch {
+    return null
+  }
+}
+
 function delegateWalletClient(privateKey, chainKey = 'arc-testnet') {
   const account = privateKeyToAccount(privateKey)
   const chain = buildViemChain(chainKey)
@@ -447,7 +577,8 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
   const decimals = token === 'USDC' || token === 'EURC' ? 6 : 18
   const parsedAmount = parseHumanAmount(amount)
   if (parsedAmount === null) return { status: 'denied', reason: 'bad_amount' }
-  const amountBigInt = BigInt(Math.floor(parsedAmount * 10 ** decimals))
+  const amountBigInt = amountToUnits(amount, decimals)
+  if (amountBigInt === null) return { status: 'denied', reason: 'bad_amount' }
 
   return executeViaSession(userId, [{
     to: tokenAddress,
@@ -466,37 +597,28 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
  * treasury. Full AMM routing via MSCA needs the swap router calldata. Upgrade
  * by passing prepared calldata from /api/eoa-swap-prepare.
  */
-export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, preparedCalldata, chainKey }) {
+export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, preparedCalldata, preparedCalls, chainKey }) {
   const gate = canExecuteViaSession(userId, amountIn)
   if (!gate.ok) return { status: 'denied', reason: gate.reason }
 
   const chain = chainKey || gate.entry?.chain || 'arc-testnet'
 
-  if (preparedCalldata?.to && preparedCalldata?.data) {
-    return executeViaSession(userId, [{
-      to: preparedCalldata.to,
-      data: preparedCalldata.data,
-      value: preparedCalldata.value || 0n,
-    }], { paymaster: true, chainKey: chain })
+  const calls = Array.isArray(preparedCalls)
+    ? preparedCalls
+    : preparedCalldata?.to && preparedCalldata?.data
+      ? [{ to: preparedCalldata.to, data: preparedCalldata.data, value: preparedCalldata.value || 0n }]
+      : []
+  if (calls.length > 0 && calls.every(call => call?.to && call?.data)) {
+    return executeViaSession(userId, calls.map(call => ({
+      to: getAddress(call.to),
+      data: call.data,
+      value: call.value || 0n,
+    })), { paymaster: true, chainKey: chain })
   }
 
-  // Fallback: simple USDC transfer (for send-as-swap without router)
-  const erc20Abi = [{
-    type: 'function', name: 'transfer', stateMutability: 'nonpayable',
-    inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }],
-    outputs: [{ name: '', type: 'bool' }],
-  }]
-  const tokenAddr = CHAINS[chain]?.tokens?.USDC || CHAINS[chain]?.tokens?.[tokenIn]
-  const parsedAmount = parseHumanAmount(amountIn)
-  if (parsedAmount === null) return { status: 'denied', reason: 'bad_amount' }
-  const amountBigInt = BigInt(Math.floor(parsedAmount * 1e6))
-
-  return executeViaSession(userId, [{
-    to: tokenAddr,
-    abi: erc20Abi,
-    functionName: 'transfer',
-    args: [getAddress(gate.limits.treasury || tokenAddr), amountBigInt],
-  }], { paymaster: true, chainKey: chain })
+  // Never silently turn a swap into a treasury transfer. The caller must
+  // provide verified router calldata prepared for this exact MSCA and quote.
+  return { status: 'denied', reason: 'swap_calldata_required', message: 'Swap MSCA membutuhkan router calldata yang telah diverifikasi.' }
 }
 
 /**
@@ -506,8 +628,11 @@ export async function getUserOpStatus(userId, userOpHash) {
   const entry = getSessionKey(userId)
   if (!entry || !entry.active) return { status: 'error', reason: 'no_session' }
 
-  const transport = toModularTransport(`${CLIENT_URL}/arcTestnet`, CLIENT_KEY)
-  const baseClient = createPublicClient({ chain: arcChain, transport })
+  const chainKey = entry.chain || 'arc-testnet'
+  const chain = CHAINS[chainKey]
+  if (!chain) return { status: 'error', reason: 'unknown_chain' }
+  const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+  const baseClient = createPublicClient({ chain: buildViemChain(chainKey), transport })
   const modularClient = toCircleModularWalletClient({ client: baseClient })
 
   try {

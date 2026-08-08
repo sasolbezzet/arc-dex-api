@@ -24,10 +24,13 @@ test('Gateway transfer submitted by the browser finalizes a matching x402 invoic
   process.env.X402_INVOICE_DB = join(directory, 'invoices.json')
   process.env.CIRCLE_GATEWAY_BASE_URL = 'https://gateway.test'
   process.env.X402_RECIPIENT_ADDRESS = recipient
+  process.env.ARCOX_TREASURY_WALLET_ADDRESS = recipient
 
   try {
     const { createX402Invoice, markUnifiedBalanceSpendSubmitted, reconcileX402Invoice } = await import('../src/middleware/x402Middleware.mjs')
-    const invoice = createX402Invoice({ resource: '/api/test', amount: '0.001' })
+    const invoice = createX402Invoice({ resource: '/api/test', amount: '0.001', paymentMethod: 'unified-balance-gateway' })
+    // Gateway settlement is explicit; direct-MSCA invoices reconcile from Arc Transfer logs.
+    invoice.paymentMethod = 'unified-balance-gateway'
     markUnifiedBalanceSpendSubmitted(invoice.invoiceId, { txHash, transferId })
     const settled = await reconcileX402Invoice(invoice.invoiceId)
     assert.equal(settled.status, 'paid')
@@ -66,10 +69,13 @@ test('Gateway transfer with a mismatched amount does not settle an x402 invoice'
   process.env.X402_INVOICE_DB = join(directory, 'invoices.json')
   process.env.CIRCLE_GATEWAY_BASE_URL = 'https://gateway.test'
   process.env.X402_RECIPIENT_ADDRESS = recipient
+  process.env.ARCOX_TREASURY_WALLET_ADDRESS = recipient
 
   try {
     const { createX402Invoice, markUnifiedBalanceSpendSubmitted, reconcileX402Invoice } = await import('../src/middleware/x402Middleware.mjs')
-    const invoice = createX402Invoice({ resource: '/api/test', amount: '0.001' })
+    const invoice = createX402Invoice({ resource: '/api/test', amount: '0.001', paymentMethod: 'unified-balance-gateway' })
+    // Gateway settlement is explicit; direct-MSCA invoices reconcile from Arc Transfer logs.
+    invoice.paymentMethod = 'unified-balance-gateway'
     markUnifiedBalanceSpendSubmitted(invoice.invoiceId, { txHash, transferId })
     const settled = await reconcileX402Invoice(invoice.invoiceId)
     assert.notEqual(settled.status, 'paid')

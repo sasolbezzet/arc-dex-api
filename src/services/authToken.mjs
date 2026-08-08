@@ -13,7 +13,7 @@
 //
 // Algorithm MUST stay byte-for-byte identical to createAuthToken/verifyAuthToken
 // in server.mjs (same AUTH_SECRET, same payload, same HMAC-SHA256/base64url).
-import { createHmac } from 'crypto'
+import { createHmac, timingSafeEqual } from 'crypto'
 import { getAddress } from 'viem'
 
 const AUTH_SECRET = process.env.AUTH_SECRET || ''
@@ -39,4 +39,22 @@ export function mintOwnerToken(address) {
   }
   const payload = b64url(JSON.stringify({ address: normalized, exp: Date.now() + AUTH_TTL_MS }))
   return `${payload}.${signPayload(payload)}`
+}
+
+/** Verify the same HMAC owner token used by requireAuth in server.mjs. */
+export function verifyOwnerToken(token) {
+  try {
+    if (!AUTH_SECRET || typeof token !== 'string') return null
+    const [payload, signature] = token.split('.')
+    if (!payload || !signature || !/^[A-Za-z0-9_-]+$/.test(payload) || !/^[A-Za-z0-9_-]+$/.test(signature)) return null
+    const expected = signPayload(payload)
+    const actualBytes = Buffer.from(signature)
+    const expectedBytes = Buffer.from(expected)
+    if (actualBytes.length !== expectedBytes.length || !timingSafeEqual(actualBytes, expectedBytes)) return null
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
+    if (!data?.address || !Number.isFinite(Number(data.exp)) || Date.now() > Number(data.exp)) return null
+    return getAddress(data.address).toLowerCase()
+  } catch {
+    return null
+  }
 }

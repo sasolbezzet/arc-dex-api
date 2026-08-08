@@ -8,6 +8,7 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs'
 
 // ── In-memory session store (production: use Redis) ──
 const sessions = new Map() // sessionId -> { transport, server }
+const executionQuotes = new Map() // previewId -> { userId, action, params, expires }
 const authCodes = new Map() // code -> { clientId, userId, redirectUri, codeChallenge, expires }
 const accessTokens = new Map() // token -> { userId, clientId, expires }
 
@@ -312,16 +313,98 @@ function resolveAgentForUser(userId) {
 }
 let mcpSessionsRef = null
 
+function createExecutionQuote(userId, action, params) {
+  const previewId = `quote_${randomUUID().replace(/-/g, '').slice(0, 16)}`
+  const quote = { previewId, userId, action, params, walletAddress: params.walletAddress || '', expires: Date.now() + 5 * 60 * 1000 }
+  executionQuotes.set(previewId, quote)
+  return quote
+}
+
+function consumeExecutionQuote(userId, action, previewId, params) {
+  const quote = executionQuotes.get(String(previewId || ''))
+  if (!quote || quote.userId !== userId || quote.action !== action || Date.now() > quote.expires) return { ok: false, reason: 'invalid_or_expired_quote' }
+  const fields = ['to', 'amount', 'token', 'tokenIn', 'tokenOut', 'amountIn', 'walletAddress']
+  for (const field of fields) {
+    if (quote.params[field] !== undefined && String(quote.params[field]) !== String(params[field])) return { ok: false, reason: 'quote_parameters_mismatch' }
+  }
+  executionQuotes.delete(quote.previewId)
+  return { ok: true, quote }
+}
+
 // ── x402 via MSCA (session key) ──
-// Pays an ARCOX x402 invoice from the Agent Wallet (MSCA) by calling the Arc
-// memo contract: memo(ARC_USDC, transfer(recipient, amount), memoId, memoData).
-// Then polls invoice status until paid, and retries the Intel resource if paid.
-import { encodeFunctionData, getAddress, keccak256, toHex } from 'viem'
+// Arc Memo must be called directly by an EOA. An ERC-4337 MSCA therefore pays
+// x402 with a plain USDC transfer from the MSCA. The invoice is bound to the
+// exact MSCA payer and reconciled from the resulting Transfer event.
+import { encodeFunctionData, getAddress } from 'viem'
 
 const X402_ARC_USDC = process.env.X402_USDC_ADDRESS || '0x3600000000000000000000000000000000000000'
-const X402_MEMO_CONTRACT = process.env.ARC_MEMO_CONTRACT || '0x5294E9927c3306DcBaDb03fe70b92e01cCede505'
 const X402_TRANSFER_ABI = [{ type: 'function', name: 'transfer', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
-const X402_MEMO_ABI = [{ type: 'function', name: 'memo', stateMutability: 'nonpayable', inputs: [{ name: 'target', type: 'address' }, { name: 'data', type: 'bytes' }, { name: 'memoId', type: 'bytes32' }, { name: 'memoData', type: 'bytes' }], outputs: [] }]
+const X402_APPROVE_ABI = [{ type: 'function', name: 'approve', stateMutability: 'nonpayable', inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
+const ADAPTER_EXECUTE_ABI = [{
+  type: 'function', name: 'execute', stateMutability: 'payable',
+  inputs: [
+    { name: 'params', type: 'tuple', components: [
+      { name: 'instructions', type: 'tuple[]', components: [
+        { name: 'target', type: 'address' }, { name: 'data', type: 'bytes' }, { name: 'value', type: 'uint256' },
+        { name: 'tokenIn', type: 'address' }, { name: 'amountToApprove', type: 'uint256' }, { name: 'tokenOut', type: 'address' }, { name: 'minTokenOut', type: 'uint256' },
+      ] },
+      { name: 'tokens', type: 'tuple[]', components: [{ name: 'token', type: 'address' }, { name: 'beneficiary', type: 'address' }] },
+      { name: 'execId', type: 'uint256' }, { name: 'deadline', type: 'uint256' }, { name: 'metadata', type: 'bytes' },
+    ] },
+    { name: 'tokenInputs', type: 'tuple[]', components: [
+      { name: 'permitType', type: 'uint8' }, { name: 'token', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'permitCalldata', type: 'bytes' },
+    ] },
+    { name: 'signature', type: 'bytes' },
+  ], outputs: [],
+}]
+
+function normalizePreparedExecution(params) {
+  if (!params || !Array.isArray(params.instructions) || params.execId === undefined || params.deadline === undefined) return null
+  return {
+    instructions: params.instructions.map(instruction => ({
+      ...instruction,
+      value: BigInt(instruction.value || 0),
+      amountToApprove: BigInt(instruction.amountToApprove || 0),
+      minTokenOut: BigInt(instruction.minTokenOut || 0),
+    })),
+    tokens: params.tokens || [],
+    execId: BigInt(params.execId),
+    deadline: BigInt(params.deadline),
+    metadata: params.metadata || '0x',
+  }
+}
+
+function buildPreparedSwapCalls(prepared, expected = {}) {
+  const allowedAdapter = String(process.env.ARCOX_SWAP_ADAPTER || '').toLowerCase()
+  // Never execute opaque adapter calldata without an explicit production
+  // allowlist. This keeps MCP swaps fail-closed until the deployment config
+  // names the exact audited adapter contract.
+  if (!allowedAdapter || !prepared?.adapterContract || !Array.isArray(prepared.legs) || prepared.legs.length === 0) return null
+  if (String(prepared.adapterContract).toLowerCase() !== allowedAdapter) return null
+  if (expected.tokenIn && String(prepared.tokenIn || '').toUpperCase() !== String(expected.tokenIn).toUpperCase()) return null
+  if (expected.tokenOut && String(prepared.tokenOut || '').toUpperCase() !== String(expected.tokenOut).toUpperCase()) return null
+  for (const leg of prepared.legs) {
+    if (!leg?.executionParams || !leg.signature || !leg.tokenInAddress || !leg.amountBaseUnits) return null
+    const executionParams = normalizePreparedExecution(leg.executionParams)
+    if (!executionParams) return null
+    const amount = BigInt(leg.amountBaseUnits)
+    calls.push({
+      to: getAddress(leg.tokenInAddress),
+      value: 0n,
+      data: encodeFunctionData({ abi: X402_APPROVE_ABI, functionName: 'approve', args: [getAddress(prepared.adapterContract), amount] }),
+    })
+    calls.push({
+      to: getAddress(prepared.adapterContract),
+      value: 0n,
+      data: encodeFunctionData({
+        abi: ADAPTER_EXECUTE_ABI,
+        functionName: 'execute',
+        args: [executionParams, [{ permitType: 0, token: getAddress(leg.tokenInAddress), amount, permitCalldata: '0x' }], leg.signature],
+      }),
+    })
+  }
+  return calls
+}
 
 async function getX402Invoice(invoiceId) {
   const r = await fetch(`${BACKEND_URL}/api/x402/invoices/${encodeURIComponent(invoiceId)}/status`)
@@ -340,19 +423,17 @@ function invoiceAmountUnits(invoice) {
   return BigInt(whole) * 1_000_000n + BigInt((fraction + '000000').slice(0, 6))
 }
 
-function x402MemoData(invoice) {
-  const memo = invoice?.memoData
-  if (typeof memo === 'string' && /^0x(?:[0-9a-fA-F]{2})*$/.test(memo)) return memo
-  return toHex(JSON.stringify({ app: 'arcox', type: 'x402', invoiceId: invoice?.invoiceId, paymentId: invoice?.paymentId, resource: invoice?.resource }))
-}
-
 async function unlockX402Resource(userId, invoice) {
   const resourcePath = String(invoice.resource || '')
   if (!resourcePath.startsWith('/api/')) return null
   if (!invoice.paymentId) return null
   try {
     const r = await fetch(`${BACKEND_URL}${resourcePath}`, {
-      headers: { 'X-Payment-Id': invoice.paymentId },
+      headers: {
+        Authorization: `Bearer ${mintOwnerToken(userId)}`,
+        'X-Payment-Id': invoice.paymentId,
+        ...(invoice.ownerWallet ? { 'X-Arcox-Owner': invoice.ownerWallet } : {}),
+      },
     })
     if (!r.ok) return null
     const data = await r.json()
@@ -377,17 +458,17 @@ async function previewX402Pay(userId, invoiceId) {
   if (!info || !info.active) {
     return { status: 'session_required', message: 'Session key MSCA belum aktif. User harus setup Agent Wallet + session key dulu di Plugin page.' }
   }
-  return {
-    status: 'preview',
-    requiresUserConfirmation: true,
-    invoice,
-    payer: info.walletAddress,
+  return {      status: 'preview',
+      requiresUserConfirmation: true,
+      invoice,
+      payer: info.walletAddress,
+      payerMatchesInvoice: String(invoice.ownerWallet || '').toLowerCase() === String(info.walletAddress || '').toLowerCase(),
+
     amount: invoice.uniqueAmount,
     token: 'USDC',
     recipient: invoice.recipient,
-    memoContract: invoice.memoContract || X402_MEMO_CONTRACT,
-    memoId: invoice.memoId,
-    instruction: `Konfirmasi untuk membayar ${invoice.uniqueAmount} USDC dari Agent Wallet (MSCA ${info.walletAddress}) ke ${invoice.recipient} untuk ${invoice.invoiceId} via memo kontrak Arc.`,
+    paymentMethod: invoice.paymentMethod || 'arc-usdc-direct',
+    instruction: `Konfirmasi untuk membayar ${invoice.uniqueAmount} USDC langsung dari Agent Wallet (MSCA ${info.walletAddress}) ke ${invoice.recipient} untuk ${invoice.invoiceId}. Pembayaran MSCA tidak menggunakan Arc Memo.`,
   }
 }
 
@@ -400,21 +481,19 @@ async function executeX402Pay(userId, invoiceId) {
     return { status: 'paid', invoice, alreadyPaid: true, unlockedResult: unlocked }
   }
   if (invoice.asset !== 'USDC') throw new Error('Hanya invoice USDC yang didukung x402.')
+  if (!invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) throw new Error('x402 recipient is not configured')
+  const info = await (await import('./vaultStore.mjs')).getSessionKeyInfo(userId)
+  if (!info?.active || info.walletAddress?.toLowerCase() !== String(invoice.ownerWallet || '').toLowerCase()) {
+    throw new Error('x402 invoice payer does not match the active MSCA')
+  }
   const amountUnits = invoiceAmountUnits(invoice)
-  const transferData = encodeFunctionData({
-    abi: X402_TRANSFER_ABI,
-    functionName: 'transfer',
-    args: [getAddress(invoice.recipient), amountUnits],
-  })
-  const memoId = (invoice.memoId && /^0x[0-9a-fA-F]{64}$/.test(invoice.memoId)) ? invoice.memoId : keccak256(toHex(String(invoice.paymentId || invoice.invoiceId)))
-  const memoData = x402MemoData(invoice)
 
   const { executeViaSession } = await import('./sessionKeyService.mjs')
   const result = await executeViaSession(userId, [{
-    to: invoice.memoContract || X402_MEMO_CONTRACT,
-    abi: X402_MEMO_ABI,
-    functionName: 'memo',
-    args: [X402_ARC_USDC, transferData, memoId, memoData],
+    to: X402_ARC_USDC,
+    abi: X402_TRANSFER_ABI,
+    functionName: 'transfer',
+    args: [getAddress(invoice.recipient), amountUnits],
   }], { paymaster: true, chainKey: 'arc-testnet' })
 
   if (result.status !== 'success') {
@@ -437,8 +516,7 @@ async function executeX402Pay(userId, invoiceId) {
     invoice: latest,
     txHash: result.txHash,
     explorerUrl: result.explorerUrl,
-    memoId,
-    memoContract: invoice.memoContract || X402_MEMO_CONTRACT,
+    paymentMethod: 'arc-usdc-direct',
     unlockedResult: unlocked,
   }
 }
@@ -494,8 +572,20 @@ export function createMcpServer(userId) {
     if (src !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote swap hanya untuk source=session.' }) }] }
     }
-    const data = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: userId }, userId)
-    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+    const { getSessionKeyInfo } = await import('./vaultStore.mjs')
+    const session = await getSessionKeyInfo(userId)
+    if (!session?.active || !session.walletAddress) {
+      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'no_session', message: 'Session key MSCA belum aktif.' }) }] }
+    }
+    const quoteData = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: session.walletAddress }, session.walletAddress)
+    if (!quoteData?.available && quoteData?.success === false) {
+      return { content: [{ type: 'text', text: JSON.stringify(quoteData) }] }
+    }
+    // Prepare immutable calldata at preview time. Execution must use this exact
+    // payload, not re-quote later with potentially different routing/slippage.
+    const prepared = await apiPost('/api/eoa-swap-prepare', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: session.walletAddress }, session.walletAddress)
+    const quote = createExecutionQuote(userId, 'swap', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, walletAddress: session.walletAddress, quote: quoteData, prepared })
+    return { content: [{ type: 'text', text: JSON.stringify({ ...quoteData, previewId: quote.previewId, expiresAt: new Date(quote.expires).toISOString(), source: 'session', walletAddress: session.walletAddress, prepared: { source: prepared.source, route: prepared.route, amountOut: prepared.amountOut } }) }] }
   })
 
   server.tool('arcox_execute_swap', 'Execute a confirmed swap via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_swap and user confirmation.', {
@@ -512,13 +602,30 @@ export function createMcpServer(userId) {
     if (source !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
     }
+    const { getSessionKeyInfo } = await import('./vaultStore.mjs')
+    const activeSession = await getSessionKeyInfo(userId)
+    const quoteCheck = consumeExecutionQuote(userId, 'swap', params.previewId, {
+      tokenIn: params.tokenIn,
+      tokenOut: params.tokenOut,
+      amountIn: params.amountIn,
+      walletAddress: activeSession?.walletAddress || '',
+    })
+    if (!quoteCheck.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     const gate = await canAutoExecute(userId, source, params.amountIn)
     if (!gate.ok) {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
     }
     try {
+      const preparedPayload = quoteCheck.quote.params.prepared
+      if (!preparedPayload || preparedPayload.source !== 'stablecoin-service' || !preparedPayload.adapterContract) {
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'swap_route_not_supported_for_msca', message: 'Route ini belum aman untuk eksekusi MSCA.' }) }] }
+      }
+        const preparedCalls = buildPreparedSwapCalls(preparedPayload, { tokenIn: params.tokenIn, tokenOut: params.tokenOut })
+      if (!preparedCalls) {
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'swap_calldata_unavailable', message: 'Quote swap ini belum menghasilkan calldata MSCA yang aman untuk dieksekusi.' }) }] }
+      }
       const { swapViaSession } = await import('./sessionKeyService.mjs')
-      const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn })
+      const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls, chainKey: 'arc-testnet' })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
@@ -609,7 +716,7 @@ export function createMcpServer(userId) {
       token,
       source: 'session',
       note: 'Send via Agent Wallet (MSCA/session key): gas dibayar paymaster, 30bps platform fee berlaku.',
-      previewId: `send_${Date.now()}`,
+      ...(() => { const q = createExecutionQuote(userId, 'send', { to: params.to, amount: params.amount, token }); return { previewId: q.previewId, expiresAt: new Date(q.expires).toISOString() } })(),
       safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_send dengan source=session dan confirmed=true.',
     }) }] }
   })
@@ -626,6 +733,8 @@ export function createMcpServer(userId) {
     if (!params.confirmed) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Ask user to confirm first.' }) }] }
     const source = params.source || 'session'
     const token = params.token || 'USDC'
+    const quoteCheck = consumeExecutionQuote(userId, 'send', params.previewId, { to: params.to, amount: params.amount, token })
+    if (!quoteCheck.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     if (source !== 'session') {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
     }
@@ -777,7 +886,12 @@ export function createMcpServer(userId) {
 
   const intelTool = (name, desc, pathFromId, schema) => server.tool(name, desc, schema, async (params) => {
     const path = pathFromId(params)
-    const headers = { 'X-Payment-Id': params.paymentId || '' }
+    const { getSessionKeyInfo } = await import('./vaultStore.mjs')
+    const sessionInfo = await getSessionKeyInfo(userId)
+    const headers = {
+      ...(sessionInfo?.active && sessionInfo.walletAddress ? { Authorization: `Bearer ${mintOwnerToken(userId)}`, 'X-Arcox-Owner': sessionInfo.walletAddress } : {}),
+      'X-Payment-Id': params.paymentId || '',
+    }
     const r = await fetch(`${BACKEND_URL}/api/intel${path}`, { headers })
     const data = await r.json()
     if (r.status === 402 || data?.paymentRequired) {
@@ -790,8 +904,8 @@ export function createMcpServer(userId) {
   })
 
   intelTool('arcox_intel_get_address', 'Get address intelligence via ARCOX Intel (may require x402 payment).', p => `/address/${encodeURIComponent(p.address)}/all`, {
-    address: z.string().describe('EVM address (0x...)'),
-    paymentId: z.string().optional().describe('x402 paymentId if already paid'),
+    address: z.string().describe('EVM address (0x...)'),      paymentId: z.string().optional().describe('x402 paymentId if already paid'),
+
   })
   intelTool('arcox_intel_get_contract', 'Get contract intelligence.', p => `/contract/${encodeURIComponent(p.chain)}/${encodeURIComponent(p.address)}`, {
     chain: z.string().describe('Chain (ethereum, base, arbitrum)'),

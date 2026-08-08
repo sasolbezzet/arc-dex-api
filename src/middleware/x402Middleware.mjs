@@ -1,7 +1,8 @@
 import { createPublicKey, randomUUID, verify as verifySignature } from 'crypto'
-import { createPublicClient, http, fallback, parseAbiItem, formatUnits, keccak256, toHex, decodeEventLog } from 'viem'
+import { createPublicClient, http, fallback, parseAbiItem, keccak256, toHex, decodeEventLog } from 'viem'
 import { atomicWriteJsonFile, readJsonFile } from '../services/jsonFileStore.mjs'
 import { verifyAgentOwnership } from '../services/agentIdentityService.mjs'
+import { verifyOwnerToken } from '../services/authToken.mjs'
 import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
 
@@ -127,10 +128,14 @@ export function createX402Invoice(input = {}) {
   const baseAmount = normalizeAmount(input.amount || cfg.baseAmount)
   const uniqueAmount = normalizeAmount(input.uniqueAmount || nextUniqueAmount(baseAmount))
   const agentId = /^\d+$/.test(String(input.agentId || '')) ? String(input.agentId) : ''
-  const agentMemo = buildAgentMemo({ agentId, paymentId, requestId: input.requestId || paymentId, service: input.service || 'x402', amount: uniqueAmount, treasury: cfg.circleTreasuryAddress })
+  const paymentMethod = input.paymentMethod || 'arc-usdc-direct'
+  const agentMemo = paymentMethod === 'unified-balance-gateway' || paymentMethod === 'arc-usdc-memo'
+    ? buildAgentMemo({ agentId, paymentId, requestId: input.requestId || paymentId, service: input.service || 'x402', amount: uniqueAmount, treasury: cfg.circleTreasuryAddress })
+    : null
   const memoId = input.memoId || agentMemo?.memoId || keccak256(toHex(paymentId))
   const memoData = input.memoData || agentMemo?.memoData || toHex(JSON.stringify({ app: 'arcox', service: 'x402', paymentIdHash: keccak256(toHex(paymentId)) }))
   const invoice = {
+
     invoiceId,
     paymentId,
     agentId,
@@ -150,11 +155,11 @@ export function createX402Invoice(input = {}) {
     amount: uniqueAmount,
     amountBaseUnits: amountToBaseUnits(uniqueAmount),
     decimals: 6,
-    memoContract: ARC_MEMO_CONTRACT,
-    memoId,
-    memoData,
-    paymentMethod: 'arc-usdc-memo',
-    paymentMethods: ['arc-usdc-memo', 'unified-balance-gateway'],
+    ...(paymentMethod === 'unified-balance-gateway' || paymentMethod === 'arc-usdc-memo' ? { memoContract: ARC_MEMO_CONTRACT, memoId, memoData } : {}),
+    // MSCA payments use a direct ERC-20 transfer. Arc Memo remains available
+    // only for legacy EOA invoices and must never be called by an MSCA.
+    paymentMethod,
+    paymentMethods: paymentMethod === 'unified-balance-gateway' ? ['unified-balance-gateway'] : paymentMethod === 'arc-usdc-memo' ? ['arc-usdc-memo'] : ['arc-usdc-direct'],
     settlementStatus: 'payment_required',
     route: {
       destination: 'Arc_Testnet',
@@ -197,7 +202,12 @@ export async function reconcileX402Invoice(id) {
   if (!invoice || !invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) return invoice
   if (invoice.status === 'paid' || invoice.status === 'refunded' || invoice.status === 'cancelled') return invoice
   try {
-    const gatewayMatch = await findFinalizedGatewayTransfer(invoice)
+    const gatewayMatch = invoice.paymentMethod === 'unified-balance-gateway'
+      ? await findFinalizedGatewayTransfer(invoice)
+      : null
+    if (invoice.paymentMethod === 'arc-usdc-direct' && !/^0x[0-9a-fA-F]{40}$/.test(String(invoice.ownerWallet || ''))) return invoice
+    if (invoice.paymentMethod === 'arc-usdc-direct' && normalizeAddress(invoice.usdcAddress) !== normalizeAddress(ARC_USDC)) return invoice
+    if (invoice.paymentMethod === 'arc-usdc-direct' && Number(invoice.chainId) !== 5042002) return invoice
     if (gatewayMatch) {
       invoice.status = 'paid'
       invoice.settlementStatus = 'paid'
@@ -222,7 +232,9 @@ export async function reconcileX402Invoice(id) {
     const current = await client.getBlockNumber()
     const lookback = BigInt(Number(process.env.X402_RECONCILE_LOOKBACK_BLOCKS || '25000'))
     const fromBlock = current > lookback ? current - lookback : 0n
-    const memoMatch = await findMemoPayment(client, invoice, fromBlock, current)
+    const memoMatch = invoice.paymentMethod === 'arc-usdc-direct'
+      ? null
+      : await findMemoPayment(client, invoice, fromBlock, current)
     if (memoMatch) {
       invoice.status = 'paid'
       invoice.settlementStatus = 'paid'
@@ -244,20 +256,37 @@ export async function reconcileX402Invoice(id) {
     let match = null
     for (let chunkStart = fromBlock; chunkStart <= current && !match; chunkStart += chunkSize) {
       const chunkEnd = chunkStart + chunkSize - 1n > current ? current : chunkStart + chunkSize - 1n
+      const chainId = await client.getChainId().catch(() => null)
+      if (chainId !== null && Number(chainId) !== Number(invoice.chainId)) return invoice
       const logs = await client.getLogs({
-        address: ARC_USDC,
+        address: invoice.usdcAddress || ARC_USDC,
         event: TRANSFER_EVENT,
-        args: { to: invoice.recipient },
+        args: {
+          from: invoice.ownerWallet && /^0x[0-9a-fA-F]{40}$/.test(invoice.ownerWallet) ? invoice.ownerWallet : undefined,
+          to: invoice.recipient,
+        },
         fromBlock: chunkStart,
-        toBlock: chunkEnd,
-      }).catch(() => [])
+        toBlock: chunkEnd,        }).catch(() => [])
       const expectedAmount = safeNormalizeAmount(invoice.uniqueAmount)
-      const amountMatches = expectedAmount
+
+      const expectedBaseUnits = invoice.amountBaseUnits || (expectedAmount ? amountToBaseUnits(expectedAmount) : null)
+      const expectedPayer = normalizeAddress(invoice.ownerWallet)
+      if (normalizeAddress(invoice.usdcAddress) !== normalizeAddress(ARC_USDC)) return invoice
+      if (Number(invoice.chainId) !== 5042002) return invoice
+      const expectedRecipient = normalizeAddress(invoice.recipient)
+      const amountMatches = expectedBaseUnits
         ? logs
-          .filter(log => formatUnits(log.args.value || 0n, 6) === expectedAmount)
+          // Keep the payer/recipient check explicit even though they are also
+          // used as indexed-log filters. This prevents a mocked or non-standard
+          // RPC response from turning a loosely matching transfer into payment.
+          .filter(log => normalizeAddress(log.args?.from) === expectedPayer)
+          .filter(log => normalizeAddress(log.args?.to) === expectedRecipient)
+          .filter(log => String(log.args?.value || 0n) === String(expectedBaseUnits))
           .sort((a, b) => Number((b.blockNumber || 0n) - (a.blockNumber || 0n)))
         : []
       for (const log of amountMatches) {
+        const receipt = await client.getTransactionReceipt({ hash: log.transactionHash }).catch(() => null)
+        if (!receipt || receipt.status !== 'success') continue
         if (Number.isFinite(invoiceCreatedAt) && log.blockNumber) {
           const block = await client.getBlock({ blockNumber: log.blockNumber }).catch(() => null)
           const blockTimeMs = block?.timestamp ? Number(block.timestamp) * 1000 : 0
@@ -274,7 +303,8 @@ export async function reconcileX402Invoice(id) {
     invoice.blockNumber = String(match.blockNumber || '')
     invoice.paidAt = new Date().toISOString()
     invoice.updatedAt = invoice.paidAt
-    invoice.reconciledBy = 'arc-usdc-transfer-log'
+    invoice.reconciledBy = 'arc-usdc-transfer-log-payer-bound'
+    invoice.payer = normalizeAddress(match.args?.from)
     invoices.set(invoice.invoiceId, invoice)
     invoices.set(invoice.paymentId, invoice)
     persistInvoices()
@@ -308,11 +338,9 @@ export function publicInvoice(invoice) {
     amount: invoice.uniqueAmount,
     amountBaseUnits: invoice.amountBaseUnits || amountToBaseUnits(invoice.uniqueAmount),
     decimals: 6,
-    memoContract: invoice.memoContract || ARC_MEMO_CONTRACT,
-    memoId: invoice.memoId,
-    memoData: invoice.memoData,
-    paymentMethod: invoice.paymentMethod || 'arc-usdc-memo',
-    paymentMethods: invoice.paymentMethods || ['arc-usdc-memo', 'unified-balance-gateway'],
+    ...(invoice.memoContract ? { memoContract: invoice.memoContract, memoId: invoice.memoId, memoData: invoice.memoData } : {}),
+    paymentMethod: invoice.paymentMethod || 'arc-usdc-direct',
+    paymentMethods: invoice.paymentMethods || ['arc-usdc-direct', 'unified-balance-gateway'],
     settlementStatus: invoice.settlementStatus || invoice.status,
     route: invoice.route,
     fee: invoice.fee,
@@ -362,7 +390,7 @@ async function findMemoPayment(client, invoice, fromBlock, toBlock) {
       if (normalizeAddress(log.address) !== normalizeAddress(ARC_USDC)) return false
       try {
         const decoded = decodeEventLog({ abi: [TRANSFER_EVENT], data: log.data, topics: log.topics })
-        return normalizeAddress(decoded.args?.to) === expectedTo && formatUnits(decoded.args?.value || 0n, 6) === expectedAmount
+        return normalizeAddress(decoded.args?.to) === expectedTo && String(decoded.args?.value || 0n) === String(invoice.amountBaseUnits || amountToBaseUnits(expectedAmount))
       } catch {
         return false
       }
@@ -524,12 +552,17 @@ export function processCircleX402Webhook(payload = {}) {
     const latest = getX402Invoice(invoice.invoiceId)
     if (!latest || !isOpenStatus(latest.status)) continue
     if (normalizeAddress(latest.recipient) !== extracted.destinationAddress) continue
+    // Gateway webhook records are accepted only when the invoice explicitly
+    // opted into Gateway settlement. Direct MSCA invoices must reconcile from
+    // an Arc Transfer log, where payer binding is available.
+    if (latest.paymentMethod !== 'unified-balance-gateway') continue
     if (normalizeAsset(latest.asset) !== extracted.asset) continue
     if (normalizeAmount(latest.uniqueAmount) !== extracted.amount) continue
     if (normalizeNetwork(latest.network || targetNetwork) !== extracted.network && targetNetwork !== extracted.network) continue
     latest.status = 'paid'
     latest.settlementStatus = 'paid'
     latest.txHash = extracted.txHash || ''
+    latest.payer = normalizeAddress(data.sourceAddress || data.fromAddress || data.source?.address || '')
     latest.paidAt = new Date().toISOString()
     latest.updatedAt = latest.paidAt
     latest.webhookEventId = eventId
@@ -636,10 +669,30 @@ export function withArcoxX402(handler, config = {}) {
     const resource = String(config.resource || req.originalUrl || req.path)
     const ownerWallet = String(req.headers['x-arcox-owner'] || req.query?.ownerWallet || '').toLowerCase()
     const agentId = String(req.headers['x-arcox-agent-id'] || req.query?.agentId || '')
+    if (ownerWallet) {
+      const authHeader = String(req.headers.authorization || '')
+      const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : ''
+      let authenticatedOwner = verifyOwnerToken(bearer)
+      if (!authenticatedOwner && bearer.startsWith('arx_vs_')) {
+        try {
+          const { validateSession } = await import('../services/vaultStore.mjs')
+          authenticatedOwner = validateSession(bearer)
+        } catch { authenticatedOwner = null }
+      }
+      if (!authenticatedOwner) return res.status(401).json({ error: 'Authenticated wallet required for MSCA x402 payment' })
+      const { getSessionKeyInfo } = await import('../services/vaultStore.mjs')
+      const session = await getSessionKeyInfo(authenticatedOwner)
+      if (!session?.active || String(session.walletAddress || '').toLowerCase() !== ownerWallet) {
+        return res.status(403).json({ error: 'x402 payer must be the authenticated active MSCA' })
+      }
+    }
     if (agentId && !await verifyAgentOwnership(agentId, ownerWallet)) {
       return res.status(403).json({ error: 'Agent identity mismatch' })
     }
     const paymentId = String(req.headers['x-payment-id'] || req.headers['x-arcox-payment-request-id'] || req.query?.paymentId || '')
+    if (paymentId && !ownerWallet) {
+      return res.status(401).json({ error: 'Authenticated MSCA owner header is required to retry a paid x402 resource' })
+    }
     if (paymentId) {
       const invoice = await reconcileX402Invoice(paymentId)
       if (invoice && ((agentId && agentId !== String(invoice.agentId || '')) || (ownerWallet && invoice.ownerWallet && ownerWallet !== invoice.ownerWallet))) {
@@ -664,10 +717,16 @@ export function withArcoxX402(handler, config = {}) {
       }
     }
 
+    if (!ownerWallet && !paymentId) {
+      // A direct MSCA invoice must be payer-bound. Legacy memo invoices are not
+      // created implicitly for remote MCP requests anymore.
+      return res.status(400).json({ error: 'Authenticated MSCA owner is required for x402 resource access' })
+    }
     const invoice = createX402Invoice({
       service: config.service || 'arcox_intel',
       ownerWallet,
       agentId,
+      paymentMethod: 'arc-usdc-direct',
       amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount),
       resource,
     })
