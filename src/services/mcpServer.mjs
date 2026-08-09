@@ -11,6 +11,7 @@ const sessions = new Map() // sessionId -> { transport, server }
 const executionQuotes = new Map() // previewId -> { userId, action, params, expires }
 const authCodes = new Map() // code -> { clientId, userId, redirectUri, codeChallenge, expires }
 const accessTokens = new Map() // token -> { userId, clientId, expires }
+const destinationMintLocks = new Set() // destination chain + CCTP nonce in-flight
 
 // MCP responses may include decoded CCTP uint256 fields represented as BigInt.
 // Always serialize them as decimal strings so direct handler execution and
@@ -670,6 +671,55 @@ const RECEIVE_MESSAGE_ABI = [{
   inputs: [{ name: 'message', type: 'bytes' }, { name: 'attestation', type: 'bytes' }],
   outputs: [{ name: 'success', type: 'bool' }],
 }]
+const USED_NONCES_ABI = [{
+  type: 'function', name: 'usedNonces', stateMutability: 'view',
+  inputs: [{ name: 'nonce', type: 'bytes32' }],
+  outputs: [{ name: '', type: 'bool' }],
+}]
+
+// CCTP V2 nonce is the 32-byte field immediately after version/source/domain.
+// Keep this separate from the decoded address fields so destination mint
+// idempotency can be checked without submitting another UserOperation.
+export function extractCctpMessageNonce(message) {
+  const raw = String(message || '').replace(/^0x/i, '').toLowerCase()
+  if (!/^[0-9a-f]+$/.test(raw) || raw.length < 88) return null
+  return `0x${raw.slice(24, 88)}`
+}
+
+export function destinationNonceDecision({ checked, processed } = {}) {
+  if (processed === true) return 'minted'
+  if (checked !== true) return 'unavailable'
+  return 'not_minted'
+}
+
+export async function destinationMintAlreadyProcessed({ status, route, client: injectedClient } = {}) {
+  const nonce = extractCctpMessageNonce(status?.message)
+  const rpcUrl = route?.destination?.rpcUrl
+  const messageTransmitter = route?.destination?.messageTransmitter
+  if (!nonce || !rpcUrl || !messageTransmitter) return { checked: false, processed: false, nonce, reason: 'destination_nonce_check_unavailable' }
+  try {
+    const destinationInfo = {
+      Base_Sepolia: { id: 84532 },
+      Arbitrum_Sepolia: { id: 421614 },
+    }[route.toKey]
+    if (!destinationInfo) return { checked: false, processed: false, nonce, reason: 'destination_nonce_check_unavailable' }
+    const client = injectedClient || createPublicClient({
+      chain: defineChain({ id: destinationInfo.id, name: route.toKey, nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [rpcUrl] } } }),
+      transport: http(rpcUrl),
+    })
+    const processed = await client.readContract({
+      address: getAddress(messageTransmitter),
+      abi: USED_NONCES_ABI,
+      functionName: 'usedNonces',
+      args: [nonce],
+    })
+    return { checked: true, processed: Boolean(processed), nonce }
+  } catch {
+    // A failed read must never be treated as not minted. Do not submit a
+    // destination UserOperation until idempotency can be proven.
+    return { checked: false, processed: false, nonce, reason: 'destination_nonce_check_unavailable' }
+  }
+}
 
 async function destinationMscaPreflight({ route, walletAddress, requireAuthorization = true }) {
   const destinationInfo = {
@@ -698,16 +748,40 @@ async function mintDestinationViaMsca({ status, route, walletAddress }) {
   if (!status?.verified || !status.message || !status.attestation) return { success: false, error: 'Attestation belum ready' }
   const destinationKey = route.toKey === 'Base_Sepolia' ? 'base-sepolia' : route.toKey === 'Arbitrum_Sepolia' ? 'arbitrum-sepolia' : null
   if (!destinationKey) return { success: false, error: 'destination_msca_route_not_supported' }
-  const preflight = await destinationMscaPreflight({ route, walletAddress })
-  if (!preflight.ok) return { success: false, error: preflight.message || preflight.reason }
-  const { executeViaSession } = await import('./sessionKeyService.mjs')
-  const result = await executeViaSession(walletAddress, [{
-    to: route.destination.messageTransmitter,
-    value: 0n,
-    data: encodeFunctionData({ abi: RECEIVE_MESSAGE_ABI, functionName: 'receiveMessage', args: [status.message, status.attestation] }),
-  }], { paymaster: true, chainKey: destinationKey, requireTransactionHash: true })
-  if (result.status !== 'success') return { success: false, error: result.reason || 'Destination MSCA UserOperation failed', userOpHash: result.userOpHash }
-  return { success: true, txHash: result.txHash, userOpHash: result.userOpHash, explorerUrl: `${route.destination.explorer}${result.txHash}` }
+  const alreadyProcessed = await destinationMintAlreadyProcessed({ status, route })
+  const nonceDecision = destinationNonceDecision(alreadyProcessed)
+  if (nonceDecision === 'unavailable') {
+    return { success: false, error: alreadyProcessed.reason || 'destination_nonce_check_unavailable', safeToRetry: true }
+  }
+  if (nonceDecision === 'minted') {
+    return {
+      success: true,
+      idempotent: true,
+      txHash: null,
+      userOpHash: null,
+      explorerUrl: null,
+      message: 'CCTP message sudah diproses di destination; tidak mengirim UserOperation ulang.',
+    }
+  }
+  const lockKey = `${route.toKey}:${alreadyProcessed.nonce}`
+  if (destinationMintLocks.has(lockKey)) {
+    return { success: false, error: 'destination_mint_in_flight', safeToRetry: true }
+  }
+  destinationMintLocks.add(lockKey)
+  try {
+    const preflight = await destinationMscaPreflight({ route, walletAddress })
+    if (!preflight.ok) return { success: false, error: preflight.message || preflight.reason }
+    const { executeViaSession } = await import('./sessionKeyService.mjs')
+    const result = await executeViaSession(walletAddress, [{
+      to: route.destination.messageTransmitter,
+      value: 0n,
+      data: encodeFunctionData({ abi: RECEIVE_MESSAGE_ABI, functionName: 'receiveMessage', args: [status.message, status.attestation] }),
+    }], { paymaster: true, chainKey: destinationKey, requireTransactionHash: true })
+    if (result.status !== 'success') return { success: false, error: result.reason || 'Destination MSCA UserOperation failed', userOpHash: result.userOpHash, safeToRetry: true }
+    return { success: true, txHash: result.txHash, userOpHash: result.userOpHash, explorerUrl: `${route.destination.explorer}${result.txHash}` }
+  } finally {
+    destinationMintLocks.delete(lockKey)
+  }
 }
 
 // Decide whether an agent-initiated action can auto-execute server-side.
@@ -1351,7 +1425,9 @@ export function createMcpServer(userId) {
       return { content: [{ type: 'text', text: jsonText({
         status: mint.success ? 'executed' : 'settlement_pending',
         executed: true,
-        safeToRetry: !mint.success ? true : undefined,
+        safeToRetry: mint.success ? false : (mint.safeToRetry ?? true),
+        destinationMintStatus: mint.success ? 'minted' : (mint.error === 'destination_nonce_check_unavailable' ? 'unknown' : 'pending'),
+        destinationMintIdempotent: Boolean(mint.idempotent),
         auditPending,
         walletAddress: info.walletAddress,
         walletType: 'MSCA',
@@ -1367,7 +1443,9 @@ export function createMcpServer(userId) {
         destinationExplorerUrl: mint.explorerUrl || null,
         mintError: mint.success ? null : mint.error,
         fee: { platformFeeBaseUnits: fee.fee.toString(), netBurnBaseUnits: fee.netAmount.toString(), totalDebitBaseUnits: amount.toString(), cctpMaxFeeBaseUnits: BRIDGE_MAX_FEE.toString() },
-        message: mint.success ? 'Bridge MSCA berhasil sampai destination.' : 'Burn MSCA berhasil; destination mint masih pending. Jalankan arcox_bridge_status lalu retry setelah attestation siap.',
+        message: mint.success
+          ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya; tidak ada UserOperation ulang.' : 'Bridge MSCA berhasil sampai destination.')
+          : 'Burn MSCA berhasil; destination mint masih pending. Jalankan arcox_bridge_status lalu retry setelah attestation siap.',
       }) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ status: 'bridge_error', executed: false, error: e?.message || 'MSCA bridge gagal' }) }] }
@@ -1410,12 +1488,44 @@ export function createMcpServer(userId) {
       safeToRetry: false,
       message: 'CCTP message tidak terikat ke route/MSCA yang aktif. Tidak ada transaksi baru yang dikirim.',
     }) }] }
+    const destinationMint = status.verified
+      ? await destinationMintAlreadyProcessed({ status, route })
+      : { checked: false, processed: false }
+    const nonceDecision = destinationNonceDecision(destinationMint)
+    if (nonceDecision === 'unavailable') {
+      return { content: [{ type: 'text', text: jsonText({
+        ...status,
+        status: 'settlement_pending',
+        destinationMintStatus: 'unknown',
+        reason: destinationMint.reason || 'destination_nonce_check_unavailable',
+        safeToRetry: true,
+        walletAddress: info.walletAddress,
+        walletType: 'MSCA',
+        source: route.fromKey,
+        note: 'Nonce destination belum dapat diverifikasi. MCP tidak mengirim transaksi baru; ulangi status setelah RPC pulih.',
+      }) }] }
+    }
+    if (nonceDecision === 'minted') {
+      return { content: [{ type: 'text', text: jsonText({
+        ...status,
+        status: 'minted',
+        minted: true,
+        destinationMintStatus: 'minted',
+        mintTxHash: null,
+        safeToRetry: false,
+        walletAddress: info.walletAddress,
+        walletType: 'MSCA',
+        source: route.fromKey,
+        note: 'CCTP message sudah diproses di destination. MCP tidak mengirim transaksi baru.',
+      }) }] }
+    }
     return { content: [{ type: 'text', text: jsonText({
       ...status,
       walletAddress: info.walletAddress,
       walletType: 'MSCA',
       source: route.fromKey,
-      note: 'Status ini membaca Iris/Circle attestation dan tidak mengirim transaksi baru.',
+      destinationMintStatus: status.verified ? 'not_minted' : 'pending',
+      note: 'Status ini membaca Iris/Circle attestation dan destination nonce; tidak mengirim transaksi baru.',
     }) }] }
   })
 
@@ -1454,8 +1564,27 @@ export function createMcpServer(userId) {
         message: 'CCTP message tidak terikat ke route/MSCA yang aktif. Retry mint diblokir dan tidak ada transaksi destination yang dikirim.',
       }) }] }
       if (!status.verified) return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, burnTxHash: params.burnTxHash, messageStatus: status.messageStatus || 'pending', message: 'Attestation belum tersedia. Tidak ada transaksi destination yang dikirim.' }) }] }
+      const destinationMint = await destinationMintAlreadyProcessed({ status, route })
+      const nonceDecision = destinationNonceDecision(destinationMint)
+      if (nonceDecision === 'unavailable') {
+        return { content: [{ type: 'text', text: jsonText({
+          status: 'settlement_pending', executed: false, burnTxHash: params.burnTxHash,
+          walletAddress: info.walletAddress, walletType: 'MSCA',
+          destinationMintStatus: 'unknown', reason: destinationMint.reason || 'destination_nonce_check_unavailable',
+          safeToRetry: true, message: 'Nonce destination belum dapat diverifikasi. Tidak ada UserOperation baru yang dikirim.',
+        }) }] }
+      }
+      if (nonceDecision === 'minted') {
+        return { content: [{ type: 'text', text: jsonText({
+          status: 'minted', executed: false, idempotent: true, burnTxHash: params.burnTxHash,
+          walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: null,
+          destinationUserOpHash: null, destinationExplorerUrl: null, safeToRetry: false,
+          error: null, message: 'Destination mint sudah selesai sebelumnya. Tidak mengirim UserOperation ulang.',
+        }) }] }
+      }
       const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress })
-      return { content: [{ type: 'text', text: jsonText({ status: mint.success ? 'minted' : 'mint_failed', executed: mint.success, burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, error: mint.success ? null : mint.error, message: mint.success ? 'Destination receiveMessage berhasil via MSCA UserOperation.' : 'Destination mint gagal; pastikan MSCA deployed dan session destination chain telah diotorisasi.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({        status: mint.success ? 'minted' : 'mint_failed', executed: mint.success && !mint.idempotent, idempotent: Boolean(mint.idempotent), burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, destinationMintStatus: mint.success ? 'minted' : 'unknown', safeToRetry: mint.success ? false : (mint.safeToRetry ?? true), error: mint.success ? null : mint.error, message: mint.success ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya.' : 'Destination receiveMessage berhasil via MSCA UserOperation.') : 'Destination mint gagal; pastikan MSCA deployed dan session destination chain telah diotorisasi.' }) }] }
+
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ status: 'retry_error', executed: false, burnTxHash: params.burnTxHash, error: e?.message || 'Retry mint gagal' }) }] }
     }

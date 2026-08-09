@@ -235,6 +235,53 @@ test('CCTP indexing lag remains pending instead of false route rejection', async
   }
 })
 
+test('CCTP nonce extraction uses the canonical 32-byte nonce field', async () => {
+  const { extractCctpMessageNonce, destinationNonceDecision } = await import('../src/services/mcpServer.mjs?cctp-nonce-' + Date.now())
+  const header = [
+    '00000001', // version
+    '0000001a', // Arc source domain
+    '00000006', // Base destination domain
+    '77669523b79da35a989a2d5e73114327974af41ceda6be8440c1b9475a84b7f5', // nonce
+    '0'.repeat(64),
+    '0'.repeat(64),
+    '0'.repeat(64),
+    '000003e8',
+    '000007d0',
+  ].join('')
+  assert.equal(
+    extractCctpMessageNonce('0x' + header),
+    '0x77669523b79da35a989a2d5e73114327974af41ceda6be8440c1b9475a84b7f5',
+  )
+  assert.equal(extractCctpMessageNonce('0x1234'), null)
+  assert.equal(destinationNonceDecision({ checked: true, processed: true }), 'minted')
+  assert.equal(destinationNonceDecision({ checked: true, processed: false }), 'not_minted')
+  assert.equal(destinationNonceDecision({ checked: false, processed: false }), 'unavailable')
+})
+
+test('destination nonce check is idempotent and fail-closed on RPC errors', async () => {
+  const { destinationMintAlreadyProcessed } = await import('../src/services/mcpServer.mjs?nonce-check-' + Date.now())
+  const status = { message: '0x' + [
+    '00000001', '0000001a', '00000006',
+    '77669523b79da35a989a2d5e73114327974af41ceda6be8440c1b9475a84b7f5',
+  ].join('') }
+  const route = {
+    toKey: 'Base_Sepolia',
+    destination: { rpcUrl: 'https://example.invalid', messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275' },
+  }
+  const used = await destinationMintAlreadyProcessed({ status, route, client: {
+    readContract: async () => true,
+  } })
+  assert.deepEqual({ checked: used.checked, processed: used.processed }, { checked: true, processed: true })
+  const unavailable = await destinationMintAlreadyProcessed({ status, route, client: {
+    readContract: async () => { throw new Error('RPC unavailable') },
+  } })
+  assert.deepEqual({ checked: unavailable.checked, processed: unavailable.processed, reason: unavailable.reason }, {
+    checked: false,
+    processed: false,
+    reason: 'destination_nonce_check_unavailable',
+  })
+})
+
 test('MSCA bridge calldata approves and calls the verified ArcoxRouter', async () => {
   const { buildMscaRouterBridgeCalls } = await import('../src/services/mcpServer.mjs?bridge-calldata-' + Date.now())
   const route = {
