@@ -43,6 +43,8 @@ test('Base→Arc bridge status binds source router, Base USDC, and Arc recipient
     assert.equal(result.messageBody.mintRecipient, MSCA)
     assert.equal(result.messageBody.messageSender, BASE_TO_ARC_ROUTE.source.router.toLowerCase())
     assert.equal(result.messageBody.burnToken, BASE_TO_ARC_ROUTE.source.usdc.toLowerCase())
+    assert.equal(result.cctpFeeExecuted, '10')
+    assert.equal(result.netMintAmount, '999990')
     assert.equal(result.messageHeader.sourceDomain, 6)
     assert.equal(result.messageHeader.destinationDomain, 26)
   } finally {
@@ -59,6 +61,29 @@ test('destination nonce check supports Arc and fails closed on RPC errors', asyn
   const unavailable = await destinationMintAlreadyProcessed({ status, route: BASE_TO_ARC_ROUTE, client: { readContract: async () => { throw new Error('rpc unavailable') } } })
   assert.equal(unavailable.checked, false)
   assert.equal(unavailable.reason, 'destination_nonce_check_unavailable')
+})
+
+test('transient Iris route candidate is polled until the exact Base→Arc message is indexed', async () => {
+  const { waitForCctpBridgeStatus } = await import('../src/services/mcpServer.mjs?cctp-transient-' + Date.now() + '-' + Math.random())
+  const previousFetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls += 1
+    const recipient = calls === 1 ? '0x3333333333333333333333333333333333333333' : MSCA
+    return new Response(JSON.stringify({ messages: [{ message: messageFor(recipient, BASE_TO_ARC_ROUTE), attestation: '0xattestation', status: 'complete' }] }), { status: 200 })
+  }
+  try {
+    const result = await waitForCctpBridgeStatus({
+      burnTxHash: '0x' + 'd'.repeat(64), sourceDomain: 6, destinationDomain: 26,
+      walletAddress: MSCA, route: BASE_TO_ARC_ROUTE, expectedBurnAmount: 1_000_000n,
+    }, { attempts: 2, delayMs: 0 })
+    assert.equal(calls, 2)
+    assert.equal(result.status, 'attestation_ready')
+    assert.equal(result.verified, true)
+    assert.equal(result.messageBody.mintRecipient, MSCA)
+  } finally {
+    globalThis.fetch = previousFetch
+  }
 })
 
 test('bridge status fetches and binds the requested burnTxHash', async () => {
@@ -78,9 +103,13 @@ test('bridge status fetches and binds the requested burnTxHash', async () => {
     assert.equal(first.messageBody.mintRecipient, MSCA)
     assert.equal(second.status, 'rejected')
     assert.equal(second.reason, 'cctp_message_route_unverified')
-    assert.equal(requested.length, 2)
+    const permanent = await getCctpBridgeStatus({ burnTxHash: '0x' + 'b'.repeat(64), sourceDomain: 26, destinationDomain: 6, walletAddress: MSCA, route: ROUTE, expectedBurnAmount: 1_000_000n })
+    assert.equal(permanent.status, 'rejected')
+    assert.equal(permanent.verified, false)
+    assert.equal(requested.length, 3)
     assert.match(requested[0], /transactionHash=0x[a]+$/)
     assert.match(requested[1], /transactionHash=0x[b]+$/)
+    assert.match(requested[2], /transactionHash=0x[b]+$/)
   } finally {
     globalThis.fetch = previousFetch
   }

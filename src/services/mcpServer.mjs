@@ -578,11 +578,17 @@ export function selectCctpMessage(messages, sourceDomain, destinationDomain, bin
   }
 }
 
-export async function waitForCctpBridgeStatus(args, { attempts = 8, delayMs = 1500 } = {}) {
+// Iris may briefly expose a non-empty candidate list before the exact burn
+// message is fully indexed. Treat only this binding result as transient while
+// polling; domain/token/recipient mismatches remain fail-closed rejections.
+const TRANSIENT_CCTP_STATUS_REASONS = new Set(['cctp_message_route_unverified'])
+
+export async function waitForCctpBridgeStatus(args, { attempts = 40, delayMs = 3000 } = {}) {
   let lastStatus = null
   for (let attempt = 0; attempt < attempts; attempt++) {
     lastStatus = await getCctpBridgeStatus(args)
-    if (lastStatus.status !== 'pending') return lastStatus
+    const transient = lastStatus.status === 'pending' || TRANSIENT_CCTP_STATUS_REASONS.has(lastStatus.reason)
+    if (!transient) return lastStatus
     if (attempt + 1 < attempts) await new Promise(resolve => setTimeout(resolve, delayMs))
   }
   return lastStatus || { status: 'pending', burnTxHash: args.burnTxHash, verified: false, reason: 'cctp_message_pending' }
@@ -676,6 +682,8 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
       }
     }
     const hasAttestation = Boolean(message.attestation && message.message)
+    const cctpFeeExecuted = body.feeExecuted ?? 0n
+    const netMintAmount = body.amount >= cctpFeeExecuted ? body.amount - cctpFeeExecuted : null
     return {
       status: hasAttestation ? 'attestation_ready' : message.status === 'complete' ? 'attestation_ready' : 'pending',
       burnTxHash,
@@ -686,6 +694,8 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
       messageStatus: message.status || 'pending',
       sourceDomain,
       destinationDomain,
+      cctpFeeExecuted: cctpFeeExecuted.toString(),
+      netMintAmount: netMintAmount === null ? null : netMintAmount.toString(),
       messageHeader: header,
       messageBody: body,
     }
@@ -1526,6 +1536,8 @@ export function createMcpServer(userId, context = {}) {
         mintTxHash: mint.txHash || null,
         destinationExplorerUrl: mint.explorerUrl || null,
         mintError: mint.success ? null : mint.error,
+        cctpFeeExecuted: bridgeStatus.cctpFeeExecuted || null,
+        netMintAmount: bridgeStatus.netMintAmount || null,
         fee: { platformFeeBaseUnits: fee.fee.toString(), netBurnBaseUnits: fee.netAmount.toString(), totalDebitBaseUnits: amount.toString(), cctpMaxFeeBaseUnits: BRIDGE_MAX_FEE.toString() },
         message: mint.success
           ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya; tidak ada UserOperation ulang.' : 'Bridge MSCA berhasil sampai destination.')
