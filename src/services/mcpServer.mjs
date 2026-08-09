@@ -316,12 +316,18 @@ const BRIDGE_CCTP = {
     domain: 6,
     explorer: 'https://sepolia.basescan.org/tx/',
     rpcUrl: process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org',
+    // CCTP MessageTransmitter header recipient is the destination TokenMessenger.
+    // The end-user/MSCA recipient lives in the TokenMessenger message body.
+    tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
   },
   Arbitrum_Sepolia: {
     domain: 3,
     explorer: 'https://sepolia.arbiscan.io/tx/',
     rpcUrl: process.env.ARB_SEPOLIA_RPC_URL || 'https://sepolia-rollup.arbitrum.io/rpc',
+    // CCTP MessageTransmitter header recipient is the destination TokenMessenger.
+    // The end-user/MSCA recipient lives in the TokenMessenger message body.
+    tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
   },
   HyperEVM_Testnet: { domain: 19, explorer: 'https://app.hyperliquid-testnet.xyz/explorer/tx/' },
@@ -437,20 +443,64 @@ async function verifyBridgeBurn({ burnTxHash, route, walletAddress, amount }) {
   return { ok: false, reason: 'bridge_burn_proof_mismatch' }
 }
 
-function decodeCctpMessageHeader(message) {
-  const raw = String(message || '').replace(/^0x/i, '')
-  // Circle MessageV2: version/source/destination (uint32), nonce (uint64),
-  // sender/recipient/destinationCaller (bytes32), then finality fields.
-  if (raw.length < 256) return null
-  return {
-    version: Number(BigInt(`0x${raw.slice(0, 8)}`)),
-    sourceDomain: Number(BigInt(`0x${raw.slice(8, 16)}`)),
-    destinationDomain: Number(BigInt(`0x${raw.slice(16, 24)}`)),
-    recipient: `0x${raw.slice(104, 168).slice(24)}`.toLowerCase(),
-  }
+function hexUint(raw, start, end) {
+  const value = raw.slice(start, end)
+  return value ? BigInt(`0x${value}`) : 0n
 }
 
-async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain, walletAddress }) {
+function bytes32EvmAddress(value) {
+  const word = String(value || '').toLowerCase()
+  if (!/^0{24}[0-9a-f]{40}$/.test(word)) return null
+  return `0x${word.slice(24)}`
+}
+
+// CCTP V2 has two distinct recipient concepts:
+//   - Message header recipient: destination TokenMessenger (a contract).
+//   - Burn message-body mintRecipient: final beneficiary (our MSCA).
+// Comparing the header recipient directly to the MSCA creates a false
+// `cctp_message_recipient_unverified` rejection and hides a valid attestation.
+export function decodeCctpMessage(message) {
+  const raw = String(message || '').replace(/^0x/i, '').toLowerCase()
+  // CCTP V2 header: uint32 version/source/destination, then bytes32 nonce,
+  // bytes32 sender/recipient/destinationCaller, then uint32 finality fields.
+  // Total header size is 148 bytes (296 hex chars).
+  if (!/^[0-9a-f]*$/.test(raw) || raw.length < 296) return null
+  const header = {
+    version: Number(hexUint(raw, 0, 8)),
+    sourceDomain: Number(hexUint(raw, 8, 16)),
+    destinationDomain: Number(hexUint(raw, 16, 24)),
+    nonce: `0x${raw.slice(24, 88)}`,
+    sender: bytes32EvmAddress(raw.slice(88, 152)),
+    recipient: bytes32EvmAddress(raw.slice(152, 216)),
+    destinationCaller: bytes32EvmAddress(raw.slice(216, 280)),
+    minFinalityThreshold: Number(hexUint(raw, 280, 288)),
+    finalityThresholdExecuted: Number(hexUint(raw, 288, 296)),
+  }
+  const bodyRaw = raw.slice(296)
+  let messageBody = null
+  // CCTP V2 burn body: version, burnToken, mintRecipient, amount,
+  // messageSender, maxFee, feeExecuted, expirationBlock, hookData.
+  if (bodyRaw.length >= 456) {
+    messageBody = {
+      version: Number(hexUint(bodyRaw, 0, 8)),
+      burnToken: bytes32EvmAddress(bodyRaw.slice(8, 72)),
+      mintRecipient: bytes32EvmAddress(bodyRaw.slice(72, 136)),
+      amount: hexUint(bodyRaw, 136, 200),
+      messageSender: bytes32EvmAddress(bodyRaw.slice(200, 264)),
+      maxFee: hexUint(bodyRaw, 264, 328),
+      feeExecuted: hexUint(bodyRaw, 328, 392),
+      expirationBlock: hexUint(bodyRaw, 392, 456),
+      hookData: bodyRaw.slice(456) ? `0x${bodyRaw.slice(456)}` : null,
+    }
+  }
+  return { ...header, messageBody }
+}
+
+export function decodeCctpMessageHeader(message) {
+  return decodeCctpMessage(message)
+}
+
+async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain, walletAddress, route, expectedBurnAmount }) {
   const url = `https://iris-api-sandbox.circle.com/v2/messages/${sourceDomain}?transactionHash=${encodeURIComponent(burnTxHash)}`
   try {
     const response = await fetch(url, { headers: { Accept: 'application/json' } })
@@ -458,13 +508,78 @@ async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain
     const data = await response.json()
     const message = data?.messages?.[0]
     if (!message) return { status: 'pending', burnTxHash, verified: false }
-    const header = decodeCctpMessageHeader(message.message)
+    const decoded = decodeCctpMessage(message.message)
+    const header = decoded
     if (!header || header.sourceDomain !== Number(sourceDomain) || header.destinationDomain !== Number(destinationDomain)) {
-      return { status: 'rejected', burnTxHash, verified: false, reason: 'cctp_message_route_unverified' }
+      return { status: 'rejected', burnTxHash, verified: false, reason: 'cctp_message_route_unverified', messageHeader: header }
     }
-    const expectedRecipient = String(walletAddress).toLowerCase()
-    if (header.recipient !== expectedRecipient) {
-      return { status: 'rejected', burnTxHash, verified: false, reason: 'cctp_message_recipient_unverified', messageHeader: header }
+    const expectedHeaderSender = route?.source?.tokenMessenger
+      ? getAddress(route.source.tokenMessenger).toLowerCase()
+      : null
+    if (!expectedHeaderSender || header.sender !== expectedHeaderSender) {
+      return {
+        status: 'rejected', burnTxHash, verified: false,
+        reason: 'cctp_message_sender_unverified',
+        expectedSender: expectedHeaderSender,
+        actualSender: header.sender,
+        messageHeader: header,
+      }
+    }
+    const expectedHeaderRecipient = route?.destination?.tokenMessenger
+      ? getAddress(route.destination.tokenMessenger).toLowerCase()
+      : null
+    if (!expectedHeaderRecipient || header.recipient !== expectedHeaderRecipient) {
+      return {
+        status: 'rejected', burnTxHash, verified: false,
+        reason: 'cctp_message_recipient_unverified',
+        expectedRecipient: expectedHeaderRecipient,
+        actualRecipient: header.recipient,
+        messageHeader: header,
+      }
+    }
+    const body = header.messageBody
+    const expectedMintRecipient = getAddress(walletAddress).toLowerCase()
+    if (!body || body.mintRecipient !== expectedMintRecipient) {
+      return {
+        status: 'rejected', burnTxHash, verified: false,
+        reason: 'cctp_message_mint_recipient_unverified',
+        expectedMintRecipient,
+        actualMintRecipient: body?.mintRecipient || null,
+        messageHeader: header,
+        messageBody: body,
+      }
+    }
+    const expectedSender = route?.source?.router ? getAddress(route.source.router).toLowerCase() : null
+    if (!body.messageSender || body.messageSender !== expectedSender) {
+      return {
+        status: 'rejected', burnTxHash, verified: false,
+        reason: 'cctp_message_sender_unverified',
+        expectedSender,
+        actualSender: body?.messageSender || null,
+        messageHeader: header,
+        messageBody: body,
+      }
+    }
+    const expectedBurnToken = route?.source?.usdc ? getAddress(route.source.usdc).toLowerCase() : null
+    if (!body.burnToken || body.burnToken !== expectedBurnToken) {
+      return {
+        status: 'rejected', burnTxHash, verified: false,
+        reason: 'cctp_message_token_unverified',
+        expectedBurnToken,
+        actualBurnToken: body?.burnToken || null,
+        messageHeader: header,
+        messageBody: body,
+      }
+    }
+    if (expectedBurnAmount !== undefined && (!body.amount || body.amount !== BigInt(expectedBurnAmount))) {
+      return {
+        status: 'rejected', burnTxHash, verified: false,
+        reason: 'cctp_message_amount_unverified',
+        expectedBurnAmount: BigInt(expectedBurnAmount).toString(),
+        actualBurnAmount: body?.amount?.toString() || null,
+        messageHeader: header,
+        messageBody: body,
+      }
     }
     const hasAttestation = Boolean(message.attestation && message.message)
     return {
@@ -478,9 +593,16 @@ async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain
       sourceDomain,
       destinationDomain,
       messageHeader: header,
+      messageBody: body,
     }
-  } catch {
-    return { status: 'pending', burnTxHash, verified: false }
+  } catch (error) {
+    const messageText = String(error?.message || '')
+    // Network/IRIS availability is transient; malformed or invalid CCTP data
+    // must remain rejected and must never be presented as safe to retry.
+    if (messageText.includes('cctp_message') || messageText.includes('decode') || messageText.includes('invalid')) {
+      return { status: 'rejected', burnTxHash, verified: false, reason: 'cctp_message_decode_failed', error: messageText }
+    }
+    return { status: 'pending', burnTxHash, verified: false, reason: 'cctp_attestation_unavailable' }
   }
 }
 
@@ -1102,7 +1224,57 @@ export function createMcpServer(userId) {
       if (result.status !== 'success') return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Bridge UserOperation gagal', userOpHash: result.userOpHash }) }] }
       const burnProof = await verifyBridgeBurn({ burnTxHash: result.txHash, route, walletAddress: info.walletAddress, amount })
       if (!burnProof.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'burn_submitted', executed: true, verified: false, burnTxHash: result.txHash, userOpHash: result.userOpHash, reason: burnProof.reason, message: 'Source UserOperation berhasil tetapi bukti event router belum terverifikasi. Jangan ulangi burn; periksa transaksi ini secara read-only.' }) }] }
-      const bridgeStatus = await getCctpBridgeStatus({ burnTxHash: result.txHash, sourceDomain: route.source.domain, destinationDomain: route.destination.domain, walletAddress: info.walletAddress })
+      const bridgeStatus = await getCctpBridgeStatus({
+        burnTxHash: result.txHash,
+        sourceDomain: route.source.domain,
+        destinationDomain: route.destination.domain,
+        walletAddress: info.walletAddress,
+        route,
+        expectedBurnAmount: burnProof.args ? BigInt(burnProof.args.amount) - BigInt(burnProof.args.fee) : undefined,
+      })
+      if (bridgeStatus.status === 'rejected') {
+        // The source burn is irreversible even when CCTP binding is rejected.
+        // Preserve it in the vault as an error/audit record without marking it
+        // approved or attempting any destination transaction.
+        try {
+          const vault = await import('./vaultStore.mjs')
+          const approval = vault.createApproval(userId, {
+            agent: resolveAgentForUser(userId),
+            action: 'bridge',
+            amount: params.amount,
+            token: 'USDC',
+            source: 'session',
+            details: JSON.stringify({
+              fromChain: route.fromKey,
+              toChain: route.toKey,
+              previewId: params.previewId,
+              settlementStatus: 'rejected',
+              reason: bridgeStatus.reason,
+            }),
+            forcePending: true,
+          })
+          vault.updateApprovalStatus(userId, approval.id, 'error', {
+            txHash: result.txHash,
+            explorerUrl: result.explorerUrl,
+            userOpHash: result.userOpHash,
+            error: bridgeStatus.reason || 'CCTP binding rejected',
+          })
+        } catch (auditError) {
+          console.error('[mcp-bridge] rejected burn audit record failed:', auditError?.message || auditError)
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({
+          ...bridgeStatus,
+          status: 'rejected',
+          executed: true,
+          verified: false,
+          burnTxHash: result.txHash,
+          userOpHash: result.userOpHash,
+          walletAddress: info.walletAddress,
+          walletType: 'MSCA',
+          safeToRetry: false,
+          message: 'Burn sudah terjadi, tetapi binding CCTP tidak cocok. Mint dan retry diblokir; jangan burn ulang.',
+        }) }] }
+      }
       const mint = bridgeStatus.verified
         ? await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress }).catch(error => ({ success: false, error: error?.message || 'Destination MSCA mint request failed' }))
         : { success: false, error: 'Attestation belum ready' }
@@ -1120,6 +1292,7 @@ export function createMcpServer(userId) {
       return { content: [{ type: 'text', text: JSON.stringify({
         status: mint.success ? 'executed' : 'settlement_pending',
         executed: true,
+        safeToRetry: !mint.success ? true : undefined,
         auditPending,
         walletAddress: info.walletAddress,
         walletType: 'MSCA',
@@ -1156,16 +1329,28 @@ export function createMcpServer(userId) {
     if (!route || route.fromKey !== 'Arc_Testnet') {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', reason: 'bridge_route_not_supported_for_msca', message: 'Status bridge MSCA hanya tersedia untuk burn dari Arc Testnet.' }) }] }
     }
+    let burnProof
     try {
-      const burnProof = await verifyBridgeBurn({ burnTxHash: params.burnTxHash, route, walletAddress: info.walletAddress })
+      burnProof = await verifyBridgeBurn({ burnTxHash: params.burnTxHash, route, walletAddress: info.walletAddress })
       if (!burnProof.ok) {
         return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', verified: false, reason: burnProof.reason }) }] }
       }
     } catch {
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', verified: false, reason: 'bridge_burn_not_found' }) }] }
     }
-    const status = await getCctpBridgeStatus({ burnTxHash: params.burnTxHash, sourceDomain: route.source.domain, destinationDomain: route.destination.domain, walletAddress: info.walletAddress })
-    if (status.status === 'rejected') return { content: [{ type: 'text', text: JSON.stringify(status) }] }
+    const status = await getCctpBridgeStatus({
+      burnTxHash: params.burnTxHash,
+      sourceDomain: route.source.domain,
+      destinationDomain: route.destination.domain,
+      walletAddress: info.walletAddress,
+      route,
+      expectedBurnAmount: BigInt(burnProof.args.amount) - BigInt(burnProof.args.fee),
+    })
+    if (status.status === 'rejected') return { content: [{ type: 'text', text: JSON.stringify({
+      ...status,
+      safeToRetry: false,
+      message: 'CCTP message tidak terikat ke route/MSCA yang aktif. Tidak ada transaksi baru yang dikirim.',
+    }) }] }
     return { content: [{ type: 'text', text: JSON.stringify({
       ...status,
       walletAddress: info.walletAddress,
@@ -1194,7 +1379,21 @@ export function createMcpServer(userId) {
     try {
       const proof = await verifyBridgeBurn({ burnTxHash: params.burnTxHash, route, walletAddress: info.walletAddress })
       if (!proof.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: proof.reason, message: 'Burn ini tidak terbukti berasal dari ArcoxRouter untuk MSCA aktif.' }) }] }
-      const status = await getCctpBridgeStatus({ burnTxHash: params.burnTxHash, sourceDomain: route.source.domain, destinationDomain: route.destination.domain, walletAddress: info.walletAddress })
+      const status = await getCctpBridgeStatus({
+        burnTxHash: params.burnTxHash,
+        sourceDomain: route.source.domain,
+        destinationDomain: route.destination.domain,
+        walletAddress: info.walletAddress,
+        route,
+        expectedBurnAmount: BigInt(proof.args.amount) - BigInt(proof.args.fee),
+      })
+      if (status.status === 'rejected') return { content: [{ type: 'text', text: JSON.stringify({
+        ...status,
+        status: 'rejected',
+        executed: false,
+        safeToRetry: false,
+        message: 'CCTP message tidak terikat ke route/MSCA yang aktif. Retry mint diblokir dan tidak ada transaksi destination yang dikirim.',
+      }) }] }
       if (!status.verified) return { content: [{ type: 'text', text: JSON.stringify({ status: 'settlement_pending', executed: false, burnTxHash: params.burnTxHash, messageStatus: status.messageStatus || 'pending', message: 'Attestation belum tersedia. Tidak ada transaksi destination yang dikirim.' }) }] }
       const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress })
       return { content: [{ type: 'text', text: JSON.stringify({ status: mint.success ? 'minted' : 'mint_failed', executed: mint.success, burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, error: mint.success ? null : mint.error, message: mint.success ? 'Destination receiveMessage berhasil via MSCA UserOperation.' : 'Destination mint gagal; pastikan MSCA deployed dan session destination chain telah diotorisasi.' }) }] }

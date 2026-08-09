@@ -100,6 +100,44 @@ test('MSCA-bound quote fields distinguish the active wallet', () => {
   assert.notEqual(quote.walletAddress.toLowerCase(), current.walletAddress.toLowerCase())
 })
 
+test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mint recipient', async () => {
+  const { decodeCctpMessage } = await import('../src/services/mcpServer.mjs?cctp-decode-' + Date.now())
+  const word = value => String(value).replace(/^0x/i, '').padStart(64, '0')
+  const addressWord = address => word(address)
+  const uint32 = value => String(value).replace(/^0x/i, '').padStart(8, '0')
+  const nonce = '0x' + '01'.padStart(64, '0')
+  const header = [
+    uint32('0x00000001'), // message version
+    uint32('0x0000001a'), // Arc source domain 26
+    uint32('0x00000006'), // Base destination domain 6
+    nonce.slice(2), // 32-byte nonce
+    addressWord('0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA'), // source TokenMessenger
+    addressWord('0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA'), // destination TokenMessenger
+    addressWord('0x0000000000000000000000000000000000000000000000000000000000000000'), // anyone may relay
+    uint32('0x000003e8'), // min finality threshold
+    uint32('0x000003e8'), // executed finality threshold
+  ].join('')
+  const body = [
+    uint32('0x00000001'), // burn message version
+    addressWord('0x3600000000000000000000000000000000000000'), // Arc USDC
+    addressWord(MSCA), // final mint recipient
+    word('0x00000000000f4240'), // 1 USDC
+    addressWord('0xDf800310443BEB589CEf91A09854203Ea36e43a7'), // message sender
+    word('0x0a'), // max fee
+    word('0x0a'), // executed fee
+    word('0x0'), // expiration block
+  ].join('')
+  const decoded = decodeCctpMessage('0x' + header + body)
+  assert.equal(decoded.sourceDomain, 26)
+  assert.equal(decoded.destinationDomain, 6)
+  assert.equal(decoded.recipient, '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa')
+  assert.equal(decoded.messageBody.mintRecipient, MSCA.toLowerCase())
+  assert.equal(decoded.messageBody.messageSender, '0xdf800310443beb589cef91a09854203ea36e43a7')
+  assert.equal(decoded.messageBody.burnToken, '0x3600000000000000000000000000000000000000')
+  assert.equal(decoded.messageBody.amount, 1_000_000n)
+  assert.equal(decoded.sender, '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa')
+})
+
 test('MSCA bridge calldata approves and calls the verified ArcoxRouter', async () => {
   const { buildMscaRouterBridgeCalls } = await import('../src/services/mcpServer.mjs?bridge-calldata-' + Date.now())
   const route = {
