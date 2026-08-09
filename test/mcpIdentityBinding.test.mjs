@@ -181,6 +181,60 @@ test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mi
   assert.equal(noValidCandidate.candidates.length, 1)
 })
 
+test('CCTP indexing lag remains pending instead of false route rejection', async () => {
+  const { waitForCctpBridgeStatus, getCctpBridgeStatus } = await import('../src/services/mcpServer.mjs?cctp-pending-' + Date.now())
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify({ messages: [] }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })
+  try {
+    const result = await waitForCctpBridgeStatus({
+      burnTxHash: '0x' + 'a'.repeat(64),
+      sourceDomain: 26,
+      destinationDomain: 6,
+      walletAddress: MSCA,
+      route: {
+        source: {
+          tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
+          router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
+          usdc: '0x3600000000000000000000000000000000000000',
+        },
+        destination: { tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
+      },
+      expectedBurnAmount: 99700n,
+    }, { attempts: 1, delayMs: 0 })
+    assert.equal(result.status, 'pending')
+    assert.equal(result.reason, 'cctp_message_pending')
+    assert.equal(result.verified, false)
+
+    const wrongMessage = '0x' + '00'.repeat(148)
+    globalThis.fetch = async () => new Response(JSON.stringify({ messages: [{ message: wrongMessage, status: 'complete' }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+    const mismatch = await getCctpBridgeStatus({
+      burnTxHash: '0x' + 'b'.repeat(64),
+      sourceDomain: 26,
+      destinationDomain: 6,
+      walletAddress: MSCA,
+      route: {
+        source: {
+          tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
+          router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
+          usdc: '0x3600000000000000000000000000000000000000',
+        },
+        destination: { tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
+      },
+      expectedBurnAmount: 99700n,
+    })
+    assert.equal(mismatch.status, 'rejected')
+    assert.equal(mismatch.reason, 'cctp_message_route_unverified')
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
 test('MSCA bridge calldata approves and calls the verified ArcoxRouter', async () => {
   const { buildMscaRouterBridgeCalls } = await import('../src/services/mcpServer.mjs?bridge-calldata-' + Date.now())
   const route = {

@@ -535,7 +535,17 @@ export function selectCctpMessage(messages, sourceDomain, destinationDomain, bin
   }
 }
 
-async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain, walletAddress, route, expectedBurnAmount }) {
+export async function waitForCctpBridgeStatus(args, { attempts = 8, delayMs = 1500 } = {}) {
+  let lastStatus = null
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    lastStatus = await getCctpBridgeStatus(args)
+    if (lastStatus.status !== 'pending') return lastStatus
+    if (attempt + 1 < attempts) await new Promise(resolve => setTimeout(resolve, delayMs))
+  }
+  return lastStatus || { status: 'pending', burnTxHash: args.burnTxHash, verified: false, reason: 'cctp_message_pending' }
+}
+
+export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain, walletAddress, route, expectedBurnAmount }) {
   const url = `https://iris-api-sandbox.circle.com/v2/messages/${sourceDomain}?transactionHash=${encodeURIComponent(burnTxHash)}`
   try {
     const response = await fetch(url, { headers: { Accept: 'application/json' } })
@@ -545,6 +555,13 @@ async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain
     const message = selection.selected
     const header = selection.decoded
     if (!message) {
+      // Iris can return an empty message list while the source burn is still
+      // being indexed. That is transient and must not be reported as a
+      // permanent route mismatch. A non-empty list with no fully-bound match
+      // remains fail-closed below as a real binding rejection.
+      if (!Array.isArray(data?.messages) || data.messages.length === 0) {
+        return { status: 'pending', burnTxHash, verified: false, reason: 'cctp_message_pending', messageHeader: header, messageCandidates: selection.candidates }
+      }
       return { status: 'rejected', burnTxHash, verified: false, reason: 'cctp_message_route_unverified', messageHeader: header, messageCandidates: selection.candidates }
     }
     const expectedHeaderSender = route?.source?.tokenMessenger
@@ -680,7 +697,7 @@ async function mintDestinationViaMsca({ status, route, walletAddress }) {
     to: route.destination.messageTransmitter,
     value: 0n,
     data: encodeFunctionData({ abi: RECEIVE_MESSAGE_ABI, functionName: 'receiveMessage', args: [status.message, status.attestation] }),
-  }], { paymaster: false, chainKey: destinationKey, requireTransactionHash: true })
+  }], { paymaster: true, chainKey: destinationKey, requireTransactionHash: true })
   if (result.status !== 'success') return { success: false, error: result.reason || 'Destination MSCA UserOperation failed', userOpHash: result.userOpHash }
   return { success: true, txHash: result.txHash, userOpHash: result.userOpHash, explorerUrl: `${route.destination.explorer}${result.txHash}` }
 }
@@ -1258,7 +1275,7 @@ export function createMcpServer(userId) {
       if (result.status !== 'success') return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Bridge UserOperation gagal', userOpHash: result.userOpHash }) }] }
       const burnProof = await verifyBridgeBurn({ burnTxHash: result.txHash, route, walletAddress: info.walletAddress, amount })
       if (!burnProof.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'burn_submitted', executed: true, verified: false, burnTxHash: result.txHash, userOpHash: result.userOpHash, reason: burnProof.reason, message: 'Source UserOperation berhasil tetapi bukti event router belum terverifikasi. Jangan ulangi burn; periksa transaksi ini secara read-only.' }) }] }
-      const bridgeStatus = await getCctpBridgeStatus({
+      const bridgeStatus = await waitForCctpBridgeStatus({
         burnTxHash: result.txHash,
         sourceDomain: route.source.domain,
         destinationDomain: route.destination.domain,
