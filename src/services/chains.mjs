@@ -1,6 +1,11 @@
 // chains.mjs — Multi-chain configuration for MSCA + balance fetching.
 // Supported: Arc Testnet, Ethereum Sepolia, Arbitrum Sepolia, Base Sepolia.
 
+// Circle Modular Wallet/MSCA support is narrower than Circle Gas Station support.
+// Ethereum Sepolia can use other Circle wallet products/Gas Station, but it is
+// not an MSCA network and must never enter the passkey/session UserOperation flow.
+export const MSCA_SUPPORTED_CHAIN_KEYS = ['arc-testnet', 'base-sepolia', 'arbitrum-sepolia']
+
 export const CHAINS = {
   'arc-testnet': {
     id: 5042002,
@@ -39,7 +44,9 @@ export const CHAINS = {
     rpcUrl: process.env.ARB_SEPOLIA_RPC_URL || 'https://arbitrum-sepolia-rpc.publicnode.com',
     explorerUrl: 'https://sepolia.arbiscan.io',
     nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-    transportSlug: 'arbSepolia',
+    // Circle Modular Web SDK uses the lowerCamelCase Chain class name.
+    // Arbitrum Sepolia is ArbitrumSepolia, not the abbreviated arbSepolia.
+    transportSlug: 'arbitrumSepolia',
     tokens: {
       USDC:  '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d',
       ETH:   null, // native

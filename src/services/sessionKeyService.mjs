@@ -23,7 +23,7 @@ import { sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abs
 import { encrypt, decrypt } from './crypto.mjs'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { getLimits } from './vaultStore.mjs'
-import { CHAINS } from './chains.mjs'
+import { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } from './chains.mjs'
 
 const ADD_OWNERS_ABI = [{
   type: 'function',
@@ -139,6 +139,7 @@ export function getSessionKey(userId) {
 
 /** Return whether the active delegate was explicitly authorized on a chain. */
 export function isSessionAuthorizedForChain(userId, chainKey = 'arc-testnet') {
+  if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(String(chainKey))) return false
   const entry = getSessionKey(userId)
   if (!entry?.active) return false
   const key = String(chainKey)
@@ -154,6 +155,7 @@ export function recordSessionChainAuthorization(userId, { walletAddress, chainKe
   if (!entry?.active) throw new Error('Active session key required')
   if (getAddress(entry.walletAddress) !== wallet) throw new Error('Session wallet mismatch')
   if (!CHAINS[chainKey]) throw new Error(`Unknown chain: ${chainKey}`)
+  if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) throw new Error(`MSCA unsupported on ${CHAINS[chainKey].name}; use a supported Circle wallet product instead`)
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
   entry.authorizationUserOpHashes = { ...(entry.authorizationUserOpHashes || {}), [chainKey]: authorizationUserOpHash }
   entry.lastAuthorizedChainAt = Date.now()
@@ -242,6 +244,7 @@ export async function verifySessionAuthorization(userId, { walletAddress, delega
   if (getAddress(entry.delegateAddress) !== delegate) throw new Error('Automation signer mismatch')
   const chain = CHAINS[chainKey]
   if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
+  if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) throw new Error(`MSCA unsupported on ${chain.name}; use a supported Circle wallet product instead`)
   if (!CLIENT_URL || !CLIENT_KEY) throw new Error('Circle bundler verification is not configured')
 
   // Do not trust a client-supplied hash merely because it has the right shape.
@@ -456,6 +459,9 @@ export function revokeSessionKey(userId) {
 export function canExecuteViaSession(userId, amount, chainKey) {
   const entry = getSessionKey(userId)
   if (!entry || !entry.active) return { ok: false, reason: 'no_session' }
+  if (chainKey !== undefined && !MSCA_SUPPORTED_CHAIN_KEYS.includes(String(chainKey))) {
+    return { ok: false, reason: 'msca_unsupported_chain', chain: chainKey }
+  }
   if (chainKey !== undefined && !isSessionAuthorizedForChain(userId, chainKey)) {
     return { ok: false, reason: 'session_chain_not_authorized', chain: chainKey }
   }
@@ -515,6 +521,7 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
   if (!CLIENT_URL || !CLIENT_KEY) throw new Error('CIRCLE_CLIENT_URL and CIRCLE_CLIENT_KEY must be set')
   const chain = CHAINS[chainKey]
   if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
+  if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) throw new Error(`MSCA unsupported on ${chain.name}; use a supported Circle wallet product instead`)
 
   const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
   const viemChain = buildViemChain(chainKey)
@@ -547,7 +554,9 @@ export async function executeViaSession(userId, calls, options = {}) {
   try { touchSessionKey(userId) } catch { /* non-fatal */ }
 
   const chainKey = options.chainKey || entry.chain || 'arc-testnet'
-  if (!CHAINS[chainKey]) throw new Error(`Session not available: unknown_chain (${chainKey})`)
+  const chain = CHAINS[chainKey]
+  if (!chain) throw new Error(`Session not available: unknown_chain (${chainKey})`)
+  if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) throw new Error(`Session not available: msca_unsupported_chain (${chainKey})`)
   if (!isSessionAuthorizedForChain(userId, chainKey)) {
     throw new Error(`Session not authorized for chain: ${chainKey}`)
   }
@@ -602,7 +611,7 @@ export async function executeViaSession(userId, calls, options = {}) {
   // bridge callers opt into requireTransactionHash because they must query the
   // source receipt and router event before minting on the destination.
   const txHash = receiptTxHash || userOpHash
-  const explorerBase = String(options.explorerBaseUrl || 'https://testnet.arcscan.app/tx/').replace(/\/?$/, '/')
+  const explorerBase = String(options.explorerBaseUrl || chain.explorerUrl + '/tx/').replace(/\/?$/, '/')
   const explorerUrl = `${explorerBase}${txHash}`
 
   return {
@@ -622,6 +631,9 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
   const requestedChain = options.chainKey
   if (requestedChain !== undefined && !CHAINS[requestedChain]) {
     return { status: 'denied', reason: 'unknown_chain', chain: requestedChain }
+  }
+  if (requestedChain !== undefined && !MSCA_SUPPORTED_CHAIN_KEYS.includes(requestedChain)) {
+    return { status: 'denied', reason: 'msca_unsupported_chain', chain: requestedChain }
   }
   const gate = canExecuteViaSession(userId, amount, requestedChain)
   if (!gate.ok) return { status: 'denied', reason: gate.reason, chain: requestedChain }
@@ -702,6 +714,7 @@ export async function getUserOpStatus(userId, userOpHash) {
   const chainKey = entry.chain || 'arc-testnet'
   const chain = CHAINS[chainKey]
   if (!chain) return { status: 'error', reason: 'unknown_chain' }
+  if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) return { status: 'error', reason: 'msca_unsupported_chain', chain: chainKey }
   const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
   const baseClient = createPublicClient({ chain: buildViemChain(chainKey), transport })
   const modularClient = toCircleModularWalletClient({ client: baseClient })
@@ -713,7 +726,7 @@ export async function getUserOpStatus(userId, userOpHash) {
     return {
       status: receipt.success ? 'success' : 'error',
       txHash,
-      explorerUrl: `https://testnet.arcscan.app/tx/${txHash}`,
+      explorerUrl: `${String(chain.explorerUrl || '').replace(/\/?$/, '')}/tx/${txHash}`,
       receipt,
     }
   } catch {
