@@ -40,6 +40,113 @@ test('EOA without explicit MSCA alias cannot resolve a session', async () => {
   }
 })
 
+test('inactive legacy OAuth owner does not shadow an active explicit MSCA alias', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
+  const path = join(dir, 'session-keys.json')
+  const EOA = '0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e'
+  const MSCA = '0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5'
+  await writeFile(path, JSON.stringify({
+    users: {
+      [EOA]: { walletAddress: EOA, delegateAddress: EOA, chain: 'arc-testnet', createdAt: 1, active: false },
+      [MSCA]: { walletAddress: MSCA, delegateAddress: MSCA, chain: 'arc-testnet', createdAt: 2, active: true, authorizationUserOpHash: '0x' + '44'.repeat(32) },
+    },
+    aliases: { [EOA]: MSCA },
+  }))
+  const prev = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  process.env.SESSION_KEY_ENCRYPTION_KEY = 'test'
+  try {
+    const mod = await import('../src/services/sessionKeyService.mjs?alias-shadow-' + Date.now())
+    const entry = mod.getSessionKey(EOA)
+    assert.equal(entry?.active, true)
+    assert.equal(entry?.walletAddress.toLowerCase(), MSCA)
+  } finally {
+    if (prev === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = prev
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('active exact identity with stale authorization does not inherit an aliased signer', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
+  const path = join(dir, 'session-keys.json')
+  const MSCA = '0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5'
+  await writeFile(path, JSON.stringify({
+    users: {
+      [EOA]: { walletAddress: EOA, delegateAddress: EOA, chain: 'arc-testnet', createdAt: 1, active: true, authorizationUserOpHash: '' },
+      [MSCA]: { walletAddress: MSCA, delegateAddress: MSCA, chain: 'arc-testnet', createdAt: 2, active: true, authorizationUserOpHash: '0x' + '55'.repeat(32) },
+    },
+    aliases: { [EOA]: MSCA },
+  }))
+  const prev = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  process.env.SESSION_KEY_ENCRYPTION_KEY = 'test'
+  try {
+    const mod = await import('../src/services/sessionKeyService.mjs?stale-exact-' + Date.now())
+    const entry = mod.getSessionKey(EOA)
+    assert.equal(entry?.active, false)
+    assert.equal(entry?.staleAuthorization, true)
+    assert.equal(entry?.walletAddress.toLowerCase(), EOA)
+  } finally {
+    if (prev === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = prev
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('touchSessionKey updates the active aliased MSCA, not inactive legacy OAuth owner', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
+  const path = join(dir, 'session-keys.json')
+  const MSCA = '0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5'
+  await writeFile(path, JSON.stringify({
+    users: {
+      [EOA]: { walletAddress: EOA, delegateAddress: EOA, chain: 'arc-testnet', createdAt: 1, active: false, lastUsedAt: 1 },
+      [MSCA]: { walletAddress: MSCA, delegateAddress: MSCA, chain: 'arc-testnet', createdAt: 2, active: true, authorizationUserOpHash: '0x' + '66'.repeat(32), lastUsedAt: 1 },
+    },
+    aliases: { [EOA]: MSCA },
+  }))
+  const prev = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  process.env.SESSION_KEY_ENCRYPTION_KEY = 'test'
+  try {
+    const mod = await import('../src/services/sessionKeyService.mjs?touch-alias-' + Date.now())
+    const before = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8'))
+    const touched = mod.touchSessionKey(EOA)
+    assert.equal(touched?.walletAddress.toLowerCase(), MSCA)
+    const after = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8'))
+    assert.equal(after.users[EOA].lastUsedAt, before.users[EOA].lastUsedAt)
+    assert.ok(after.users[MSCA].lastUsedAt > before.users[MSCA].lastUsedAt)
+  } finally {
+    if (prev === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = prev
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('inactive legacy owner with walletAddress but no explicit alias remains inactive', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
+  const path = join(dir, 'session-keys.json')
+  const MSCA = '0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5'
+  await writeFile(path, JSON.stringify({
+    users: {
+      [EOA]: { walletAddress: MSCA, delegateAddress: EOA, chain: 'arc-testnet', createdAt: 1, active: false },
+      [MSCA]: { walletAddress: MSCA, delegateAddress: MSCA, chain: 'arc-testnet', createdAt: 2, active: true, authorizationUserOpHash: '0x' + '77'.repeat(32) },
+    },
+    aliases: {},
+  }))
+  const prev = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  process.env.SESSION_KEY_ENCRYPTION_KEY = 'test'
+  try {
+    const mod = await import('../src/services/sessionKeyService.mjs?no-wallet-promotion-' + Date.now())
+    assert.equal(mod.getSessionKey(EOA)?.active, false)
+  } finally {
+    if (prev === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = prev
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('listRelatedAddresses clusters EOA and MSCA bidirectionally', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
   const path = join(dir, 'session-keys.json')

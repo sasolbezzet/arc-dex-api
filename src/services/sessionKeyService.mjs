@@ -82,30 +82,29 @@ export function getSessionKey(userId) {
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
   let entry = null
-  // 1) Exact owner match
-  if (store.users[key]) entry = store.users[key]
-  // 2) Explicit EOA alias -> MSCA walletAddress
+  // 1) Prefer an active exact owner record.
+  // Legacy/inactive records for an old OAuth/EOA identity must not shadow an
+  // explicit alias that points to the currently active MSCA session.
+  const exact = store.users[key]
+  if (exact?.active === true) entry = exact
+  // 2) Explicit EOA alias -> MSCA walletAddress. Resolve this when the exact
+  // record is absent, inactive, or stale; never fall back to a global wallet.
   if (!entry) {
     const walletAddr = store.aliases?.[key]
-    if (walletAddr && store.users[walletAddr.toLowerCase()]) entry = store.users[walletAddr.toLowerCase()]
-  }
-  if (!entry) return null
-  // If the found entry is revoked but its wallet has an active entry, prefer that.
-  if (entry && entry.active === false && entry.walletAddress) {
-    const walletKey = entry.walletAddress.toLowerCase()
-    const walletEntry = store.users[walletKey]
-    if (walletEntry && walletEntry.active !== false) entry = walletEntry
-  }
-  // If the found entry's wallet has a NEWER active entry under the wallet key,
-  // prefer that one (newer delegate key from latest loginPasskey/setupSessionKey).
-  if (entry && entry.walletAddress) {
-    const walletKey = entry.walletAddress.toLowerCase()
-    const walletEntry = store.users[walletKey]
-    if (walletEntry && walletEntry.active !== false && walletEntry !== entry) {
-      const entryTime = entry.lastUsedAt || entry.createdAt || 0
-      const walletTime = walletEntry.lastUsedAt || walletEntry.createdAt || 0
-      if (walletTime > entryTime) entry = walletEntry
+    if (walletAddr && store.users[String(walletAddr).toLowerCase()]) {
+      entry = store.users[String(walletAddr).toLowerCase()]
     }
+  }
+  // 3) Keep an exact inactive record visible for staleAuthorization diagnostics
+  // when no explicit alias exists.
+  if (!entry && exact) entry = exact
+  if (!entry) return null
+  // Do not promote an inactive record through walletAddress alone. Only the
+  // explicit alias above may cross an OAuth/EOA → MSCA identity boundary.
+  // Likewise, reject a stale exact record before considering any related data;
+  // an active-but-unauthorized identity must never inherit another signer.
+  if (entry.active === true && !/^0x[0-9a-fA-F]{64}$/.test(String(entry.authorizationUserOpHash || ''))) {
+    return { ...entry, active: false, staleAuthorization: true }
   }
   // Decrypt delegate key for in-memory use only (never written back encrypted twice)
   if (entry.delegatePrivateKey && !entry._decrypted) {
@@ -314,11 +313,15 @@ export function listRelatedAddresses(userId) {
 export function touchSessionKey(userId) {
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
-  let entry = store.users[key]
-  // Resolve through alias / auto-detect the same way getSessionKey does.
+  let entry = store.users[key]?.active === true ? store.users[key] : null
+  // Resolve through the same explicit alias rules as getSessionKey. An
+  // inactive/stale exact OAuth record must not be touched when its alias points
+  // to the active MSCA entry.
   if (!entry) {
     const walletAddr = store.aliases?.[key]
-    if (walletAddr && store.users[walletAddr.toLowerCase()]) entry = store.users[walletAddr.toLowerCase()]
+    if (walletAddr && store.users[String(walletAddr).toLowerCase()]?.active === true) {
+      entry = store.users[String(walletAddr).toLowerCase()]
+    }
   }
   if (!entry) return null
   entry.lastUsedAt = Date.now()
