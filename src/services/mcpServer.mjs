@@ -9,7 +9,9 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs'
 // ── In-memory session store (production: use Redis) ──
 const sessions = new Map() // sessionId -> { transport, server }
 const executionQuotes = new Map() // previewId -> { userId, action, params, expires }
-const authCodes = new Map() // code -> { clientId, userId, redirectUri, codeChallenge, expires }
+const authCodes = new Map() // code -> { clientId, userId, redirectUri, codeChallenge, state, expires }
+const oauthRequests = new Map() // requestId -> original authorization request
+const siweChallenges = new Map() // nonce -> exact SIWE challenge binding
 const accessTokens = new Map() // token -> { userId, clientId, expires }
 const destinationMintLocks = new Set() // destination chain + CCTP nonce in-flight
 
@@ -60,10 +62,29 @@ export function registerOAuthClient({ clientName, redirectUris = [] }) {
   return { clientId, clientSecret, clientName, redirectUris }
 }
 
-export function createAuthCode(clientId, userId, { redirectUri, codeChallenge } = {}) {
+export function createAuthCode(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce } = {}) {
   const code = randomUUID()
-  authCodes.set(code, { clientId, userId, redirectUri, codeChallenge, expires: Date.now() + 600000 }) // 10 min
+  authCodes.set(code, { clientId, userId, redirectUri, codeChallenge, state: state || '', requestId: requestId || null, challengeNonce: challengeNonce || null, expires: Date.now() + 600000 }) // 10 min
   return code
+}
+
+// A repeated SIWE verification can happen when a wallet returns successfully
+// but the browser loses the first HTTP response. Reuse the still-valid grant
+// instead of issuing competing codes and leaving the MCP client waiting on a
+// stale callback. The signature itself is verified by the caller before this
+// helper is used.
+export function findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state } = {}) {
+  const now = Date.now()
+  for (const [code, auth] of authCodes) {
+    if (now > auth.expires) {
+      authCodes.delete(code)
+      continue
+    }
+    if (auth.clientId === clientId && auth.userId === userId && auth.redirectUri === redirectUri && auth.codeChallenge === codeChallenge && (auth.state || '') === (state || '')) {
+      return code
+    }
+  }
+  return null
 }
 
 export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, codeVerifier) {
@@ -82,6 +103,10 @@ export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, 
     if (client.clientSecret !== clientSecret) return { error: 'invalid_client', error_description: 'Invalid client_secret' }
   }
   authCodes.delete(code)
+  if (auth.challengeNonce) {
+    const challenge = siweChallenges.get(auth.challengeNonce)
+    if (challenge) challenge.consumed = true
+  }
   const token = 'arx_at_' + randomUUID().replace(/-/g, '')
   accessTokens.set(token, { userId: auth.userId, clientId, expires: Date.now() + TOKEN_TTL * 1000 })
   saveTokens()
@@ -104,13 +129,17 @@ export function validateAccessToken(token) {
   return auth
 }
 
-// Periodic sweep of expired auth codes + access tokens so these maps can't grow
-// unbounded and contribute to gradual memory pressure / OOM kills.
+// Periodic sweep of expired auth codes, authorization requests, SIWE challenges,
+// and access tokens so these maps cannot grow unbounded and contribute to
+// gradual memory pressure / OOM kills.
 const _authSweep = setInterval(() => {
   const now = Date.now()
   let changed = false
   for (const [code, v] of authCodes) if (now > v.expires) authCodes.delete(code)
+  for (const [requestId, v] of oauthRequests) if (now > v.expires) oauthRequests.delete(requestId)
+  for (const [nonce, v] of siweChallenges) if (now > v.expires) siweChallenges.delete(nonce)
   for (const [tok, v] of accessTokens) if (now > v.expires) { accessTokens.delete(tok); changed = true }
+
   if (changed) saveTokens()
 }, 10 * 60 * 1000)
 if (_authSweep.unref) _authSweep.unref()
@@ -168,49 +197,88 @@ export function oauthAuthorizeHandler(req, res) {
   if (response_type !== 'code') return res.status(400).json({ error: 'unsupported_response_type' })
   const client = oauthClients.get(client_id)
   if (!client) return res.status(400).json({ error: 'invalid_client', error_description: 'Unknown client_id' })
+  if (!redirect_uri || !client.redirectUris.includes(redirect_uri)) return res.status(400).json({ error: 'invalid_redirect_uri' })
+  if (!state) return res.status(400).json({ error: 'invalid_request', error_description: 'state required' })
+  if (!code_challenge || code_challenge_method !== 'S256') return res.status(400).json({ error: 'invalid_request', error_description: 'S256 PKCE required' })
+
+  // Keep the original request server-side. The browser may display these
+  // values, but it must not be able to change the redirect, state, or PKCE
+  // binding before SIWE verification completes.
+  const requestId = randomUUID()
+  oauthRequests.set(requestId, {
+    clientId: client_id,
+    redirectUri: redirect_uri,
+    state,
+    codeChallenge: code_challenge,
+    expires: Date.now() + 600000,
+  })
 
   // Redirect to frontend Plugin page with OAuth params
   // Frontend handles SIWE login + approval, then redirects back to ChatGPT
   const params = new URLSearchParams({
     auth: 'mcp',
+    request_id: requestId,
     client_id,
     redirect_uri,
-    state: state || '',
-    code_challenge: code_challenge || '',
+    state,
+    code_challenge,
   })
   res.redirect(302, `${SERVER_URL}/arc-dex/plugin?${params.toString()}`)
 }
 
 // ── SIWE message generation ──
 export function siweMessageHandler(req, res) {
-  const { address, client_id } = req.query
+  const { address, client_id, request_id } = req.query
   if (!address) return res.status(400).json({ error: 'address required' })
+  const client = oauthClients.get(client_id)
+  const request = oauthRequests.get(request_id)
+  if (!client || !request || request.clientId !== client_id || Date.now() > request.expires) return res.status(400).json({ error: 'invalid_authorization_request' })
   const domain = req.headers.host || 'arcoxdex.vercel.app'
   const nonce = randomUUID().slice(0, 8)
   const message = `${domain} wants you to sign in with your Ethereum account:\n${address}\n\nAuthorize ARCOX MCP Server\n\nURI: ${SERVER_URL}\nVersion: 1\nChain ID: 5042002\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`
+  siweChallenges.set(nonce, {
+    address: String(address).toLowerCase(),
+    clientId: client_id,
+    requestId: request_id,
+    message,
+    expires: Date.now() + 300000,
+  })
   res.json({ message, nonce })
 }
 
 // ── SIWE verify + issue auth code ──
 import { createPublicClient, decodeEventLog, defineChain, encodeFunctionData, formatUnits, getAddress, http, parseUnits, verifyMessage } from 'viem'
 export async function siweVerifyHandler(req, res) {
-  const { address, message, signature, clientId, redirectUri, state, codeChallenge } = req.body || {}
-  if (!address || !message || !clientId) return res.status(400).json({ error: 'missing fields' })
+  const { address, message, signature, clientId, redirectUri, state, codeChallenge, requestId } = req.body || {}
+  if (!address || !message || !clientId || !requestId) return res.status(400).json({ error: 'missing_fields' })
   
   if (!redirectUri || !codeChallenge) return res.status(400).json({ error: 'missing_pkce_or_redirect_uri' })
   const client = oauthClients.get(clientId)
-  if (!client || !client.redirectUris.includes(redirectUri)) return res.status(400).json({ error: 'invalid_redirect_uri' })
+  const request = oauthRequests.get(requestId)
+  if (!client || !request || request.clientId !== clientId || Date.now() > request.expires) return res.status(400).json({ error: 'invalid_authorization_request' })
+  if (request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri)) return res.status(400).json({ error: 'authorization_request_mismatch' })
+  const nonceMatch = String(message).match(/\nNonce: ([^\n]+)\n/)
+  const challenge = nonceMatch ? siweChallenges.get(nonceMatch[1]) : null
+  if (!challenge || Date.now() > challenge.expires || challenge.consumed || challenge.requestId !== requestId || challenge.clientId !== clientId || challenge.address !== String(address).toLowerCase() || challenge.message !== message) return res.status(400).json({ error: 'invalid_or_expired_siwe_challenge' })
   try {
     const valid = await verifyMessage({ address, message, signature })
     if (!valid) return res.status(401).json({ error: 'invalid_signature' })
   } catch {
     return res.status(401).json({ error: 'signature_verification_failed' })
   }
-  
+
   const userId = address.toLowerCase()
-  const code = createAuthCode(clientId, userId, { redirectUri, codeChallenge })
-  const redirect = `${redirectUri}?code=${code}&state=${state || ''}`
-  res.json({ redirect })
+  const existingCode = findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state })
+  const code = existingCode || createAuthCode(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce: nonceMatch[1] })
+  challenge.completedCode = code
+  challenge.signature = String(signature).toLowerCase()
+  // Keep the challenge around until expiry so a lost HTTP response can be
+  // retried with the same signed message and receive the same authorization
+  // code. The code itself remains single-use at token exchange.
+  const redirectUrl = new URL(redirectUri)
+  redirectUrl.searchParams.set('code', code)
+  if (state) redirectUrl.searchParams.set('state', state)
+  res.json({ redirect: redirectUrl.toString(), code, state: state || '' })
 }
 
 // ── Token endpoint ──

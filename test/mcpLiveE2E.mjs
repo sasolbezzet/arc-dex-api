@@ -22,11 +22,14 @@ const clientId = registered.body.client_id
 
 const authorized = await get(`/api/auth/authorize?${new URLSearchParams({ response_type: 'code', client_id: clientId, redirect_uri: redirectUri, state: 'state-live', code_challenge: challenge, code_challenge_method: 'S256' })}`)
 if (authorized.status !== 302 || !authorized.location?.startsWith('https://arcoxdex.vercel.app/arc-dex/plugin?')) throw new Error(`Authorize redirect bad: ${authorized.status} ${authorized.location}`)
+const authorizeParams = new URL(authorized.location).searchParams
+const requestId = authorizeParams.get('request_id')
+if (!requestId) throw new Error('Missing authorization request ID')
 
-const msg = await fetch(`${base}/api/auth/siwe-message?${new URLSearchParams({ address: account.address, client_id: clientId })}`).then(r => r.json())
+const msg = await fetch(`${base}/api/auth/siwe-message?${new URLSearchParams({ address: account.address, client_id: clientId, request_id: requestId })}`).then(r => r.json())
 if (!msg.message) throw new Error(`SIWE message failed: ${JSON.stringify(msg)}`)
 const signature = await account.signMessage({ message: msg.message })
-const verified = await post('/api/auth/siwe-verify', { address: account.address, message: msg.message, signature, clientId, redirectUri, state: 'state-live', codeChallenge: challenge })
+const verified = await post('/api/auth/siwe-verify', { address: account.address, message: msg.message, signature, requestId, clientId, redirectUri, state: 'state-live', codeChallenge: challenge })
 if (verified.status !== 200 || !verified.body.redirect) throw new Error(`SIWE verify failed: ${verified.status} ${JSON.stringify(verified.body)}`)
 const code = new URL(verified.body.redirect).searchParams.get('code')
 if (!code) throw new Error('Missing auth code')
