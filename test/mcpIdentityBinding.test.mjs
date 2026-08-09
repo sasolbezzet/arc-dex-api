@@ -222,7 +222,7 @@ test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mi
     addressWord('0x3600000000000000000000000000000000000000'), // Arc USDC
     addressWord(MSCA), // final mint recipient
     word('0x00000000000f4240'), // 1 USDC
-    addressWord('0xDf800310443BEB589CEf91A09854203Ea36e43a7'), // message sender
+    addressWord('0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA'), // TokenMessengerV2 is the BurnMessage sender
     word('0x0a'), // max fee
     word('0x0a'), // executed fee
     word('0x0'), // expiration block
@@ -232,7 +232,7 @@ test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mi
   assert.equal(decoded.destinationDomain, 6)
   assert.equal(decoded.recipient, '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa')
   assert.equal(decoded.messageBody.mintRecipient, MSCA.toLowerCase())
-  assert.equal(decoded.messageBody.messageSender, '0xdf800310443beb589cef91a09854203ea36e43a7')
+  assert.equal(decoded.messageBody.messageSender, '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa')
   assert.equal(decoded.messageBody.burnToken, '0x3600000000000000000000000000000000000000')
   assert.equal(decoded.messageBody.amount, 1_000_000n)
   assert.equal(decoded.sender, '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa')

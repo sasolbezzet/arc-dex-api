@@ -474,6 +474,11 @@ const BRIDGE_ROUTER_ABI = [
       { name: 'maxFee', type: 'uint256' }, { name: 'minFinalityThreshold', type: 'uint32' },
     ], outputs: [{ name: 'fee', type: 'uint256' }, { name: 'netAmount', type: 'uint256' }],
   },
+  { type: 'function', name: 'usdc', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { type: 'function', name: 'tokenMessenger', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { type: 'function', name: 'localDomain', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint32' }] },
+  { type: 'function', name: 'supportedDestinationDomains', stateMutability: 'view', inputs: [{ name: 'domain', type: 'uint32' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'localMessageTransmitter', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
 ]
 function bridgeConfig(fromChain, toChain) {
   const source = BRIDGE_CCTP[chainKey(fromChain)]
@@ -481,6 +486,58 @@ function bridgeConfig(fromChain, toChain) {
   if (!source || !destination || source.domain === destination.domain) return null
   if (!source.router) return null
   return { fromKey: chainKey(fromChain), toKey: chainKey(toChain), source, destination }
+}
+
+// Keep the deployed-router checks pure so they can be regression-tested without
+// a live RPC. This is deliberately stricter than merely checking that bytecode
+// exists: a wrong router/token/domain can burn funds into an untrackable route.
+export function compareRouterRouteConfiguration({ code, configuredUsdc, configuredMessenger, localDomain, supportedDestination, route } = {}) {
+  const mismatches = []
+  if (!code || code === '0x') mismatches.push('router_not_deployed')
+  if (String(configuredUsdc || '').toLowerCase() !== String(route?.source?.usdc || '').toLowerCase()) mismatches.push('router_usdc_mismatch')
+  if (String(configuredMessenger || '').toLowerCase() !== String(route?.source?.tokenMessenger || '').toLowerCase()) mismatches.push('router_token_messenger_mismatch')
+  if (Number(localDomain) !== Number(route?.source?.domain)) mismatches.push('router_source_domain_mismatch')
+  if (supportedDestination !== true) mismatches.push('router_destination_domain_not_enabled')
+  return mismatches
+}
+
+async function validateRouterRoute(route) {
+  const chain = defineChain({
+    id: route.source.chainId,
+    name: route.fromKey,
+    nativeCurrency: { name: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', symbol: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', decimals: 18 },
+    rpcUrls: { default: { http: [route.source.rpcUrl] } },
+  })
+  const client = createPublicClient({ chain, transport: http(route.source.rpcUrl) })
+  const router = getAddress(route.source.router)
+  const [code, configuredUsdc, configuredMessenger, localDomain, supportedDestination] = await Promise.all([
+    client.getBytecode({ address: router }),
+    client.readContract({ address: router, abi: BRIDGE_ROUTER_ABI, functionName: 'usdc' }),
+    client.readContract({ address: router, abi: BRIDGE_ROUTER_ABI, functionName: 'tokenMessenger' }),
+    client.readContract({ address: router, abi: BRIDGE_ROUTER_ABI, functionName: 'localDomain' }),
+    client.readContract({ address: router, abi: BRIDGE_ROUTER_ABI, functionName: 'supportedDestinationDomains', args: [route.destination.domain] }),
+  ])
+  const mismatches = compareRouterRouteConfiguration({ code, configuredUsdc, configuredMessenger, localDomain, supportedDestination, route })
+  if (mismatches.length) throw new Error(`ArcoxRouter CCTP route validation failed: ${mismatches.join(', ')}`)
+
+  const destinationChain = defineChain({
+    id: route.destination.chainId,
+    name: route.toKey,
+    nativeCurrency: { name: route.toKey === 'Arc_Testnet' ? 'USDC' : 'ETH', symbol: route.toKey === 'Arc_Testnet' ? 'USDC' : 'ETH', decimals: 18 },
+    rpcUrls: { default: { http: [route.destination.rpcUrl] } },
+  })
+  const destinationClient = createPublicClient({ chain: destinationChain, transport: http(route.destination.rpcUrl) })
+  const destinationMessenger = getAddress(route.destination.tokenMessenger)
+  const destinationTransmitter = getAddress(route.destination.messageTransmitter)
+  const [destinationMessengerCode, destinationTransmitterCode, configuredTransmitter] = await Promise.all([
+    destinationClient.getBytecode({ address: destinationMessenger }),
+    destinationClient.getBytecode({ address: destinationTransmitter }),
+    destinationClient.readContract({ address: destinationMessenger, abi: BRIDGE_ROUTER_ABI, functionName: 'localMessageTransmitter' }),
+  ])
+  if (!destinationMessengerCode || destinationMessengerCode === '0x') throw new Error('CCTP destination TokenMessenger is not deployed')
+  if (!destinationTransmitterCode || destinationTransmitterCode === '0x') throw new Error('CCTP destination MessageTransmitter is not deployed')
+  if (String(configuredTransmitter).toLowerCase() !== destinationTransmitter.toLowerCase()) throw new Error('CCTP destination MessageTransmitter mismatch')
+  return { router, usdc: getAddress(configuredUsdc), tokenMessenger: getAddress(configuredMessenger), localDomain: Number(localDomain), destinationDomain: route.destination.domain }
 }
 
 async function getRouterFeeQuote(route, amount) {
@@ -491,6 +548,7 @@ async function getRouterFeeQuote(route, amount) {
     rpcUrls: { default: { http: [route.source.rpcUrl] } },
   })
   const client = createPublicClient({ chain, transport: http(route.source.rpcUrl) })
+  await validateRouterRoute(route)
   const result = await client.readContract({
     address: getAddress(route.source.router),
     abi: BRIDGE_ROUTER_ABI,
@@ -621,7 +679,9 @@ export function selectCctpMessage(messages, sourceDomain, destinationDomain, bin
   const expectedSender = binding.route?.source?.tokenMessenger ? getAddress(binding.route.source.tokenMessenger).toLowerCase() : null
   const expectedRecipient = binding.route?.destination?.tokenMessenger ? getAddress(binding.route.destination.tokenMessenger).toLowerCase() : null
   const expectedMintRecipient = binding.walletAddress ? getAddress(binding.walletAddress).toLowerCase() : null
-  const expectedMessageSender = binding.route?.source?.router ? getAddress(binding.route.source.router).toLowerCase() : null
+  // ArcoxRouter calls TokenMessengerV2.depositForBurn; the CCTP BurnMessage
+  // records TokenMessengerV2 (its msg.sender), not the outer router.
+  const expectedMessageSender = binding.route?.source?.tokenMessenger ? getAddress(binding.route.source.tokenMessenger).toLowerCase() : null
   const expectedBurnToken = binding.route?.source?.usdc ? getAddress(binding.route.source.usdc).toLowerCase() : null
   const expectedAmount = binding.expectedBurnAmount === undefined ? null : BigInt(binding.expectedBurnAmount)
   const selected = domainCandidates.find(item => {
@@ -634,13 +694,24 @@ export function selectCctpMessage(messages, sourceDomain, destinationDomain, bin
       && body?.burnToken === expectedBurnToken
       && (expectedAmount === null || body?.amount === expectedAmount)
   })
+  // Preserve the first domain-matching decoded message as diagnostics when no
+  // candidate binds. This prevents a generic route_unverified response from
+  // hiding the actual header/body that Iris returned for this burn hash.
+  const diagnostic = selected?.decoded || domainCandidates[0]?.decoded || null
   return {
     selected: selected?.message || null,
     decoded: selected?.decoded || null,
+    diagnostic,
     candidates: candidates.map(item => ({
       index: item.index,
       sourceDomain: item.decoded?.sourceDomain ?? null,
       destinationDomain: item.decoded?.destinationDomain ?? null,
+      headerSender: item.decoded?.sender || null,
+      headerRecipient: item.decoded?.recipient || null,
+      mintRecipient: item.decoded?.messageBody?.mintRecipient || null,
+      messageSender: item.decoded?.messageBody?.messageSender || null,
+      burnToken: item.decoded?.messageBody?.burnToken || null,
+      amount: item.decoded?.messageBody?.amount?.toString() || null,
       messageStatus: item.message?.status || null,
     })),
   }
@@ -649,14 +720,15 @@ export function selectCctpMessage(messages, sourceDomain, destinationDomain, bin
 // Iris may briefly expose a non-empty candidate list before the exact burn
 // message is fully indexed. Treat only this binding result as transient while
 // polling; domain/token/recipient mismatches remain fail-closed rejections.
-const TRANSIENT_CCTP_STATUS_REASONS = new Set(['cctp_message_route_unverified'])
-
 export async function waitForCctpBridgeStatus(args, { attempts = 40, delayMs = 3000 } = {}) {
   let lastStatus = null
   for (let attempt = 0; attempt < attempts; attempt++) {
     lastStatus = await getCctpBridgeStatus(args)
-    const transient = lastStatus.status === 'pending' || TRANSIENT_CCTP_STATUS_REASONS.has(lastStatus.reason)
-    if (!transient) return lastStatus
+    // Only an empty/not-yet-indexed Iris response is transient. A non-empty
+    // response that fails exact route binding is terminal for this burn hash;
+    // polling cannot repair a cryptographic route mismatch and must not make a
+    // user wait while presenting an unsafe retry posture.
+    if (lastStatus.status !== 'pending' || lastStatus.reason !== 'cctp_message_pending') return lastStatus
     if (attempt + 1 < attempts) await new Promise(resolve => setTimeout(resolve, delayMs))
   }
   return lastStatus || { status: 'pending', burnTxHash: args.burnTxHash, verified: false, reason: 'cctp_message_pending' }
@@ -679,7 +751,22 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
       if (!Array.isArray(data?.messages) || data.messages.length === 0) {
         return { status: 'pending', burnTxHash, verified: false, reason: 'cctp_message_pending', messageHeader: header, messageCandidates: selection.candidates }
       }
-      return { status: 'rejected', burnTxHash, verified: false, reason: 'cctp_message_route_unverified', messageHeader: header, messageCandidates: selection.candidates }
+      return {
+        status: 'rejected', burnTxHash, verified: false,
+        reason: 'cctp_message_route_unverified',
+        messageHeader: selection.diagnostic,
+        messageCandidates: selection.candidates,
+        expectedRoute: {
+          sourceDomain: Number(sourceDomain),
+          destinationDomain: Number(destinationDomain),
+          headerSender: route?.source?.tokenMessenger ? getAddress(route.source.tokenMessenger).toLowerCase() : null,
+          headerRecipient: route?.destination?.tokenMessenger ? getAddress(route.destination.tokenMessenger).toLowerCase() : null,
+          mintRecipient: walletAddress ? getAddress(walletAddress).toLowerCase() : null,
+          messageSender: route?.source?.tokenMessenger ? getAddress(route.source.tokenMessenger).toLowerCase() : null,
+          burnToken: route?.source?.usdc ? getAddress(route.source.usdc).toLowerCase() : null,
+          amount: expectedBurnAmount === undefined ? null : BigInt(expectedBurnAmount).toString(),
+        },
+      }
     }
     const expectedHeaderSender = route?.source?.tokenMessenger
       ? getAddress(route.source.tokenMessenger).toLowerCase()
@@ -717,7 +804,9 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
         messageBody: body,
       }
     }
-    const expectedSender = route?.source?.router ? getAddress(route.source.router).toLowerCase() : null
+    // CCTP BurnMessageV2.messageSender is the TokenMessengerV2 contract that
+    // invokes MessageTransmitterV2, not the ArcoxRouter that called it.
+    const expectedSender = route?.source?.tokenMessenger ? getAddress(route.source.tokenMessenger).toLowerCase() : null
     if (!body.messageSender || body.messageSender !== expectedSender) {
       return {
         status: 'rejected', burnTxHash, verified: false,
@@ -786,7 +875,7 @@ const RECEIVE_MESSAGE_ABI = [{
 const USED_NONCES_ABI = [{
   type: 'function', name: 'usedNonces', stateMutability: 'view',
   inputs: [{ name: 'nonce', type: 'bytes32' }],
-  outputs: [{ name: '', type: 'bool' }],
+  outputs: [{ name: '', type: 'uint256' }],
 }]
 
 // CCTP V2 nonce is the 32-byte field immediately after version/source/domain.
@@ -1249,11 +1338,15 @@ export function createMcpServer(userId, context = {}) {
     const bridgeIsSupported = action === 'bridge' && ENABLE_MSCA_CCTP_BRIDGE && String(params.token || 'USDC').toUpperCase() === 'USDC' && Boolean(route?.source?.router && route?.destination?.messageTransmitter)
     const session = await resolveActiveMsca(userId)
     const disabledReason = action === 'bridge' ? bridgeConfigDisabledReason(route) : null
+    let routerValidation = null
+    if (bridgeIsSupported && !disabledReason) {
+      routerValidation = await validateRouterRoute(route).then(() => ({ ok: true })).catch(error => ({ ok: false, reason: 'router_route_validation_failed', message: error?.message || 'ArcoxRouter route validation failed' }))
+    }
     let destinationReadiness = null
-    if (bridgeIsSupported && session && !disabledReason) {
+    if (bridgeIsSupported && routerValidation?.ok === true && session && !disabledReason) {
       destinationReadiness = await destinationMscaPreflight({ route, walletAddress: session.walletAddress }).catch(error => ({ ok: false, reason: 'destination_msca_preflight_failed', message: error?.message || 'Destination MSCA preflight gagal' }))
     }
-    const bridgeReady = bridgeIsSupported && !disabledReason && destinationReadiness?.ok === true
+    const bridgeReady = bridgeIsSupported && !disabledReason && routerValidation?.ok === true && destinationReadiness?.ok === true
     const mscaSupported = Boolean(session) && source === 'session' && knownAction && (action === 'bridge' ? bridgeReady : !hasUnsupportedSwapToken)
     const reason = !session
       ? 'no_session'
@@ -1265,7 +1358,9 @@ export function createMcpServer(userId, context = {}) {
             ? disabledReason
             : action === 'bridge' && !bridgeIsSupported
               ? 'bridge_route_not_supported_for_msca'
-              : action === 'bridge' && !destinationReadiness?.ok
+              : action === 'bridge' && routerValidation?.ok !== true
+                ? (routerValidation?.reason || 'router_route_validation_failed')
+                : action === 'bridge' && !destinationReadiness?.ok
                 ? (destinationReadiness?.reason || 'destination_msca_not_ready')
               : hasUnsupportedSwapToken
               ? 'swap_route_not_supported_for_msca'
@@ -1281,6 +1376,8 @@ export function createMcpServer(userId, context = {}) {
       tokens: ['USDC', 'EURC', 'cirBTC'],
       sources: ['session'],
       reason,
+      routerValidated: action === 'bridge' ? Boolean(routerValidation?.ok) : undefined,
+      routerValidationError: action === 'bridge' && routerValidation?.ok === false ? routerValidation.message : undefined,
       destinationReady: action === 'bridge' ? Boolean(destinationReadiness?.ok) : undefined,
       note: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote tetap wajib sebelum eksekusi.',
     }) }] }
