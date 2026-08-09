@@ -411,11 +411,13 @@ const BRIDGE_CCTP = {
     usdc: '0x3600000000000000000000000000000000000000',
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
+    // Arc destination uses CCTP V2 Standard Transfer/finalized threshold.
+    requiredFinalityThreshold: 2000,
     rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network',
     explorer: 'https://testnet.arcscan.app/tx/',
     router: process.env.ARCOX_FEE_ROUTER_ADDRESS || '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
   },
-  Ethereum_Sepolia: { chainId: 11155111, domain: 0, explorer: 'https://sepolia.etherscan.io/tx/' },
+  Ethereum_Sepolia: { chainId: 11155111, domain: 0, requiredFinalityThreshold: 1000, explorer: 'https://sepolia.etherscan.io/tx/' },
   Base_Sepolia: {
     chainId: 84532,
     domain: 6,
@@ -424,19 +426,22 @@ const BRIDGE_CCTP = {
     usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
+    requiredFinalityThreshold: 1000,
     // Frontend's verified Base Sepolia ArcoxRouter.
     router: process.env.ARCOX_BASE_FEE_ROUTER_ADDRESS || '0x9425cC5b3C8B9e0FCb35beBdE737B4365A614Acc',
   },
   Arbitrum_Sepolia: {
     chainId: 421614,
     domain: 3,
+    requiredFinalityThreshold: 1000,
     explorer: 'https://sepolia.arbiscan.io/tx/',
     rpcUrl: process.env.ARB_SEPOLIA_RPC_URL || 'https://sepolia-rollup.arbitrum.io/rpc',
     usdc: '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d',
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
+    requiredFinalityThreshold: 1000,
   },
-  HyperEVM_Testnet: { domain: 19, explorer: 'https://app.hyperliquid-testnet.xyz/explorer/tx/' },
+  HyperEVM_Testnet: { domain: 19, requiredFinalityThreshold: 1000, explorer: 'https://app.hyperliquid-testnet.xyz/explorer/tx/' },
 }
 // The route is explicit opt-in so a deployment cannot start moving funds just
 // because code was updated. Enable it only after the router and destination
@@ -444,7 +449,22 @@ const BRIDGE_CCTP = {
 const ENABLE_MSCA_CCTP_BRIDGE = process.env.ENABLE_MSCA_CCTP_BRIDGE === 'true'
 const BRIDGE_ZERO_BYTES32 = `0x${'0'.repeat(64)}`
 const BRIDGE_MAX_FEE = BigInt(process.env.CCTP_MAX_FEE_BASE_UNITS || '10')
-const BRIDGE_MIN_FINALITY_THRESHOLD = Number(process.env.CCTP_MIN_FINALITY_THRESHOLD || '1000')
+const configuredBridgeFinalityThreshold = Number(process.env.CCTP_MIN_FINALITY_THRESHOLD || '1000')
+// Circle CCTP V2 defines only 1000 (Confirmed) and 2000 (Finalized). Keep an
+// invalid deployment setting from producing unsupported calldata; normalize it
+// to the conservative confirmed threshold for non-Arc destinations.
+const BRIDGE_MIN_FINALITY_THRESHOLD = [1000, 2000].includes(configuredBridgeFinalityThreshold)
+  ? configuredBridgeFinalityThreshold
+  : 1000
+
+// Arc destination requires CCTP V2 Standard Transfer finality. Bind this to
+// both the canonical route key and domain so a malformed route cannot inherit
+// Arc-specific behavior merely because its numeric domain happens to be 26.
+function bridgeFinalityThreshold(route) {
+  const required = Number(route?.destination?.requiredFinalityThreshold)
+  if (![1000, 2000].includes(required)) throw new Error('CCTP route finality threshold is not configured')
+  return required
+}
 const BRIDGE_APPROVE_ABI = [{
   type: 'function', name: 'approve', stateMutability: 'nonpayable',
   inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }],
@@ -486,6 +506,15 @@ function bridgeConfig(fromChain, toChain) {
   if (!source || !destination || source.domain === destination.domain) return null
   if (!source.router) return null
   return { fromKey: chainKey(fromChain), toKey: chainKey(toChain), source, destination }
+}
+
+// Expose the route capability as a pure predicate for regression tests and
+// diagnostics. A configured CCTP destination alone is not enough: the source
+// ArcoxRouter must also be deployed/configured, otherwise a burn cannot be
+// safely initiated from the MSCA.
+export function isMscaCctpRouteConfigured(fromChain, toChain) {
+  const route = bridgeConfig(fromChain, toChain)
+  return Boolean(route?.source?.router && route?.destination?.messageTransmitter)
 }
 
 // Keep the deployed-router checks pure so they can be regression-tested without
@@ -564,9 +593,14 @@ async function getRouterFeeQuote(route, amount) {
 // Pure calldata builder shared by execution and regression tests. The router
 // pulls the gross amount from msg.sender (the MSCA), sends its platform fee to
 // treasury, and burns the remaining netAmount through standard CCTP V2.
-export function buildMscaRouterBridgeCalls({ route, amount, mintRecipient, maxFee = BRIDGE_MAX_FEE, minFinalityThreshold = BRIDGE_MIN_FINALITY_THRESHOLD }) {
+export function buildMscaRouterBridgeCalls({ route, amount, mintRecipient, maxFee = BRIDGE_MAX_FEE, minFinalityThreshold }) {
   if (!route?.source?.router || !route?.source?.usdc || route?.destination?.domain === undefined) throw new Error('Invalid ArcoxRouter bridge route')
   const grossAmount = BigInt(amount)
+  const requiredFinalityThreshold = bridgeFinalityThreshold(route)
+  if (minFinalityThreshold !== undefined && Number(minFinalityThreshold) !== requiredFinalityThreshold) {
+    throw new Error('CCTP route finality threshold mismatch')
+  }
+  const finalityThreshold = requiredFinalityThreshold
   if (grossAmount <= 0n) throw new Error('Bridge amount must be positive')
   const recipient = getAddress(mintRecipient)
   const recipientBytes32 = `0x${recipient.slice(2).toLowerCase().padStart(64, '0')}`
@@ -580,7 +614,7 @@ export function buildMscaRouterBridgeCalls({ route, amount, mintRecipient, maxFe
       data: encodeFunctionData({
         abi: BRIDGE_ROUTER_ABI,
         functionName: 'bridgeUsdcWithFee',
-        args: [grossAmount, route.destination.domain, recipientBytes32, BRIDGE_ZERO_BYTES32, BigInt(maxFee), Number(minFinalityThreshold)],
+        args: [grossAmount, route.destination.domain, recipientBytes32, BRIDGE_ZERO_BYTES32, BigInt(maxFee), finalityThreshold],
       }),
     },
   ]
@@ -679,9 +713,10 @@ export function selectCctpMessage(messages, sourceDomain, destinationDomain, bin
   const expectedSender = binding.route?.source?.tokenMessenger ? getAddress(binding.route.source.tokenMessenger).toLowerCase() : null
   const expectedRecipient = binding.route?.destination?.tokenMessenger ? getAddress(binding.route.destination.tokenMessenger).toLowerCase() : null
   const expectedMintRecipient = binding.walletAddress ? getAddress(binding.walletAddress).toLowerCase() : null
-  // ArcoxRouter calls TokenMessengerV2.depositForBurn; the CCTP BurnMessage
-  // records TokenMessengerV2 (its msg.sender), not the outer router.
-  const expectedMessageSender = binding.route?.source?.tokenMessenger ? getAddress(binding.route.source.tokenMessenger).toLowerCase() : null
+  // ArcoxRouter calls TokenMessengerV2.depositForBurn. CCTP BurnMessageV2
+  // messageSender is the direct caller of depositForBurn: the source router,
+  // not the TokenMessenger that receives the forwarded call.
+  const expectedMessageSender = binding.route?.source?.router ? getAddress(binding.route.source.router).toLowerCase() : null
   const expectedBurnToken = binding.route?.source?.usdc ? getAddress(binding.route.source.usdc).toLowerCase() : null
   const expectedAmount = binding.expectedBurnAmount === undefined ? null : BigInt(binding.expectedBurnAmount)
   const selected = domainCandidates.find(item => {
@@ -720,7 +755,9 @@ export function selectCctpMessage(messages, sourceDomain, destinationDomain, bin
 // Iris may briefly expose a non-empty candidate list before the exact burn
 // message is fully indexed. Treat only this binding result as transient while
 // polling; domain/token/recipient mismatches remain fail-closed rejections.
-export async function waitForCctpBridgeStatus(args, { attempts = 40, delayMs = 3000 } = {}) {
+export async function waitForCctpBridgeStatus(args, options = {}) {
+  const attempts = options.attempts ?? (Number(args?.destinationDomain) === 26 ? 120 : 40)
+  const delayMs = options.delayMs ?? (Number(args?.destinationDomain) === 26 ? 5000 : 3000)
   let lastStatus = null
   for (let attempt = 0; attempt < attempts; attempt++) {
     lastStatus = await getCctpBridgeStatus(args)
@@ -738,7 +775,7 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
   const url = `https://iris-api-sandbox.circle.com/v2/messages/${sourceDomain}?transactionHash=${encodeURIComponent(burnTxHash)}`
   try {
     const response = await fetch(url, { headers: { Accept: 'application/json' } })
-    if (!response.ok) return { status: 'pending', burnTxHash, verified: false }
+    if (!response.ok) return { status: 'pending', burnTxHash, verified: false, reason: 'cctp_message_pending' }
     const data = await response.json()
     const selection = selectCctpMessage(data?.messages, sourceDomain, destinationDomain, { route, walletAddress, expectedBurnAmount })
     const message = selection.selected
@@ -748,8 +785,16 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
       // being indexed. That is transient and must not be reported as a
       // permanent route mismatch. A non-empty list with no fully-bound match
       // remains fail-closed below as a real binding rejection.
-      if (!Array.isArray(data?.messages) || data.messages.length === 0) {
-        return { status: 'pending', burnTxHash, verified: false, reason: 'cctp_message_pending', messageHeader: header, messageCandidates: selection.candidates }
+      const pendingCandidate = Array.isArray(data?.messages) && data.messages.some(item => {
+        const status = String(item?.status || '').toLowerCase()
+        return !item?.message || ['pending', 'pending_confirmations', 'unknown', 'processing'].includes(status)
+      })
+      if (!Array.isArray(data?.messages) || data.messages.length === 0 || pendingCandidate) {
+        return {
+          status: 'pending', burnTxHash, verified: false, reason: 'cctp_message_pending',
+          messageStatus: data?.messages?.find(item => item?.status)?.status || 'pending',
+          messageHeader: header, messageCandidates: selection.candidates,
+        }
       }
       return {
         status: 'rejected', burnTxHash, verified: false,
@@ -762,7 +807,7 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
           headerSender: route?.source?.tokenMessenger ? getAddress(route.source.tokenMessenger).toLowerCase() : null,
           headerRecipient: route?.destination?.tokenMessenger ? getAddress(route.destination.tokenMessenger).toLowerCase() : null,
           mintRecipient: walletAddress ? getAddress(walletAddress).toLowerCase() : null,
-          messageSender: route?.source?.tokenMessenger ? getAddress(route.source.tokenMessenger).toLowerCase() : null,
+          messageSender: route?.source?.router ? getAddress(route.source.router).toLowerCase() : null,
           burnToken: route?.source?.usdc ? getAddress(route.source.usdc).toLowerCase() : null,
           amount: expectedBurnAmount === undefined ? null : BigInt(expectedBurnAmount).toString(),
         },
@@ -792,6 +837,23 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
         messageHeader: header,
       }
     }
+    const expectedFinality = bridgeFinalityThreshold(route)
+    const supportedFinality = value => value === 1000 || value === 2000
+    // CCTP may execute at a stronger finality than requested. Require a
+    // supported threshold and at least the route's configured minimum rather
+    // than requiring an exact equality for the executed value.
+    if (!supportedFinality(header.minFinalityThreshold)
+      || !supportedFinality(header.finalityThresholdExecuted)
+      || header.finalityThresholdExecuted < expectedFinality) {
+      return {
+        status: 'rejected', burnTxHash, verified: false,
+        reason: 'cctp_message_finality_unverified',
+        expectedFinalityThreshold: expectedFinality,
+        actualMinFinalityThreshold: header.minFinalityThreshold,
+        actualFinalityThresholdExecuted: header.finalityThresholdExecuted,
+        messageHeader: header,
+      }
+    }
     const body = header.messageBody
     const expectedMintRecipient = getAddress(walletAddress).toLowerCase()
     if (!body || body.mintRecipient !== expectedMintRecipient) {
@@ -804,9 +866,9 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
         messageBody: body,
       }
     }
-    // CCTP BurnMessageV2.messageSender is the TokenMessengerV2 contract that
-    // invokes MessageTransmitterV2, not the ArcoxRouter that called it.
-    const expectedSender = route?.source?.tokenMessenger ? getAddress(route.source.tokenMessenger).toLowerCase() : null
+    // CCTP BurnMessageV2.messageSender is the direct caller of
+    // TokenMessengerV2.depositForBurn: our source ArcoxRouter.
+    const expectedSender = route?.source?.router ? getAddress(route.source.router).toLowerCase() : null
     if (!body.messageSender || body.messageSender !== expectedSender) {
       return {
         status: 'rejected', burnTxHash, verified: false,
@@ -839,10 +901,24 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
       }
     }
     const hasAttestation = Boolean(message.attestation && message.message)
+    if (!hasAttestation) {
+      return {
+        status: 'pending', burnTxHash, verified: false,
+        reason: 'cctp_message_pending',
+        walletAddress,
+        message: message.message || null,
+        attestation: message.attestation || null,
+        messageStatus: message.status || 'pending',
+        sourceDomain,
+        destinationDomain,
+        messageHeader: header,
+        messageBody: body,
+      }
+    }
     const cctpFeeExecuted = body.feeExecuted ?? 0n
     const netMintAmount = body.amount >= cctpFeeExecuted ? body.amount - cctpFeeExecuted : null
     return {
-      status: hasAttestation ? 'attestation_ready' : message.status === 'complete' ? 'attestation_ready' : 'pending',
+      status: 'attestation_ready',
       burnTxHash,
       verified: hasAttestation,
       walletAddress,
@@ -932,19 +1008,47 @@ async function destinationMscaPreflight({ route, walletAddress, requireAuthoriza
   if (!destinationInfo) return { ok: false, reason: 'destination_msca_route_not_supported', message: 'Destination MSCA UserOperation belum mendukung chain tujuan ini.' }
   if (!route?.destination?.rpcUrl || !route.destination.messageTransmitter) return { ok: false, reason: 'destination_chain_not_configured' }
   const { createPublicClient } = await import('viem')
-  const client = createPublicClient({
-    chain: defineChain({ id: destinationInfo.id, name: route.toKey, nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [route.destination.rpcUrl] } } }),
-    transport: http(route.destination.rpcUrl),
-  })
-  const code = await client.getBytecode({ address: getAddress(walletAddress) }).catch(() => undefined)
-  if (!code || code === '0x') return { ok: false, reason: 'destination_msca_not_deployed', message: `MSCA ${walletAddress} belum deployed di ${route.toKey}. Deploy MSCA via Plugin passkey sebelum bridge.` }
+  const rpcUrls = [...new Set([
+    route.destination.rpcUrl,
+    ...(route.toKey === 'Arc_Testnet' ? [process.env.ARC_RPC_URL, 'https://rpc.testnet.arc.network', 'https://arc-testnet.drpc.org'] : []),
+    ...(route.toKey === 'Base_Sepolia' ? [process.env.BASE_SEPOLIA_RPC_URL, 'https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com'] : []),
+    ...(route.toKey === 'Arbitrum_Sepolia' ? [process.env.ARB_SEPOLIA_RPC_URL, 'https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com'] : []),
+  ].filter(Boolean))]
+  let code
+  let sawSuccessfulRpcRead = false
+  for (const rpcUrl of rpcUrls) {
+    const retryClient = createPublicClient({
+      chain: defineChain({ id: destinationInfo.id, name: route.toKey, nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [rpcUrl] } } }),
+      transport: http(rpcUrl),
+    })
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        code = await retryClient.getBytecode({ address: getAddress(walletAddress) })
+        sawSuccessfulRpcRead = true
+        if (code && code !== '0x') break
+      } catch {
+        // Try the next attempt/provider; a single RPC miss is not proof that
+        // the deterministic MSCA is absent.
+      }
+      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)))
+    }
+    if (code && code !== '0x') break
+  }
+  // A successful eth_getCode response is authoritative even when another
+  // provider/attempt failed. Only classify the destination as unavailable when
+  // every provider failed; a successful 0x response is a definitive
+  // not-deployed result and must not be reported as an RPC outage.
+  if (!sawSuccessfulRpcRead) {
+    return { ok: false, reason: 'destination_rpc_unavailable', message: `RPC destination ${route.toKey} belum dapat memverifikasi deployment MSCA setelah retry/fallback. Tidak ada transaksi yang dikirim; coba status lagi.` }
+  }
+  if (!code || code === '0x') return { ok: false, reason: 'destination_msca_not_deployed', message: `MSCA ${walletAddress} belum terdeteksi deployed di ${route.toKey}; deploy MSCA via Plugin passkey sebelum bridge.` }
   if (requireAuthorization) {
     const { isSessionAuthorizedForChain } = await import('./sessionKeyService.mjs')
     if (!isSessionAuthorizedForChain(walletAddress, destinationInfo.chainKey)) {
       return { ok: false, reason: 'destination_msca_session_not_authorized', message: `Delegate session belum diotorisasi di ${route.toKey}. Jalankan setup destination chain via Plugin passkey.` }
     }
   }
-  return { ok: true, client }
+  return { ok: true }
 }
 
 async function mintDestinationViaMsca({ status, route, walletAddress }) {
@@ -1530,7 +1634,7 @@ export function createMcpServer(userId, context = {}) {
         netBurnBaseUnits: fee.netAmount.toString(),
         router: route.source.router,
         maxFeeBaseUnits: BRIDGE_MAX_FEE.toString(),
-        minFinalityThreshold: BRIDGE_MIN_FINALITY_THRESHOLD,
+        minFinalityThreshold: bridgeFinalityThreshold(route),
       })
       return { content: [{ type: 'text', text: jsonText({
         schemaVersion: 1,
@@ -1606,11 +1710,11 @@ export function createMcpServer(userId, context = {}) {
       if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
       const quotedFee = quoteCheck.quote.params.platformFeeBaseUnits
       const quotedNet = quoteCheck.quote.params.netBurnBaseUnits
-      if (quoteCheck.quote.params.router !== route.source.router || quoteCheck.quote.params.maxFeeBaseUnits !== BRIDGE_MAX_FEE.toString() || Number(quoteCheck.quote.params.minFinalityThreshold) !== BRIDGE_MIN_FINALITY_THRESHOLD || quotedFee !== fee.fee.toString() || quotedNet !== fee.netAmount.toString()) {
+      if (quoteCheck.quote.params.router !== route.source.router || quoteCheck.quote.params.maxFeeBaseUnits !== BRIDGE_MAX_FEE.toString() || Number(quoteCheck.quote.params.minFinalityThreshold) !== bridgeFinalityThreshold(route) || quotedFee !== fee.fee.toString() || quotedNet !== fee.netAmount.toString()) {
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'quote_fee_changed', message: 'Router fee berubah setelah preview. Buat quote bridge baru.' }) }] }
       }
       executionQuotes.delete(quoteCheck.quote.previewId)
-      const calls = buildMscaRouterBridgeCalls({ route, amount, mintRecipient: info.walletAddress })
+      const calls = buildMscaRouterBridgeCalls({ route, amount, mintRecipient: info.walletAddress, minFinalityThreshold: bridgeFinalityThreshold(route) })
       const { executeViaSession } = await import('./sessionKeyService.mjs')
       const result = await executeViaSession(userId, calls, { paymaster: true, chainKey: executionChainKey(route.fromKey), explorerBaseUrl: route.source.explorer, requireTransactionHash: true })
       if (result.status !== 'success') return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, error: result.reason || 'Bridge UserOperation gagal', userOpHash: result.userOpHash }) }] }

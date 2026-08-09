@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { decodeFunctionData } from 'viem'
 
 const MSCA = '0x2222222222222222222222222222222222222222'
 const TOKEN_MESSENGER = '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA'
@@ -9,26 +10,28 @@ const ROUTE = {
   fromKey: 'Arc_Testnet',
   toKey: 'Base_Sepolia',
   source: { tokenMessenger: TOKEN_MESSENGER, router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7', usdc: '0x3600000000000000000000000000000000000000' },
-  destination: { tokenMessenger: TOKEN_MESSENGER, messageTransmitter: MESSAGE_TRANSMITTER, rpcUrl: 'https://example.invalid/base' },
+  destination: { domain: 6, requiredFinalityThreshold: 1000, tokenMessenger: TOKEN_MESSENGER, messageTransmitter: MESSAGE_TRANSMITTER, rpcUrl: 'https://example.invalid/base' },
 }
 const BASE_TO_ARC_ROUTE = {
   fromKey: 'Base_Sepolia',
   toKey: 'Arc_Testnet',
   source: { tokenMessenger: TOKEN_MESSENGER, router: '0x9425cC5b3C8B9e0FCb35beBdE737B4365A614Acc', usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e' },
-  destination: { tokenMessenger: TOKEN_MESSENGER, messageTransmitter: MESSAGE_TRANSMITTER, rpcUrl: 'https://example.invalid/arc' },
+  destination: { domain: 26, requiredFinalityThreshold: 2000, tokenMessenger: TOKEN_MESSENGER, messageTransmitter: MESSAGE_TRANSMITTER, rpcUrl: 'https://example.invalid/arc' },
 }
 
 function messageFor(recipient, route = ROUTE) {
   const word = value => String(value).replace(/^0x/i, '').padStart(64, '0')
   const uint32 = value => String(value).replace(/^0x/i, '').padStart(8, '0')
+  const finalityThreshold = Number(route.destination.domain) === 26 ? '0x7d0' : '0x3e8'
   const header = [
     uint32('0x1'),
     uint32(route.fromKey === 'Base_Sepolia' ? '0x6' : '0x1a'),
     uint32(route.toKey === 'Arc_Testnet' ? '0x1a' : '0x6'),
-    word('1'), word(route.source.tokenMessenger), word(route.destination.tokenMessenger), word('0'), uint32('1000'), uint32('1000'),
+    word('1'), word(route.source.tokenMessenger), word(route.destination.tokenMessenger), word('0'), uint32(finalityThreshold), uint32(finalityThreshold),
   ].join('')
   const body = [
-    uint32('1'), word(route.source.usdc), word(recipient), word('0x0f4240'), word(route.source.tokenMessenger), word('0x0a'), word('0x0a'), word('0'),
+    uint32('1'), word(route.source.usdc), word(recipient), word('0x0f4240'),    word(route.source.router), word('0x0a'), word('0x0a'), word('0'),
+
   ].join('')
   return '0x' + header + body
 }
@@ -67,7 +70,7 @@ test('Base→Arc bridge status binds source router, Base USDC, and Arc recipient
     const result = await getCctpBridgeStatus({ burnTxHash: '0x' + 'c'.repeat(64), sourceDomain: 6, destinationDomain: 26, walletAddress: MSCA, route: BASE_TO_ARC_ROUTE, expectedBurnAmount: 1_000_000n })
     assert.equal(result.status, 'attestation_ready')
     assert.equal(result.messageBody.mintRecipient, MSCA)
-    assert.equal(result.messageBody.messageSender, BASE_TO_ARC_ROUTE.source.tokenMessenger.toLowerCase())
+    assert.equal(result.messageBody.messageSender, BASE_TO_ARC_ROUTE.source.router.toLowerCase())
     assert.equal(result.messageBody.burnToken, BASE_TO_ARC_ROUTE.source.usdc.toLowerCase())
     assert.equal(result.cctpFeeExecuted, '10')
     assert.equal(result.netMintAmount, '999990')
@@ -92,7 +95,7 @@ test('route mismatch exposes the exact decoded candidate and expected binding', 
     assert.equal(result.messageHeader.messageBody.mintRecipient, '0x3333333333333333333333333333333333333333')
     assert.equal(result.expectedRoute.headerSender, TOKEN_MESSENGER.toLowerCase())
     assert.equal(result.expectedRoute.headerRecipient, TOKEN_MESSENGER.toLowerCase())
-    assert.equal(result.expectedRoute.messageSender, BASE_TO_ARC_ROUTE.source.tokenMessenger.toLowerCase())
+    assert.equal(result.expectedRoute.messageSender, BASE_TO_ARC_ROUTE.source.router.toLowerCase())
     assert.equal(result.expectedRoute.amount, '1000000')
     assert.equal(result.messageCandidates[0].mintRecipient, '0x3333333333333333333333333333333333333333')
   } finally {
@@ -187,6 +190,105 @@ test('bridge status fetches and binds the requested burnTxHash', async () => {
     assert.match(requested[0], /transactionHash=0x[a]+$/)
     assert.match(requested[1], /transactionHash=0x[b]+$/)
     assert.match(requested[2], /transactionHash=0x[b]+$/)
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+test('Base→Arc calldata requests finalized CCTP threshold 2000', async () => {
+  const { buildMscaRouterBridgeCalls } = await import('../src/services/mcpServer.mjs?base-arc-finality-' + Date.now() + '-' + Math.random())
+  const route = {
+    fromKey: 'Base_Sepolia',
+    toKey: 'Arc_Testnet',
+    source: {
+      domain: 6,
+      usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+      router: '0x9425cC5b3C8B9e0FCb35beBdE737B4365A614Acc',
+    },
+    destination: { domain: 26, requiredFinalityThreshold: 2000 },
+  }
+  const calls = buildMscaRouterBridgeCalls({ route, amount: 1_000_000n, mintRecipient: MSCA })
+  const decoded = decodeFunctionData({
+    abi: [{
+      type: 'function', name: 'bridgeUsdcWithFee', stateMutability: 'nonpayable',
+      inputs: [
+        { name: 'amount', type: 'uint256' }, { name: 'destinationDomain', type: 'uint32' },
+        { name: 'mintRecipient', type: 'bytes32' }, { name: 'destinationCaller', type: 'bytes32' },
+        { name: 'maxFee', type: 'uint256' }, { name: 'minFinalityThreshold', type: 'uint32' },
+      ], outputs: [],
+    }],
+    data: calls[1].data,
+  })
+  assert.equal(decoded.args?.[5], 2000)
+})
+
+test('Arbitrum→Arc is not advertised until a source ArcoxRouter is configured', async () => {
+  const { isMscaCctpRouteConfigured } = await import('../src/services/mcpServer.mjs?arb-arc-capability-' + Date.now() + '-' + Math.random())
+  assert.equal(isMscaCctpRouteConfigured('arbitrum-sepolia', 'arc-testnet'), false)
+})
+
+test('decoded pending Iris message remains retryable until attestation exists', async () => {
+  const { waitForCctpBridgeStatus } = await import('../src/services/mcpServer.mjs?decoded-pending-' + Date.now() + '-' + Math.random())
+  const previousFetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    const message = messageFor(MSCA, BASE_TO_ARC_ROUTE)
+    const response = calls === 1
+      ? { messages: [{ message, status: 'pending_confirmations' }] }
+      : { messages: [{ message, attestation: '0xattestation', status: 'complete' }] }
+    return new Response(JSON.stringify(response), { status: 200 })
+  }
+  try {
+    const result = await waitForCctpBridgeStatus({
+      burnTxHash: '0x' + '2'.repeat(64), sourceDomain: 6, destinationDomain: 26,
+      walletAddress: MSCA, route: BASE_TO_ARC_ROUTE, expectedBurnAmount: 1_000_000n,
+    }, { attempts: 2, delayMs: 0 })
+    assert.equal(calls, 2)
+    assert.equal(result.status, 'attestation_ready')
+    assert.equal(result.verified, true)
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+test('invalid finality values are normalized to a supported CCTP threshold', async () => {
+  const previous = process.env.CCTP_MIN_FINALITY_THRESHOLD
+  process.env.CCTP_MIN_FINALITY_THRESHOLD = '1234'
+  try {
+    const { buildMscaRouterBridgeCalls } = await import('../src/services/mcpServer.mjs?finality-normalize-' + Date.now() + '-' + Math.random())
+    const route = { fromKey: 'Arc_Testnet', toKey: 'Base_Sepolia', source: { domain: 26, usdc: ROUTE.source.usdc, router: ROUTE.source.router }, destination: { domain: 6, requiredFinalityThreshold: 1000 } }
+    const calls = buildMscaRouterBridgeCalls({ route, amount: 1_000_000n, mintRecipient: MSCA })
+    const decoded = decodeFunctionData({
+      abi: [{ type: 'function', name: 'bridgeUsdcWithFee', stateMutability: 'nonpayable', inputs: [
+        { name: 'amount', type: 'uint256' }, { name: 'destinationDomain', type: 'uint32' }, { name: 'mintRecipient', type: 'bytes32' }, { name: 'destinationCaller', type: 'bytes32' }, { name: 'maxFee', type: 'uint256' }, { name: 'minFinalityThreshold', type: 'uint32' },
+      ], outputs: [] }], data: calls[1].data,
+    })
+    assert.equal(decoded.args?.[5], 1000)
+  } finally {
+    if (previous === undefined) delete process.env.CCTP_MIN_FINALITY_THRESHOLD
+    else process.env.CCTP_MIN_FINALITY_THRESHOLD = previous
+  }
+})
+
+test('Iris non-2xx and pending confirmations remain retryable', async () => {
+  const { waitForCctpBridgeStatus } = await import('../src/services/mcpServer.mjs?cctp-http-pending-' + Date.now())
+  const previousFetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    if (calls === 1) return new Response('temporarily unavailable', { status: 503 })
+    return new Response(JSON.stringify({ messages: [{ status: 'pending_confirmations' }] }), { status: 200 })
+  }
+  try {
+    const result = await waitForCctpBridgeStatus({
+      burnTxHash: '0x' + '1'.repeat(64), sourceDomain: 6, destinationDomain: 26,
+      walletAddress: MSCA, route: BASE_TO_ARC_ROUTE, expectedBurnAmount: 1_000_000n,
+    }, { attempts: 2, delayMs: 0 })
+    assert.equal(calls, 2)
+    assert.equal(result.status, 'pending')
+    assert.equal(result.reason, 'cctp_message_pending')
+    assert.equal(result.messageStatus, 'pending_confirmations')
   } finally {
     globalThis.fetch = previousFetch
   }

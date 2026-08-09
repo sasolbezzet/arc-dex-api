@@ -153,6 +153,41 @@ test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
   }
 })
 
+test('MCP rejects Arbitrum→Arc bridge before any source burn when router is absent', async () => {
+  const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE
+  process.env.ENABLE_MSCA_CCTP_BRIDGE = 'true'
+  try {
+    await withSessionStore({
+      [MSCA.toLowerCase()]: {
+        walletAddress: MSCA,
+        delegateAddress: OTHER,
+        active: true,
+        authorizationUserOpHash: '0x' + 'a'.repeat(64),
+      },
+    }, { [EOA.toLowerCase()]: MSCA }, async ({ createMcpServer }) => {
+      const server = createMcpServer(EOA)
+      const quote = await server._registeredTools.arcox_quote_bridge.handler({
+        fromChain: 'arbitrum-sepolia', toChain: 'arc-testnet', amount: '1', token: 'USDC', source: 'session',
+      })
+      const result = JSON.parse(quote.content[0].text)
+      assert.equal(result.rejected, true)
+      assert.equal(result.reason, 'bridge_route_not_supported_for_msca')
+
+      const execute = await server._registeredTools.arcox_execute_bridge.handler({
+        fromChain: 'arbitrum-sepolia', toChain: 'arc-testnet', amount: '1', token: 'USDC', source: 'session',
+        previewId: 'quote_that_must_not_be_used', confirmed: true, confirmationText: 'yes',
+      })
+      const executeResult = JSON.parse(execute.content[0].text)
+      assert.equal(executeResult.status, 'rejected')
+      assert.equal(executeResult.executed, false)
+      assert.equal(executeResult.reason, 'bridge_route_not_supported_for_msca')
+    })
+  } finally {
+    if (previousBridgeFlag === undefined) delete process.env.ENABLE_MSCA_CCTP_BRIDGE
+    else process.env.ENABLE_MSCA_CCTP_BRIDGE = previousBridgeFlag
+  }
+})
+
 test('MCP resolver fails closed without an active explicit MSCA session', async () => {
   await withSessionStore({
     [MSCA.toLowerCase()]: {
@@ -222,7 +257,7 @@ test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mi
     addressWord('0x3600000000000000000000000000000000000000'), // Arc USDC
     addressWord(MSCA), // final mint recipient
     word('0x00000000000f4240'), // 1 USDC
-    addressWord('0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA'), // TokenMessengerV2 is the BurnMessage sender
+    addressWord('0xDf800310443BEB589CEf91A09854203Ea36e43a7'), // ArcoxRouter directly calls depositForBurn
     word('0x0a'), // max fee
     word('0x0a'), // executed fee
     word('0x0'), // expiration block
@@ -232,7 +267,7 @@ test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mi
   assert.equal(decoded.destinationDomain, 6)
   assert.equal(decoded.recipient, '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa')
   assert.equal(decoded.messageBody.mintRecipient, MSCA.toLowerCase())
-  assert.equal(decoded.messageBody.messageSender, '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa')
+  assert.equal(decoded.messageBody.messageSender, '0xdf800310443beb589cef91a09854203ea36e43a7')
   assert.equal(decoded.messageBody.burnToken, '0x3600000000000000000000000000000000000000')
   assert.equal(decoded.messageBody.amount, 1_000_000n)
   assert.equal(decoded.sender, '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa')
@@ -258,7 +293,7 @@ test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mi
         router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
         usdc: '0x3600000000000000000000000000000000000000',
       },
-      destination: { tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
+      destination: { domain: 6, tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
     },
     walletAddress: MSCA,
     expectedBurnAmount: 1_000_000n,
@@ -272,7 +307,7 @@ test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mi
         router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
         usdc: '0x3600000000000000000000000000000000000000',
       },
-      destination: { tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
+      destination: { domain: 6, tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
     },
     walletAddress: MSCA,
     expectedBurnAmount: 1_000_000n,
@@ -300,7 +335,7 @@ test('CCTP indexing lag remains pending instead of false route rejection', async
           router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
           usdc: '0x3600000000000000000000000000000000000000',
         },
-        destination: { tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
+        destination: { domain: 6, tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
       },
       expectedBurnAmount: 99700n,
     }, { attempts: 1, delayMs: 0 })
@@ -324,7 +359,7 @@ test('CCTP indexing lag remains pending instead of false route rejection', async
           router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
           usdc: '0x3600000000000000000000000000000000000000',
         },
-        destination: { tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
+        destination: { domain: 6, tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
       },
       expectedBurnAmount: 99700n,
     })
@@ -392,7 +427,7 @@ test('MSCA bridge calldata approves and calls the verified ArcoxRouter', async (
       usdc: '0x3600000000000000000000000000000000000000',
       router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
     },
-    destination: { domain: 6 },
+    destination: { domain: 6, requiredFinalityThreshold: 1000 },
   }
   const calls = buildMscaRouterBridgeCalls({ route, amount: 1_000_000n, mintRecipient: MSCA })
   assert.equal(calls.length, 2)
