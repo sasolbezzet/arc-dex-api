@@ -101,7 +101,7 @@ test('MSCA-bound quote fields distinguish the active wallet', () => {
 })
 
 test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mint recipient', async () => {
-  const { decodeCctpMessage } = await import('../src/services/mcpServer.mjs?cctp-decode-' + Date.now())
+  const { decodeCctpMessage, selectCctpMessage } = await import('../src/services/mcpServer.mjs?cctp-decode-' + Date.now())
   const word = value => String(value).replace(/^0x/i, '').padStart(64, '0')
   const addressWord = address => word(address)
   const uint32 = value => String(value).replace(/^0x/i, '').padStart(8, '0')
@@ -136,6 +136,49 @@ test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mi
   assert.equal(decoded.messageBody.burnToken, '0x3600000000000000000000000000000000000000')
   assert.equal(decoded.messageBody.amount, 1_000_000n)
   assert.equal(decoded.sender, '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa')
+
+  const wrongRouteMessage = '0x' + header.replace(uint32('0x0000001a'), uint32('0x00000003')) + body
+  const selection = selectCctpMessage([
+    { message: wrongRouteMessage, status: 'complete' },
+    { message: '0x' + header + body, status: 'complete' },
+  ], 26, 6)
+  assert.equal(selection.selected.message, '0x' + header + body)
+  assert.equal(selection.decoded.sourceDomain, 26)
+  assert.equal(selection.decoded.destinationDomain, 6)
+  assert.deepEqual(selection.candidates.map(item => [item.sourceDomain, item.destinationDomain]), [[3, 6], [26, 6]])
+
+  const sameRouteWrongMessage = '0x' + header + body.replace(addressWord(MSCA), addressWord(OTHER))
+  const boundSelection = selectCctpMessage([
+    { message: sameRouteWrongMessage, status: 'complete' },
+    { message: '0x' + header + body, status: 'complete' },
+  ], 26, 6, {
+    route: {
+      source: {
+        tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
+        router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
+        usdc: '0x3600000000000000000000000000000000000000',
+      },
+      destination: { tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
+    },
+    walletAddress: MSCA,
+    expectedBurnAmount: 1_000_000n,
+  })
+  assert.equal(boundSelection.selected.message, '0x' + header + body)
+
+  const noValidCandidate = selectCctpMessage([{ message: sameRouteWrongMessage, status: 'complete' }], 26, 6, {
+    route: {
+      source: {
+        tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
+        router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
+        usdc: '0x3600000000000000000000000000000000000000',
+      },
+      destination: { tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' },
+    },
+    walletAddress: MSCA,
+    expectedBurnAmount: 1_000_000n,
+  })
+  assert.equal(noValidCandidate.selected, null)
+  assert.equal(noValidCandidate.candidates.length, 1)
 })
 
 test('MSCA bridge calldata approves and calls the verified ArcoxRouter', async () => {

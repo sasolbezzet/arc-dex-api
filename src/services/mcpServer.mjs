@@ -500,18 +500,52 @@ export function decodeCctpMessageHeader(message) {
   return decodeCctpMessage(message)
 }
 
+export function selectCctpMessage(messages, sourceDomain, destinationDomain, binding = {}) {
+  const candidates = (Array.isArray(messages) ? messages : []).map((message, index) => ({
+    message,
+    index,
+    decoded: decodeCctpMessage(message?.message),
+  }))
+  const domainCandidates = candidates.filter(item => item.decoded && item.decoded.sourceDomain === Number(sourceDomain) && item.decoded.destinationDomain === Number(destinationDomain))
+  const expectedSender = binding.route?.source?.tokenMessenger ? getAddress(binding.route.source.tokenMessenger).toLowerCase() : null
+  const expectedRecipient = binding.route?.destination?.tokenMessenger ? getAddress(binding.route.destination.tokenMessenger).toLowerCase() : null
+  const expectedMintRecipient = binding.walletAddress ? getAddress(binding.walletAddress).toLowerCase() : null
+  const expectedMessageSender = binding.route?.source?.router ? getAddress(binding.route.source.router).toLowerCase() : null
+  const expectedBurnToken = binding.route?.source?.usdc ? getAddress(binding.route.source.usdc).toLowerCase() : null
+  const expectedAmount = binding.expectedBurnAmount === undefined ? null : BigInt(binding.expectedBurnAmount)
+  const selected = domainCandidates.find(item => {
+    if (!binding.route && !binding.walletAddress && expectedAmount === null) return true
+    const body = item.decoded.messageBody
+    return item.decoded.sender === expectedSender
+      && item.decoded.recipient === expectedRecipient
+      && body?.mintRecipient === expectedMintRecipient
+      && body?.messageSender === expectedMessageSender
+      && body?.burnToken === expectedBurnToken
+      && (expectedAmount === null || body?.amount === expectedAmount)
+  })
+  return {
+    selected: selected?.message || null,
+    decoded: selected?.decoded || null,
+    candidates: candidates.map(item => ({
+      index: item.index,
+      sourceDomain: item.decoded?.sourceDomain ?? null,
+      destinationDomain: item.decoded?.destinationDomain ?? null,
+      messageStatus: item.message?.status || null,
+    })),
+  }
+}
+
 async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain, walletAddress, route, expectedBurnAmount }) {
   const url = `https://iris-api-sandbox.circle.com/v2/messages/${sourceDomain}?transactionHash=${encodeURIComponent(burnTxHash)}`
   try {
     const response = await fetch(url, { headers: { Accept: 'application/json' } })
     if (!response.ok) return { status: 'pending', burnTxHash, verified: false }
     const data = await response.json()
-    const message = data?.messages?.[0]
-    if (!message) return { status: 'pending', burnTxHash, verified: false }
-    const decoded = decodeCctpMessage(message.message)
-    const header = decoded
-    if (!header || header.sourceDomain !== Number(sourceDomain) || header.destinationDomain !== Number(destinationDomain)) {
-      return { status: 'rejected', burnTxHash, verified: false, reason: 'cctp_message_route_unverified', messageHeader: header }
+    const selection = selectCctpMessage(data?.messages, sourceDomain, destinationDomain, { route, walletAddress, expectedBurnAmount })
+    const message = selection.selected
+    const header = selection.decoded
+    if (!message) {
+      return { status: 'rejected', burnTxHash, verified: false, reason: 'cctp_message_route_unverified', messageHeader: header, messageCandidates: selection.candidates }
     }
     const expectedHeaderSender = route?.source?.tokenMessenger
       ? getAddress(route.source.tokenMessenger).toLowerCase()
