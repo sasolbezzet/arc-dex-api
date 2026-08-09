@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { listCredentials, addCredential, revealCredential, deleteCredential, getLimits, setLimits, listApprovals, createApproval, approveRequest, rejectRequest, listActivity, createChallenge, consumeChallenge, createSession, validateSession, listMcpSessions } from '../services/vaultStore.mjs'
+import { listCredentials, addCredential, deduplicateCredentials, revealCredential, deleteCredential, getLimits, setLimits, listApprovals, createApproval, approveRequest, rejectRequest, listActivity, createChallenge, consumeChallenge, createSession, validateSession, listMcpSessions } from '../services/vaultStore.mjs'
 import { listRelatedAddresses } from '../services/sessionKeyService.mjs'
 import { verifyMessage } from 'viem'
 
@@ -86,6 +86,10 @@ vault.post('/credentials', requireAuth, (req, res) => {
   if (!validTypes.includes(type)) return res.status(400).json({ error: `type must be one of: ${validTypes.join(', ')}` })
   const cred = addCredential(req.owner, { type, label, value })
   res.json({ credential: cred })
+})
+
+vault.post('/credentials/deduplicate', requireAuth, (req, res) => {
+  res.json(deduplicateCredentials(req.owner))
 })
 
 vault.post('/credentials/:id/reveal', requireAuth, (req, res) => {

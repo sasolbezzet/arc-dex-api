@@ -1,5 +1,7 @@
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { randomUUID } from 'crypto'
+import { mkdirSync, rmSync, statSync } from 'fs'
+import { dirname } from 'path'
 
 const VAULT_PATH = process.env.VAULT_PATH || './data/vault.json'
 const ACTIVITY_PATH = process.env.VAULT_ACTIVITY_PATH || './data/vault-activity.json'
@@ -87,6 +89,45 @@ function loadVault() {
 function saveVault(v) {
   atomicWriteJsonFile(VAULT_PATH, v)
 }
+
+// Credential setup can be retried concurrently by multiple frontend callbacks.
+// Serialize the read-modify-write section across Node processes so idempotency
+// is preserved even when more than one worker serves the vault endpoint.
+function withVaultLock(fn) {
+  const lockPath = `${VAULT_PATH}.lock`
+  const ownerToken = `${process.pid}:${randomUUID()}`
+  const ownerPath = `${lockPath}/owner`
+  mkdirSync(dirname(lockPath), { recursive: true })
+  const deadline = Date.now() + 5000
+  const sleeper = new Int32Array(new SharedArrayBuffer(4))
+  while (true) {
+    try {
+      mkdirSync(lockPath)
+      // The directory creation is the lock acquisition. Write the owner only
+      // after acquisition so a stale-lock reclaimer can identify ownership.
+      atomicWriteJsonFile(ownerPath, { token: ownerToken, acquiredAt: Date.now() })
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      try {
+        const owner = readJsonFile(`${lockPath}/owner`, null)
+        const acquiredAt = Number(owner?.acquiredAt || 0)
+        if (acquiredAt && Date.now() - acquiredAt > 15000) rmSync(lockPath, { recursive: true, force: true })
+      } catch { /* another worker may be acquiring/releasing the lock */ }
+      if (Date.now() >= deadline) throw new Error('Vault mutation lock timeout')
+      Atomics.wait(sleeper, 0, 0, 10)
+    }
+  }
+  try {
+    return fn()
+  } finally {
+    // Never remove a lock that was replaced after stale-lock recovery.
+    try {
+      const current = readJsonFile(ownerPath, null)
+      if (current?.token === ownerToken) rmSync(lockPath, { recursive: true, force: true })
+    } catch { /* lock may already have been removed after a timeout */ }
+  }
+}
 function loadActivity() {
   return readJsonFile(ACTIVITY_PATH, [])
 }
@@ -101,25 +142,87 @@ function saveActivity(a) {
 // type: 'eoa' | 'circle' | 'solana' | 'api_key'
 // Wallet credentials auto-registered from frontend. API key credentials manually added.
 
+function credentialValueKey(type, value) {
+  const normalized = String(value || '').trim()
+  // EVM addresses are case-insensitive; preserve case for opaque/API-key values.
+  return ['eoa', 'circle'].includes(String(type || '').toLowerCase()) && /^0x[0-9a-f]{40}$/i.test(normalized)
+    ? normalized.toLowerCase()
+    : normalized
+}
+
+function collapseCredentialDuplicates(v, owner) {
+  const normalizedOwner = String(owner || '').toLowerCase()
+  const seen = new Set()
+  const kept = []
+  let removed = 0
+  for (const credential of v.credentials) {
+    if (String(credential.owner || '').toLowerCase() !== normalizedOwner) {
+      kept.push(credential)
+      continue
+    }
+    const key = `${String(credential.type || '').toLowerCase()}\u0000${credentialValueKey(credential.type, credential.value)}`
+    if (seen.has(key)) {
+      removed++
+      continue
+    }
+    seen.add(key)
+    kept.push(credential)
+  }
+  if (removed > 0) v.credentials = kept
+  return removed
+}
+
 export function listCredentials(owner) {
-  const v = loadVault()
-  return v.credentials
-    .filter(c => c.owner === owner)
-    .map(c => ({ ...c, value: maskValue(c.value) }))
+  return withVaultLock(() => {
+    const v = loadVault()
+    const removed = collapseCredentialDuplicates(v, owner)
+    // Heal legacy bloat on the normal read path; list remains idempotent.
+    if (removed > 0) saveVault(v)
+    const normalizedOwner = String(owner || '').toLowerCase()
+    return v.credentials
+      .filter(c => String(c.owner || '').toLowerCase() === normalizedOwner)
+      .map(c => ({ ...c, value: maskValue(c.value) }))
+  })
 }
 
 export function addCredential(owner, { type, label, value }) {
-  const v = loadVault()
-  const cred = { id: randomUUID(), owner, type, label, value, createdAt: Date.now() }
-  v.credentials.push(cred)
-  saveVault(v)
-  logActivity(owner, 'credential_added', { type, label })
-  return { ...cred, value: maskValue(cred.value) }
+  return withVaultLock(() => {
+    const v = loadVault()
+    const normalizedOwner = String(owner || '').toLowerCase()
+    const normalizedType = String(type || '').toLowerCase()
+    const normalizedLabel = String(label || '').trim()
+    const normalizedValue = String(value || '').trim()
+    // Credential registration is idempotent: repeated frontend setup callbacks
+    // must not create another secret record for the same owner/type/value.
+    const existing = v.credentials.find(c => String(c.owner || '').toLowerCase() === normalizedOwner
+      && String(c.type || '').toLowerCase() === normalizedType
+      && credentialValueKey(normalizedType, c.value) === credentialValueKey(normalizedType, normalizedValue))
+    if (existing) return { ...existing, value: maskValue(existing.value), deduplicated: true }
+    const cred = { id: randomUUID(), owner, type: normalizedType, label: normalizedLabel, value: normalizedValue, createdAt: Date.now() }
+    v.credentials.push(cred)
+    saveVault(v)
+    logActivity(owner, 'credential_added', { type: normalizedType, label: normalizedLabel })
+    return { ...cred, value: maskValue(cred.value), deduplicated: false }
+  })
+}
+
+export function deduplicateCredentials(owner) {
+  const removed = withVaultLock(() => {
+    const v = loadVault()
+    const count = collapseCredentialDuplicates(v, owner)
+    if (count > 0) {
+      saveVault(v)
+      logActivity(owner, 'credentials_deduplicated', { removed: count })
+    }
+    return count
+  })
+  return { removed, credentials: listCredentials(owner) }
 }
 
 export function revealCredential(owner, id) {
   const v = loadVault()
-  const cred = v.credentials.find(c => c.owner === owner && c.id === id)
+  const normalizedOwner = String(owner || '').toLowerCase()
+  const cred = v.credentials.find(c => String(c.owner || '').toLowerCase() === normalizedOwner && c.id === id)
   if (!cred) return null
   logActivity(owner, 'credential_revealed', { id, label: cred.label })
   return cred
@@ -127,7 +230,8 @@ export function revealCredential(owner, id) {
 
 export function deleteCredential(owner, id) {
   const v = loadVault()
-  const idx = v.credentials.findIndex(c => c.owner === owner && c.id === id)
+  const normalizedOwner = String(owner || '').toLowerCase()
+  const idx = v.credentials.findIndex(c => String(c.owner || '').toLowerCase() === normalizedOwner && c.id === id)
   if (idx === -1) return false
   const cred = v.credentials[idx]
   v.credentials.splice(idx, 1)
@@ -165,6 +269,7 @@ export function createApproval(owner, { agent, action, amount, token, source, to
   // execute without a browser signature — which the remote MCP server cannot do.
   const withinLimit = !forcePending && limits.autoApprove && Number(amount) <= limits.maxPerTx
 
+  const createdAt = Date.now()
   const approval = {
     id: randomUUID(),
     owner,
@@ -179,7 +284,8 @@ export function createApproval(owner, { agent, action, amount, token, source, to
     // Or: pending → rejected, denied, error
     status: withinLimit ? 'auto_approved' : 'pending',
     paramHash: '', // ponytail: operation-bound hash — add when security hardened
-    createdAt: Date.now(),
+    createdAt,
+    ...(withinLimit ? { approvedAt: createdAt } : {}),
   }
   v.approvals.push(approval)
   saveVault(v)
@@ -223,7 +329,8 @@ export function updateApprovalStatus(owner, id, status, extra = {}) {
   if (extra.explorerUrl) a.explorerUrl = extra.explorerUrl
   if (extra.userOpHash) a.userOpHash = extra.userOpHash
   if (extra.error) a.error = extra.error
-  if (status === 'success') a.completedAt = Date.now()
+  if (['approved', 'auto_approved'].includes(status) && !a.approvedAt) a.approvedAt = Date.now()
+  if (['success', 'error', 'rejected', 'denied'].includes(status) && !a.completedAt) a.completedAt = Date.now()
   saveVault(v)
   logActivity(owner, `approval_${status}`, { id, action: a.action, txHash: extra.txHash || '' })
   return a

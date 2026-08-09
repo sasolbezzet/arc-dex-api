@@ -252,6 +252,7 @@ const BACKEND_URL = process.env.ARCOX_BACKEND_URL || 'http://localhost:3001'
 
 import { mintOwnerToken } from './authToken.mjs'
 import { fetchAllChainBalances } from './multiChainBalance.mjs'
+import { CHAINS } from './chains.mjs'
 
 // The MCP userId is the SIWE-verified EOA used only as the tenant/auth identity.
 // On-chain reads, quotes, and execution must use the explicitly mapped Agent
@@ -313,6 +314,20 @@ function chainKey(slug) {
   if (!slug) return undefined
   const s = String(slug).toLowerCase().trim()
   return CHAIN_SLUG_TO_KEY[s] || slug
+}
+
+function executionChainKey(slug) {
+  if (!slug) return undefined
+  const s = String(slug).toLowerCase().trim()
+  const aliases = {
+    arc: 'arc-testnet',
+    arc_testnet: 'arc-testnet',
+    'eth-sepolia': 'ethereum-sepolia',
+    ethereum_sepolia: 'ethereum-sepolia',
+    base_sepolia: 'base-sepolia',
+    arbitrum_sepolia: 'arbitrum-sepolia',
+  }
+  return aliases[s] || s
 }
 
 // CCTP bridge support for the MCP Agent Wallet. The source path is limited to
@@ -795,13 +810,13 @@ async function mintDestinationViaMsca({ status, route, walletAddress }) {
 // MCP server is MSCA-ONLY: only session-key (MSCA) auto-executes. Circle proxy
 // wallet and EOA are explicitly NOT available to remote ChatGPT/Claude, per
 // security policy (remote agents must only use the locked passkey MSCA).
-async function canAutoExecute(userId, source, amount) {
+async function canAutoExecute(userId, source, amount, chainKey) {
   if (source !== 'session') {
     return { ok: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Circle proxy dan EOA tidak diizinkan untuk agent remote.' }
   }
   try {
     const { canExecuteViaSession } = await import('./sessionKeyService.mjs')
-    const gate = canExecuteViaSession(userId, amount)
+    const gate = canExecuteViaSession(userId, amount, chainKey)
     return gate
   } catch { return { ok: false, reason: 'session_error' } }
 }
@@ -812,7 +827,7 @@ async function recordAutoExec(userId, { agent, action, amount, token, source, to
   const vault = await import('./vaultStore.mjs')
   const approval = vault.createApproval(userId, { agent, action, amount, token, source, to, details, forcePending: true })
   vault.approveRequest(userId, approval.id, { txHash, explorerUrl })
-  return approval
+  return vault.updateApprovalStatus(userId, approval.id, 'success', { txHash, explorerUrl }) || approval
 }
 
 // Best-effort current agent label for a user, from the most recent MCP session.
@@ -1072,7 +1087,8 @@ async function executeX402Pay(userId, invoiceId) {
 
 
 // ── MCP Server factory ──
-export function createMcpServer(userId) {
+export function createMcpServer(userId, context = {}) {
+  const requestAgent = context.agent || resolveAgentForUser(userId)
   const server = new McpServer({
     name: 'arcox-mcp',
     version: '1.0.0',
@@ -1250,7 +1266,7 @@ export function createMcpServer(userId) {
       const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: 'arc-testnet' })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
-          agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
+          agent: requestAgent, action: 'swap', amount: params.amountIn, token: params.tokenIn,
           source: 'session', details: jsonText({ tokenOut: params.tokenOut, previewId: params.previewId }),
           txHash: result.txHash, explorerUrl: result.explorerUrl,
         })
@@ -1401,7 +1417,7 @@ export function createMcpServer(userId) {
         try {
           const vault = await import('./vaultStore.mjs')
           const approval = vault.createApproval(userId, {
-            agent: resolveAgentForUser(userId),
+            agent: requestAgent,
             action: 'bridge',
             amount: params.amount,
             token: 'USDC',
@@ -1443,7 +1459,7 @@ export function createMcpServer(userId) {
       let auditPending = false
       try {
         await recordAutoExec(userId, {
-          agent: resolveAgentForUser(userId), action: 'bridge', amount: params.amount, token: 'USDC',
+          agent: requestAgent, action: 'bridge', amount: params.amount, token: 'USDC',
           source: 'session', details: jsonText({ fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId, destinationMint: mint.success }),
           txHash: result.txHash, explorerUrl: result.explorerUrl,
         })
@@ -1625,32 +1641,44 @@ export function createMcpServer(userId) {
     to: z.string().describe('Recipient address'),
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol. Default USDC'),
+    fromChain: z.string().describe('Source chain (for example arc-testnet or base-sepolia). Required.'),
     source: z.string().optional().describe('session'),
   }, async (params) => {
-    const token = params.token || 'USDC'
+    const token = String(params.token || 'USDC').toUpperCase()
     const src = params.source || 'session'
+    const fromChain = executionChainKey(params.fromChain)
     if (src !== 'session') {
       return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote send hanya untuk source=session.' }) }] }
     }
+    if (!CHAINS[fromChain]) {
+      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'unsupported_chain', fromChain: params.fromChain, supportedChains: Object.keys(CHAINS), message: 'fromChain wajib berupa chain yang didukung; tidak ada fallback ke Arc.' }) }] }
+    }
+    const chain = CHAINS[fromChain]
+    if (!chain.tokens[token] && token !== chain.nativeCurrency.symbol) {
+      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'token_not_supported', fromChain, token, message: `Token ${token} tidak tersedia di ${fromChain}.` }) }] }
+    }
     const info = await resolveActiveMsca(userId)
     if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
-    // MSCA send quote is bound to the active wallet. A later MSCA switch makes
-    // the preview unusable instead of silently sending from another wallet.
-    const q = createExecutionQuote(userId, 'send', { to: params.to, amount: params.amount, token, walletAddress: info.walletAddress })
+    // MSCA send quote is bound to the active wallet and exact source chain. A
+    // later MSCA or chain change makes the preview unusable instead of silently
+    // sending from another wallet/network.
+    const q = createExecutionQuote(userId, 'send', { to: params.to, amount: params.amount, token, fromChain, walletAddress: info.walletAddress })
     return { content: [{ type: 'text', text: jsonText({
       preview: true,
       action: 'send',
       to: params.to,
       amount: params.amount,
       token,
+      fromChain,
+      chain: fromChain,
       source: 'session',
       walletAddress: info.walletAddress,
       walletType: 'MSCA',
       payer: info.walletAddress,
-      note: 'Send via Agent Wallet (MSCA/session key): gas dibayar paymaster, 30bps platform fee berlaku.',
+      note: 'Send via Agent Wallet (MSCA/session key): chain wajib eksplisit dan session chain authorization harus aktif.',
       previewId: q.previewId,
       expiresAt: new Date(q.expires).toISOString(),
-      safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_send dengan source=session dan confirmed=true.',
+      safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_send dengan fromChain, source=session, confirmed=true.',
     }) }] }
   })
 
@@ -1658,6 +1686,7 @@ export function createMcpServer(userId) {
     to: z.string().describe('Recipient address'),
     amount: z.string().describe('Exact amount from quote'),
     token: z.string().optional().describe('Token symbol'),
+    fromChain: z.string().describe('Exact source chain from arcox_quote_send; required.'),
     source: z.string().optional().describe('session (MSCA)'),
     previewId: z.string().describe('Preview ID from arcox_quote_send'),
     confirmed: z.boolean().describe('Must be true to execute'),
@@ -1665,25 +1694,29 @@ export function createMcpServer(userId) {
   }, async (params) => {
     if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: jsonText({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
     const source = params.source || 'session'
-    const token = params.token || 'USDC'
+    const token = String(params.token || 'USDC').toUpperCase()
+    const fromChain = executionChainKey(params.fromChain)
     if (source !== 'session') {
       return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
     }
+    if (!CHAINS[fromChain]) {
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'unsupported_chain', fromChain: params.fromChain, supportedChains: Object.keys(CHAINS), message: 'fromChain wajib berupa chain yang didukung; tidak ada fallback ke Arc.' }) }] }
+    }
     const activeSession = await resolveActiveMsca(userId)
     if (!activeSession) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
-    const quoteCheck = consumeExecutionQuote(userId, 'send', params.previewId, { to: params.to, amount: params.amount, token, walletAddress: activeSession.walletAddress })
-    if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
-    const gate = await canAutoExecute(userId, source, params.amount)
+    const gate = await canAutoExecute(userId, source, params.amount, fromChain)
     if (!gate.ok) {
-      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, chain: fromChain, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
     }
+    const quoteCheck = consumeExecutionQuote(userId, 'send', params.previewId, { to: params.to, amount: params.amount, token, fromChain, walletAddress: activeSession.walletAddress })
+    if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     try {
       const { sendViaSession } = await import('./sessionKeyService.mjs')
-      const result = await sendViaSession(userId, params.to, params.amount, token)
+      const result = await sendViaSession(userId, params.to, params.amount, token, { chainKey: fromChain })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
-          agent: resolveAgentForUser(userId), action: 'send', amount: params.amount, token,
-          source: 'session', to: params.to, details: jsonText({ previewId: params.previewId }),
+          agent: requestAgent, action: 'send', amount: params.amount, token,
+          source: 'session', to: params.to, details: jsonText({ previewId: params.previewId, fromChain }),
           txHash: result.txHash, explorerUrl: result.explorerUrl,
         })
         return { content: [{ type: 'text', text: jsonText({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Kirim ${params.amount} ${token} ke ${params.to} berhasil via MSCA (session key).` }) }] }
@@ -1710,7 +1743,7 @@ export function createMcpServer(userId) {
     to: z.string().optional().describe('Destination address'),
   }, async (params) => {
     const { createApproval } = await import('./vaultStore.mjs')
-    const approval = createApproval(userId, { agent: 'chatgpt-mcp', ...params })
+    const approval = createApproval(userId, { agent: requestAgent, ...params })
     return { content: [{ type: 'text', text: jsonText({ approval }) }] }
   })
 
@@ -1808,7 +1841,10 @@ export function createMcpServer(userId) {
         if (liveStatus.status !== a.status) {
           const { updateApprovalStatus } = await import('./vaultStore.mjs')
           updateApprovalStatus(userId, a.id, liveStatus.status, { txHash: liveStatus.txHash, explorerUrl: liveStatus.explorerUrl })
+          const refreshed = listApprovals(userId).find(item => item.id === a.id)
           response.status = liveStatus.status
+          response.approvedAt = refreshed?.approvedAt || response.approvedAt
+          response.completedAt = refreshed?.completedAt || response.completedAt
           response.txHash = liveStatus.txHash || response.txHash
           response.explorerUrl = liveStatus.explorerUrl || response.explorerUrl
         }
@@ -1822,13 +1858,28 @@ export function createMcpServer(userId) {
   // Endpoint ini return invoice (paymentRequired) saat belum dibayar. Setelah
   // arcox_x402_pay_invoice (MSCA), retry dengan paymentId → unlockedResult.
 
+  const intelTokenAliases = {
+    BTC: 'bitcoin',
+    XBT: 'bitcoin',
+    ETH: 'ethereum',
+    WETH: 'wrapped-ether',
+    USDC: 'usd-coin',
+    USDT: 'tether',
+  }
+  const normalizeIntelTokenId = value => {
+    const raw = String(value || '').trim()
+    return intelTokenAliases[raw.toUpperCase()] || raw
+  }
   const intelTool = (name, desc, pathFromId, schema) => server.tool(name, desc, schema, async (params) => {
-    const path = pathFromId(params)
+    const normalizedParams = name === 'arcox_intel_get_token'
+      ? { ...params, id: normalizeIntelTokenId(params.id) }
+      : params
+    const path = pathFromId(normalizedParams)
     const { getSessionKeyInfo } = await import('./vaultStore.mjs')
     const sessionInfo = await getSessionKeyInfo(userId)
     const headers = {
       ...(sessionInfo?.active && sessionInfo.walletAddress ? { Authorization: `Bearer ${mintOwnerToken(userId)}`, 'X-Arcox-Owner': sessionInfo.walletAddress } : {}),
-      'X-Payment-Id': params.paymentId || '',
+      'X-Payment-Id': normalizedParams.paymentId || '',
     }
     const r = await fetch(`${BACKEND_URL}/api/intel${path}`, { headers })
     const data = await r.json()
@@ -1854,7 +1905,7 @@ export function createMcpServer(userId) {
     entity: z.string().describe('Entity name/organization'),
     paymentId: z.string().optional(),
   })
-  intelTool('arcox_intel_get_token', 'Get token intelligence.', p => (p.address ? `/token/${encodeURIComponent(p.chain)}/${encodeURIComponent(p.address)}` : `/token/${encodeURIComponent(p.id)}`), {
+  intelTool('arcox_intel_get_token', 'Get token intelligence. Common aliases such as BTC are normalized before the paid provider request.', p => (p.address ? `/token/${encodeURIComponent(p.chain)}/${encodeURIComponent(p.address)}` : `/token/${encodeURIComponent(p.id)}`), {
     id: z.string().optional().describe('Token id/symbol'),
     chain: z.string().optional(),
     address: z.string().optional(),
@@ -1941,7 +1992,7 @@ export async function mcpHttpHandler(req, res) {
   let session = sessions.get(sessionId)
   if (!session) {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId })
-    const server = createMcpServer(auth.userId)
+    const server = createMcpServer(auth.userId, { agent: agentName })
     await server.connect(transport)
     session = { transport, server }
     sessions.set(sessionId, session)

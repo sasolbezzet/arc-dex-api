@@ -453,9 +453,12 @@ export function revokeSessionKey(userId) {
 /**
  * Check if user has an active session key and is within spending limits.
  */
-export function canExecuteViaSession(userId, amount) {
+export function canExecuteViaSession(userId, amount, chainKey) {
   const entry = getSessionKey(userId)
   if (!entry || !entry.active) return { ok: false, reason: 'no_session' }
+  if (chainKey !== undefined && !isSessionAuthorizedForChain(userId, chainKey)) {
+    return { ok: false, reason: 'session_chain_not_authorized', chain: chainKey }
+  }
   // Record real usage so auto-detect picks the MSCA most recently used.
   try { touchSessionKey(userId) } catch { /* non-fatal */ }
   const limits = getLimits(userId)
@@ -544,6 +547,10 @@ export async function executeViaSession(userId, calls, options = {}) {
   try { touchSessionKey(userId) } catch { /* non-fatal */ }
 
   const chainKey = options.chainKey || entry.chain || 'arc-testnet'
+  if (!CHAINS[chainKey]) throw new Error(`Session not available: unknown_chain (${chainKey})`)
+  if (!isSessionAuthorizedForChain(userId, chainKey)) {
+    throw new Error(`Session not authorized for chain: ${chainKey}`)
+  }
   const { smartAccount, modularClient } = await buildSmartAccountClient(entry.walletAddress, entry.delegatePrivateKey, chainKey)
 
   // Override: skip factory initCode when wallet is not yet deployed on-chain.
@@ -611,12 +618,19 @@ export async function executeViaSession(userId, calls, options = {}) {
  * @param options.chainKey — which chain to execute on (default: session's chain)
  */
 export async function sendViaSession(userId, to, amount, token = 'USDC', options = {}) {
-  const gate = canExecuteViaSession(userId, amount)
-  if (!gate.ok) return { status: 'denied', reason: gate.reason }
+  const requestedChain = options.chainKey
+  if (requestedChain !== undefined && !CHAINS[requestedChain]) {
+    return { status: 'denied', reason: 'unknown_chain', chain: requestedChain }
+  }
+  const gate = canExecuteViaSession(userId, amount, requestedChain)
+  if (!gate.ok) return { status: 'denied', reason: gate.reason, chain: requestedChain }
 
-  const chainKey = options.chainKey || gate.entry?.chain || 'arc-testnet'
+  const chainKey = requestedChain || gate.entry?.chain || 'arc-testnet'
   const chain = CHAINS[chainKey]
-  if (!chain) return { status: 'denied', reason: 'unknown_chain' }
+  if (!chain) return { status: 'denied', reason: 'unknown_chain', chain: chainKey }
+  if (!isSessionAuthorizedForChain(userId, chainKey)) {
+    return { status: 'denied', reason: 'session_chain_not_authorized', chain: chainKey }
+  }
 
   const tokenAddress = chain.tokens[token]
   if (!tokenAddress && token !== chain.nativeCurrency.symbol) {
