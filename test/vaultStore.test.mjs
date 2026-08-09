@@ -52,6 +52,7 @@ test('auto-approved approvals expose approval and completion timestamps', async 
     assert.equal(approval.status, 'auto_approved')
     assert.equal(typeof approval.approvedAt, 'number')
     assert.equal(approval.completedAt, undefined)
+    assert.equal(approval.approvalCompletedAt, approval.approvedAt)
     assert.ok(approval.approvedAt >= approval.createdAt)
 
     const updated = updateApprovalStatus('0xowner', approval.id, 'success', { txHash: '0xabc' })

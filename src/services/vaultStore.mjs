@@ -189,6 +189,11 @@ export function addCredential(owner, { type, label, value }) {
   return withVaultLock(() => {
     const v = loadVault()
     const normalizedOwner = String(owner || '').toLowerCase()
+    // Heal legacy duplicates before checking for an existing record. This
+    // makes repeated registration idempotent even when old bloat is still in
+    // the vault and the caller has not listed credentials first.
+    const removed = collapseCredentialDuplicates(v, owner)
+    if (removed > 0) saveVault(v)
     const normalizedType = String(type || '').toLowerCase()
     const normalizedLabel = String(label || '').trim()
     const normalizedValue = String(value || '').trim()
@@ -285,7 +290,11 @@ export function createApproval(owner, { agent, action, amount, token, source, to
     status: withinLimit ? 'auto_approved' : 'pending',
     paramHash: '', // ponytail: operation-bound hash — add when security hardened
     createdAt,
-    ...(withinLimit ? { approvedAt: createdAt } : {}),
+    // `auto_approved` records the approval decision, not completion of a
+    // value-moving execution. Keep the execution `completedAt` unset until a
+    // terminal execution status is observed; expose a separate timestamp for
+    // consumers auditing the approval lifecycle.
+    ...(withinLimit ? { approvedAt: createdAt, approvalCompletedAt: createdAt } : {}),
   }
   v.approvals.push(approval)
   saveVault(v)

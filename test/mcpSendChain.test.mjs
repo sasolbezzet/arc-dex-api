@@ -64,7 +64,9 @@ test('send quote includes canonical chain in preview and binds it to execution q
     const preview = resultOf(await server._registeredTools.arcox_quote_send.handler({
       to: EOA, amount: '0.1', token: 'USDC', fromChain: 'base_sepolia', source: 'session',
     }))
+    assert.equal(preview.schemaVersion, 1)
     assert.equal(preview.preview, true)
+    assert.equal(preview.action, 'send')
     assert.equal(preview.fromChain, 'base-sepolia')
     assert.equal(preview.chain, 'base-sepolia')
     assert.ok(preview.previewId)

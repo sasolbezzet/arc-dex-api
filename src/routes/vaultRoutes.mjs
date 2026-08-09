@@ -121,9 +121,12 @@ vault.get('/approvals', requireAuth, (req, res) => {
 })
 
 vault.post('/approvals', requireAuth, (req, res) => {
-  const { agent, action, amount, token, source, to, details } = req.body
+  const { action, amount, token, source, to, details } = req.body
   if (!action || !amount) return res.status(400).json({ error: 'action, amount required' })
-  const approval = createApproval(req.owner, { agent, action, amount, token, source, to, details })
+  // This HTTP route is the vault UI/API boundary, not the authenticated MCP
+  // context. Never trust a caller-supplied `agent` label here; MCP tools pass
+  // their verified OAuth client context directly to createMcpServer.
+  const approval = createApproval(req.owner, { agent: 'vault-ui', action, amount, token, source, to, details })
   res.json({ approval })
 })
 

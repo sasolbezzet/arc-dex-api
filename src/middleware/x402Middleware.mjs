@@ -316,6 +316,27 @@ export async function reconcileX402Invoice(id) {
   }
 }
 
+// Record the result of the paid service separately from payment settlement.
+// A paid invoice must never be presented as a successful service response when
+// the provider returns "not found" or another terminal provider error. Refunds
+// are deliberately represented as an explicit reviewable outcome here; this
+// service must not invent a treasury private key or send an unapproved refund.
+export function markX402ServiceOutcome(invoiceOrId, { status = 'provider_error', reason = '', refundEligible = true } = {}) {
+  const invoice = typeof invoiceOrId === 'string'
+    ? invoices.get(invoiceOrId)
+    : invoiceOrId
+  if (!invoice) return null
+  invoice.serviceStatus = status
+  invoice.serviceOutcomeAt = new Date().toISOString()
+  invoice.serviceError = reason || ''
+  invoice.refundEligible = Boolean(refundEligible)
+  invoice.refundStatus = refundEligible ? 'pending_review' : 'not_eligible'
+  invoices.set(invoice.invoiceId, invoice)
+  if (invoice.paymentId) invoices.set(invoice.paymentId, invoice)
+  persistInvoices()
+  return invoice
+}
+
 export function publicInvoice(invoice) {
   if (!invoice) return null
   return {
@@ -355,6 +376,10 @@ export function publicInvoice(invoice) {
     paidAt: invoice.paidAt,
     reconciledBy: invoice.reconciledBy,
     serviceStatus: invoice.serviceStatus,
+    serviceOutcomeAt: invoice.serviceOutcomeAt,
+    serviceError: invoice.serviceError || '',
+    refundEligible: Boolean(invoice.refundEligible),
+    refundStatus: invoice.refundStatus || '',
     serviceUnlockedAt: invoice.serviceUnlockedAt,
     memoIndex: invoice.memoIndex,
     memoSender: invoice.memoSender,
