@@ -8,7 +8,9 @@ async function rpcCall(rpcUrl, method, params = []) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    signal: AbortSignal.timeout(12_000),
   })
+  if (!res.ok) throw new Error(`RPC HTTP ${res.status}`)
   const data = await res.json()
   if (data.error) throw new Error(data.error.message || 'RPC error')
   return data.result
@@ -32,34 +34,41 @@ async function fetchChainBalances(chainKey, walletAddress) {
   if (!chain) return null
 
   const balances = {}
+  const errors = []
+  const nativeSymbol = chain.nativeCurrency.symbol
 
-  // Native token balance (ETH on ETH/ARB/BASE, USDC on Arc)
+  // Keep native and ERC-20 balances separate. Arc uses USDC as its native
+  // currency and also exposes an ERC-20 USDC contract, so one `USDC` key would
+  // otherwise overwrite the native value.
   try {
     const hex = await rpcCall(chain.rpcUrl, 'eth_getBalance', [walletAddress, 'latest'])
-    const wei = hexToBigInt(hex)
-    balances[chain.nativeCurrency.symbol] = formatUnits(wei, chain.nativeCurrency.decimals)
-  } catch {
-    balances[chain.nativeCurrency.symbol] = '0'
+    balances.nativeBalance = formatUnits(hexToBigInt(hex), chain.nativeCurrency.decimals)
+  } catch (error) {
+    balances.nativeBalance = null
+    errors.push(`native ${nativeSymbol}: ${error?.message || 'RPC lookup failed'}`)
   }
+  balances.nativeSymbol = nativeSymbol
 
-  // ERC-20 token balances
+  const tokens = {}
   for (const [symbol, address] of Object.entries(chain.tokens)) {
     if (!address) continue
     try {
       const calldata = erc20BalanceOfCalldata(walletAddress)
-      const hex = await rpcCall(chain.rpcUrl, 'eth_call', [
-        { to: address, data: calldata },
-        'latest',
-      ])
-      const raw = hexToBigInt(hex)
-      // Most ERC-20 on testnets use 6 decimals (USDC, EURC) — try 6 first
-      const decimals = symbol === 'USDC' ? 6 : symbol === 'EURC' ? 6 : 18
-      balances[symbol] = formatUnits(raw, decimals)
-    } catch {
-      balances[symbol] = '0'
+      const hex = await rpcCall(chain.rpcUrl, 'eth_call', [{ to: address, data: calldata }, 'latest'])
+      const decimals = symbol === 'USDC' || symbol === 'EURC' || symbol === 'USYC' ? 6 : symbol === 'cirBTC' ? 8 : 18
+      tokens[symbol] = formatUnits(hexToBigInt(hex), decimals)
+    } catch (error) {
+      tokens[symbol] = null
+      errors.push(`${symbol}: ${error?.message || 'RPC lookup failed'}`)
     }
   }
-
+  balances.tokens = tokens
+  // Preserve the established flat token keys consumed by the frontend and
+  // older MCP clients, while exposing nativeBalance separately.
+  Object.assign(balances, tokens)
+  const successfulTokenReads = Object.values(tokens).filter(value => value !== null).length
+  balances.status = errors.length === 0 ? 'ok' : (successfulTokenReads > 0 || balances.nativeBalance !== null ? 'partial' : 'error')
+  if (errors.length) balances.errors = errors
   return balances
 }
 
@@ -69,14 +78,24 @@ async function fetchChainBalances(chainKey, walletAddress) {
  */
 export async function fetchAllChainBalances(walletAddress) {
   const results = {}
-  const chains = Object.keys(CHAINS)
+  // Keep the MCP/dashboard contract explicit and deterministic: exactly the
+  // four EVM chains used by the Agent Wallet, not future registry additions.
+  const chains = ['arc-testnet', 'ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia']
 
   // Fetch in parallel
   const promises = chains.map(async (key) => {
     try {
       results[key] = await fetchChainBalances(key, walletAddress)
-    } catch {
-      results[key] = {}
+    } catch (error) {
+      // Preserve the four-chain response contract and make an unavailable
+      // chain distinguishable from a real zero balance.
+      results[key] = {
+        nativeBalance: null,
+        nativeSymbol: CHAINS[key]?.nativeCurrency?.symbol || null,
+        tokens: {},
+        status: 'error',
+        errors: [error?.message || 'RPC lookup failed'],
+      }
     }
   })
 

@@ -29,6 +29,81 @@ async function withSessionStore(users, aliases, fn) {
   }
 }
 
+test('MCP wallet balances are bound to the active MSCA and expose four chains', async () => {
+  const previousFetch = globalThis.fetch
+  const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE
+  delete process.env.ENABLE_MSCA_CCTP_BRIDGE
+  const { CHAINS } = await import('../src/services/chains.mjs?balance-test-' + Date.now())
+  const values = {
+    'arc-testnet': { native: '0xde0b6b3a7640000', USDC: '0xf4240' },
+    'ethereum-sepolia': { native: '0x16345785d8a0000', USDC: '0x0f4240', EURC: '0x1e8480' },
+    'base-sepolia': { native: '0x6f05b59d3b20000', USDC: '0x2dc6c0', EURC: '0x1e8480' },
+    'arbitrum-sepolia': { native: '0x2386f26fc10000', USDC: '0x4c4b40' },
+  }
+  const expected = Object.fromEntries(Object.entries(values).map(([key, value]) => [
+    CHAINS[key].rpcUrl,
+    {
+      native: value.native,
+      tokens: Object.fromEntries(Object.entries(CHAINS[key].tokens)
+        .filter(([, address]) => Boolean(address))
+        .map(([symbol, address]) => [address.toLowerCase(), value[symbol]])),
+    },
+  ]))
+  globalThis.fetch = async (url, options = {}) => {
+    const body = JSON.parse(options.body)
+    const chain = expected[String(url)]
+    assert.ok(chain, `unexpected balance RPC URL: ${url}`)
+    if (body.method === 'eth_getBalance') {
+      assert.equal(body.params?.[0], MSCA, 'native balance reads must use the active MSCA')
+    }
+    const result = body.method === 'eth_getBalance'
+      ? chain.native
+      : chain.tokens[String(body.params?.[0]?.to || '').toLowerCase()]
+    if (body.method === 'eth_call') {
+      const calldata = String(body.params?.[0]?.data || '').toLowerCase()
+      assert.equal(calldata.slice(-40), MSCA.slice(2).toLowerCase(), 'ERC-20 balanceOf must target the active MSCA')
+    }
+    assert.ok(result, `unexpected RPC call: ${body.method} ${body.params?.[0]?.to || ''}`)
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result }), { status: 200 })
+  }
+  try {
+    await withSessionStore({
+      [MSCA.toLowerCase()]: {
+        walletAddress: MSCA,
+        delegateAddress: OTHER,
+        active: true,
+        authorizationUserOpHash: '0x' + 'a'.repeat(64),
+      },
+    }, { [EOA.toLowerCase()]: MSCA }, async ({ createMcpServer }) => {
+      const server = createMcpServer(EOA)
+      const raw = await server._registeredTools.arcox_wallet_balances.handler({})
+      const result = JSON.parse(raw.content[0].text)
+      assert.equal(result.walletAddress, MSCA)
+      assert.equal(result.walletType, 'MSCA')
+      assert.deepEqual(result.supportedChains, ['arc-testnet', 'ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia'])
+      assert.deepEqual(Object.keys(result.chains).sort(), ['arbitrum-sepolia', 'arc-testnet', 'base-sepolia', 'ethereum-sepolia'])
+      for (const chain of Object.values(result.chains)) {
+        assert.equal(typeof chain, 'object')
+        assert.ok('nativeBalance' in chain)
+        assert.ok('nativeSymbol' in chain)
+        assert.ok('tokens' in chain)
+        assert.ok(['ok', 'partial', 'error'].includes(chain.status))
+      }
+      assert.ok('USDC' in result, 'legacy flat Arc token field remains available')
+      assert.equal(result.chains['arc-testnet'].nativeBalance, '1')
+      assert.equal(result.chains['arc-testnet'].tokens.USDC, '1')
+      assert.equal(result.chains['ethereum-sepolia'].nativeBalance, '0.1')
+      assert.equal(result.chains['ethereum-sepolia'].tokens.USDC, '1')
+      assert.equal(result.chains['base-sepolia'].tokens.USDC, '3')
+      assert.equal(result.chains['arbitrum-sepolia'].tokens.USDC, '5')
+    })
+  } finally {
+    globalThis.fetch = previousFetch
+    if (previousBridgeFlag === undefined) delete process.env.ENABLE_MSCA_CCTP_BRIDGE
+    else process.env.ENABLE_MSCA_CCTP_BRIDGE = previousBridgeFlag
+  }
+})
+
 test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
   const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE
   delete process.env.ENABLE_MSCA_CCTP_BRIDGE
@@ -98,6 +173,31 @@ test('MSCA-bound quote fields distinguish the active wallet', () => {
   const quote = { walletAddress: MSCA, amount: '1', token: 'USDC' }
   const current = { walletAddress: OTHER, amount: '1', token: 'USDC' }
   assert.notEqual(quote.walletAddress.toLowerCase(), current.walletAddress.toLowerCase())
+})
+
+test('multi-chain balance preserves a structured error for an unavailable chain', async () => {
+  const { fetchAllChainBalances } = await import('../src/services/multiChainBalance.mjs?balance-error-' + Date.now())
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async () => { throw new Error('test RPC unavailable') }
+  try {
+    const result = await fetchAllChainBalances(MSCA)
+    assert.deepEqual(Object.keys(result).sort(), ['arbitrum-sepolia', 'arc-testnet', 'base-sepolia', 'ethereum-sepolia'])
+    for (const chain of Object.values(result)) {
+      assert.equal(chain.status, 'error')
+      assert.equal(chain.nativeBalance, null)
+      assert.ok(Object.values(chain.tokens).every(value => value === null))
+      assert.ok(Array.isArray(chain.errors))
+    }
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+test('multi-chain balance config has canonical USDC addresses and no fake Arbitrum EURC', async () => {
+  const { CHAINS } = await import('../src/services/chains.mjs?balance-config-' + Date.now())
+  assert.equal(CHAINS['base-sepolia'].tokens.USDC.toLowerCase(), '0x036cbd53842c5426634e7929541ec2318f3dcf7e')
+  assert.equal(CHAINS['arbitrum-sepolia'].tokens.USDC.toLowerCase(), '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d')
+  assert.equal(CHAINS['arbitrum-sepolia'].tokens.EURC, null)
 })
 
 test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mint recipient', async () => {

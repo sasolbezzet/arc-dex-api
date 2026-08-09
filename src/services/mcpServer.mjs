@@ -251,6 +251,7 @@ function extractBearer(req) {
 const BACKEND_URL = process.env.ARCOX_BACKEND_URL || 'http://localhost:3001'
 
 import { mintOwnerToken } from './authToken.mjs'
+import { fetchAllChainBalances } from './multiChainBalance.mjs'
 
 // The MCP userId is the SIWE-verified EOA used only as the tenant/auth identity.
 // On-chain reads, quotes, and execution must use the explicitly mapped Agent
@@ -258,8 +259,14 @@ import { mintOwnerToken } from './authToken.mjs'
 export async function resolveActiveMsca(userId) {
   try {
     const { getSessionKeyInfo } = await import('./vaultStore.mjs')
+    const { hasExplicitSessionAlias } = await import('./sessionKeyService.mjs')
     const info = await getSessionKeyInfo(userId)
     if (!info?.active || !info.walletAddress) return null
+    // MCP is MSCA-only. An authenticated identity must resolve through an
+    // explicit owner -> MSCA alias; never treat an EOA or an unbound wallet
+    // record as the agent wallet.
+    if (String(info.walletAddress).toLowerCase() === String(userId).toLowerCase()) return null
+    if (!hasExplicitSessionAlias(userId, info.walletAddress)) return null
     return info
   } catch {
     return null
@@ -1073,11 +1080,33 @@ export function createMcpServer(userId) {
 
   // ── READ-ONLY TOOLS ──
 
-  server.tool('arcox_wallet_balances', 'Show Agent Wallet (MSCA) balances on Arc', {}, async () => {
+  server.tool('arcox_wallet_balances', 'Show Agent Wallet (MSCA) balances on Arc, Ethereum Sepolia, Base Sepolia, and Arbitrum Sepolia', {}, async () => {
     const msca = await resolveActiveMsca(userId)
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
-    const data = await apiGet(`/api/balance/${encodeURIComponent(msca.walletAddress)}`, msca.walletAddress)
-    return { content: [{ type: 'text', text: jsonText({ ...data, walletAddress: msca.walletAddress, walletType: 'MSCA' }) }] }
+    try {
+      const chains = await fetchAllChainBalances(msca.walletAddress)
+      return { content: [{ type: 'text', text: jsonText({
+        walletAddress: msca.walletAddress,
+        walletType: 'MSCA',
+        chains,
+        // Backward-compatible Arc summary for older Claude/GPT prompts. The
+        // canonical multi-chain data lives under chains[chainKey].
+        USDC: chains['arc-testnet']?.USDC ?? null,
+        EURC: chains['arc-testnet']?.EURC ?? null,
+        USYC: chains['arc-testnet']?.USYC ?? null,
+        cirBTC: chains['arc-testnet']?.cirBTC ?? null,
+        supportedChains: ['arc-testnet', 'ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia'],
+        note: 'Semua balance dibaca dari alamat MSCA yang sama melalui read-only RPC; tidak memakai EOA atau Circle proxy wallet.',
+      }) }] }
+    } catch (error) {
+      return { content: [{ type: 'text', text: jsonText({
+        walletAddress: msca.walletAddress,
+        walletType: 'MSCA',
+        status: 'partial',
+        chains: {},
+        error: error?.message || 'Multi-chain balance lookup failed',
+      }) }] }
+    }
   })
 
   server.tool('arcox_transaction_history', 'Check transaction history and auto-mint worker status', {}, async () => {

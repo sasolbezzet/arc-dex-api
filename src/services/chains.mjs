@@ -41,9 +41,9 @@ export const CHAINS = {
     nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
     transportSlug: 'arbSepolia',
     tokens: {
-      USDC:  '0x75faf114eafb1BDbe2F0316DF893fd19174a3817',
+      USDC:  '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d',
       ETH:   null, // native
-      EURC:  '0x1330c1d8b3a2b80c1d0f5f2b4b7d8c0f3e5a1b2c', // placeholder - check Circle docs
+      EURC:  null, // No verified Arbitrum Sepolia EURC address configured.
       cirBTC: null,
     },
   },
@@ -56,7 +56,7 @@ export const CHAINS = {
     nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
     transportSlug: 'baseSepolia',
     tokens: {
-      USDC:  '0x036CbD53842c5426634c7223063F5E1809233a16',
+      USDC:  '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
       ETH:   null, // native
       EURC:  '0x044d5736a68653d2bc4751b3f8a238ee189c5f71',
       cirBTC: null,

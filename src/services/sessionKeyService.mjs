@@ -42,7 +42,11 @@ const ADD_OWNERS_ABI = [{
 const CLIENT_URL = process.env.CIRCLE_CLIENT_URL || ''
 const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
 
-const SESSION_KEYS_PATH = process.env.SESSION_KEYS_PATH || './data/session-keys.json'
+// Resolve on each store operation so tests and controlled runtime configuration
+// can switch the backing file without retaining a stale path from module load.
+function sessionKeysPath() {
+  return process.env.SESSION_KEYS_PATH || './data/session-keys.json'
+}
 
 // ── Pending transactions (unsigned UserOps awaiting browser passkey signature) ──
 const PENDING_TX_TTL = 5 * 60 * 1000 // 5 minutes
@@ -62,11 +66,11 @@ function buildViemChain(chainKey) {
 
 // ── Session key store (per user) ──
 function loadStore() {
-  return readJsonFile(SESSION_KEYS_PATH, { users: {} })
+  return readJsonFile(sessionKeysPath(), { users: {} })
 }
 
 function saveStore(data) {
-  atomicWriteJsonFile(SESSION_KEYS_PATH, data)
+  atomicWriteJsonFile(sessionKeysPath(), data)
 }
 
 /**
@@ -78,6 +82,17 @@ function saveStore(data) {
  * wallet identity) while the session key is stored against the MSCA address.
  * setup stores an `ownerAddress` alias so getSessionKey(EOA) finds the MSCA entry.
  */
+export function hasExplicitSessionAlias(userId, walletAddress) {
+  const owner = String(userId || '').toLowerCase()
+  const wallet = String(walletAddress || '').toLowerCase()
+  return Boolean(wallet && storeAliasWallet(owner) === wallet)
+}
+
+function storeAliasWallet(owner) {
+  const store = loadStore()
+  return String(store.aliases?.[String(owner || '').toLowerCase()] || '').toLowerCase()
+}
+
 export function getSessionKey(userId) {
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
