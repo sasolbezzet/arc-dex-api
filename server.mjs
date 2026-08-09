@@ -287,6 +287,9 @@ app.post('/api/pending-txs/:txId/submit', apiLimiter, requireAuth, async (req, r
 
     const { signedUserOp } = req.body
     if (!signedUserOp) return res.status(400).json({ error: 'signedUserOp required' })
+    if (!isAddress(tx.walletAddress) || !isAddress(signedUserOp.sender) || getAddress(signedUserOp.sender).toLowerCase() !== getAddress(tx.walletAddress).toLowerCase()) {
+      return res.status(400).json({ error: 'user_operation_sender_mismatch' })
+    }
 
     // Relay signed UserOp to chain via Circle RPC
     const { toModularTransport } = await import('@circle-fin/modular-wallets-core')
@@ -294,8 +297,10 @@ app.post('/api/pending-txs/:txId/submit', apiLimiter, requireAuth, async (req, r
     const CLIENT_URL = process.env.CIRCLE_CLIENT_URL
     const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY
     const chainKey = tx.chainKey || 'arc-testnet'
-    const { CHAINS } = await import('./src/services/chains.mjs')
+    const { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } = await import('./src/services/chains.mjs')
     const chain = CHAINS[chainKey]
+    if (!chain) return res.status(400).json({ error: 'unknown_chain', chain: chainKey })
+    if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) return res.status(400).json({ error: 'msca_unsupported_chain', chain: chainKey })
     const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
     const viemChain = defineChain({ id: chain.id, name: chain.name, nativeCurrency: chain.nativeCurrency, rpcUrls: { default: { http: [chain.rpcUrl] } } })
     const client = createPublicClient({ chain: viemChain, transport })
@@ -305,7 +310,7 @@ app.post('/api/pending-txs/:txId/submit', apiLimiter, requireAuth, async (req, r
 
     const result = completePendingTx(req.params.txId, {
       txHash: userOpHash,
-      explorerUrl: `https://testnet.arcscan.app/tx/${userOpHash}`,
+      explorerUrl: `${String(chain.explorerUrl || '').replace(/\/?$/, '')}/tx/${userOpHash}`,
     })
     res.json({ success: true, txHash: userOpHash, explorerUrl: result.explorerUrl })
   } catch (e) { res.status(500).json({ error: e.message }) }
