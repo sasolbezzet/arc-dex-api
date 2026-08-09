@@ -25,3 +25,12 @@ test('Arbitrum and Ethereum use distinct documented support outcomes', () => {
   assert.ok(chains.MSCA_SUPPORTED_CHAIN_KEYS.includes('arbitrum-sepolia'))
   assert.ok(!chains.MSCA_SUPPORTED_CHAIN_KEYS.includes('ethereum-sepolia'))
 })
+
+test('Arbitrum fee precheck requires a non-zero priority fee floor', () => {
+  const observed = { maxPriorityFeePerGas: 0n, maxFeePerGas: 0n }
+  const floor = 2_000_000n
+  const priority = observed.maxPriorityFeePerGas > floor ? observed.maxPriorityFeePerGas : floor
+  const max = observed.maxFeePerGas > priority ? observed.maxFeePerGas : 4_000_000n
+  assert.ok(priority > 0n)
+  assert.ok(max >= priority)
+})

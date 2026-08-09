@@ -809,7 +809,7 @@ function normalizeArcToken(value) {
 
 function tokenSymbolForAddress(address) {
   const match = Object.entries(TOKENS).find(([, tokenAddress]) => tokenAddress.toLowerCase() === String(address || '').toLowerCase())
-  return match?.[0] || 'USDC'
+  return (match ? match[0] : undefined) || 'USDC'
 }
 
 function decimalToUnits(value, decimals) {
@@ -1273,16 +1273,18 @@ async function verifyInvoicePaymentTx(invoice, input = {}) {
   if (!receipt) throw new Error('Payment transaction receipt not found')
   if (receipt.status !== 'success') throw new Error('Payment transaction failed on-chain')
   const expectedAmount = decimalToUnits(invoice.amount, 6)
-  const merchant = getAddress(invoice.merchantAddress).toLowerCase()
+  let merchant
+  try { merchant = getAddress(invoice.merchantAddress).toLowerCase() } catch { throw new Error('Invoice merchantAddress is invalid') }
   const payer = payerAddress ? payerAddress.toLowerCase() : ''
   const matched = receipt.logs.some((log) => {
     if (String(log.address).toLowerCase() !== TOKENS.USDC.toLowerCase()) return false
     try {
       const decoded = decodeEventLog({ abi: erc20Abi, data: log.data, topics: log.topics })
-      if (decoded.eventName !== 'Transfer') return false
-      const from = String(decoded.args?.from || '').toLowerCase()
-      const to = String(decoded.args?.to || '').toLowerCase()
-      const value = BigInt(decoded.args?.value || 0n)
+      if (String(Reflect.get(decoded, 'eventName') || '') !== 'Transfer') return false
+      const args = Reflect.get(decoded, 'args') || {}
+      const from = String(Reflect.get(args, 'from') || '').toLowerCase()
+      const to = String(Reflect.get(args, 'to') || '').toLowerCase()
+      const value = BigInt(String(Reflect.get(args, 'value') || '0'))
       return to === merchant && value === expectedAmount && (!payer || from === payer)
     } catch {
       return false
@@ -1296,7 +1298,10 @@ function pickWebhookValue(payload, keys) {
   for (const key of keys) {
     const parts = key.split('.')
     let current = payload
-    for (const part of parts) current = current?.[part]
+    for (const part of parts) {
+      const isObject = current !== null && (typeof current === 'object' || typeof current === 'function')
+      current = isObject ? Reflect.get(current, part) : undefined
+    }
     if (current !== undefined && current !== null && String(current).trim()) return current
   }
   return ''
@@ -1455,14 +1460,21 @@ async function processCircleGatewayWebhook(payload = {}) {
   return { duplicate: false, matched: true, event, invoice: target }
 }
 
+function walletRecordId(record) {
+  if (typeof record === 'string') return record
+  if (record && typeof record === 'object') return record.id || ''
+  return ''
+}
+
 async function getOrCreateWallet(metamaskAddr) {
   const addr = metamaskAddr.toLowerCase()
   const db = loadWallets()
   if (db[addr]) {
-    const record = typeof db[addr] === 'string' ? { id: db[addr] } : db[addr]
-    const res = await circleClient.getWallet({ id: record.id })
-    const wallet = res.data?.wallet
-    if (wallet?.id && wallet?.address && (typeof db[addr] === 'string' || db[addr].address !== wallet.address)) {
+    const record = db[addr]
+    const walletResponse = await circleClient.getWallet({ id: walletRecordId(record) })
+    const walletData = walletResponse && typeof walletResponse === 'object' ? walletResponse.data : undefined
+    const wallet = walletData && typeof walletData === 'object' ? walletData.wallet : undefined
+    if (wallet && wallet.id && wallet.address && (typeof db[addr] === 'string' || db[addr].address !== wallet.address)) {
       db[addr] = { id: wallet.id, address: wallet.address }
       saveWallets(db)
     }
@@ -1471,9 +1483,10 @@ async function getOrCreateWallet(metamaskAddr) {
   const ws = await circleClient.createWalletSet({ name: `user-${addr.slice(0,8)}` })
   const wr = await circleClient.createWallets({
     blockchains: ['ARC-TESTNET'], count: 1,
-    walletSetId: ws.data?.walletSet?.id ?? '', accountType: 'SCA',
+    walletSetId: ws && ws.data && ws.data.walletSet ? ws.data.walletSet.id : '', accountType: 'SCA',
   })
-  const wallet = wr.data?.wallets?.[0]
+  const wallet = wr && wr.data && Array.isArray(wr.data.wallets) ? wr.data.wallets[0] : undefined
+  if (!wallet || !wallet.id || !wallet.address) throw new Error('Circle wallet creation response is incomplete')
   db[addr] = { id: wallet.id, address: wallet.address }
   saveWallets(db)
   console.log(`[wallet] new: ${addr} → ${wallet.address}`)
@@ -1503,7 +1516,7 @@ async function pollAttestation(domain, txHash, maxRetries = 60, fastMode = false
       const ct = r.headers.get('content-type') || ''
       if (!ct.includes('json')) { if (i % 10 === 0) console.log('[iris] non-JSON response'); continue }
       const data = await r.json()
-      const msg = data?.messages?.[0]
+      const msg = data && Array.isArray(data.messages) ? data.messages[0] : undefined
       const curStatus = msg?.status || 'no message'
       if (curStatus !== lastStatus || i % 10 === 0) {
         console.log(`[iris] attempt ${i+1}/${maxRetries}: ${curStatus}`)
@@ -1526,7 +1539,7 @@ async function checkAttestationOnce(domain, txHash) {
   const ct = r.headers.get('content-type') || ''
   if (!ct.includes('json')) return { complete: false, status: 'non_json' }
   const data = await r.json()
-  const msg = data?.messages?.[0]
+  const msg = data && Array.isArray(data.messages) ? data.messages[0] : undefined
   if (msg?.status === 'complete' && msg.attestation && msg.message) {
     return { complete: true, attestation: msg.attestation, message: msg.message, status: msg.status }
   }
@@ -1557,7 +1570,7 @@ function hashAgentText(text) {
 function agentPlanResponse({ prompt, agentId, owner, requester }) {
   const cleanPrompt = String(prompt || '').trim().slice(0, 1000)
   const budgetMatch = cleanPrompt.match(/(\d+(?:\.\d+)?)\s*(?:USDC|usd)/i)
-  const suggestedBudget = budgetMatch?.[1] || '1'
+  const suggestedBudget = (budgetMatch ? budgetMatch[1] : undefined) || '1'
   const provider = isAddress(owner || '') ? getAddress(owner) : requester
   const evaluator = isAddress(requester || '') ? getAddress(requester) : provider
   const deliverable = [
@@ -3012,12 +3025,18 @@ app.get('/api/history/:address', async (req, res) => {
   } catch { res.json({ txs: [] }) }
 })
 
-app.listen(PORT, () => {
-  console.log(`\n╔════════════════════════════════╗`)
-  console.log(`║  Arc DEX API v2.0 :${PORT}        ║`)
-  console.log(`║  EVM Bridge + Solana CCTP      ║`)
-  console.log(`╚════════════════════════════════╝\n`)
-  console.log('Routes: health, wallet, balance, quote, swap, prepare-bridge,')
-  console.log('        get-attestation, mint-cctp-solana, mint-cctp-from-solana, send, history')
-  console.log('        invoices, circle-gateway webhook, eco route-preview')
-})
+export { app }
+
+// Vercel imports the Express app as a serverless handler. PM2/local runs still
+// own the HTTP listener; never bind a port during a Vercel function import.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`\n╔════════════════════════════════╗`)
+    console.log(`║  Arc DEX API v2.0 :${PORT}        ║`)
+    console.log(`║  EVM Bridge + Solana CCTP      ║`)
+    console.log(`╚════════════════════════════════╝\n`)
+    console.log('Routes: health, wallet, balance, quote, swap, prepare-bridge,')
+    console.log('        get-attestation, mint-cctp-solana, mint-cctp-from-solana, send, history')
+    console.log('        invoices, circle-gateway webhook, eco route-preview')
+  })
+}
