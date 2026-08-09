@@ -173,6 +173,45 @@ test('listRelatedAddresses clusters EOA and MSCA bidirectionally', async () => {
   }
 })
 
+test('hashless pending reservation stays bound and never rotates automatically', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
+  const path = join(dir, 'session-keys.json')
+  const MSCA = '0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5'
+  const pendingDelegate = '0xf59dbe98c0863519d5f8f7e82a6b5451763782af'
+  await writeFile(path, JSON.stringify({
+    users: {
+      [MSCA]: {
+        walletAddress: MSCA,
+        delegateAddress: pendingDelegate,
+        delegatePrivateKey: 'ZGVuZw==',
+        chain: 'arc-testnet',
+        createdAt: 1,
+        active: false,
+        pendingAuthorization: true,
+      },
+    },
+    aliases: {},
+  }))
+  const prev = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  process.env.SESSION_KEY_ENCRYPTION_KEY = 'test'
+  try {
+    const mod = await import('../src/services/sessionKeyService.mjs?orphan-stable-' + Date.now())
+    const result = mod.reserveSessionKey(MSCA, { walletAddress: MSCA })
+    assert.equal(result.pending, true)
+    assert.equal(result.hashless, true)
+    assert.equal(result.address.toLowerCase(), pendingDelegate)
+    const after = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8'))
+    assert.equal(after.users[MSCA].delegateAddress.toLowerCase(), pendingDelegate)
+    assert.equal(after.users[MSCA].pendingAuthorization, true)
+  } finally {
+    if (prev === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = prev
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
 test('canExecuteViaSession parses human amounts tolerantly and rejects bad ones', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
   const path = join(dir, 'session-keys.json')

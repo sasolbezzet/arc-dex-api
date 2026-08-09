@@ -186,11 +186,13 @@ export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet'
   if (existing?.active && /^0x[0-9a-fA-F]{64}$/.test(String(existing.authorizationUserOpHash || ''))) {
     return { address: existing.delegateAddress, walletAddress: wallet, pending: false }
   }
-  // Keep an in-flight reservation stable. If the browser completed the
-  // on-chain UserOperation but the activation request was interrupted, rotating
-  // the key here would orphan the authorized delegate and make recovery opaque.
+  // Keep every pending reservation stable. A missing UserOperation hash is
+  // ambiguous: the browser/backend may have lost the response even though
+  // addOwners succeeded. Never rotate automatically, because that could create
+  // a second active delegate. Recovery requires manual reconciliation and an
+  // explicitly reviewed backend operation that records the old delegate.
   if (existing?.pendingAuthorization && existing.delegateAddress) {
-    return { address: existing.delegateAddress, walletAddress: wallet, pending: true }
+    return { address: existing.delegateAddress, walletAddress: wallet, pending: true, hashless: !existing.authorizationUserOpHash }
   }
   const generated = generateSessionKey()
   store.users[key] = {
