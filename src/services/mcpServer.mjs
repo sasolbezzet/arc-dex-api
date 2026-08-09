@@ -12,6 +12,14 @@ const executionQuotes = new Map() // previewId -> { userId, action, params, expi
 const authCodes = new Map() // code -> { clientId, userId, redirectUri, codeChallenge, expires }
 const accessTokens = new Map() // token -> { userId, clientId, expires }
 
+// MCP responses may include decoded CCTP uint256 fields represented as BigInt.
+// Always serialize them as decimal strings so direct handler execution and
+// production HTTP requests behave identically (server.mjs may define a global
+// BigInt serializer, but mcpServer must not depend on that side effect).
+function jsonText(value) {
+  return JSON.stringify(value, (_key, item) => typeof item === 'bigint' ? item.toString() : item)
+}
+
 const SERVER_URL = process.env.SERVER_URL || 'https://arcoxdex.vercel.app'
 const TOKEN_TTL = 3600 * 24 // 24 hours
 const OAUTH_PATH = process.env.OAUTH_PATH || './data/oauth-clients.json'
@@ -279,7 +287,7 @@ async function apiPost(path, body, ownerAddress) {
   const r = await fetch(`${BACKEND_URL}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}) },
-    body: JSON.stringify(body),
+    body: jsonText(body),
   })
   return r.json()
 }
@@ -993,16 +1001,16 @@ export function createMcpServer(userId) {
 
   server.tool('arcox_wallet_balances', 'Show Agent Wallet (MSCA) balances on Arc', {}, async () => {
     const msca = await resolveActiveMsca(userId)
-    if (!msca) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const data = await apiGet(`/api/balance/${encodeURIComponent(msca.walletAddress)}`, msca.walletAddress)
-    return { content: [{ type: 'text', text: JSON.stringify({ ...data, walletAddress: msca.walletAddress, walletType: 'MSCA' }) }] }
+    return { content: [{ type: 'text', text: jsonText({ ...data, walletAddress: msca.walletAddress, walletType: 'MSCA' }) }] }
   })
 
   server.tool('arcox_transaction_history', 'Check transaction history and auto-mint worker status', {}, async () => {
     const msca = await resolveActiveMsca(userId)
-    if (!msca) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const data = await apiGet(`/api/tx-history?address=${encodeURIComponent(msca.walletAddress)}`, msca.walletAddress)
-    return { content: [{ type: 'text', text: JSON.stringify({ ...data, walletAddress: msca.walletAddress, walletType: 'MSCA' }) }] }
+    return { content: [{ type: 'text', text: jsonText({ ...data, walletAddress: msca.walletAddress, walletType: 'MSCA' }) }] }
   })
 
   server.tool('arcox_route_status', 'Check if a swap/bridge/send route is supported', {
@@ -1046,7 +1054,7 @@ export function createMcpServer(userId) {
               : hasUnsupportedSwapToken
               ? 'swap_route_not_supported_for_msca'
               : null
-    return { content: [{ type: 'text', text: JSON.stringify({
+    return { content: [{ type: 'text', text: jsonText({
       supported: mscaSupported,
       executionSupported: mscaSupported,
       action: params.action,
@@ -1072,24 +1080,24 @@ export function createMcpServer(userId) {
   }, async (params) => {
     const src = params.source || 'session'
     if (src !== 'session') {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote swap hanya untuk source=session.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote swap hanya untuk source=session.' }) }] }
     }
     const session = await resolveActiveMsca(userId)
     if (!session) {
-      return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+      return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     }
     const quoteData = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: session.walletAddress }, session.walletAddress)
     if (quoteData?.available !== true) {
-      return { content: [{ type: 'text', text: JSON.stringify({ ...quoteData, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ ...quoteData, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
     }
     // Prepare immutable calldata at preview time. Execution must use this exact
     // payload, not re-quote later with potentially different routing/slippage.
     const prepared = await apiPost('/api/eoa-swap-prepare', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: session.walletAddress }, session.walletAddress)
     if (prepared?.success === false || prepared?.available === false || typeof prepared !== 'object' || !prepared) {
-      return { content: [{ type: 'text', text: JSON.stringify({ ...prepared, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ ...prepared, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
     }
     const quote = createExecutionQuote(userId, 'swap', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, walletAddress: session.walletAddress, quote: quoteData, prepared })
-    return { content: [{ type: 'text', text: JSON.stringify({ ...quoteData, previewId: quote.previewId, expiresAt: new Date(quote.expires).toISOString(), source: 'session', walletAddress: session.walletAddress, prepared: { source: prepared.source, route: prepared.route, amountOut: prepared.amountOut } }) }] }
+    return { content: [{ type: 'text', text: jsonText({ ...quoteData, previewId: quote.previewId, expiresAt: new Date(quote.expires).toISOString(), source: 'session', walletAddress: session.walletAddress, prepared: { source: prepared.source, route: prepared.route, amountOut: prepared.amountOut } }) }] }
   })
 
   server.tool('arcox_execute_swap', 'Execute a confirmed swap via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_swap and user confirmation.', {
@@ -1101,28 +1109,28 @@ export function createMcpServer(userId) {
     confirmed: z.boolean().describe('Must be true to execute'),
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
-    if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
+    if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: jsonText({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
     const source = params.source || 'session'
     if (source !== 'session') {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
     }
     const activeSession = await resolveActiveMsca(userId)
-    if (!activeSession) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
+    if (!activeSession) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
     const quoteCheck = consumeExecutionQuote(userId, 'swap', params.previewId, {
       tokenIn: params.tokenIn,
       tokenOut: params.tokenOut,
       amountIn: params.amountIn,
       walletAddress: activeSession.walletAddress,
     })
-    if (!quoteCheck.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
+    if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     const gate = await canAutoExecute(userId, source, params.amountIn)
     if (!gate.ok) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
     }
     try {
       const preparedPayload = quoteCheck.quote.params.prepared
       if (!preparedPayload || preparedPayload.source !== 'stablecoin-service' || !preparedPayload.adapterContract) {
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'swap_route_not_supported_for_msca', message: 'Route ini belum aman untuk eksekusi MSCA.' }) }] }
+        return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'swap_route_not_supported_for_msca', message: 'Route ini belum aman untuk eksekusi MSCA.' }) }] }
       }
         const preparedResult = buildPreparedSwapCalls(preparedPayload, { tokenIn: params.tokenIn, tokenOut: params.tokenOut })
       if (!preparedResult.calls) {
@@ -1133,21 +1141,21 @@ export function createMcpServer(userId) {
             : preparedResult.reason === 'adapter_mismatch'
               ? 'Adapter swap dari quote tidak cocok dengan adapter yang diizinkan server.'
               : 'Quote swap ini belum menghasilkan calldata MSCA yang aman untuk dieksekusi.'
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: preparedResult.reason || 'swap_calldata_unavailable', message }) }] }
+        return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: preparedResult.reason || 'swap_calldata_unavailable', message }) }] }
       }
       const { swapViaSession } = await import('./sessionKeyService.mjs')
       const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: 'arc-testnet' })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: resolveAgentForUser(userId), action: 'swap', amount: params.amountIn, token: params.tokenIn,
-          source: 'session', details: JSON.stringify({ tokenOut: params.tokenOut, previewId: params.previewId }),
+          source: 'session', details: jsonText({ tokenOut: params.tokenOut, previewId: params.previewId }),
           txHash: result.txHash, explorerUrl: result.explorerUrl,
         })
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Swap ${params.amountIn} ${params.tokenIn} → ${params.tokenOut} berhasil via MSCA (session key).` }) }] }
+        return { content: [{ type: 'text', text: jsonText({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Swap ${params.amountIn} ${params.tokenIn} → ${params.tokenOut} berhasil via MSCA (session key).` }) }] }
       }
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session swap gagal' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, error: result.reason || 'Session swap gagal' }) }] }
     } catch (e) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e?.message || 'Session error' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'session_error', executed: false, error: e?.message || 'Session error' }) }] }
     }
   })
 
@@ -1165,21 +1173,21 @@ export function createMcpServer(userId) {
     const token = params.token || 'USDC'
     const src = params.source || 'session'
     if (src !== 'session') {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote bridge hanya untuk source=session.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote bridge hanya untuk source=session.' }) }] }
     }
     const info = await resolveActiveMsca(userId)
-    if (!info) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
     if (!route || route.fromKey !== 'Arc_Testnet' || token.toUpperCase() !== 'USDC') {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke Base Sepolia atau Arbitrum Sepolia.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke Base Sepolia atau Arbitrum Sepolia.' }) }] }
     }
     const disabledReason = bridgeConfigDisabledReason(route)
     if (disabledReason) {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: disabledReason, message: disabledReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi.' : 'Bridge MSCA belum diaktifkan.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: disabledReason, message: disabledReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi.' : 'Bridge MSCA belum diaktifkan.' }) }] }
     }
     const destinationPreflight = await destinationMscaPreflight({ route, walletAddress: info.walletAddress })
     if (!destinationPreflight.ok) {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: destinationPreflight.reason, message: destinationPreflight.message || 'Destination MSCA belum siap. Deploy MSCA terlebih dahulu; source burn belum dilakukan.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: destinationPreflight.reason, message: destinationPreflight.message || 'Destination MSCA belum siap. Deploy MSCA terlebih dahulu; source burn belum dilakukan.' }) }] }
     }
     try {
       const amount = parseUnits(String(params.amount).trim(), 6)
@@ -1197,7 +1205,7 @@ export function createMcpServer(userId) {
         maxFeeBaseUnits: BRIDGE_MAX_FEE.toString(),
         minFinalityThreshold: BRIDGE_MIN_FINALITY_THRESHOLD,
       })
-      return { content: [{ type: 'text', text: JSON.stringify({
+      return { content: [{ type: 'text', text: jsonText({
         preview: true,
         route: `${params.fromChain} → ${params.toChain}`,
         amountIn: params.amount,
@@ -1216,7 +1224,7 @@ export function createMcpServer(userId) {
         safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_bridge dengan confirmed=true.',
       }) }] }
     } catch (e) {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'bridge_quote_unavailable', message: e?.message || 'ArcoxRouter quote tidak tersedia' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'bridge_quote_unavailable', message: e?.message || 'ArcoxRouter quote tidak tersedia' }) }] }
     }
   })
 
@@ -1230,27 +1238,27 @@ export function createMcpServer(userId) {
     confirmed: z.boolean().describe('Must be true to execute'),
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
-    if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
+    if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: jsonText({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
     const source = params.source || 'session'
     if (source !== 'session') {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Circle proxy dan EOA tidak diizinkan untuk agent remote.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Circle proxy dan EOA tidak diizinkan untuk agent remote.' }) }] }
     }
     const info = await resolveActiveMsca(userId)
-    if (!info) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
+    if (!info) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
     if (!route || route.fromKey !== 'Arc_Testnet' || String(params.token || 'USDC').toUpperCase() !== 'USDC') {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke Base Sepolia atau Arbitrum Sepolia.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke Base Sepolia atau Arbitrum Sepolia.' }) }] }
     }
     const disabledReason = bridgeConfigDisabledReason(route)
     if (disabledReason) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: disabledReason, message: disabledReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi. Tidak ada UserOperation yang dikirim.' : 'Bridge MSCA belum diaktifkan. Tidak ada UserOperation yang dikirim.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: disabledReason, message: disabledReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi. Tidak ada UserOperation yang dikirim.' : 'Bridge MSCA belum diaktifkan. Tidak ada UserOperation yang dikirim.' }) }] }
     }
     const destinationPreflight = await destinationMscaPreflight({ route, walletAddress: info.walletAddress })
     if (!destinationPreflight.ok) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: destinationPreflight.reason, message: destinationPreflight.message || 'Destination MSCA belum siap. Tidak ada source burn.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: destinationPreflight.reason, message: destinationPreflight.message || 'Destination MSCA belum siap. Tidak ada source burn.' }) }] }
     }
     const gate = await canAutoExecute(userId, source, params.amount)
-    if (!gate.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: gate.reason, message: gate.message || 'Session key MSCA tidak dapat mengeksekusi bridge.' }) }] }
+    if (!gate.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, message: gate.message || 'Session key MSCA tidak dapat mengeksekusi bridge.' }) }] }
     try {
       const amount = parseUnits(String(params.amount).trim(), 6)
       if (amount <= 0n) throw new Error('Amount bridge tidak valid')
@@ -1262,19 +1270,19 @@ export function createMcpServer(userId) {
         token: 'USDC',
         walletAddress: info.walletAddress,
       })
-      if (!quoteCheck.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
+      if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
       const quotedFee = quoteCheck.quote.params.platformFeeBaseUnits
       const quotedNet = quoteCheck.quote.params.netBurnBaseUnits
       if (quoteCheck.quote.params.router !== route.source.router || quoteCheck.quote.params.maxFeeBaseUnits !== BRIDGE_MAX_FEE.toString() || Number(quoteCheck.quote.params.minFinalityThreshold) !== BRIDGE_MIN_FINALITY_THRESHOLD || quotedFee !== fee.fee.toString() || quotedNet !== fee.netAmount.toString()) {
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'quote_fee_changed', message: 'Router fee berubah setelah preview. Buat quote bridge baru.' }) }] }
+        return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'quote_fee_changed', message: 'Router fee berubah setelah preview. Buat quote bridge baru.' }) }] }
       }
       executionQuotes.delete(quoteCheck.quote.previewId)
       const calls = buildMscaRouterBridgeCalls({ route, amount, mintRecipient: info.walletAddress })
       const { executeViaSession } = await import('./sessionKeyService.mjs')
       const result = await executeViaSession(userId, calls, { paymaster: true, chainKey: 'arc-testnet', requireTransactionHash: true })
-      if (result.status !== 'success') return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Bridge UserOperation gagal', userOpHash: result.userOpHash }) }] }
+      if (result.status !== 'success') return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, error: result.reason || 'Bridge UserOperation gagal', userOpHash: result.userOpHash }) }] }
       const burnProof = await verifyBridgeBurn({ burnTxHash: result.txHash, route, walletAddress: info.walletAddress, amount })
-      if (!burnProof.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'burn_submitted', executed: true, verified: false, burnTxHash: result.txHash, userOpHash: result.userOpHash, reason: burnProof.reason, message: 'Source UserOperation berhasil tetapi bukti event router belum terverifikasi. Jangan ulangi burn; periksa transaksi ini secara read-only.' }) }] }
+      if (!burnProof.ok) return { content: [{ type: 'text', text: jsonText({ status: 'burn_submitted', executed: true, verified: false, burnTxHash: result.txHash, userOpHash: result.userOpHash, reason: burnProof.reason, message: 'Source UserOperation berhasil tetapi bukti event router belum terverifikasi. Jangan ulangi burn; periksa transaksi ini secara read-only.' }) }] }
       const bridgeStatus = await waitForCctpBridgeStatus({
         burnTxHash: result.txHash,
         sourceDomain: route.source.domain,
@@ -1295,7 +1303,7 @@ export function createMcpServer(userId) {
             amount: params.amount,
             token: 'USDC',
             source: 'session',
-            details: JSON.stringify({
+            details: jsonText({
               fromChain: route.fromKey,
               toChain: route.toKey,
               previewId: params.previewId,
@@ -1313,7 +1321,7 @@ export function createMcpServer(userId) {
         } catch (auditError) {
           console.error('[mcp-bridge] rejected burn audit record failed:', auditError?.message || auditError)
         }
-        return { content: [{ type: 'text', text: JSON.stringify({
+        return { content: [{ type: 'text', text: jsonText({
           ...bridgeStatus,
           status: 'rejected',
           executed: true,
@@ -1333,14 +1341,14 @@ export function createMcpServer(userId) {
       try {
         await recordAutoExec(userId, {
           agent: resolveAgentForUser(userId), action: 'bridge', amount: params.amount, token: 'USDC',
-          source: 'session', details: JSON.stringify({ fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId, destinationMint: mint.success }),
+          source: 'session', details: jsonText({ fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId, destinationMint: mint.success }),
           txHash: result.txHash, explorerUrl: result.explorerUrl,
         })
       } catch (auditError) {
         auditPending = true
         console.error('[mcp-bridge] audit record failed after burn:', auditError?.message || auditError)
       }
-      return { content: [{ type: 'text', text: JSON.stringify({
+      return { content: [{ type: 'text', text: jsonText({
         status: mint.success ? 'executed' : 'settlement_pending',
         executed: true,
         safeToRetry: !mint.success ? true : undefined,
@@ -1362,7 +1370,7 @@ export function createMcpServer(userId) {
         message: mint.success ? 'Bridge MSCA berhasil sampai destination.' : 'Burn MSCA berhasil; destination mint masih pending. Jalankan arcox_bridge_status lalu retry setelah attestation siap.',
       }) }] }
     } catch (e) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'bridge_error', executed: false, error: e?.message || 'MSCA bridge gagal' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'bridge_error', executed: false, error: e?.message || 'MSCA bridge gagal' }) }] }
     }
   })
 
@@ -1372,22 +1380,22 @@ export function createMcpServer(userId) {
     toChain: z.string().describe('Destination chain used by the original quote'),
   }, async (params) => {
     if (!ENABLE_MSCA_CCTP_BRIDGE) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'disabled', verified: false, reason: 'msca_bridge_disabled_until_router_validation', message: 'Bridge MSCA status belum diaktifkan karena ArcoxRouter dan destination mint relayer belum tervalidasi. Tidak ada transaksi yang dikirim.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'disabled', verified: false, reason: 'msca_bridge_disabled_until_router_validation', message: 'Bridge MSCA status belum diaktifkan karena ArcoxRouter dan destination mint relayer belum tervalidasi. Tidak ada transaksi yang dikirim.' }) }] }
     }
     const info = await resolveActiveMsca(userId)
-    if (!info) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const route = bridgeConfig(params.fromChain, params.toChain || 'ethereum-sepolia')
     if (!route || route.fromKey !== 'Arc_Testnet') {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', reason: 'bridge_route_not_supported_for_msca', message: 'Status bridge MSCA hanya tersedia untuk burn dari Arc Testnet.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', reason: 'bridge_route_not_supported_for_msca', message: 'Status bridge MSCA hanya tersedia untuk burn dari Arc Testnet.' }) }] }
     }
     let burnProof
     try {
       burnProof = await verifyBridgeBurn({ burnTxHash: params.burnTxHash, route, walletAddress: info.walletAddress })
       if (!burnProof.ok) {
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', verified: false, reason: burnProof.reason }) }] }
+        return { content: [{ type: 'text', text: jsonText({ status: 'rejected', verified: false, reason: burnProof.reason }) }] }
       }
     } catch {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', verified: false, reason: 'bridge_burn_not_found' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', verified: false, reason: 'bridge_burn_not_found' }) }] }
     }
     const status = await getCctpBridgeStatus({
       burnTxHash: params.burnTxHash,
@@ -1397,12 +1405,12 @@ export function createMcpServer(userId) {
       route,
       expectedBurnAmount: BigInt(burnProof.args.amount) - BigInt(burnProof.args.fee),
     })
-    if (status.status === 'rejected') return { content: [{ type: 'text', text: JSON.stringify({
+    if (status.status === 'rejected') return { content: [{ type: 'text', text: jsonText({
       ...status,
       safeToRetry: false,
       message: 'CCTP message tidak terikat ke route/MSCA yang aktif. Tidak ada transaksi baru yang dikirim.',
     }) }] }
-    return { content: [{ type: 'text', text: JSON.stringify({
+    return { content: [{ type: 'text', text: jsonText({
       ...status,
       walletAddress: info.walletAddress,
       walletType: 'MSCA',
@@ -1419,17 +1427,17 @@ export function createMcpServer(userId) {
     confirmationText: z.string().describe('Must be exactly yes or ya'),
   }, async (params) => {
     if (!params.confirmed || !validConfirmationText(params.confirmationText)) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'preview_required', executed: false, message: 'Retry mint memerlukan confirmed=true dan confirmationText exactly yes atau ya.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'preview_required', executed: false, message: 'Retry mint memerlukan confirmed=true dan confirmationText exactly yes atau ya.' }) }] }
     }
     const info = await resolveActiveMsca(userId)
-    if (!info) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
     const disabledReason = bridgeConfigDisabledReason(route)
-    if (disabledReason) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: disabledReason }) }] }
-    if (!route || route.fromKey !== 'Arc_Testnet') return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca' }) }] }
+    if (disabledReason) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: disabledReason }) }] }
+    if (!route || route.fromKey !== 'Arc_Testnet') return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca' }) }] }
     try {
       const proof = await verifyBridgeBurn({ burnTxHash: params.burnTxHash, route, walletAddress: info.walletAddress })
-      if (!proof.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: proof.reason, message: 'Burn ini tidak terbukti berasal dari ArcoxRouter untuk MSCA aktif.' }) }] }
+      if (!proof.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: proof.reason, message: 'Burn ini tidak terbukti berasal dari ArcoxRouter untuk MSCA aktif.' }) }] }
       const status = await getCctpBridgeStatus({
         burnTxHash: params.burnTxHash,
         sourceDomain: route.source.domain,
@@ -1438,18 +1446,18 @@ export function createMcpServer(userId) {
         route,
         expectedBurnAmount: BigInt(proof.args.amount) - BigInt(proof.args.fee),
       })
-      if (status.status === 'rejected') return { content: [{ type: 'text', text: JSON.stringify({
+      if (status.status === 'rejected') return { content: [{ type: 'text', text: jsonText({
         ...status,
         status: 'rejected',
         executed: false,
         safeToRetry: false,
         message: 'CCTP message tidak terikat ke route/MSCA yang aktif. Retry mint diblokir dan tidak ada transaksi destination yang dikirim.',
       }) }] }
-      if (!status.verified) return { content: [{ type: 'text', text: JSON.stringify({ status: 'settlement_pending', executed: false, burnTxHash: params.burnTxHash, messageStatus: status.messageStatus || 'pending', message: 'Attestation belum tersedia. Tidak ada transaksi destination yang dikirim.' }) }] }
+      if (!status.verified) return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, burnTxHash: params.burnTxHash, messageStatus: status.messageStatus || 'pending', message: 'Attestation belum tersedia. Tidak ada transaksi destination yang dikirim.' }) }] }
       const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress })
-      return { content: [{ type: 'text', text: JSON.stringify({ status: mint.success ? 'minted' : 'mint_failed', executed: mint.success, burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, error: mint.success ? null : mint.error, message: mint.success ? 'Destination receiveMessage berhasil via MSCA UserOperation.' : 'Destination mint gagal; pastikan MSCA deployed dan session destination chain telah diotorisasi.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: mint.success ? 'minted' : 'mint_failed', executed: mint.success, burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, error: mint.success ? null : mint.error, message: mint.success ? 'Destination receiveMessage berhasil via MSCA UserOperation.' : 'Destination mint gagal; pastikan MSCA deployed dan session destination chain telah diotorisasi.' }) }] }
     } catch (e) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'retry_error', executed: false, burnTxHash: params.burnTxHash, error: e?.message || 'Retry mint gagal' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'retry_error', executed: false, burnTxHash: params.burnTxHash, error: e?.message || 'Retry mint gagal' }) }] }
     }
   })
 
@@ -1464,14 +1472,14 @@ export function createMcpServer(userId) {
     const token = params.token || 'USDC'
     const src = params.source || 'session'
     if (src !== 'session') {
-      return { content: [{ type: 'text', text: JSON.stringify({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote send hanya untuk source=session.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote send hanya untuk source=session.' }) }] }
     }
     const info = await resolveActiveMsca(userId)
-    if (!info) return { content: [{ type: 'text', text: JSON.stringify(mscaRequiredResult()) }] }
+    if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     // MSCA send quote is bound to the active wallet. A later MSCA switch makes
     // the preview unusable instead of silently sending from another wallet.
     const q = createExecutionQuote(userId, 'send', { to: params.to, amount: params.amount, token, walletAddress: info.walletAddress })
-    return { content: [{ type: 'text', text: JSON.stringify({
+    return { content: [{ type: 'text', text: jsonText({
       preview: true,
       action: 'send',
       to: params.to,
@@ -1497,19 +1505,19 @@ export function createMcpServer(userId) {
     confirmed: z.boolean().describe('Must be true to execute'),
     confirmationText: z.string().describe('User confirmation text (yes/ya)'),
   }, async (params) => {
-    if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
+    if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: jsonText({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
     const source = params.source || 'session'
     const token = params.token || 'USDC'
     if (source !== 'session') {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
     }
     const activeSession = await resolveActiveMsca(userId)
-    if (!activeSession) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
+    if (!activeSession) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
     const quoteCheck = consumeExecutionQuote(userId, 'send', params.previewId, { to: params.to, amount: params.amount, token, walletAddress: activeSession.walletAddress })
-    if (!quoteCheck.ok) return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
+    if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     const gate = await canAutoExecute(userId, source, params.amount)
     if (!gate.ok) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
     }
     try {
       const { sendViaSession } = await import('./sessionKeyService.mjs')
@@ -1517,14 +1525,14 @@ export function createMcpServer(userId) {
       if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: resolveAgentForUser(userId), action: 'send', amount: params.amount, token,
-          source: 'session', to: params.to, details: JSON.stringify({ previewId: params.previewId }),
+          source: 'session', to: params.to, details: jsonText({ previewId: params.previewId }),
           txHash: result.txHash, explorerUrl: result.explorerUrl,
         })
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Kirim ${params.amount} ${token} ke ${params.to} berhasil via MSCA (session key).` }) }] }
+        return { content: [{ type: 'text', text: jsonText({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Kirim ${params.amount} ${token} ke ${params.to} berhasil via MSCA (session key).` }) }] }
       }
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_failed', executed: false, error: result.reason || 'Session send gagal' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, error: result.reason || 'Session send gagal' }) }] }
     } catch (e) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'session_error', executed: false, error: e?.message || 'Session error' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'session_error', executed: false, error: e?.message || 'Session error' }) }] }
     }
   })
 
@@ -1533,7 +1541,7 @@ export function createMcpServer(userId) {
   server.tool('arcox_vault_list_credentials', 'List vault credentials for the authenticated user', {}, async () => {
     const { listCredentials } = await import('./vaultStore.mjs')
     const creds = listCredentials(userId)
-    return { content: [{ type: 'text', text: JSON.stringify({ credentials: creds }) }] }
+    return { content: [{ type: 'text', text: jsonText({ credentials: creds }) }] }
   })
 
   server.tool('arcox_vault_request_approval', 'Request user approval for a transaction. Agent calls this before executing value-moving actions', {
@@ -1545,13 +1553,13 @@ export function createMcpServer(userId) {
   }, async (params) => {
     const { createApproval } = await import('./vaultStore.mjs')
     const approval = createApproval(userId, { agent: 'chatgpt-mcp', ...params })
-    return { content: [{ type: 'text', text: JSON.stringify({ approval }) }] }
+    return { content: [{ type: 'text', text: jsonText({ approval }) }] }
   })
 
   server.tool('arcox_vault_get_limits', 'Get spending limits for the authenticated user', {}, async () => {
     const { getLimits } = await import('./vaultStore.mjs')
     const limits = getLimits(userId)
-    return { content: [{ type: 'text', text: JSON.stringify({ limits }) }] }
+    return { content: [{ type: 'text', text: jsonText({ limits }) }] }
   })
 
   // ── INFO TOOL ──
@@ -1560,7 +1568,7 @@ export function createMcpServer(userId) {
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify({
+        text: jsonText({
           server: 'arcox-mcp',
           version: '1.1.0',
           url: SERVER_URL,
@@ -1598,9 +1606,9 @@ export function createMcpServer(userId) {
       } catch { /* non-fatal */ }
     }
     if (!info || !info.active) {
-      return { content: [{ type: 'text', text: JSON.stringify({ active: false, message: 'Session key belum diaktifkan. User harus setup di Plugin page (passkey required).' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ active: false, message: 'Session key belum diaktifkan. User harus setup di Plugin page (passkey required).' }) }] }
     }
-    return { content: [{ type: 'text', text: JSON.stringify({
+    return { content: [{ type: 'text', text: jsonText({
       active: true,
       walletAddress: info.walletAddress,
       delegateAddress: info.delegateAddress,
@@ -1616,7 +1624,7 @@ export function createMcpServer(userId) {
     const { listApprovals } = await import('./vaultStore.mjs')
     const approvals = listApprovals(userId)
     const a = approvals.find(x => x.id === params.approvalId)
-    if (!a) return { content: [{ type: 'text', text: JSON.stringify({ status: 'not_found', error: 'Approval/request ID not found' }) }] }
+    if (!a) return { content: [{ type: 'text', text: jsonText({ status: 'not_found', error: 'Approval/request ID not found' }) }] }
 
     const response = {
       id: a.id,
@@ -1649,7 +1657,7 @@ export function createMcpServer(userId) {
       } catch { /* polling failed, return stored status */ }
     }
 
-    return { content: [{ type: 'text', text: JSON.stringify(response) }] }
+    return { content: [{ type: 'text', text: jsonText(response) }] }
   })
 
   // ── INTEL (x402-paid, read-only, via MSCA payment) ──
@@ -1667,12 +1675,12 @@ export function createMcpServer(userId) {
     const r = await fetch(`${BACKEND_URL}/api/intel${path}`, { headers })
     const data = await r.json()
     if (r.status === 402 || data?.paymentRequired) {
-      return { content: [{ type: 'text', text: JSON.stringify({ paymentRequired: true, ...data, safeNextStep: 'Invoice x402 dibuat. Call arcox_x402_pay_invoice (tanpa confirmed) untuk preview. Setelah user setuju dan bayar, retry intel tool dengan paymentId yang sama.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ paymentRequired: true, ...data, safeNextStep: 'Invoice x402 dibuat. Call arcox_x402_pay_invoice (tanpa confirmed) untuk preview. Setelah user setuju dan bayar, retry intel tool dengan paymentId yang sama.' }) }] }
     }
     if (data?.unlockedResult) {
-      return { content: [{ type: 'text', text: JSON.stringify({ intelPresentation: data.intelPresentation, result: data.unlockedResult, x402Payment: data.x402Payment }) }] }
+      return { content: [{ type: 'text', text: jsonText({ intelPresentation: data.intelPresentation, result: data.unlockedResult, x402Payment: data.x402Payment }) }] }
     }
-    return { content: [{ type: 'text', text: JSON.stringify(data) }] }
+    return { content: [{ type: 'text', text: jsonText(data) }] }
   })
 
   intelTool('arcox_intel_get_address', 'Get address intelligence via ARCOX Intel (may require x402 payment).', p => `/address/${encodeURIComponent(p.address)}/all`, {
@@ -1714,21 +1722,21 @@ export function createMcpServer(userId) {
       try {
         const preview = await previewX402Pay(userId, params.invoiceId)
         if (preview.status !== 'preview') {
-          return { content: [{ type: 'text', text: JSON.stringify({ ...preview, invoiceId: params.invoiceId }) }] }
+          return { content: [{ type: 'text', text: jsonText({ ...preview, invoiceId: params.invoiceId }) }] }
         }
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'preview', requiresUserConfirmation: true, amount: preview.amount, token: preview.token, recipient: preview.recipient, payer: preview.payer, invoiceId: params.invoiceId, instruction: preview.instruction, safeNextStep: 'Tampilkan preview ini ke user. Setelah user bilang yes/ya, panggil arcox_x402_pay_invoice dengan confirmed=true dan confirmationText.' }) }] }
+        return { content: [{ type: 'text', text: jsonText({ status: 'preview', requiresUserConfirmation: true, amount: preview.amount, token: preview.token, recipient: preview.recipient, payer: preview.payer, invoiceId: params.invoiceId, instruction: preview.instruction, safeNextStep: 'Tampilkan preview ini ke user. Setelah user bilang yes/ya, panggil arcox_x402_pay_invoice dengan confirmed=true dan confirmationText.' }) }] }
       } catch (e) {
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: e?.message || 'preview error' }) }] }
+        return { content: [{ type: 'text', text: jsonText({ status: 'error', error: e?.message || 'preview error' }) }] }
       }
     }
     if (String(params.confirmationText || '').trim().toLowerCase() !== 'yes' && String(params.confirmationText || '').trim().toLowerCase() !== 'ya') {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'confirmation_required', reason: 'Konfirmasi eksplisit (ya/yes) wajib sebelum bayar x402.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'confirmation_required', reason: 'Konfirmasi eksplisit (ya/yes) wajib sebelum bayar x402.' }) }] }
     }
     try {
       const result = await executeX402Pay(userId, params.invoiceId)
-      return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+      return { content: [{ type: 'text', text: jsonText(result) }] }
     } catch (e) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', executed: false, error: e?.message || 'x402 payment error' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'error', executed: false, error: e?.message || 'x402 payment error' }) }] }
     }
   })
 
@@ -1737,10 +1745,10 @@ export function createMcpServer(userId) {
   }, async (params) => {
     try {
       const invoice = await getX402Invoice(params.invoiceId)
-      if (!invoice) return { content: [{ type: 'text', text: JSON.stringify({ status: 'not_found' }) }] }
-      return { content: [{ type: 'text', text: JSON.stringify({ status: invoice.status, invoice }) }] }
+      if (!invoice) return { content: [{ type: 'text', text: jsonText({ status: 'not_found' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: invoice.status, invoice }) }] }
     } catch (e) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: e?.message || 'status error' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ status: 'error', error: e?.message || 'status error' }) }] }
     }
   })
 
