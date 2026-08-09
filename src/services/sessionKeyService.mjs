@@ -602,7 +602,8 @@ export async function executeViaSession(userId, calls, options = {}) {
   // bridge callers opt into requireTransactionHash because they must query the
   // source receipt and router event before minting on the destination.
   const txHash = receiptTxHash || userOpHash
-  const explorerUrl = `https://testnet.arcscan.app/tx/${txHash}`
+  const explorerBase = String(options.explorerBaseUrl || 'https://testnet.arcscan.app/tx/').replace(/\/?$/, '/')
+  const explorerUrl = `${explorerBase}${txHash}`
 
   return {
     status: success ? 'success' : 'error',

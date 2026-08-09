@@ -332,34 +332,39 @@ function executionChainKey(slug) {
   return aliases[s] || s
 }
 
-// CCTP bridge support for the MCP Agent Wallet. The source path is limited to
-// Arc Testnet and reuses the verified ArcoxRouter flow used by the frontend and
-// local ARCOX MCP. The router sees the MSCA as msg.sender when called inside a
-// UserOperation, so the user's EOA is never a payer or signer.
+// CCTP bridge support for the MCP Agent Wallet. Each router address is
+// chain-specific and mirrors the frontend's proven ArcoxRouter route. The
+// router sees the MSCA as msg.sender inside the UserOperation; the user's EOA
+// remains only the MCP tenant/auth identity.
 const BRIDGE_CCTP = {
   Arc_Testnet: {
+    chainId: 5042002,
     domain: 26,
     usdc: '0x3600000000000000000000000000000000000000',
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
-    // The same verified ArcoxRouter used by the frontend/local ARCOX MCP.
+    messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
+    rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network',
+    explorer: 'https://testnet.arcscan.app/tx/',
     router: process.env.ARCOX_FEE_ROUTER_ADDRESS || '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
   },
-  Ethereum_Sepolia: { domain: 0, explorer: 'https://sepolia.etherscan.io/tx/' },
+  Ethereum_Sepolia: { chainId: 11155111, domain: 0, explorer: 'https://sepolia.etherscan.io/tx/' },
   Base_Sepolia: {
+    chainId: 84532,
     domain: 6,
     explorer: 'https://sepolia.basescan.org/tx/',
     rpcUrl: process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org',
-    // CCTP MessageTransmitter header recipient is the destination TokenMessenger.
-    // The end-user/MSCA recipient lives in the TokenMessenger message body.
+    usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
+    // Frontend's verified Base Sepolia ArcoxRouter.
+    router: process.env.ARCOX_BASE_FEE_ROUTER_ADDRESS || '0x9425cC5b3C8B9e0FCb35beBdE737B4365A614Acc',
   },
   Arbitrum_Sepolia: {
+    chainId: 421614,
     domain: 3,
     explorer: 'https://sepolia.arbiscan.io/tx/',
     rpcUrl: process.env.ARB_SEPOLIA_RPC_URL || 'https://sepolia-rollup.arbitrum.io/rpc',
-    // CCTP MessageTransmitter header recipient is the destination TokenMessenger.
-    // The end-user/MSCA recipient lives in the TokenMessenger message body.
+    usdc: '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d',
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
   },
@@ -402,13 +407,6 @@ const BRIDGE_ROUTER_ABI = [
     ], outputs: [{ name: 'fee', type: 'uint256' }, { name: 'netAmount', type: 'uint256' }],
   },
 ]
-const ARC_BRIDGE_CHAIN = defineChain({
-  id: 5042002,
-  name: 'Arc Testnet',
-  nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-  rpcUrls: { default: { http: [process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network'] } },
-})
-
 function bridgeConfig(fromChain, toChain) {
   const source = BRIDGE_CCTP[chainKey(fromChain)]
   const destination = BRIDGE_CCTP[chainKey(toChain)]
@@ -418,7 +416,13 @@ function bridgeConfig(fromChain, toChain) {
 }
 
 async function getRouterFeeQuote(route, amount) {
-  const client = createPublicClient({ chain: ARC_BRIDGE_CHAIN, transport: http(ARC_BRIDGE_CHAIN.rpcUrls.default.http[0]) })
+  const chain = defineChain({
+    id: route.source.chainId,
+    name: route.fromKey,
+    nativeCurrency: { name: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', symbol: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', decimals: 18 },
+    rpcUrls: { default: { http: [route.source.rpcUrl] } },
+  })
+  const client = createPublicClient({ chain, transport: http(route.source.rpcUrl) })
   const result = await client.readContract({
     address: getAddress(route.source.router),
     abi: BRIDGE_ROUTER_ABI,
@@ -457,7 +461,13 @@ export function buildMscaRouterBridgeCalls({ route, amount, mintRecipient, maxFe
 }
 
 async function verifyBridgeBurn({ burnTxHash, route, walletAddress, amount }) {
-  const client = createPublicClient({ chain: ARC_BRIDGE_CHAIN, transport: http(ARC_BRIDGE_CHAIN.rpcUrls.default.http[0]) })
+  const chain = defineChain({
+    id: route.source.chainId,
+    name: route.fromKey,
+    nativeCurrency: { name: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', symbol: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', decimals: 18 },
+    rpcUrls: { default: { http: [route.source.rpcUrl] } },
+  })
+  const client = createPublicClient({ chain, transport: http(route.source.rpcUrl) })
   const receipt = await client.getTransactionReceipt({ hash: burnTxHash })
   const expectedPayer = getAddress(walletAddress).toLowerCase()
   const expectedAmount = amount === undefined || amount === null ? null : BigInt(amount)
@@ -723,6 +733,7 @@ export async function destinationMintAlreadyProcessed({ status, route, client: i
   if (!nonce || !rpcUrl || !messageTransmitter) return { checked: false, processed: false, nonce, reason: 'destination_nonce_check_unavailable' }
   try {
     const destinationInfo = {
+      Arc_Testnet: { id: 5042002 },
       Base_Sepolia: { id: 84532 },
       Arbitrum_Sepolia: { id: 421614 },
     }[route.toKey]
@@ -747,10 +758,11 @@ export async function destinationMintAlreadyProcessed({ status, route, client: i
 
 async function destinationMscaPreflight({ route, walletAddress, requireAuthorization = true }) {
   const destinationInfo = {
+    Arc_Testnet: { id: 5042002, chainKey: 'arc-testnet' },
     Base_Sepolia: { id: 84532, chainKey: 'base-sepolia' },
     Arbitrum_Sepolia: { id: 421614, chainKey: 'arbitrum-sepolia' },
   }[route?.toKey]
-  if (!destinationInfo) return { ok: false, reason: 'destination_msca_route_not_supported', message: 'Destination MSCA UserOperation hanya mendukung Base Sepolia atau Arbitrum Sepolia.' }
+  if (!destinationInfo) return { ok: false, reason: 'destination_msca_route_not_supported', message: 'Destination MSCA UserOperation belum mendukung chain tujuan ini.' }
   if (!route?.destination?.rpcUrl || !route.destination.messageTransmitter) return { ok: false, reason: 'destination_chain_not_configured' }
   const { createPublicClient } = await import('viem')
   const client = createPublicClient({
@@ -770,7 +782,11 @@ async function destinationMscaPreflight({ route, walletAddress, requireAuthoriza
 
 async function mintDestinationViaMsca({ status, route, walletAddress }) {
   if (!status?.verified || !status.message || !status.attestation) return { success: false, error: 'Attestation belum ready' }
-  const destinationKey = route.toKey === 'Base_Sepolia' ? 'base-sepolia' : route.toKey === 'Arbitrum_Sepolia' ? 'arbitrum-sepolia' : null
+  const destinationKey = {
+    Arc_Testnet: 'arc-testnet',
+    Base_Sepolia: 'base-sepolia',
+    Arbitrum_Sepolia: 'arbitrum-sepolia',
+  }[route.toKey]
   if (!destinationKey) return { success: false, error: 'destination_msca_route_not_supported' }
   const alreadyProcessed = await destinationMintAlreadyProcessed({ status, route })
   const nonceDecision = destinationNonceDecision(alreadyProcessed)
@@ -858,6 +874,7 @@ function destinationMintDisabledReason() {
 function bridgeConfigDisabledReason(route) {
   if (!ENABLE_MSCA_CCTP_BRIDGE) return 'msca_bridge_disabled_until_router_validation'
   if (!route?.source?.router) return 'bridge_router_not_configured'
+  if (!route?.source?.usdc || !route?.source?.rpcUrl) return 'source_chain_not_configured'
   if (!route.destination?.rpcUrl || !route.destination?.messageTransmitter) return 'destination_chain_not_configured'
   return destinationMintDisabledReason()
 }
@@ -1151,7 +1168,7 @@ export function createMcpServer(userId, context = {}) {
     const hasUnsupportedSwapToken = action === 'swap' && tokens.some(token => token === 'CIRBTC' || token === 'USYC')
     const knownAction = ['swap', 'send', 'bridge'].includes(action)
     const route = action === 'bridge' ? bridgeConfig(params.fromChain, params.toChain) : null
-    const bridgeIsSupported = action === 'bridge' && ENABLE_MSCA_CCTP_BRIDGE && String(params.token || 'USDC').toUpperCase() === 'USDC' && Boolean(route?.fromKey === 'Arc_Testnet')
+    const bridgeIsSupported = action === 'bridge' && ENABLE_MSCA_CCTP_BRIDGE && String(params.token || 'USDC').toUpperCase() === 'USDC' && Boolean(route?.source?.router && route?.destination?.messageTransmitter)
     const session = await resolveActiveMsca(userId)
     const disabledReason = action === 'bridge' ? bridgeConfigDisabledReason(route) : null
     let destinationReadiness = null
@@ -1313,8 +1330,8 @@ export function createMcpServer(userId, context = {}) {
     const info = await resolveActiveMsca(userId)
     if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
-    if (!route || route.fromKey !== 'Arc_Testnet' || token.toUpperCase() !== 'USDC') {
-      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke Base Sepolia atau Arbitrum Sepolia.' }) }] }
+    if (!route || !route.source?.router || !route.destination?.messageTransmitter || token.toUpperCase() !== 'USDC') {
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'bridge', fromChain: executionChainKey(params.fromChain), toChain: executionChainKey(params.toChain), reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge hanya mendukung route CCTP USDC yang memiliki router source dan MessageTransmitter destination.' }) }] }
     }
     const disabledReason = bridgeConfigDisabledReason(route)
     if (disabledReason) {
@@ -1386,8 +1403,8 @@ export function createMcpServer(userId, context = {}) {
     const info = await resolveActiveMsca(userId)
     if (!info) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
-    if (!route || route.fromKey !== 'Arc_Testnet' || String(params.token || 'USDC').toUpperCase() !== 'USDC') {
-      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge saat ini mendukung USDC dari Arc Testnet ke Base Sepolia atau Arbitrum Sepolia.' }) }] }
+    if (!route || !route.source?.router || !route.destination?.messageTransmitter || String(params.token || 'USDC').toUpperCase() !== 'USDC') {
+       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'rejected', executed: false, action: 'bridge', fromChain: executionChainKey(params.fromChain), toChain: executionChainKey(params.toChain), reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge hanya mendukung route CCTP USDC yang memiliki router source dan MessageTransmitter destination.' }) }] }
     }
     const disabledReason = bridgeConfigDisabledReason(route)
     if (disabledReason) {
@@ -1397,7 +1414,8 @@ export function createMcpServer(userId, context = {}) {
     if (!destinationPreflight.ok) {
       return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: destinationPreflight.reason, message: destinationPreflight.message || 'Destination MSCA belum siap. Tidak ada source burn.' }) }] }
     }
-    const gate = await canAutoExecute(userId, source, params.amount)
+    const gate = await canAutoExecute(userId, source, params.amount, executionChainKey(params.fromChain))
+
     if (!gate.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, message: gate.message || 'Session key MSCA tidak dapat mengeksekusi bridge.' }) }] }
     try {
       const amount = parseUnits(String(params.amount).trim(), 6)
@@ -1419,7 +1437,7 @@ export function createMcpServer(userId, context = {}) {
       executionQuotes.delete(quoteCheck.quote.previewId)
       const calls = buildMscaRouterBridgeCalls({ route, amount, mintRecipient: info.walletAddress })
       const { executeViaSession } = await import('./sessionKeyService.mjs')
-      const result = await executeViaSession(userId, calls, { paymaster: true, chainKey: 'arc-testnet', requireTransactionHash: true })
+      const result = await executeViaSession(userId, calls, { paymaster: true, chainKey: executionChainKey(route.fromKey), explorerBaseUrl: route.source.explorer, requireTransactionHash: true })
       if (result.status !== 'success') return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, error: result.reason || 'Bridge UserOperation gagal', userOpHash: result.userOpHash }) }] }
       const burnProof = await verifyBridgeBurn({ burnTxHash: result.txHash, route, walletAddress: info.walletAddress, amount })
       if (!burnProof.ok) return { content: [{ type: 'text', text: jsonText({ status: 'burn_submitted', executed: true, verified: false, burnTxHash: result.txHash, userOpHash: result.userOpHash, reason: burnProof.reason, message: 'Source UserOperation berhasil tetapi bukti event router belum terverifikasi. Jangan ulangi burn; periksa transaksi ini secara read-only.' }) }] }
@@ -1519,18 +1537,17 @@ export function createMcpServer(userId, context = {}) {
   })
 
   server.tool('arcox_bridge_status', 'Check attestation and destination mint status for an MSCA bridge burn transaction.', {
-    burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Source-chain burn transaction hash'),
-    fromChain: z.string().describe('Source chain, currently arc-testnet'),
+    burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Source-chain burn transaction hash'),     fromChain: z.string().describe('Original source chain (arc-testnet or base-sepolia)'),
     toChain: z.string().describe('Destination chain used by the original quote'),
   }, async (params) => {
     if (!ENABLE_MSCA_CCTP_BRIDGE) {
-      return { content: [{ type: 'text', text: jsonText({ status: 'disabled', verified: false, reason: 'msca_bridge_disabled_until_router_validation', message: 'Bridge MSCA status belum diaktifkan karena ArcoxRouter dan destination mint relayer belum tervalidasi. Tidak ada transaksi yang dikirim.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'disabled', verified: false, reason: 'msca_bridge_disabled_until_router_validation', message: 'Bridge MSCA status belum diaktifkan karena ArcoxRouter dan destination mint relayer belum tervalidasi. Tidak ada transaksi yang dikirim.' }) }] }
     }
     const info = await resolveActiveMsca(userId)
     if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const route = bridgeConfig(params.fromChain, params.toChain || 'ethereum-sepolia')
-    if (!route || route.fromKey !== 'Arc_Testnet') {
-      return { content: [{ type: 'text', text: jsonText({ status: 'rejected', reason: 'bridge_route_not_supported_for_msca', message: 'Status bridge MSCA hanya tersedia untuk burn dari Arc Testnet.' }) }] }
+    if (!route || !route.source?.router || !route.destination?.messageTransmitter) {
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'rejected', reason: 'bridge_route_not_supported_for_msca', message: 'Status bridge MSCA hanya tersedia untuk route CCTP yang memiliki router source dan MessageTransmitter destination.' }) }] }
     }
     let burnProof
     try {
@@ -1596,8 +1613,7 @@ export function createMcpServer(userId, context = {}) {
   })
 
   server.tool('arcox_retry_bridge_mint', 'Retry destination receiveMessage for a confirmed MSCA bridge burn. This never burns again; it only polls attestation and mints the already-bound MSCA recipient.', {
-    burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Previously confirmed Arc router bridge transaction hash'),
-    fromChain: z.string().describe('Original source chain, currently arc-testnet'),
+    burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Previously confirmed Arc router bridge transaction hash'),     fromChain: z.string().describe('Original source chain (arc-testnet or base-sepolia)'),
     toChain: z.string().describe('Original destination chain'),
     confirmed: z.boolean().describe('Must be true to retry destination mint'),
     confirmationText: z.string().describe('Must be exactly yes or ya'),
@@ -1610,7 +1626,7 @@ export function createMcpServer(userId, context = {}) {
     const route = bridgeConfig(params.fromChain, params.toChain)
     const disabledReason = bridgeConfigDisabledReason(route)
     if (disabledReason) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: disabledReason }) }] }
-    if (!route || route.fromKey !== 'Arc_Testnet') return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca' }) }] }
+    if (!route || !route.source?.router || !route.destination?.messageTransmitter) return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'rejected', executed: false, reason: 'bridge_route_not_supported_for_msca' }) }] }
     try {
       const proof = await verifyBridgeBurn({ burnTxHash: params.burnTxHash, route, walletAddress: info.walletAddress })
       if (!proof.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: proof.reason, message: 'Burn ini tidak terbukti berasal dari ArcoxRouter untuk MSCA aktif.' }) }] }
