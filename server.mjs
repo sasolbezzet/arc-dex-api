@@ -102,14 +102,19 @@ app.use('/api/ai-router', apiLimiter, aiRouterRoutes)
 app.use('/api/vault', apiLimiter, vaultRoutes)
 
 // ── Circle Modular Wallet proxy ──
-// Browser → /api/circle-modular/* → https://modular-sdk.circle.com/v1/rpc/*
+// Browser → /api/circle-modular/* → the same tenant-specific Circle RPC base
+// used by the frontend and MCP transport. The client URL contains the
+// application/tenant path; dropping it causes upstream 404 responses.
 // Used so mobile browsers never fetch modular-sdk.circle.com directly
 // (mobile networks, ad-block, captive portals often block it).
 const CIRCLE_MODULAR_KEY = process.env.CIRCLE_CLIENT_KEY || process.env.VITE_CIRCLE_CLIENT_KEY || ''
+const CIRCLE_MODULAR_BASE_URL = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc').replace(/\/+$/, '')
 app.use('/api/circle-modular', express.json({ limit: '128kb' }), async (req, res) => {
   try {
-    const tail = req.url.replace(/^\//, '')
-    const target = `https://modular-sdk.circle.com/v1/rpc/${tail}`
+    // Express leaves the mounted middleware path in req.url and preserves the
+    // query string, so forward both without introducing duplicate slashes.
+    const tail = req.url.replace(/^\/+/, '')
+    const target = tail ? `${CIRCLE_MODULAR_BASE_URL}/${tail}` : CIRCLE_MODULAR_BASE_URL
     const upstream = await fetch(target, {
       method: 'POST',
       headers: {
