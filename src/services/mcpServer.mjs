@@ -2367,12 +2367,15 @@ export function createMcpServer(userId, context = {}) {
         requireTransactionHash: true,
         requireSuccessfulTransactionReceipt: true,
       }
+      const combinedSourceOperation = isE2eTestnetIntentBypassEnabled(route)
       const { executeViaSession } = await import('./sessionKeyService.mjs')
 
-      // Frontend parity: approve is its own transaction and must be finalized
-      // before the router burn is sent. If approval was already confirmed by a
-      // previous call, skip it and continue directly to the burn UserOp.
-      if (!approvalConfirmed) {
+      // The normal production path mirrors the frontend's separate
+      // approve→receipt→burn sequence. During the explicitly enabled testnet
+      // proof, batch approve and burn into one MSCA UserOperation to avoid
+      // Circle bundler account-reputation limits; calls execute sequentially
+      // inside the deployed MSCA and the router still pulls from that MSCA.
+      if (!approvalConfirmed && !combinedSourceOperation) {
         let approvalResult
         try {
           approvalResult = await executeViaSession(userId, [approveCall], executionOptions)
@@ -2415,7 +2418,7 @@ export function createMcpServer(userId, context = {}) {
       // bridgeUsdcWithFee sequence exactly.
       let result
       try {
-        result = await executeViaSession(userId, [burnCall], executionOptions)
+        result = await executeViaSession(userId, combinedSourceOperation ? [approveCall, burnCall] : [burnCall], executionOptions)
       } catch (submissionError) {
         await updateBridgePending(userId, approvalId, {
           fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId,
@@ -2430,7 +2433,7 @@ export function createMcpServer(userId, context = {}) {
       const sourceFailed = result.status === 'error'
       await updateBridgePending(userId, approvalId, {
         fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId,
-        sourceApprovalUserOpHash,
+        sourceApprovalUserOpHash: combinedSourceOperation ? null : sourceApprovalUserOpHash,
         sourceUserOpHash: result.userOpHash || null,
         burnTxHash: sourceSucceeded ? result.txHash : null,
         sourceChainKey: executionChainKey(route.fromChain),
