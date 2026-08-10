@@ -173,28 +173,58 @@ test('MCP recognizes Arbitrum→Arc as an MSCA route before any source burn', as
   assert.equal(isMscaCctpRouteConfigured('arbitrum-sepolia', 'arc-testnet'), true)
 })
 
-test('E2E intent bypass is default-off and limited to Arc-source testnet routes', async () => {
-  const previous = process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS
-  delete process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS
-  try {
-    const mod = await import('../src/services/mcpServer.mjs?e2e-bypass-off-' + Date.now())
-    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Arc_Testnet', toKey: 'Base_Sepolia' }), false)
-    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Arc_Testnet', toKey: 'Arbitrum_Sepolia' }), false)
-  } finally {
-    if (previous === undefined) delete process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS
-    else process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS = previous
-  }
-
+test('legacy E2E flags cannot bypass the final unresolved-intent guard', async () => {
+  const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE
+  const previousBypass = process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS
+  const previousPaymaster = process.env.ENABLE_E2E_TESTNET_PAYMASTER
+  process.env.ENABLE_MSCA_CCTP_BRIDGE = 'true'
   process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS = 'true'
+  process.env.ENABLE_E2E_TESTNET_PAYMASTER = 'true'
   try {
-    const mod = await import('../src/services/mcpServer.mjs?e2e-bypass-on-' + Date.now())
-    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Arc_Testnet', toKey: 'Base_Sepolia' }), true)
-    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Arc_Testnet', toKey: 'Arbitrum_Sepolia' }), true)
-    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Base_Sepolia', toKey: 'Arc_Testnet' }), false)
-    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Arc_Testnet', toKey: 'Ethereum_Sepolia' }), false)
+    await withSessionStore({
+      [MSCA.toLowerCase()]: {
+        walletAddress: MSCA,
+        delegateAddress: OTHER,
+        active: true,
+        authorizationUserOpHash: '0x' + 'd'.repeat(64),
+      },
+    }, { [EOA.toLowerCase()]: MSCA }, async ({ createMcpServer }) => {
+      const { createApproval, updateApprovalStatus } = await import('../src/services/vaultStore.mjs')
+      const pending = createApproval(EOA.toLowerCase(), {
+        agent: 'test-agent',
+        action: 'bridge',
+        amount: '1',
+        token: 'USDC',
+        source: 'session',
+        details: JSON.stringify({
+          fromChain: 'Arc_Testnet',
+          toChain: 'Base_Sepolia',
+          previewId: 'legacy-flag-preview',
+          walletAddress: MSCA,
+          settlementPhase: 'source_submission_unknown',
+        }),
+        forcePending: true,
+      })
+      updateApprovalStatus(EOA.toLowerCase(), pending.id, 'pending_confirmation')
+      const response = await createMcpServer(EOA.toLowerCase())._registeredTools.arcox_quote_bridge.handler({
+        fromChain: 'arc-testnet',
+        toChain: 'base-sepolia',
+        amount: '1',
+        token: 'USDC',
+        source: 'session',
+      })
+      const result = JSON.parse(response.content[0].text)
+      assert.equal(result.rejected, true)
+      assert.equal(result.reason, 'unresolved_source_intent')
+      assert.equal(result.approvalId, pending.id)
+    })
   } finally {
-    if (previous === undefined) delete process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS
-    else process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS = previous
+    if (previousBridgeFlag === undefined) delete process.env.ENABLE_MSCA_CCTP_BRIDGE
+    else process.env.ENABLE_MSCA_CCTP_BRIDGE = previousBridgeFlag
+    if (previousBypass === undefined) delete process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS
+    else process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS = previousBypass
+    if (previousPaymaster === undefined) delete process.env.ENABLE_E2E_TESTNET_PAYMASTER
+    else process.env.ENABLE_E2E_TESTNET_PAYMASTER = previousPaymaster
   }
 })
 

@@ -811,18 +811,11 @@ export async function executeViaSession(userId, calls, options = {}) {
   const rollupFeeProfile = chainKey === 'arbitrum-sepolia' || (chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || '')))
   const arcBridgeProfile = chainKey === 'arc-testnet'
     && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
-  const e2ePaymaster = options.e2eTestnet === true
-    && process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS === 'true'
-    && process.env.ENABLE_E2E_TESTNET_PAYMASTER === 'true'
-  if (arcBridgeProfile && options.paymaster && !e2ePaymaster) {
+  if (arcBridgeProfile && options.paymaster) {
     // `undefined` would inherit the Circle modular client's default paymaster.
     // Use an explicit false sentinel so viem prepares an unsponsored UserOp
     // paid from the Arc MSCA's native USDC balance.
     userOpParams.paymaster = false
-  } else if (e2ePaymaster) {
-    // Explicit testnet experiment only. Keep the validated Arc fee envelope
-    // while asking Circle's paymaster to sponsor the single proof operation.
-    userOpParams.paymaster = paymasterWithFeeOverrides(modularClient, userOpParams)
   } else if (shouldUseSessionPaymaster({ chainKey, feeProfile: options.feeProfile, paymaster: options.paymaster })) {
     userOpParams.paymaster = rollupFeeProfile
       ? paymasterWithFeeOverrides(modularClient, userOpParams)
