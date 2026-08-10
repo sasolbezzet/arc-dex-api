@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -o pipefail
 
-URL="https://43.134.14.43.nip.io/health"
+URL="https://arcoxdex.vercel.app/health"
 LOG_DIR="/home/ubuntu/arc-dex-api/logs"
 LOG_FILE="$LOG_DIR/monitor.log"
 STATE_DIR="$LOG_DIR"

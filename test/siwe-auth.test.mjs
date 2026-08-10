@@ -1,7 +1,7 @@
 import { SiweMessage } from 'siwe'
 import { Wallet } from 'ethers'
 
-const BASE_URL = process.env.BASE_URL || 'https://43.134.14.43.nip.io'
+const BASE_URL = process.env.BASE_URL || 'http://127.0.0.1:3001'
 const PATH = process.env.API_PATH || '/api/auth/session'
 const API = BASE_URL + PATH
 
