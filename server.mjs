@@ -36,8 +36,8 @@ app.disable('x-powered-by')
 const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:5173',
   'http://localhost:4173',
-  'https://43.163.98.128.nip.io',
-  'https://43.163.98.128.nip.io/arc-dex',
+  'https://43.134.14.43.nip.io',
+  'https://43.134.14.43.nip.io/arc-dex',
   'https://arcoxdex.vercel.app',
 ]
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(','))
@@ -344,7 +344,7 @@ const ARCOX_PAY_BASE_URL = (process.env.ARCOX_PAY_BASE_URL || process.env.ARCOX_
 const ENABLE_DEV_TOOLS = String(process.env.ENABLE_DEV_TOOLS || 'false').toLowerCase() === 'true'
 const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS || 24 * 60 * 60 * 1000)
 const LOGIN_WINDOW_MS = 5 * 60 * 1000
-const DEFAULT_SIWE_DOMAINS = ['localhost', 'localhost:5173', 'localhost:4173', 'arcoxdex.vercel.app', '43.163.98.128.nip.io']
+const DEFAULT_SIWE_DOMAINS = ['localhost', 'localhost:5173', 'localhost:4173', 'arcoxdex.vercel.app', '43.134.14.43.nip.io']
 const SIWE_ALLOWED_DOMAINS = (process.env.SIWE_ALLOWED_DOMAINS || DEFAULT_SIWE_DOMAINS.join(',')).split(',').map(d => d.trim()).filter(Boolean)
 if (!process.env.AUTH_SECRET) console.warn('[security] AUTH_SECRET not set. Set a dedicated random AUTH_SECRET before production.')
 
@@ -2497,15 +2497,35 @@ app.post('/api/mint-cctp-from-solana', apiLimiter, requireServerSignedMintAuth, 
 // ── Auto-mint worker (for web bridge) ───────────────────────────
 // Background worker yang poll attestation untuk bridge yang timeout di frontend.
 // Saat attestation siap, frontend bisa mint via MetaMask menggunakan data dari worker.
-const autoMintJobs = new Map() // jobId -> { burnTx, fromChain, toChain, status, attestation, message, messageTransmitter, error, createdAt }
+const AUTO_MINT_DB = './auto-mint-jobs.json'
+const autoMintJobs = new Map(Object.entries(readJsonObject(AUTO_MINT_DB))) // jobId -> job
 
-function startAutoMintWorker(jobId, burnTx, fromChain, toChain) {
+function persistAutoMintJobs() {
+  atomicWriteJson(AUTO_MINT_DB, Object.fromEntries(autoMintJobs))
+}
+
+function startAutoMintWorker(jobId, burnTx, fromChain, toChain, owner) {
+  const normalizedOwner = String(owner || '').toLowerCase()
+  if (!normalizedOwner) throw new Error('Authenticated owner required')
   const fromInfo = CCTP[fromChain]
   const toInfo = CCTP[toChain]
   if (!fromInfo || !toInfo) return
 
-  const job = autoMintJobs.get(jobId) || { burnTx, fromChain, toChain, status: 'polling', createdAt: Date.now() }
+  const existing = autoMintJobs.get(jobId)
+  if (existing?.owner && String(existing.owner).toLowerCase() !== normalizedOwner) throw new Error('Auto-mint job belongs to another wallet')
+  const job = {
+    ...(existing || {}),
+    burnTx,
+    fromChain,
+    toChain,
+    owner: normalizedOwner,
+    status: 'polling',
+    error: undefined,
+    createdAt: existing?.createdAt || Date.now(),
+    attempts: 0,
+  }
   autoMintJobs.set(jobId, job)
+  persistAutoMintJobs()
 
   console.log(`[auto-mint] worker started for ${burnTx.slice(0, 16)}... ${fromChain}→${toChain}`)
 
@@ -2529,10 +2549,12 @@ function startAutoMintWorker(jobId, burnTx, fromChain, toChain) {
             burnTx,
             readyAt: Date.now(),
           })
+          persistAutoMintJobs()
           console.log(`[auto-mint] attestation ready for ${burnTx.slice(0, 16)}...`)
           return
         }
         autoMintJobs.set(jobId, { ...current, attempts: i + 1 })
+        if (i % 10 === 0) persistAutoMintJobs()
         await new Promise(r => setTimeout(r, 3000))
       } catch (e) {
         console.error(`[auto-mint] poll error attempt ${i + 1}:`, e.message)
@@ -2542,6 +2564,7 @@ function startAutoMintWorker(jobId, burnTx, fromChain, toChain) {
     const final = autoMintJobs.get(jobId)
     if (final && final.status === 'polling') {
       autoMintJobs.set(jobId, { ...final, status: 'timeout', error: 'Attestation timeout after 200 attempts' })
+      persistAutoMintJobs()
       console.log(`[auto-mint] timeout for ${burnTx.slice(0, 16)}...`)
     }
   })()
@@ -2555,12 +2578,16 @@ app.post('/api/auto-mint/register', apiLimiter, requireAuth, async (req, res) =>
     if (!CCTP[fromChain] || !CCTP[toChain]) return res.status(400).json({ error: 'Unsupported chain' })
 
     const jobId = safeBurnTx
+    const owner = String(req.owner || '').toLowerCase()
     const existing = autoMintJobs.get(jobId)
+    if (existing && (!existing.owner || String(existing.owner).toLowerCase() !== owner)) {
+      return res.status(404).json({ error: 'Job not found' })
+    }
     if (existing && (existing.status === 'ready' || existing.status === 'polling')) {
       return res.json({ jobId, status: existing.status, message: 'Job already exists' })
     }
 
-    startAutoMintWorker(jobId, safeBurnTx, fromChain, toChain)
+    startAutoMintWorker(jobId, safeBurnTx, fromChain, toChain, owner)
     res.json({ jobId, status: 'polling', message: 'Auto-mint worker started' })
   } catch (e) {
     console.error('[auto-mint/register]', e.message)
@@ -2572,7 +2599,9 @@ app.get('/api/auto-mint/status/:jobId', apiLimiter, requireAuth, async (req, res
   try {
     const jobId = normalizeTxHash(req.params.jobId, 'jobId')
     const job = autoMintJobs.get(jobId)
-    if (!job) return res.status(404).json({ error: 'Job not found' })
+    if (!job || !job.owner || String(job.owner).toLowerCase() !== String(req.owner || '').toLowerCase()) {
+      return res.status(404).json({ error: 'Job not found' })
+    }
     res.json(job)
   } catch (e) {
     res.status(500).json({ error: e.message })
@@ -3026,6 +3055,16 @@ app.get('/api/history/:address', async (req, res) => {
 })
 
 export { app }
+
+// Resume persisted attestation workers after a VPS restart. A completed/failed
+// job is left untouched; only polling jobs are safe to resume idempotently.
+for (const [jobId, job] of autoMintJobs) {
+  if (job?.status === 'polling' && job.owner) {
+    try { startAutoMintWorker(jobId, job.burnTx, job.fromChain, job.toChain, job.owner) } catch (error) {
+      console.error('[auto-mint] resume failed:', error?.message || error)
+    }
+  }
+}
 
 // Vercel imports the Express app as a serverless handler. PM2/local runs still
 // own the HTTP listener; never bind a port during a Vercel function import.
