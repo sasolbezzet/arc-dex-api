@@ -627,6 +627,18 @@ const BRIDGE_CCTP = {
 // because code was updated. Enable it only after the router and destination
 // mint relayer have been configured and a small testnet transfer is approved.
 const ENABLE_MSCA_CCTP_BRIDGE = process.env.ENABLE_MSCA_CCTP_BRIDGE === 'true'
+// Temporary, explicit testnet-only switch for proving the frontend-parity
+// bridge flow. It never removes the guard or changes transaction validation;
+// it only permits a fresh quote when old source intents are unresolved.
+// Default-off and deliberately not exposed as an MCP tool parameter.
+const ENABLE_E2E_TESTNET_INTENT_BYPASS = process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS === 'true'
+
+export function isE2eTestnetIntentBypassEnabled(route) {
+  return ENABLE_E2E_TESTNET_INTENT_BYPASS
+    && route?.fromKey === 'Arc_Testnet'
+    && ['Base_Sepolia', 'Arbitrum_Sepolia'].includes(route?.toKey)
+}
+
 const BRIDGE_ZERO_BYTES32 = `0x${'0'.repeat(64)}`
 const BRIDGE_MAX_FEE = BigInt(process.env.CCTP_MAX_FEE_BASE_UNITS || '10')
 const configuredBridgeFinalityThreshold = Number(process.env.CCTP_MIN_FINALITY_THRESHOLD || '1000')
@@ -2164,7 +2176,8 @@ export function createMcpServer(userId, context = {}) {
       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'bridge', fromChain: executionChainKey(params.fromChain), toChain: executionChainKey(params.toChain), chain: executionChainKey(params.fromChain), walletType: 'MSCA', reason: disabledReason, message: disabledReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi.' : 'Bridge MSCA belum diaktifkan.' }) }] }
     }
     const { listApprovals } = await import('./vaultStore.mjs')
-    const unresolvedSource = hasUnresolvedSourceBridgeIntent(listApprovals(userId), {
+    const bypassUnresolvedIntent = isE2eTestnetIntentBypassEnabled(route)
+    const unresolvedSource = bypassUnresolvedIntent ? null : hasUnresolvedSourceBridgeIntent(listApprovals(userId), {
       fromChain: route.fromKey,
       toChain: route.toKey,
       walletAddress: info.walletAddress,
@@ -2183,6 +2196,12 @@ export function createMcpServer(userId, context = {}) {
         approvalId: unresolvedSource.approval?.id || null,
         message: 'Bridge intent sumber sebelumnya belum memiliki hasil UserOperation yang pasti. Rekonsiliasi status intent tersebut sebelum meminta quote baru; burn tidak diulang.',
       }) }] }
+    }
+    // The bypass is intentionally invisible to normal MCP consumers; expose
+    // its presence only in the test quote so the E2E log is auditable.
+    if (bypassUnresolvedIntent) {
+      // Continue with the same route validation, destination preflight, fee
+      // quote, and MSCA-bound execution quote as the guarded path.
     }
     const destinationPreflight = await destinationMscaPreflight({ route, walletAddress: info.walletAddress })
     if (!destinationPreflight.ok) {

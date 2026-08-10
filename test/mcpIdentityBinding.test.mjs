@@ -173,6 +173,31 @@ test('MCP recognizes Arbitrum→Arc as an MSCA route before any source burn', as
   assert.equal(isMscaCctpRouteConfigured('arbitrum-sepolia', 'arc-testnet'), true)
 })
 
+test('E2E intent bypass is default-off and limited to Arc-source testnet routes', async () => {
+  const previous = process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS
+  delete process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS
+  try {
+    const mod = await import('../src/services/mcpServer.mjs?e2e-bypass-off-' + Date.now())
+    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Arc_Testnet', toKey: 'Base_Sepolia' }), false)
+    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Arc_Testnet', toKey: 'Arbitrum_Sepolia' }), false)
+  } finally {
+    if (previous === undefined) delete process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS
+    else process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS = previous
+  }
+
+  process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS = 'true'
+  try {
+    const mod = await import('../src/services/mcpServer.mjs?e2e-bypass-on-' + Date.now())
+    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Arc_Testnet', toKey: 'Base_Sepolia' }), true)
+    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Arc_Testnet', toKey: 'Arbitrum_Sepolia' }), true)
+    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Base_Sepolia', toKey: 'Arc_Testnet' }), false)
+    assert.equal(mod.isE2eTestnetIntentBypassEnabled({ fromKey: 'Arc_Testnet', toKey: 'Ethereum_Sepolia' }), false)
+  } finally {
+    if (previous === undefined) delete process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS
+    else process.env.ENABLE_E2E_TESTNET_INTENT_BYPASS = previous
+  }
+})
+
 test('MCP resolver fails closed without an active explicit MSCA session', async () => {
   await withSessionStore({
     [MSCA.toLowerCase()]: {
