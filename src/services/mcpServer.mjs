@@ -2366,6 +2366,7 @@ export function createMcpServer(userId, context = {}) {
         explorerBaseUrl: route.source.explorer,
         requireTransactionHash: true,
         requireSuccessfulTransactionReceipt: true,
+        e2eTestnet: isE2eTestnetIntentBypassEnabled(route),
       }
       const combinedSourceOperation = isE2eTestnetIntentBypassEnabled(route)
       const { executeViaSession } = await import('./sessionKeyService.mjs')
