@@ -246,8 +246,8 @@ test('Arbitrum UserOperation fees never use a zero priority fee', async () => {
   assert.ok(normalized.maxFeePerGas >= normalized.maxPriorityFeePerGas * 2n)
 
   const observed = mod.normalizeArbitrumUserOperationFees({ maxFeePerGas: 100_000_000n, maxPriorityFeePerGas: 3_000_000n })
-  assert.equal(observed.maxPriorityFeePerGas, 3_000_000n)
-  assert.equal(observed.maxFeePerGas, 103_000_000n)
+  assert.equal(observed.maxPriorityFeePerGas, 1_000_000_000n)
+  assert.equal(observed.maxFeePerGas, 1_100_000_000n)
   const malformed = mod.normalizeArbitrumUserOperationFees({ maxFeePerGas: 'not-a-number', maxPriorityFeePerGas: '-1' })
   assert.ok(malformed.maxPriorityFeePerGas > 0n)
 
@@ -256,11 +256,104 @@ test('Arbitrum UserOperation fees never use a zero priority fee', async () => {
     request: async () => 0n,
   }
   const params = await mod.buildUserOperationParams({ account: {}, calls: [], chainKey: 'arbitrum-sepolia', baseClient: fakeClient })
-  assert.ok(params.maxPriorityFeePerGas > 0n)
+  assert.ok(params.maxPriorityFeePerGas >= 1_000_000_000n)
   assert.ok(params.maxFeePerGas >= params.maxPriorityFeePerGas)
+  const destinationParams = await mod.buildUserOperationParams({ account: {}, calls: [], chainKey: 'arc-testnet', feeProfile: 'arbitrum-destination', baseClient: fakeClient })
+  assert.ok(destinationParams.maxPriorityFeePerGas >= 1_000_000_000n)
+  assert.ok(destinationParams.maxFeePerGas >= destinationParams.maxPriorityFeePerGas)
+  const arcParams = await mod.buildUserOperationParams({ account: {}, calls: [], chainKey: 'arc-testnet', feeProfile: 'arc-bridge', baseClient: fakeClient })
+  assert.ok(arcParams.maxPriorityFeePerGas >= 1_000_000_000n)
+  assert.ok(arcParams.maxFeePerGas >= arcParams.maxPriorityFeePerGas)
+  const ordinaryArcParams = await mod.buildUserOperationParams({ account: {}, calls: [], chainKey: 'arc-testnet', baseClient: fakeClient })
+  assert.equal(ordinaryArcParams.maxPriorityFeePerGas, undefined, 'ordinary Arc keeps its established fee preparation')
+  assert.equal(ordinaryArcParams.maxFeePerGas, undefined, 'ordinary Arc keeps its established fee preparation')
+  const baseParams = await mod.buildUserOperationParams({ account: {}, calls: [], chainKey: 'base-sepolia', baseClient: fakeClient })
+  assert.equal(baseParams.maxPriorityFeePerGas, undefined, 'Base keeps its established fee preparation')
+  assert.equal(baseParams.maxFeePerGas, undefined, 'Base keeps its established fee preparation')
 
   const secondBased = mod.sweepInactiveSessions(Date.now())
   assert.equal(typeof secondBased.revoked, 'number')
+
+  assert.equal(mod.validateSignedUserOperationFees({
+    chainKey: 'arbitrum-sepolia',
+    signedUserOp: { maxFeePerGas: '0x77359400', maxPriorityFeePerGas: '0x3b9aca00' },
+  }).ok, true)
+  assert.equal(mod.validateSignedUserOperationFees({
+    chainKey: 'arbitrum-sepolia',
+    signedUserOp: { maxFeePerGas: '0x5f5e100', maxPriorityFeePerGas: '0x17d78400' },
+  }).reason, 'user_operation_priority_fee_too_low')
+  assert.equal(mod.validateSignedUserOperationFees({
+    chainKey: 'arbitrum-sepolia',
+    signedUserOp: { maxFeePerGas: '0x3d0900', maxPriorityFeePerGas: '0x0' },
+  }).reason, 'user_operation_priority_fee_too_low')
+  assert.equal(mod.validateSignedUserOperationFees({
+    chainKey: 'arbitrum-sepolia',
+    signedUserOp: { maxFeePerGas: '0x1', maxPriorityFeePerGas: '0x3b9aca00' },
+  }).reason, 'user_operation_max_fee_invalid')
+  assert.equal(mod.validateSignedUserOperationFees({
+    chainKey: 'arc-testnet',
+    signedUserOp: { maxFeePerGas: '0x0', maxPriorityFeePerGas: '0x0' },
+  }).ok, true)
+
+  const paymasterRequests = []
+  const fakePaymasterClient = {
+    request: async ({ method, params }) => {
+      paymasterRequests.push({ method, params })
+      return {
+        paymaster: '0x0000000000000000000000000000000000000001',
+        paymasterData: '0x1234',
+        maxFeePerGas: '0x0',
+        maxPriorityFeePerGas: '0x0',
+      }
+    },
+  }
+  const paymaster = mod.paymasterWithFeeOverrides(fakePaymasterClient, params)
+  const paymasterResult = await paymaster.getPaymasterData({
+    chainId: 421614,
+    entryPointAddress: '0x0000000000000000000000000000000000000002',
+    sender: A,
+    callData: '0x',
+    maxFeePerGas: params.maxFeePerGas,
+    maxPriorityFeePerGas: params.maxPriorityFeePerGas,
+  })
+  assert.equal(paymasterResult.maxFeePerGas, params.maxFeePerGas)
+  assert.equal(paymasterResult.maxPriorityFeePerGas, params.maxPriorityFeePerGas)
+  assert.ok(paymasterResult.maxPriorityFeePerGas > 0n)
+  assert.ok(paymasterResult.maxFeePerGas >= paymasterResult.maxPriorityFeePerGas)
+  assert.equal(paymasterResult.paymaster, '0x0000000000000000000000000000000000000001')
+  assert.equal(paymasterRequests[0].method, 'pm_getPaymasterData')
+  assert.equal(paymasterRequests[0].params[0].maxPriorityFeePerGas, `0x${params.maxPriorityFeePerGas.toString(16)}`)
+  assert.equal(mod.isKnownPreSubmissionError(new Error('precheck failed: maxPriorityFeePerGas is 400000000')), true)
+  assert.equal(mod.classifyUserOperationPrecheckError(new Error('precheck failed: maxPriorityFeePerGas is 400000000')), 'user_operation_precheck_failed')
+  assert.equal(mod.classifyUserOperationPrecheckError(new Error('paymaster stake too low')), 'bundler_stake_requirement')
+  assert.equal(mod.classifyUserOperationPrecheckError(new Error('Max operations (4) reached for account: 0xabc due to being unstaked')), 'bundler_account_reputation_limit')
+  assert.equal(mod.isKnownPreSubmissionError(new Error('network timeout after submission')), false)
+  assert.equal(mod.shouldUseSessionPaymaster({ chainKey: 'arc-testnet', feeProfile: 'arc-bridge', paymaster: true }), false)
+  assert.equal(mod.shouldUseSessionPaymaster({ chainKey: 'arc-testnet', feeProfile: undefined, paymaster: true }), true)
+  assert.equal(mod.shouldUseSessionPaymaster({ chainKey: 'arbitrum-sepolia', feeProfile: 'arbitrum-destination', paymaster: true }), true)
+  const arcPaymaster = mod.paymasterWithFeeOverrides(fakePaymasterClient, arcParams)
+  const arcPaymasterResult = await arcPaymaster.getPaymasterData({
+    chainId: 5042002,
+    entryPointAddress: '0x0000000000000000000000000000000000000002',
+    sender: A,
+    callData: '0x',
+    maxFeePerGas: arcParams.maxFeePerGas,
+    maxPriorityFeePerGas: arcParams.maxPriorityFeePerGas,
+  })
+  assert.equal(arcPaymasterResult.maxPriorityFeePerGas, arcParams.maxPriorityFeePerGas)
+  assert.equal(arcPaymasterResult.maxFeePerGas, arcParams.maxFeePerGas)
+})
+
+test('UserOperation status can explicitly target a destination chain instead of session default', async () => {
+  const mod = await import('../src/services/sessionKeyService.mjs?chain-override-' + Date.now())
+  assert.deepEqual(mod.resolveUserOpChainKey({ chain: 'arc-testnet' }, 'arbitrum-sepolia'), {
+    chainKey: 'arbitrum-sepolia',
+    explicit: true,
+  })
+  assert.deepEqual(mod.resolveUserOpChainKey({ chain: 'arc-testnet' }), {
+    chainKey: 'arc-testnet',
+    explicit: false,
+  })
 })
 
 test('session is automatically revoked after 24 hours without agent activity', async () => {

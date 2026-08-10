@@ -13,9 +13,18 @@ async function withSessionStore(users, aliases, fn) {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-mcp-identity-'))
   const previousPath = process.env.SESSION_KEYS_PATH
   const previousEncryptionKey = process.env.SESSION_KEY_ENCRYPTION_KEY
+  const previousVaultPath = process.env.VAULT_PATH
+  const previousActivityPath = process.env.VAULT_ACTIVITY_PATH
+  const previousSessionPath = process.env.VAULT_SESSION_PATH
   process.env.SESSION_KEYS_PATH = join(dir, 'session-keys.json')
   process.env.SESSION_KEY_ENCRYPTION_KEY = 'test-only-session-encryption-key'
+  process.env.VAULT_PATH = join(dir, 'vault.json')
+  process.env.VAULT_ACTIVITY_PATH = join(dir, 'vault-activity.json')
+  process.env.VAULT_SESSION_PATH = join(dir, 'vault-sessions.json')
   await writeFile(process.env.SESSION_KEYS_PATH, JSON.stringify({ users, aliases }), 'utf8')
+  await writeFile(process.env.VAULT_PATH, JSON.stringify({ credentials: [], limits: {}, approvals: [] }), 'utf8')
+  await writeFile(process.env.VAULT_ACTIVITY_PATH, '[]', 'utf8')
+  await writeFile(process.env.VAULT_SESSION_PATH, JSON.stringify({ tokens: {} }), 'utf8')
   try {
     const { resolveActiveMsca } = await import('../src/services/mcpServer.mjs?identity-' + Date.now() + '-' + Math.random())
     const createMcpServer = (await import('../src/services/mcpServer.mjs?identity-' + Date.now() + '-' + Math.random())).createMcpServer
@@ -25,6 +34,12 @@ async function withSessionStore(users, aliases, fn) {
     else process.env.SESSION_KEYS_PATH = previousPath
     if (previousEncryptionKey === undefined) delete process.env.SESSION_KEY_ENCRYPTION_KEY
     else process.env.SESSION_KEY_ENCRYPTION_KEY = previousEncryptionKey
+    if (previousVaultPath === undefined) delete process.env.VAULT_PATH
+    else process.env.VAULT_PATH = previousVaultPath
+    if (previousActivityPath === undefined) delete process.env.VAULT_ACTIVITY_PATH
+    else process.env.VAULT_ACTIVITY_PATH = previousActivityPath
+    if (previousSessionPath === undefined) delete process.env.VAULT_SESSION_PATH
+    else process.env.VAULT_SESSION_PATH = previousSessionPath
     await rm(dir, { recursive: true, force: true })
   }
 }
@@ -153,39 +168,9 @@ test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
   }
 })
 
-test('MCP rejects Arbitrum→Arc bridge before any source burn when router is absent', async () => {
-  const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE
-  process.env.ENABLE_MSCA_CCTP_BRIDGE = 'true'
-  try {
-    await withSessionStore({
-      [MSCA.toLowerCase()]: {
-        walletAddress: MSCA,
-        delegateAddress: OTHER,
-        active: true,
-        authorizationUserOpHash: '0x' + 'a'.repeat(64),
-      },
-    }, { [EOA.toLowerCase()]: MSCA }, async ({ createMcpServer }) => {
-      const server = createMcpServer(EOA)
-      const quote = await server._registeredTools.arcox_quote_bridge.handler({
-        fromChain: 'arbitrum-sepolia', toChain: 'arc-testnet', amount: '1', token: 'USDC', source: 'session',
-      })
-      const result = JSON.parse(quote.content[0].text)
-      assert.equal(result.rejected, true)
-      assert.equal(result.reason, 'bridge_route_not_supported_for_msca')
-
-      const execute = await server._registeredTools.arcox_execute_bridge.handler({
-        fromChain: 'arbitrum-sepolia', toChain: 'arc-testnet', amount: '1', token: 'USDC', source: 'session',
-        previewId: 'quote_that_must_not_be_used', confirmed: true, confirmationText: 'yes',
-      })
-      const executeResult = JSON.parse(execute.content[0].text)
-      assert.equal(executeResult.status, 'rejected')
-      assert.equal(executeResult.executed, false)
-      assert.equal(executeResult.reason, 'bridge_route_not_supported_for_msca')
-    })
-  } finally {
-    if (previousBridgeFlag === undefined) delete process.env.ENABLE_MSCA_CCTP_BRIDGE
-    else process.env.ENABLE_MSCA_CCTP_BRIDGE = previousBridgeFlag
-  }
+test('MCP recognizes Arbitrum→Arc as an MSCA route before any source burn', async () => {
+  const { isMscaCctpRouteConfigured } = await import('../src/services/mcpServer.mjs?arb-arc-route-' + Date.now() + '-' + Math.random())
+  assert.equal(isMscaCctpRouteConfigured('arbitrum-sepolia', 'arc-testnet'), true)
 })
 
 test('MCP resolver fails closed without an active explicit MSCA session', async () => {
@@ -208,6 +193,96 @@ test('MSCA-bound quote fields distinguish the active wallet', () => {
   const quote = { walletAddress: MSCA, amount: '1', token: 'USDC' }
   const current = { walletAddress: OTHER, amount: '1', token: 'USDC' }
   assert.notEqual(quote.walletAddress.toLowerCase(), current.walletAddress.toLowerCase())
+})
+
+test('MCP quote handler blocks a new quote when a source intent is unresolved', async () => {
+  const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE
+  process.env.ENABLE_MSCA_CCTP_BRIDGE = 'true'
+  try {
+    await withSessionStore({
+      [MSCA.toLowerCase()]: {
+        walletAddress: MSCA,
+        delegateAddress: OTHER,
+        active: true,
+        authorizationUserOpHash: '0x' + 'c'.repeat(64),
+      },
+    }, { [EOA.toLowerCase()]: MSCA }, async ({ createMcpServer }) => {
+      const { createApproval, updateApprovalStatus } = await import('../src/services/vaultStore.mjs')
+      const pending = createApproval(EOA.toLowerCase(), {
+        agent: 'test-agent',
+        action: 'bridge',
+        amount: '1',
+        token: 'USDC',
+        source: 'session',
+        details: JSON.stringify({
+          fromChain: 'Arc_Testnet',
+          toChain: 'Base_Sepolia',
+          previewId: 'old-preview',
+          walletAddress: MSCA,
+          settlementPhase: 'source_submission_unknown',
+        }),
+        forcePending: true,
+      })
+      updateApprovalStatus(EOA.toLowerCase(), pending.id, 'pending_confirmation')
+      const server = createMcpServer(EOA.toLowerCase())
+      const response = await server._registeredTools.arcox_quote_bridge.handler({
+        fromChain: 'arc-testnet',
+        toChain: 'base-sepolia',
+        amount: '1',
+        token: 'USDC',
+        source: 'session',
+      })
+      const result = JSON.parse(response.content[0].text)
+      assert.equal(result.rejected, true)
+      assert.equal(result.reason, 'unresolved_source_intent')
+      assert.equal(result.approvalId, pending.id)
+    })
+  } finally {
+    if (previousBridgeFlag === undefined) delete process.env.ENABLE_MSCA_CCTP_BRIDGE
+    else process.env.ENABLE_MSCA_CCTP_BRIDGE = previousBridgeFlag
+  }
+})
+
+test('unresolved source intent helper cannot be bypassed with a new bridge quote', async () => {
+  const { hasUnresolvedSourceBridgeIntent } = await import('../src/services/mcpServer.mjs?unresolved-source-' + Date.now())
+  const pending = {
+    id: 'approval-source-unknown',
+    action: 'bridge',
+    status: 'pending_confirmation',
+    details: JSON.stringify({
+      fromChain: 'Arc_Testnet',
+      toChain: 'Base_Sepolia',
+      previewId: 'old-preview',
+      walletAddress: MSCA,
+      settlementPhase: 'source_submission_unknown',
+    }),
+  }
+  assert.equal(hasUnresolvedSourceBridgeIntent([pending], {
+    fromChain: 'Arc_Testnet',
+    toChain: 'Base_Sepolia',
+    walletAddress: MSCA,
+  })?.approval.id, pending.id)
+  assert.equal(hasUnresolvedSourceBridgeIntent([pending], {
+    fromChain: 'Arc_Testnet',
+    toChain: 'Arbitrum_Sepolia',
+    walletAddress: MSCA,
+  }), null)
+  assert.equal(hasUnresolvedSourceBridgeIntent([{
+    ...pending,
+    details: JSON.stringify({ ...JSON.parse(pending.details), settlementPhase: 'source_reverted' }),
+  }], {
+    fromChain: 'Arc_Testnet',
+    toChain: 'Base_Sepolia',
+    walletAddress: MSCA,
+  }), null)
+  assert.equal(hasUnresolvedSourceBridgeIntent([{
+    ...pending,
+    details: JSON.stringify({ ...JSON.parse(pending.details), walletAddress: '' }),
+  }], {
+    fromChain: 'Arc_Testnet',
+    toChain: 'Base_Sepolia',
+    walletAddress: MSCA,
+  })?.approval.id, pending.id)
 })
 
 test('multi-chain balance preserves a structured error for an unavailable chain', async () => {

@@ -16,7 +16,19 @@ const BASE_TO_ARC_ROUTE = {
   fromKey: 'Base_Sepolia',
   toKey: 'Arc_Testnet',
   source: { tokenMessenger: TOKEN_MESSENGER, router: '0x9425cC5b3C8B9e0FCb35beBdE737B4365A614Acc', usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e' },
-  destination: { domain: 26, requiredFinalityThreshold: 2000, tokenMessenger: TOKEN_MESSENGER, messageTransmitter: MESSAGE_TRANSMITTER, rpcUrl: 'https://example.invalid/arc' },
+  destination: { domain: 26, requiredFinalityThreshold: 1000, tokenMessenger: TOKEN_MESSENGER, messageTransmitter: MESSAGE_TRANSMITTER, rpcUrl: 'https://example.invalid/arc' },
+}
+const ARC_TO_ARBITRUM_ROUTE = {
+  fromKey: 'Arc_Testnet',
+  toKey: 'Arbitrum_Sepolia',
+  source: { tokenMessenger: TOKEN_MESSENGER, router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7', usdc: '0x3600000000000000000000000000000000000000' },
+  destination: { domain: 3, requiredFinalityThreshold: 1000, tokenMessenger: TOKEN_MESSENGER, messageTransmitter: MESSAGE_TRANSMITTER, rpcUrl: 'https://example.invalid/arbitrum' },
+}
+const ARBITRUM_TO_ARC_ROUTE = {
+  fromKey: 'Arbitrum_Sepolia',
+  toKey: 'Arc_Testnet',
+  source: { tokenMessenger: TOKEN_MESSENGER, router: '0x5dCAA895dDc7350cF0f9eb69E69536a4548b0cA7', usdc: '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d' },
+  destination: { domain: 26, requiredFinalityThreshold: 1000, tokenMessenger: TOKEN_MESSENGER, messageTransmitter: MESSAGE_TRANSMITTER, rpcUrl: 'https://example.invalid/arc' },
 }
 
 function messageFor(recipient, route = ROUTE) {
@@ -195,7 +207,28 @@ test('bridge status fetches and binds the requested burnTxHash', async () => {
   }
 })
 
-test('Base→Arc calldata requests finalized CCTP threshold 2000', async () => {
+test('Arc→Base calldata keeps the proven standard CCTP threshold 1000', async () => {
+  const { buildMscaRouterBridgeCalls } = await import('../src/services/mcpServer.mjs?arc-base-regression-' + Date.now() + '-' + Math.random())
+  const calls = buildMscaRouterBridgeCalls({ route: ROUTE, amount: 1_000_000n, mintRecipient: MSCA })
+  const decoded = decodeFunctionData({
+    abi: [{
+      type: 'function', name: 'bridgeUsdcWithFee', stateMutability: 'nonpayable',
+      inputs: [
+        { name: 'amount', type: 'uint256' }, { name: 'destinationDomain', type: 'uint32' },
+        { name: 'mintRecipient', type: 'bytes32' }, { name: 'destinationCaller', type: 'bytes32' },
+        { name: 'maxFee', type: 'uint256' }, { name: 'minFinalityThreshold', type: 'uint32' },
+      ], outputs: [],
+    }],
+    data: calls[1].data,
+  })
+  assert.equal(calls[0].to.toLowerCase(), ROUTE.source.usdc.toLowerCase())
+  assert.equal(calls[1].to.toLowerCase(), ROUTE.source.router.toLowerCase())
+  assert.equal(decoded.args?.[1], 6)
+  assert.equal(decoded.args?.[5], 1000)
+  assert.equal(decoded.args?.[2], '0x' + MSCA.slice(2).toLowerCase().padStart(64, '0'))
+})
+
+test('Base→Arc calldata mirrors frontend fast CCTP threshold 1000', async () => {
   const { buildMscaRouterBridgeCalls } = await import('../src/services/mcpServer.mjs?base-arc-finality-' + Date.now() + '-' + Math.random())
   const route = {
     fromKey: 'Base_Sepolia',
@@ -205,7 +238,7 @@ test('Base→Arc calldata requests finalized CCTP threshold 2000', async () => {
       usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
       router: '0x9425cC5b3C8B9e0FCb35beBdE737B4365A614Acc',
     },
-    destination: { domain: 26, requiredFinalityThreshold: 2000 },
+    destination: { domain: 26, requiredFinalityThreshold: 1000 },
   }
   const calls = buildMscaRouterBridgeCalls({ route, amount: 1_000_000n, mintRecipient: MSCA })
   const decoded = decodeFunctionData({
@@ -219,12 +252,37 @@ test('Base→Arc calldata requests finalized CCTP threshold 2000', async () => {
     }],
     data: calls[1].data,
   })
-  assert.equal(decoded.args?.[5], 2000)
+  assert.equal(decoded.args?.[5], 1000)
 })
 
-test('Arbitrum→Arc is not advertised until a source ArcoxRouter is configured', async () => {
-  const { isMscaCctpRouteConfigured } = await import('../src/services/mcpServer.mjs?arb-arc-capability-' + Date.now() + '-' + Math.random())
-  assert.equal(isMscaCctpRouteConfigured('arbitrum-sepolia', 'arc-testnet'), false)
+test('all four Arc↔Base and Arc↔Arbitrum MSCA routes are advertised', async () => {
+  const { isMscaCctpRouteConfigured } = await import('../src/services/mcpServer.mjs?four-route-capability-' + Date.now() + '-' + Math.random())
+  assert.deepEqual([
+    ['arc-testnet', 'base-sepolia'],
+    ['base-sepolia', 'arc-testnet'],
+    ['arc-testnet', 'arbitrum-sepolia'],
+    ['arbitrum-sepolia', 'arc-testnet'],
+  ].map(([from, to]) => isMscaCctpRouteConfigured(from, to)), [true, true, true, true])
+})
+
+test('all four route calldata builders bind the correct source router, domain, and MSCA', async () => {
+  const { buildMscaRouterBridgeCalls } = await import('../src/services/mcpServer.mjs?four-route-calldata-' + Date.now() + '-' + Math.random())
+  const routes = [ROUTE, BASE_TO_ARC_ROUTE, ARC_TO_ARBITRUM_ROUTE, ARBITRUM_TO_ARC_ROUTE]
+  for (const route of routes) {
+    const calls = buildMscaRouterBridgeCalls({ route, amount: 1_000_000n, mintRecipient: MSCA })
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0].to.toLowerCase(), route.source.usdc.toLowerCase())
+    assert.equal(calls[1].to.toLowerCase(), route.source.router.toLowerCase())
+    const decoded = decodeFunctionData({
+      abi: [{ type: 'function', name: 'bridgeUsdcWithFee', stateMutability: 'nonpayable', inputs: [
+        { name: 'amount', type: 'uint256' }, { name: 'destinationDomain', type: 'uint32' }, { name: 'mintRecipient', type: 'bytes32' }, { name: 'destinationCaller', type: 'bytes32' }, { name: 'maxFee', type: 'uint256' }, { name: 'minFinalityThreshold', type: 'uint32' },
+      ], outputs: [] }],
+      data: calls[1].data,
+    })
+    assert.equal(decoded.args?.[1], route.destination.domain)
+    assert.equal(decoded.args?.[2], `0x${MSCA.slice(2).toLowerCase().padStart(64, '0')}`)
+    assert.equal(decoded.args?.[5], 1000)
+  }
 })
 
 test('decoded pending Iris message remains retryable until attestation exists', async () => {

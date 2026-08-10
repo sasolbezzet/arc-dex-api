@@ -491,7 +491,11 @@ async function circleWebhookPublicKey(keyId) {
 
   const apiKey = String(process.env.CIRCLE_API_KEY || '').trim()
   if (!apiKey) throw new Error('CIRCLE_API_KEY is required for Circle webhook verification')
-  const baseUrl = String(process.env.CIRCLE_BASE_URL || 'https://api-sandbox.circle.com').replace(/\/+$/, '')
+  // Circle v2 Gateway webhook public keys are served from the production
+  // notifications API even for TEST subscriptions. Keep the legacy
+  // CIRCLE_BASE_URL for other sandbox product calls, but allow an explicit
+  // override for operators who use a private/proxied Circle endpoint.
+  const baseUrl = String(process.env.CIRCLE_WEBHOOK_API_BASE_URL || 'https://api.circle.com').replace(/\/+$/, '')
   const response = await fetch(`${baseUrl}/v2/notifications/publicKey/${encodeURIComponent(keyId)}`, {
     headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
     signal: AbortSignal.timeout(8_000),

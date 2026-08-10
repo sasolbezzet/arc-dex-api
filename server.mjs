@@ -2,7 +2,7 @@
 import './src/polyfill-node.mjs'
 import 'dotenv/config'
 import express from 'express'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto'
 import { AppKit, SwapChain } from '@circle-fin/app-kit'
 import * as BridgeKitChains from '@circle-fin/bridge-kit'
@@ -25,6 +25,7 @@ import { estimateUnifiedBalanceX402, getX402Invoice, markUnifiedBalanceSpendSubm
 import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
+import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus } from './src/services/circleWalletWebhookService.mjs'
 
 process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -61,7 +62,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.status(204).end()
   next()
 })
-app.use(['/api/webhooks/circle', '/api/webhooks/circle-gateway', '/api/circle/webhook'], express.raw({ type: '*/*', limit: '256kb' }))
+app.use(['/api/webhooks/circle', '/api/webhooks/circle-wallet', '/api/webhooks/circle-gateway', '/api/circle/webhook'], express.raw({ type: '*/*', limit: '256kb' }))
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || process.env.AI_ROUTER_JSON_BODY_LIMIT || '8mb'
 app.use(express.json({ limit: JSON_BODY_LIMIT }))
 // OAuth 2.1 token/registration endpoints send application/x-www-form-urlencoded.
@@ -291,6 +292,10 @@ app.post('/api/pending-txs/:txId/submit', apiLimiter, requireAuth, async (req, r
     }
 
     // Relay signed UserOp to chain via Circle RPC
+    const { validateSignedUserOperationFees } = await import('./src/services/sessionKeyService.mjs')
+    const feeValidation = validateSignedUserOperationFees({ chainKey: tx.chainKey || 'arc-testnet', signedUserOp })
+    if (!feeValidation.ok) return res.status(400).json({ error: feeValidation.reason, ...feeValidation })
+
     const { toModularTransport } = await import('@circle-fin/modular-wallets-core')
     const { createPublicClient, defineChain } = await import('viem')
     const CLIENT_URL = process.env.CIRCLE_CLIENT_URL
@@ -1366,24 +1371,104 @@ function extractCircleGatewayFields(payload = {}) {
   }
 }
 
-function saveGenericWebhookEvent(provider, notificationId, eventType, rawPayload, extra = {}) {
-  const eventDb = loadWebhookEvents()
-  const id = String(notificationId || `${provider}_${Date.now()}_${randomUUID().slice(0, 8)}`)
-  if (eventDb[id]) return { duplicate: true, event: eventDb[id] }
-  const event = {
-    id: `wh_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`,
-    provider,
-    notificationId: id,
-    eventType: String(eventType || ''),
-    rawPayload,
-    processed: false,
-    matched: false,
-    createdAt: nowIso(),
-    ...extra,
+// Protect webhook idempotency across concurrent PM2 workers. Atomic rename
+// protects a single write, but without a read-modify-write lock two workers
+// could both accept the same notificationId.
+function withWebhookDbLock(fn) {
+  const lockPath = `${WEBHOOK_DB}.lock`
+  const ownerToken = `${process.pid}:${randomUUID()}`
+  const ownerPath = `${lockPath}/owner`
+  const deadline = Date.now() + 5000
+  const sleeper = new Int32Array(new SharedArrayBuffer(4))
+  while (true) {
+    try {
+      mkdirSync(lockPath)
+      writeFileSync(ownerPath, JSON.stringify({ token: ownerToken, acquiredAt: Date.now() }), { mode: 0o600 })
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      try {
+        const owner = JSON.parse(readFileSync(ownerPath, 'utf8'))
+        if (Date.now() - Number(owner?.acquiredAt || 0) > 15000) rmSync(lockPath, { recursive: true, force: true })
+      } catch {
+        try { if (Date.now() - statSync(lockPath).mtimeMs > 15000) rmSync(lockPath, { recursive: true, force: true }) } catch { /* another worker may be acquiring */ }
+      }
+      if (Date.now() >= deadline) throw new Error('Webhook dedupe lock timeout')
+      Atomics.wait(sleeper, 0, 0, 10)
+    }
   }
-  eventDb[id] = event
-  saveWebhookEvents(eventDb)
-  return { duplicate: false, event }
+  try { return fn() } finally {
+    try {
+      const owner = JSON.parse(readFileSync(ownerPath, 'utf8'))
+      if (owner?.token === ownerToken) rmSync(lockPath, { recursive: true, force: true })
+    } catch { /* stale recovery or another worker owns the lock */ }
+  }
+}
+
+function saveGenericWebhookEvent(provider, notificationId, eventType, rawPayload, extra = {}) {
+  return withWebhookDbLock(() => {
+    const eventDb = loadWebhookEvents()
+    const id = String(notificationId || `${provider}_${Date.now()}_${randomUUID().slice(0, 8)}`)
+    if (eventDb[id]) return { duplicate: true, event: eventDb[id] }
+    const event = {
+      id: `wh_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`,
+      provider,
+      notificationId: id,
+      eventType: String(eventType || ''),
+      rawPayload,
+      processed: false,
+      matched: false,
+      createdAt: nowIso(),
+      ...extra,
+    }
+    eventDb[id] = event
+    saveWebhookEvents(eventDb)
+    return { duplicate: false, event }
+  })
+}
+
+function updateGenericWebhookEvent(notificationId, mutate) {
+  return withWebhookDbLock(() => {
+    const eventDb = loadWebhookEvents()
+    const event = eventDb[String(notificationId)]
+    if (!event) return null
+    const next = mutate({ ...event }) || event
+    eventDb[String(notificationId)] = next
+    saveWebhookEvents(eventDb)
+    return next
+  })
+}
+
+// Webhooks are only a wake-up hint. An exact hash match may resume the
+// attestation worker, but this path never submits receiveMessage or marks a
+// mint complete. Destination mint remains wallet-signed/on-chain verified.
+function wakeAutoMintFromWebhook(reconciliation, status) {
+  if (!isSuccessfulCircleWalletStatus(status)) return []
+  const queued = []
+  for (const match of reconciliation?.matches || []) {
+    const details = match?.details || {}
+    const burnTxHash = String(details.burnTxHash || '')
+    if (!/^0x[0-9a-f]{64}$/i.test(burnTxHash)) continue
+    if (!CCTP[details.fromChain] || !CCTP[details.toChain]) continue
+    // Only a source burn/UserOperation notification may wake attestation
+    // polling. A successful destination UserOperation must not restart a
+    // source worker or create a second mint path.
+    const webhookTx = String(details.webhookTxHash || '').toLowerCase()
+    const webhookOp = String(details.webhookUserOpHash || '').toLowerCase()
+    const sourceOp = String(details.sourceUserOpHash || '').toLowerCase()
+    const sourceHashMatch = webhookTx === burnTxHash.toLowerCase() || (sourceOp && webhookOp === sourceOp)
+    if (!sourceHashMatch) continue
+    try {
+      const existing = autoMintJobs.get(burnTxHash)
+      if (!existing || !['polling', 'ready'].includes(existing.status)) {
+        startAutoMintWorker(burnTxHash, burnTxHash, details.fromChain, details.toChain, match.owner)
+      }
+      queued.push({ approvalId: match.id, jobId: burnTxHash, status: existing?.status || 'polling' })
+    } catch (error) {
+      console.error('[webhook:auto-mint]', error.message)
+    }
+  }
+  return queued
 }
 
 function findInvoiceForWebhook(payload) {
@@ -1496,21 +1581,24 @@ async function pollAttestation(domain, txHash, maxRetries = 60, fastMode = false
   const url = `https://iris-api-sandbox.circle.com/v2/messages/${domain}?transactionHash=${txHash}`
   console.log(`[iris] polling: domain=${domain} tx=${txHash.slice(0,12)}... (fast=${fastMode})`)
   let lastStatus = ''
+  let consecutiveRateLimits = 0
   for (let i = 0; i < maxRetries; i++) {
-    // Adaptive delay: fast chains (instant finality) poll quicker
-    let delay
-    if (fastMode) {
-      delay = 500
-    } else if (i < 20) {
-      delay = 500  // First 10s: aggressive
-    } else if (i < 60) {
-      delay = 1000 // Next 40s: moderate
-    } else {
-      delay = 2000 // After 60s: slow/patient
-    }
+    // Adaptive delay: avoid hammering Iris while still giving fast routes a
+    // quick first check. Circle documents 429 responses as temporary service
+    // throttling, so honor Retry-After when present and back off exponentially.
+    let delay = fastMode ? 500 : (i < 20 ? 500 : i < 60 ? 1000 : 2000)
+    if (consecutiveRateLimits > 0) delay = Math.min(Math.max(delay, 1000) * (2 ** Math.min(consecutiveRateLimits, 4)), 30_000)
     await new Promise(r => setTimeout(r, delay))
     try {
       const r = await fetch(url, { headers: { Accept: 'application/json' } })
+      if (r.status === 429) {
+        consecutiveRateLimits++
+        const retryAfter = Number(r.headers.get('retry-after') || 0)
+        if (retryAfter > 0) await new Promise(resolve => setTimeout(resolve, Math.min(retryAfter * 1000, 60_000)))
+        if (i % 5 === 0) console.log(`[iris] HTTP 429 (retry ${i + 1}/${maxRetries}, backoff=${consecutiveRateLimits})`)
+        continue
+      }
+      consecutiveRateLimits = 0
       if (!r.ok) { if (i % 10 === 0) console.log(`[iris] HTTP ${r.status} (retry ${i+1}/${maxRetries})`); continue }
       const ct = r.headers.get('content-type') || ''
       if (!ct.includes('json')) { if (i % 10 === 0) console.log('[iris] non-JSON response'); continue }
@@ -1526,7 +1614,10 @@ async function pollAttestation(domain, txHash, maxRetries = 60, fastMode = false
         console.log(`[iris] ✓ attestation ready after ~${elapsed.toFixed(1)}s`)
         return { attestation: msg.attestation, message: msg.message }
       }
-    } catch(e) { if (i % 10 === 0) console.log(`[iris] error: ${e.message}`) }
+    } catch(e) {
+      if (i % 10 === 0) console.log(`[iris] error: ${e.message}`)
+      consecutiveRateLimits = Math.min(consecutiveRateLimits + 1, 4)
+    }
   }
   return null
 }
@@ -2965,6 +3056,78 @@ app.post('/api/webhooks/circle', apiLimiter, async (req, res) => {
     eventType: fields.eventType || null,
     status: fields.status || null,
   })
+})
+
+app.head('/api/webhooks/circle-wallet', (_req, res) => res.status(200).end())
+
+app.get('/api/webhooks/circle-wallet', (_req, res) => {
+  res.json({
+    ok: true,
+    provider: 'circle',
+    product: 'wallets',
+    message: 'Circle Wallets webhook endpoint is alive. Use POST for callbacks.',
+  })
+})
+
+app.post('/api/webhooks/circle-wallet', apiLimiter, async (req, res) => {
+  try {
+    const rawBody = rawWebhookBody(req)
+    const payload = parseWebhookJson(rawBody)
+    const verification = await verifyCircleWebhookSignature(req, rawBody)
+    if (!verification.ok) return res.status(401).json({ ok: false, provider: 'circle', product: 'wallets', error: verification.error })
+
+    const eventId = firstWebhookString(payload.notificationId, payload.id, payload.eventId, payload.notification?.id)
+    const eventType = firstWebhookString(payload.notificationType, payload.type, payload.eventType, payload.notification?.type)
+    const walletEventPrefixes = ['transactions.', 'challenges.', 'contracts.', 'modularWallet.', 'travelRule.', 'rampSession.']
+    if (!eventId) return res.status(400).json({ ok: false, provider: 'circle', product: 'wallets', error: 'notificationId is required' })
+    if (eventType !== 'webhooks.test' && !walletEventPrefixes.some(prefix => eventType.startsWith(prefix))) {
+      return res.status(400).json({ ok: false, provider: 'circle', product: 'wallets', error: 'Unsupported Wallets notification type' })
+    }
+    const notification = payload.notification && typeof payload.notification === 'object' ? payload.notification : payload.data && typeof payload.data === 'object' ? payload.data : {}
+    const extracted = extractCircleWalletTransaction(payload)
+    const saved = saveGenericWebhookEvent('circle-wallets', eventId, eventType, payload, {
+      relatedTxHash: extracted.txHash || undefined,
+      relatedUserOpHash: extracted.userOpHash || undefined,
+      walletAddress: extracted.walletAddress || undefined,
+      status: extracted.status || undefined,
+    })
+    let reconciliation = { matched: 0, updated: 0, ignored: true, reason: 'duplicate_event' }
+    if (!saved.duplicate) {
+      const { reconcileCircleWalletWebhook } = await import('./src/services/vaultStore.mjs')
+      reconciliation = reconcileCircleWalletWebhook({
+        walletAddress: extracted.walletAddress,
+        txHash: extracted.txHash,
+        userOpHash: extracted.userOpHash,
+        status: extracted.status,
+        eventId,
+        eventType,
+      })
+      const autoMint = wakeAutoMintFromWebhook(reconciliation, extracted.status)
+      saved.event.processed = true
+      saved.event.processedAt = nowIso()
+      saved.event.reconciliation = reconciliation
+      saved.event.autoMint = autoMint
+      updateGenericWebhookEvent(eventId, () => saved.event)
+    }
+
+    res.json({
+      ok: true,
+      received: true,
+      provider: 'circle',
+      product: 'wallets',
+      duplicate: Boolean(saved.duplicate),
+      eventId,
+      eventType,
+      status: extracted.status || firstWebhookString(notification.status, notification.state) || null,
+      txHash: extracted.txHash,
+      userOpHash: extracted.userOpHash,
+      walletAddress: extracted.walletAddress,
+      reconciliation,
+      autoMint: saved.event.autoMint || [],
+    })
+  } catch (error) {
+    res.status(400).json({ ok: false, provider: 'circle', product: 'wallets', error: error.message })
+  }
 })
 
 app.post('/api/webhooks/circle-gateway', apiLimiter, async (req, res) => {

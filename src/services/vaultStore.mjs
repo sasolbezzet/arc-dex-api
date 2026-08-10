@@ -3,9 +3,9 @@ import { randomUUID } from 'crypto'
 import { mkdirSync, rmSync, statSync } from 'fs'
 import { dirname } from 'path'
 
-const VAULT_PATH = process.env.VAULT_PATH || './data/vault.json'
-const ACTIVITY_PATH = process.env.VAULT_ACTIVITY_PATH || './data/vault-activity.json'
-const SESSION_PATH = process.env.VAULT_SESSION_PATH || './data/vault-sessions.json'
+function vaultPath() { return process.env.VAULT_PATH || './data/vault.json' }
+function activityPath() { return process.env.VAULT_ACTIVITY_PATH || './data/vault-activity.json' }
+function sessionPath() { return process.env.VAULT_SESSION_PATH || './data/vault-sessions.json' }
 
 // ── Session tokens (persisted to disk, TTL 24h) ──
 // Backend session tokens used to live only in memory, so every backend restart
@@ -14,7 +14,7 @@ const SESSION_PATH = process.env.VAULT_SESSION_PATH || './data/vault-sessions.js
 // vault deep-link. Persisting them to a JSON file survives restarts.
 const SESSION_TTL_MS = 86400000 // 24h
 function loadSessions() {
-  const data = readJsonFile(SESSION_PATH, { tokens: {} })
+  const data = readJsonFile(sessionPath(), { tokens: {} })
   const map = new Map(Object.entries(data.tokens || {}))
   // Drop anything already expired at load time.
   const now = Date.now()
@@ -26,7 +26,7 @@ function loadSessions() {
   return map
 }
 function persistSessions(map) {
-  atomicWriteJsonFile(SESSION_PATH, { tokens: Object.fromEntries(map) })
+  atomicWriteJsonFile(sessionPath(), { tokens: Object.fromEntries(map) })
 }
 const sessionTokens = loadSessions() // token -> { userId, expires }
 
@@ -93,17 +93,17 @@ export function listMcpSessions(userId) {
 
 // ── Helpers ──
 function loadVault() {
-  return readJsonFile(VAULT_PATH, { credentials: [], limits: {}, approvals: [] })
+  return readJsonFile(vaultPath(), { credentials: [], limits: {}, approvals: [] })
 }
 function saveVault(v) {
-  atomicWriteJsonFile(VAULT_PATH, v)
+  atomicWriteJsonFile(vaultPath(), v)
 }
 
 // Credential setup can be retried concurrently by multiple frontend callbacks.
 // Serialize the read-modify-write section across Node processes so idempotency
 // is preserved even when more than one worker serves the vault endpoint.
 function withVaultLock(fn) {
-  const lockPath = `${VAULT_PATH}.lock`
+  const lockPath = `${vaultPath()}.lock`
   const ownerToken = `${process.pid}:${randomUUID()}`
   const ownerPath = `${lockPath}/owner`
   mkdirSync(dirname(lockPath), { recursive: true })
@@ -138,12 +138,12 @@ function withVaultLock(fn) {
   }
 }
 function loadActivity() {
-  return readJsonFile(ACTIVITY_PATH, [])
+  return readJsonFile(activityPath(), [])
 }
 function saveActivity(a) {
   // Keep last 500 entries
   if (a.length > 500) a = a.slice(-500)
-  atomicWriteJsonFile(ACTIVITY_PATH, a)
+  atomicWriteJsonFile(activityPath(), a)
 }
 
 // ── Credentials ──
@@ -347,11 +347,83 @@ export function updateApprovalStatus(owner, id, status, extra = {}) {
   if (extra.explorerUrl) a.explorerUrl = extra.explorerUrl
   if (extra.userOpHash) a.userOpHash = extra.userOpHash
   if (extra.error) a.error = extra.error
+  if (extra.details !== undefined) {
+    try {
+      const previous = JSON.parse(a.details || '{}')
+      const next = typeof extra.details === 'string' ? JSON.parse(extra.details) : extra.details
+      a.details = JSON.stringify({ ...previous, ...(next && typeof next === 'object' ? next : {}) })
+    } catch {
+      a.details = String(extra.details)
+    }
+  }
   if (['approved', 'auto_approved'].includes(status) && !a.approvedAt) a.approvedAt = Date.now()
   if (['success', 'error', 'rejected', 'denied'].includes(status) && !a.completedAt) a.completedAt = Date.now()
   saveVault(v)
   logActivity(owner, `approval_${status}`, { id, action: a.action, txHash: extra.txHash || '' })
   return a
+}
+
+/**
+ * Reconcile a Circle Wallets webhook against bridge approvals without trusting
+ * the webhook as proof of settlement. The webhook is an event hint: receipt,
+ * CCTP attestation, and destination nonce checks still decide final success.
+ */
+export function reconcileCircleWalletWebhook({ walletAddress, txHash, userOpHash, status, eventId, eventType } = {}) {
+  const normalizedWallet = String(walletAddress || '').toLowerCase()
+  const normalizedTx = String(txHash || '').toLowerCase()
+  const normalizedUserOp = String(userOpHash || '').toLowerCase()
+  const failed = ['failed', 'reverted', 'denied', 'rejected', 'cancelled', 'canceled', 'error'].includes(String(status || '').toLowerCase())
+  const successful = ['complete', 'completed', 'confirmed', 'success', 'succeeded'].includes(String(status || '').toLowerCase())
+  // A wallet address identifies an owner, not one bridge operation. Never use
+  // it as the sole correlation key: a duplicate/late notification could then
+  // mutate an unrelated pending bridge for the same MSCA.
+  if (!normalizedTx && !normalizedUserOp) return { matched: 0, updated: 0, ignored: true, reason: 'webhook_reference_missing' }
+  const matches = withVaultLock(() => {
+    const v = loadVault()
+    const candidates = []
+    for (const approval of v.approvals || []) {
+      let details = {}
+      try { details = JSON.parse(approval.details || '{}') } catch { details = {} }
+      if (approval.action !== 'bridge' && details.action !== 'bridge') continue
+      const txMatch = normalizedTx && [approval.txHash, details.txHash, details.burnTxHash, details.webhookTxHash].some(value => String(value || '').toLowerCase() === normalizedTx)
+      const userOpMatch = normalizedUserOp && [approval.userOpHash, details.sourceUserOpHash, details.destinationUserOpHash, details.webhookUserOpHash].some(value => String(value || '').toLowerCase() === normalizedUserOp)
+      if (!txMatch && !userOpMatch) continue
+      // The HTTP route deduplicates notificationId; keep this guard here too so
+      // direct callers and concurrent workers remain idempotent.
+      if (eventId && details.webhookEventId === eventId) continue
+      candidates.push({ approval, details })
+    }
+    // A hash must identify exactly one approval. Refuse to mutate anything when
+    // old/duplicated records make the reference ambiguous.
+    if (candidates.length > 1) return { ambiguous: true, matches: [] }
+    const changed = []
+    for (const { approval, details } of candidates) {
+      const previousStatus = approval.status
+      details.webhookEventId = eventId || details.webhookEventId || null
+      details.webhookEventType = eventType || details.webhookEventType || null
+      details.webhookStatus = status || null
+      details.webhookObservedAt = new Date().toISOString()
+      if (normalizedWallet) details.webhookWalletAddress = walletAddress
+      if (normalizedTx) details.webhookTxHash = txHash
+      if (normalizedUserOp) details.webhookUserOpHash = userOpHash
+      let nextStatus = previousStatus
+      if (failed && !['success', 'error', 'rejected', 'denied'].includes(previousStatus)) nextStatus = 'error'
+      else if (successful && !['success', 'error', 'rejected', 'denied'].includes(previousStatus)) nextStatus = 'pending_confirmation'
+      approval.status = nextStatus
+      approval.details = JSON.stringify(details)
+      if (normalizedTx) approval.txHash = txHash
+      if (normalizedUserOp) approval.userOpHash = userOpHash
+      if (failed) approval.error = `Circle Wallet webhook reported ${status}`
+      if (nextStatus === 'error' && !approval.completedAt) approval.completedAt = Date.now()
+      changed.push({ id: approval.id, owner: approval.owner, previousStatus, status: nextStatus, details })
+    }
+    if (changed.length) saveVault(v)
+    return { ambiguous: false, matches: changed }
+  })
+  if (matches.ambiguous) return { matched: 0, updated: 0, ignored: true, reason: 'webhook_reference_ambiguous' }
+  if (!matches.matches.length) return { matched: 0, updated: 0, ignored: true, reason: 'webhook_reference_not_found' }
+  for (const match of matches.matches) logActivity(match.owner, 'approval_webhook_reconciled', { id: match.id, eventId, eventType, status, txHash, userOpHash })
+  return { matched: matches.matches.length, updated: matches.matches.length, matches: matches.matches }
 }
 
 // ── Session key info (lightweight, stored in vault) ──

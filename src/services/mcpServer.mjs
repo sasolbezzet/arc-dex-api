@@ -13,7 +13,10 @@ const authCodes = new Map() // code -> { clientId, userId, redirectUri, codeChal
 const oauthRequests = new Map() // requestId -> original authorization request
 const siweChallenges = new Map() // nonce -> exact SIWE challenge binding
 const accessTokens = new Map() // token -> { userId, clientId, expires }
-const destinationMintLocks = new Set() // destination chain + CCTP nonce in-flight
+// destination chain + CCTP nonce -> { userId, userOpHash, chainKey }
+// A pending destination UserOperation must remain discoverable until its
+// receipt is known; a plain Set would lose the hash on timeout/restart.
+const destinationMintLocks = new Map()
 
 // MCP responses may include decoded CCTP uint256 fields represented as BigInt.
 // Always serialize them as decimal strings so direct handler execution and
@@ -247,7 +250,7 @@ export function siweMessageHandler(req, res) {
 }
 
 // ── SIWE verify + issue auth code ──
-import { createPublicClient, decodeEventLog, defineChain, encodeFunctionData, formatUnits, getAddress, http, parseUnits, verifyMessage } from 'viem'
+import { createPublicClient, decodeEventLog, defineChain, encodeFunctionData, fallback, formatUnits, getAddress, http, parseUnits, verifyMessage } from 'viem'
 export async function siweVerifyHandler(req, res) {
   const { address, message, signature, clientId, redirectUri, state, codeChallenge, requestId } = req.body || {}
   if (!address || !message || !clientId || !requestId) return res.status(400).json({ error: 'missing_fields' })
@@ -368,7 +371,8 @@ async function apiPost(path, body, ownerAddress) {
     headers: { 'Content-Type': 'application/json', ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}) },
     body: jsonText(body),
   })
-  return r.json()
+  const data = await r.json().catch(() => ({}))
+  return { ...(data && typeof data === 'object' ? data : {}), _httpStatus: r.status }
 }
 
 // ── Auto-execute helper (Circle-source, server-signed) ──
@@ -411,8 +415,8 @@ const BRIDGE_CCTP = {
     usdc: '0x3600000000000000000000000000000000000000',
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
-    // Arc destination uses CCTP V2 Standard Transfer/finalized threshold.
-    requiredFinalityThreshold: 2000,
+    // Frontend uses CCTP V2 fast finality for all EVM routes.
+    requiredFinalityThreshold: 1000,
     rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network',
     explorer: 'https://testnet.arcscan.app/tx/',
     router: process.env.ARCOX_FEE_ROUTER_ADDRESS || '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
@@ -440,6 +444,8 @@ const BRIDGE_CCTP = {
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
     requiredFinalityThreshold: 1000,
+    // Frontend's verified Arbitrum Sepolia ArcoxRouter.
+    router: process.env.ARCOX_ARBITRUM_FEE_ROUTER_ADDRESS || '0x5dCAA895dDc7350cF0f9eb69E69536a4548b0cA7',
   },
   HyperEVM_Testnet: { domain: 19, requiredFinalityThreshold: 1000, explorer: 'https://app.hyperliquid-testnet.xyz/explorer/tx/' },
 }
@@ -457,9 +463,8 @@ const BRIDGE_MIN_FINALITY_THRESHOLD = [1000, 2000].includes(configuredBridgeFina
   ? configuredBridgeFinalityThreshold
   : 1000
 
-// Arc destination requires CCTP V2 Standard Transfer finality. Bind this to
-// both the canonical route key and domain so a malformed route cannot inherit
-// Arc-specific behavior merely because its numeric domain happens to be 26.
+// Bind finality to the verified route configuration so a malformed route
+// cannot inherit behavior merely because its numeric domain happens to match.
 function bridgeFinalityThreshold(route) {
   const required = Number(route?.destination?.requiredFinalityThreshold)
   if (![1000, 2000].includes(required)) throw new Error('CCTP route finality threshold is not configured')
@@ -508,6 +513,37 @@ function bridgeConfig(fromChain, toChain) {
   return { fromKey: chainKey(fromChain), toKey: chainKey(toChain), source, destination }
 }
 
+function bridgeRpcUrls(chainConfig) {
+  const key = String(chainConfig?.name || '').toLowerCase()
+  const chainId = Number(chainConfig?.chainId)
+  const configured = key === 'arc_testnet' || chainId === 5042002
+    ? [process.env.ARC_RPC_URL, 'https://rpc.testnet.arc.network', 'https://arc-testnet.drpc.org']
+    : key === 'base_sepolia' || chainId === 84532
+      ? [process.env.BASE_SEPOLIA_RPC_URL, 'https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com']
+      : key === 'arbitrum_sepolia' || chainId === 421614
+        ? [process.env.ARB_SEPOLIA_RPC_URL, 'https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com']
+        : [chainConfig?.rpcUrl]
+  return [...new Set(configured.filter(Boolean))]
+}
+
+function bridgePublicClient(chainConfig) {
+  const rpcUrls = bridgeRpcUrls(chainConfig)
+  if (!rpcUrls.length) throw new Error(`RPC not configured for ${chainConfig?.name || 'bridge chain'}`)
+  const drpcKey = process.env.DRPC_KEY || ''
+  const chain = defineChain({
+    id: chainConfig.chainId,
+    name: chainConfig.name,
+    nativeCurrency: { name: chainConfig.name === 'Arc_Testnet' ? 'USDC' : 'ETH', symbol: chainConfig.name === 'Arc_Testnet' ? 'USDC' : 'ETH', decimals: 18 },
+    rpcUrls: { default: { http: rpcUrls } },
+  })
+  const transports = rpcUrls.map(url => http(url, {
+    timeout: 12_000,
+    retryCount: 1,
+    ...(drpcKey && url.includes('drpc.org') ? { fetchOptions: { headers: { Authorization: `Bearer ${drpcKey}` } } } : {}),
+  }))
+  return createPublicClient({ chain, transport: fallback(transports, { retryCount: 2, rank: false }) })
+}
+
 // Expose the route capability as a pure predicate for regression tests and
 // diagnostics. A configured CCTP destination alone is not enough: the source
 // ArcoxRouter must also be deployed/configured, otherwise a burn cannot be
@@ -531,13 +567,7 @@ export function compareRouterRouteConfiguration({ code, configuredUsdc, configur
 }
 
 async function validateRouterRoute(route) {
-  const chain = defineChain({
-    id: route.source.chainId,
-    name: route.fromKey,
-    nativeCurrency: { name: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', symbol: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', decimals: 18 },
-    rpcUrls: { default: { http: [route.source.rpcUrl] } },
-  })
-  const client = createPublicClient({ chain, transport: http(route.source.rpcUrl) })
+  const client = bridgePublicClient(route.source)
   const router = getAddress(route.source.router)
   const [code, configuredUsdc, configuredMessenger, localDomain, supportedDestination] = await Promise.all([
     client.getBytecode({ address: router }),
@@ -549,13 +579,7 @@ async function validateRouterRoute(route) {
   const mismatches = compareRouterRouteConfiguration({ code, configuredUsdc, configuredMessenger, localDomain, supportedDestination, route })
   if (mismatches.length) throw new Error(`ArcoxRouter CCTP route validation failed: ${mismatches.join(', ')}`)
 
-  const destinationChain = defineChain({
-    id: route.destination.chainId,
-    name: route.toKey,
-    nativeCurrency: { name: route.toKey === 'Arc_Testnet' ? 'USDC' : 'ETH', symbol: route.toKey === 'Arc_Testnet' ? 'USDC' : 'ETH', decimals: 18 },
-    rpcUrls: { default: { http: [route.destination.rpcUrl] } },
-  })
-  const destinationClient = createPublicClient({ chain: destinationChain, transport: http(route.destination.rpcUrl) })
+  const destinationClient = bridgePublicClient(route.destination)
   const destinationMessenger = getAddress(route.destination.tokenMessenger)
   const destinationTransmitter = getAddress(route.destination.messageTransmitter)
   const [destinationMessengerCode, destinationTransmitterCode, configuredTransmitter] = await Promise.all([
@@ -570,13 +594,7 @@ async function validateRouterRoute(route) {
 }
 
 async function getRouterFeeQuote(route, amount) {
-  const chain = defineChain({
-    id: route.source.chainId,
-    name: route.fromKey,
-    nativeCurrency: { name: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', symbol: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', decimals: 18 },
-    rpcUrls: { default: { http: [route.source.rpcUrl] } },
-  })
-  const client = createPublicClient({ chain, transport: http(route.source.rpcUrl) })
+  const client = bridgePublicClient(route.source)
   await validateRouterRoute(route)
   const result = await client.readContract({
     address: getAddress(route.source.router),
@@ -621,13 +639,7 @@ export function buildMscaRouterBridgeCalls({ route, amount, mintRecipient, maxFe
 }
 
 async function verifyBridgeBurn({ burnTxHash, route, walletAddress, amount }) {
-  const chain = defineChain({
-    id: route.source.chainId,
-    name: route.fromKey,
-    nativeCurrency: { name: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', symbol: route.fromKey === 'Arc_Testnet' ? 'USDC' : 'ETH', decimals: 18 },
-    rpcUrls: { default: { http: [route.source.rpcUrl] } },
-  })
-  const client = createPublicClient({ chain, transport: http(route.source.rpcUrl) })
+  const client = bridgePublicClient(route.source)
   const receipt = await client.getTransactionReceipt({ hash: burnTxHash })
   const expectedPayer = getAddress(walletAddress).toLowerCase()
   const expectedAmount = amount === undefined || amount === null ? null : BigInt(amount)
@@ -758,6 +770,13 @@ export function selectCctpMessage(messages, sourceDomain, destinationDomain, bin
 export async function waitForCctpBridgeStatus(args, options = {}) {
   const attempts = options.attempts ?? (Number(args?.destinationDomain) === 26 ? 120 : 40)
   const delayMs = options.delayMs ?? (Number(args?.destinationDomain) === 26 ? 5000 : 3000)
+  const autoMintAfterMs = options.autoMintAfterMs ?? 30_000
+  const autoMintRetryMs = options.autoMintRetryMs ?? 60_000
+  const now = options.now || (() => Date.now())
+  const sleep = options.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)))
+  const startedAt = now()
+  let autoMintQueued = false
+  let autoMintAttemptedAt = 0
   let lastStatus = null
   for (let attempt = 0; attempt < attempts; attempt++) {
     lastStatus = await getCctpBridgeStatus(args)
@@ -765,10 +784,22 @@ export async function waitForCctpBridgeStatus(args, options = {}) {
     // response that fails exact route binding is terminal for this burn hash;
     // polling cannot repair a cryptographic route mismatch and must not make a
     // user wait while presenting an unsafe retry posture.
-    if (lastStatus.status !== 'pending' || lastStatus.reason !== 'cctp_message_pending') return lastStatus
-    if (attempt + 1 < attempts) await new Promise(resolve => setTimeout(resolve, delayMs))
+    const transientAttestation = lastStatus.status === 'pending'
+      && ['cctp_message_pending', 'cctp_attestation_unavailable'].includes(lastStatus.reason)
+    if (!transientAttestation) return { ...lastStatus, autoMintQueued }
+    const elapsedMs = now() - startedAt
+    if (!autoMintQueued && typeof options.onPending === 'function' && elapsedMs >= autoMintAfterMs && (autoMintAttemptedAt === 0 || now() - autoMintAttemptedAt >= autoMintRetryMs)) {
+      autoMintAttemptedAt = now()
+      try {        const queued = await options.onPending({ ...lastStatus, burnTxHash: args.burnTxHash, elapsedMs })
+        autoMintQueued = queued !== false
+      } catch {
+        // Queue registration is best-effort. Manual status/retry remains
+        // available, and a later retry is rate-limited by autoMintRetryMs.
+      }
+    }
+    if (attempt + 1 < attempts) await sleep(delayMs)
   }
-  return lastStatus || { status: 'pending', burnTxHash: args.burnTxHash, verified: false, reason: 'cctp_message_pending' }
+  return { ...(lastStatus || { status: 'pending', burnTxHash: args.burnTxHash, verified: false, reason: 'cctp_message_pending' }), autoMintQueued }
 }
 
 export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain, walletAddress, route, expectedBurnAmount }) {
@@ -981,10 +1012,7 @@ export async function destinationMintAlreadyProcessed({ status, route, client: i
       Arbitrum_Sepolia: { id: 421614 },
     }[route.toKey]
     if (!destinationInfo) return { checked: false, processed: false, nonce, reason: 'destination_nonce_check_unavailable' }
-    const client = injectedClient || createPublicClient({
-      chain: defineChain({ id: destinationInfo.id, name: route.toKey, nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [rpcUrl] } } }),
-      transport: http(rpcUrl),
-    })
+    const client = injectedClient || bridgePublicClient(route.destination)
     const processed = await client.readContract({
       address: getAddress(messageTransmitter),
       abi: USED_NONCES_ABI,
@@ -1051,7 +1079,175 @@ async function destinationMscaPreflight({ route, walletAddress, requireAuthoriza
   return { ok: true }
 }
 
-async function mintDestinationViaMsca({ status, route, walletAddress }) {
+async function findPendingBridgeMint(userId, burnTxHash, toKey) {
+  try {
+    const vault = await import('./vaultStore.mjs')
+    for (const approval of vault.listApprovals(userId) || []) {
+      if (!['pending_confirmation', 'pending_signature'].includes(approval.status)) continue
+      let details
+      try { details = JSON.parse(approval.details || '{}') } catch { details = null }
+      if (details?.burnTxHash !== burnTxHash || details?.toChain !== toKey) continue
+      if (!details.destinationChainKey) continue
+      return {
+        approval,
+        phase: details.settlementPhase || (details.destinationUserOpHash ? 'destination_submitted' : 'intent_created'),
+        userOpHash: details.destinationUserOpHash || null,
+        chainKey: details.destinationChainKey,
+      }
+    }
+  } catch { /* status/retry remains fail-closed below */ }
+  return null
+}
+
+// A new quote must not bypass an unresolved source UserOperation by using a
+// different previewId. Only an explicitly terminal/reverted approval is safe
+// to quote again; pending/unknown source submissions remain blocked per
+// user, MSCA, and route until reconciled.
+export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain, walletAddress } = {}) {
+  const pendingPhases = new Set(['source_intent_created', 'source_submission_unknown', 'source_submitted', 'source_confirmed'])
+  const expectedFrom = String(fromChain || '').toLowerCase()
+  const expectedTo = String(toChain || '').toLowerCase()
+  const expectedWallet = String(walletAddress || '').toLowerCase()
+  for (const approval of Array.isArray(approvals) ? approvals : []) {
+    if (approval?.action !== 'bridge') continue
+    let details
+    try { details = JSON.parse(approval.details || '{}') } catch { continue }
+    const unknownSubmission = details?.settlementPhase === 'source_submission_failed'
+      && details?.userOpAccepted === 'unknown'
+      && details?.safeToRetry !== true
+    if (!['pending_confirmation', 'pending_signature'].includes(approval?.status) && !unknownSubmission) continue
+    if (!pendingPhases.has(details?.settlementPhase) && !unknownSubmission) continue
+    if (String(details?.fromChain || '').toLowerCase() !== expectedFrom || String(details?.toChain || '').toLowerCase() !== expectedTo) continue
+    const storedWallet = String(details?.walletAddress || '').toLowerCase()
+    // Missing wallet binding is not evidence that the intent belongs to a
+    // different wallet. Fail closed and block the same user's route.
+    if (expectedWallet && storedWallet && storedWallet !== expectedWallet) continue
+    return { approval, details }
+  }
+  return null
+}
+
+async function findPendingSourceIntent(userId, { fromChain, toChain, previewId, walletAddress } = {}) {
+  try {
+    const vault = await import('./vaultStore.mjs')
+    for (const approval of vault.listApprovals(userId) || []) {
+      if (!['pending_confirmation', 'pending_signature'].includes(approval.status)) continue
+      let details
+      try { details = JSON.parse(approval.details || '{}') } catch { details = null }
+      if (!['source_intent_created', 'source_submission_unknown', 'source_submitted', 'source_confirmed'].includes(details?.settlementPhase)) continue
+      if (details?.fromChain !== fromChain || details?.toChain !== toChain || details?.previewId !== previewId) continue
+      if (walletAddress && details?.walletAddress && String(details.walletAddress).toLowerCase() !== String(walletAddress).toLowerCase()) continue
+      return { approval, details }
+    }
+  } catch { /* source intent recovery remains fail-closed */ }
+  return null
+}
+
+async function findPendingBridgeIntent(userId, burnTxHash, toKey) {
+  try {
+    const vault = await import('./vaultStore.mjs')
+    for (const approval of vault.listApprovals(userId) || []) {
+      if (!['pending_confirmation', 'pending_signature'].includes(approval.status)) continue
+      let details
+      try { details = JSON.parse(approval.details || '{}') } catch { details = null }
+      if (details?.burnTxHash === burnTxHash && details?.toChain === toKey && details?.destinationChainKey && !details.destinationUserOpHash) {
+        return { approval, details, phase: details.settlementPhase || 'intent_created' }
+      }
+    }
+  } catch { /* fail closed in the mint path */ }
+  return null
+}
+
+async function recordBridgePending(userId, {
+  agent, amount, fromChain, toChain, previewId, burnTxHash, sourceUserOpHash,
+  sourceChainKey, sourceExplorerUrl, walletAddress, destinationUserOpHash, destinationChainKey, settlementPhase, error,
+} = {}) {
+  const vault = await import('./vaultStore.mjs')
+  const approval = vault.createApproval(userId, {
+    agent: agent || 'mcp-agent', action: 'bridge', amount, token: 'USDC', source: 'session',
+    details: jsonText({
+      fromChain, toChain, previewId, amount: String(amount ?? ''), burnTxHash: burnTxHash || null,
+      sourceUserOpHash: sourceUserOpHash || null,
+      sourceChainKey: sourceChainKey || null,
+      walletAddress: walletAddress || null,
+      destinationUserOpHash: destinationUserOpHash || null,
+      destinationChainKey: destinationChainKey || null,
+      settlementStatus: 'pending_confirmation',
+      settlementPhase: settlementPhase || (destinationUserOpHash ? 'destination_submitted' : 'source_submitted'),
+    }),
+    forcePending: true,
+  })
+  vault.updateApprovalStatus(userId, approval.id, 'pending_confirmation', {
+    txHash: burnTxHash,
+    explorerUrl: sourceExplorerUrl,
+    userOpHash: destinationUserOpHash || sourceUserOpHash,
+    error,
+  })
+  return approval.id
+}
+
+async function updateBridgePending(userId, approvalId, details, status = 'pending_confirmation', extra = {}) {
+  if (!approvalId) return
+  try {
+    const vault = await import('./vaultStore.mjs')
+    vault.updateApprovalStatus(userId, approvalId, status, { ...extra, details: jsonText(details) })
+  } catch { /* audit persistence must not change transaction safety */ }
+}
+
+async function markBridgePendingResolved(userId, pending, status, extra = {}) {
+  if (!pending?.approval?.id) return
+  try {
+    const vault = await import('./vaultStore.mjs')
+    vault.updateApprovalStatus(userId, pending.approval.id, status, extra)
+  } catch { /* audit persistence must not change transaction safety */ }
+}
+
+async function resumePendingBridgeApproval(userId, approval, details, info) {
+  const route = bridgeConfig(details?.fromChain, details?.toChain)
+  if (!route || !info?.walletAddress) return { status: 'error', reason: 'bridge_route_not_supported_for_msca' }
+  const burnTxHash = details?.burnTxHash
+  if (!burnTxHash) return { status: 'pending_confirmation', reason: 'source_user_operation_pending' }
+  const amountText = String(details.amount || approval.amount || '').trim()
+  const amount = amountText && amountText !== '0' ? parseUnits(amountText, 6) : undefined
+  let proof
+  try {
+    proof = await verifyBridgeBurn({ burnTxHash, route, walletAddress: info.walletAddress, amount })
+  } catch {
+    return { status: 'pending_confirmation', reason: 'source_burn_receipt_unavailable', burnTxHash }
+  }
+  if (!proof.ok) return { status: 'error', reason: proof.reason, burnTxHash }
+  const bridgeStatus = await getCctpBridgeStatus({
+    burnTxHash,
+    sourceDomain: route.source.domain,
+    destinationDomain: route.destination.domain,
+    walletAddress: info.walletAddress,
+    route,
+    expectedBurnAmount: BigInt(proof.args.amount) - BigInt(proof.args.fee),
+  })
+  if (bridgeStatus.status === 'rejected') return { status: 'error', reason: bridgeStatus.reason, burnTxHash }
+  if (!bridgeStatus.verified) return { status: 'pending_confirmation', reason: bridgeStatus.reason || 'cctp_message_pending', burnTxHash, messageStatus: bridgeStatus.messageStatus }
+  const mint = await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress, userId, approvalId: approval.id })
+  if (mint.success) {
+    return {
+      status: 'success',
+      burnTxHash,
+      destinationTxHash: mint.txHash || null,
+      destinationUserOpHash: mint.userOpHash || null,
+      destinationExplorerUrl: mint.explorerUrl || null,
+      idempotent: Boolean(mint.idempotent),
+    }
+  }
+  return {
+    status: 'pending_confirmation',
+    reason: mint.error || 'destination_mint_pending',
+    burnTxHash,
+    destinationUserOpHash: mint.userOpHash || null,
+    destinationChainKey: executionChainKey(route.toKey),
+    destinationExplorerUrl: mint.explorerUrl || null,
+  }
+}
+
+async function mintDestinationViaMsca({ status, route, walletAddress, userId, approvalId: existingApprovalId = null }) {
   if (!status?.verified || !status.message || !status.attestation) return { success: false, error: 'Attestation belum ready' }
   const destinationKey = {
     Arc_Testnet: 'arc-testnet',
@@ -1062,7 +1258,10 @@ async function mintDestinationViaMsca({ status, route, walletAddress }) {
   const alreadyProcessed = await destinationMintAlreadyProcessed({ status, route })
   const nonceDecision = destinationNonceDecision(alreadyProcessed)
   if (nonceDecision === 'unavailable') {
-    return { success: false, error: alreadyProcessed.reason || 'destination_nonce_check_unavailable', safeToRetry: true }
+    // A failed nonce read is not evidence that receiveMessage was never sent.
+    // Keep the operation fail-closed until the destination RPC can prove the
+    // message is unused; no duplicate mint is safe while idempotency is unknown.
+    return { success: false, error: alreadyProcessed.reason || 'destination_nonce_check_unavailable', approvalId: existingApprovalId || null, safeToRetry: false }
   }
   if (nonceDecision === 'minted') {
     return {
@@ -1071,27 +1270,165 @@ async function mintDestinationViaMsca({ status, route, walletAddress }) {
       txHash: null,
       userOpHash: null,
       explorerUrl: null,
+      approvalId: existingApprovalId || null,
       message: 'CCTP message sudah diproses di destination; tidak mengirim UserOperation ulang.',
     }
   }
   const lockKey = `${route.toKey}:${alreadyProcessed.nonce}`
-  if (destinationMintLocks.has(lockKey)) {
-    return { success: false, error: 'destination_mint_in_flight', safeToRetry: true }
+  const existingLock = destinationMintLocks.get(lockKey)
+  if (existingLock) {
+    if (!existingLock.userOpHash) {
+      return { success: false, error: 'destination_mint_in_flight', approvalId: existingLock.approvalId || existingApprovalId || null, safeToRetry: false }
+    }
+    const { getUserOpStatus } = await import('./sessionKeyService.mjs')
+    const live = await getUserOpStatus(existingLock.userId || userId, existingLock.userOpHash, existingLock.chainKey)
+    if (live.status === 'success') {
+      destinationMintLocks.delete(lockKey)
+      return { success: true, txHash: live.txHash, userOpHash: existingLock.userOpHash, explorerUrl: live.explorerUrl }
+    }
+    if (live.status === 'pending_confirmation') {
+      return { success: false, error: 'destination_mint_in_flight', userOpHash: existingLock.userOpHash, safeToRetry: false }
+    }
+    if (live.status !== 'error' || !live.receipt || !['reverted', '0x0', 0, false].includes(live.receipt?.receipt?.status)) {
+      return { success: false, error: live.reason || 'destination_mint_status_unavailable', userOpHash: existingLock.userOpHash, safeToRetry: false }
+    }
+    // Only an explicitly reverted transaction releases the lock for a retry.
+    destinationMintLocks.delete(lockKey)
   }
-  destinationMintLocks.add(lockKey)
+  const persisted = await findPendingBridgeMint(userId, status.burnTxHash, route.toKey)
+  if (persisted) {
+    if (!persisted.userOpHash) {
+      destinationMintLocks.set(lockKey, { userId, userOpHash: null, chainKey: persisted.chainKey, approvalId: persisted.approval?.id || existingApprovalId || null })
+      return { success: false, error: 'destination_submission_unknown', approvalId: persisted.approval?.id || existingApprovalId || null, safeToRetry: false }
+    }
+    const { getUserOpStatus } = await import('./sessionKeyService.mjs')
+    const live = await getUserOpStatus(userId, persisted.userOpHash, persisted.chainKey)
+    if (live.status === 'success') {
+      await markBridgePendingResolved(userId, persisted, 'success', { txHash: live.txHash, explorerUrl: live.explorerUrl, userOpHash: persisted.userOpHash })
+      return { success: true, txHash: live.txHash, userOpHash: persisted.userOpHash, explorerUrl: live.explorerUrl, idempotent: true }
+    }
+    if (live.status === 'pending_confirmation') {
+      destinationMintLocks.set(lockKey, { userId, userOpHash: persisted.userOpHash, chainKey: persisted.chainKey })
+      return { success: false, error: 'destination_mint_in_flight', userOpHash: persisted.userOpHash, safeToRetry: false }
+    }
+    if (live.status !== 'error' || !live.receipt || !['reverted', '0x0', 0, false].includes(live.receipt?.receipt?.status)) {
+      destinationMintLocks.set(lockKey, { userId, userOpHash: persisted.userOpHash, chainKey: persisted.chainKey })
+      return { success: false, error: live.reason || 'destination_mint_status_unavailable', userOpHash: persisted.userOpHash, safeToRetry: false }
+    }
+    await markBridgePendingResolved(userId, persisted, 'error', { userOpHash: persisted.userOpHash, error: live.reason || 'destination UserOperation failed' })
+  }
+  const pendingIntent = await findPendingBridgeIntent(userId, status.burnTxHash, route.toKey)
+  let approvalId = existingApprovalId || pendingIntent?.approval?.id || null
+  if (pendingIntent?.phase === 'destination_submitted' || pendingIntent?.phase === 'submission_unknown') {
+    destinationMintLocks.set(lockKey, { userId, userOpHash: null, chainKey: destinationKey, approvalId })
+    return { success: false, error: 'destination_mint_in_flight', approvalId, safeToRetry: false }
+  }
+  destinationMintLocks.set(lockKey, { userId, userOpHash: null, chainKey: destinationKey, approvalId })
   try {
     const preflight = await destinationMscaPreflight({ route, walletAddress })
-    if (!preflight.ok) return { success: false, error: preflight.message || preflight.reason }
+    if (!preflight.ok) {
+      destinationMintLocks.delete(lockKey)
+      return { success: false, error: preflight.message || preflight.reason, safeToRetry: false }
+    }
+    try {
+      approvalId = approvalId || await recordBridgePending(userId, {
+        agent: 'mcp-agent',
+        amount: status.messageBody?.amount ? formatUnits(status.messageBody.amount, 6) : '0',
+        fromChain: route.fromKey,
+        toChain: route.toKey,
+        burnTxHash: status.burnTxHash,
+        destinationChainKey: destinationKey,
+        settlementPhase: 'intent_created',
+      })
+    } catch (error) {
+      destinationMintLocks.delete(lockKey)
+      return { success: false, error: 'destination_intent_persist_failed', approvalId: existingApprovalId || null, safeToRetry: false }
+    }
+    destinationMintLocks.set(lockKey, { userId, userOpHash: null, chainKey: destinationKey, approvalId })
+    await updateBridgePending(userId, approvalId, {
+      fromChain: route.fromKey,
+      toChain: route.toKey,
+      burnTxHash: status.burnTxHash,
+      destinationChainKey: destinationKey,
+      settlementStatus: 'pending_confirmation',
+      settlementPhase: 'submission_unknown',
+    }, 'pending_confirmation', { txHash: status.burnTxHash })
     const { executeViaSession } = await import('./sessionKeyService.mjs')
     const result = await executeViaSession(walletAddress, [{
       to: route.destination.messageTransmitter,
       value: 0n,
       data: encodeFunctionData({ abi: RECEIVE_MESSAGE_ABI, functionName: 'receiveMessage', args: [status.message, status.attestation] }),
-    }], { paymaster: true, chainKey: destinationKey, requireTransactionHash: true })
-    if (result.status !== 'success') return { success: false, error: result.reason || 'Destination MSCA UserOperation failed', userOpHash: result.userOpHash, safeToRetry: true }
-    return { success: true, txHash: result.txHash, userOpHash: result.userOpHash, explorerUrl: `${route.destination.explorer}${result.txHash}` }
-  } finally {
+    }], { paymaster: true, chainKey: destinationKey, feeProfile: destinationKey === 'arbitrum-sepolia' ? 'arbitrum-destination' : destinationKey === 'arc-testnet' ? 'arc-bridge' : undefined, requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+    if (result.status === 'pending_confirmation') {
+      const details = {
+        fromChain: route.fromKey,
+        toChain: route.toKey,
+        burnTxHash: status.burnTxHash,
+        destinationChainKey: destinationKey,
+        destinationUserOpHash: result.userOpHash || null,
+        settlementStatus: 'pending_confirmation',
+        settlementPhase: 'destination_submitted',
+      }
+      await updateBridgePending(userId, approvalId, details, 'pending_confirmation', {
+        txHash: status.burnTxHash,
+        userOpHash: result.userOpHash,
+        error: result.reason,
+      })
+      destinationMintLocks.set(lockKey, { userId, userOpHash: result.userOpHash || null, chainKey: destinationKey, approvalId })
+      return { success: false, error: result.reason || 'destination_mint_pending', approvalId, userOpHash: result.userOpHash, safeToRetry: false }
+    }
+    if (result.status !== 'success') {
+      if (!(result.status === 'error' && result.receipt && ['reverted', '0x0', 0, false].includes(result.receipt?.receipt?.status))) {
+        const details = {
+          fromChain: route.fromKey,
+          toChain: route.toKey,
+          burnTxHash: status.burnTxHash,
+          destinationChainKey: destinationKey,
+          destinationUserOpHash: result.userOpHash || null,
+          settlementStatus: 'pending_confirmation',
+        }
+        await updateBridgePending(userId, approvalId, details, 'pending_confirmation', { txHash: status.burnTxHash, userOpHash: result.userOpHash, error: result.reason })
+        destinationMintLocks.set(lockKey, { userId, userOpHash: result.userOpHash || null, chainKey: destinationKey, approvalId, error: result.reason || 'destination_mint_status_unavailable' })
+        return { success: false, error: result.reason || 'destination_mint_status_unavailable', approvalId, userOpHash: result.userOpHash, safeToRetry: false }
+      }
+      await updateBridgePending(userId, approvalId, {
+        fromChain: route.fromKey,
+        toChain: route.toKey,
+        burnTxHash: status.burnTxHash,
+        destinationChainKey: destinationKey,
+        settlementStatus: 'error',
+      }, 'error', { txHash: status.burnTxHash, userOpHash: result.userOpHash, error: result.reason })
+      destinationMintLocks.delete(lockKey)
+      return { success: false, error: result.reason || 'Destination MSCA UserOperation failed', approvalId, userOpHash: result.userOpHash, safeToRetry: true }
+    }
+    await updateBridgePending(userId, approvalId, {
+      fromChain: route.fromKey,
+      toChain: route.toKey,
+      burnTxHash: status.burnTxHash,
+      destinationChainKey: destinationKey,
+      destinationUserOpHash: result.userOpHash || null,
+      settlementStatus: 'success',
+    }, 'success', { txHash: result.txHash, userOpHash: result.userOpHash })
     destinationMintLocks.delete(lockKey)
+    return { success: true, approvalId, txHash: result.txHash, userOpHash: result.userOpHash, explorerUrl: `${route.destination.explorer}${result.txHash}` }
+  } catch (error) {
+    // The transport may fail after the bundler accepted the UserOperation. Do
+    // not release this lock on an ambiguous outcome; retrying receiveMessage
+    // could duplicate a valid mint. The lock stays fail-closed until nonce or
+    // UserOperation status proves the original operation final.
+    const message = String(error?.message || error)
+    const currentLock = destinationMintLocks.get(lockKey)
+    if (currentLock?.approvalId) {
+      await updateBridgePending(userId, currentLock.approvalId, {
+        settlementPhase: 'submission_unknown',
+        settlementStatus: 'pending_confirmation',
+        destinationChainKey: destinationKey,
+        destinationUserOpHash: null,
+      }, 'pending_confirmation', { error: message })
+    }
+    destinationMintLocks.set(lockKey, { userId, userOpHash: null, chainKey: destinationKey, approvalId: currentLock?.approvalId || null, error: message })
+    return { success: false, error: 'destination_mint_status_unavailable', approvalId: currentLock?.approvalId || approvalId || null, safeToRetry: false }
+
   }
 }
 
@@ -1593,7 +1930,7 @@ export function createMcpServer(userId, context = {}) {
   // ── BRIDGE TOOLS (route → quote → confirm → execute) ──
 
   server.tool('arcox_quote_bridge', 'Get a bridge quote preview. Show preview to user, wait for confirmation, then call arcox_execute_bridge', {
-    fromChain: z.string().describe('Source chain (arc-testnet, ethereum-sepolia, base-sepolia, arbitrum-sepolia, solana-devnet)'),
+    fromChain: z.string().describe('Source chain (arc-testnet, base-sepolia, arbitrum-sepolia)'),
     toChain: z.string().describe('Destination chain'),
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol. Default USDC'),
@@ -1615,6 +1952,27 @@ export function createMcpServer(userId, context = {}) {
     const disabledReason = bridgeConfigDisabledReason(route)
     if (disabledReason) {
       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'bridge', fromChain: executionChainKey(params.fromChain), toChain: executionChainKey(params.toChain), chain: executionChainKey(params.fromChain), walletType: 'MSCA', reason: disabledReason, message: disabledReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi.' : 'Bridge MSCA belum diaktifkan.' }) }] }
+    }
+    const { listApprovals } = await import('./vaultStore.mjs')
+    const unresolvedSource = hasUnresolvedSourceBridgeIntent(listApprovals(userId), {
+      fromChain: route.fromKey,
+      toChain: route.toKey,
+      walletAddress: info.walletAddress,
+    })
+    if (unresolvedSource) {
+      return { content: [{ type: 'text', text: jsonText({
+        schemaVersion: 1,
+        preview: false,
+        rejected: true,
+        action: 'bridge',
+        fromChain: executionChainKey(params.fromChain),
+        toChain: executionChainKey(params.toChain),
+        walletAddress: info.walletAddress,
+        walletType: 'MSCA',
+        reason: 'unresolved_source_intent',
+        approvalId: unresolvedSource.approval?.id || null,
+        message: 'Bridge intent sumber sebelumnya belum memiliki hasil UserOperation yang pasti. Rekonsiliasi status intent tersebut sebelum meminta quote baru; burn tidak diulang.',
+      }) }] }
     }
     const destinationPreflight = await destinationMscaPreflight({ route, walletAddress: info.walletAddress })
     if (!destinationPreflight.ok) {
@@ -1713,11 +2071,103 @@ export function createMcpServer(userId, context = {}) {
       if (quoteCheck.quote.params.router !== route.source.router || quoteCheck.quote.params.maxFeeBaseUnits !== BRIDGE_MAX_FEE.toString() || Number(quoteCheck.quote.params.minFinalityThreshold) !== bridgeFinalityThreshold(route) || quotedFee !== fee.fee.toString() || quotedNet !== fee.netAmount.toString()) {
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'quote_fee_changed', message: 'Router fee berubah setelah preview. Buat quote bridge baru.' }) }] }
       }
-      executionQuotes.delete(quoteCheck.quote.previewId)
       const calls = buildMscaRouterBridgeCalls({ route, amount, mintRecipient: info.walletAddress, minFinalityThreshold: bridgeFinalityThreshold(route) })
+      const existingSourceIntent = await findPendingSourceIntent(userId, {
+        fromChain: route.fromKey,
+        toChain: route.toKey,
+        previewId: params.previewId,
+        walletAddress: info.walletAddress,
+      })
+      if (existingSourceIntent) {
+        const storedHash = existingSourceIntent.details?.sourceUserOpHash
+        if (storedHash) {
+          const { getUserOpStatus } = await import('./sessionKeyService.mjs')
+          const liveSource = await getUserOpStatus(userId, storedHash, executionChainKey(route.fromKey))
+          if (liveSource.status === 'pending_confirmation') {
+            return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: true, approvalId: existingSourceIntent.approval.id, userOpHash: storedHash, safeToRetry: false, reason: 'source_user_operation_pending', message: 'Source UserOperation masih pending. Jangan mengirim burn ulang.' }) }] }
+          }
+          if (liveSource.status === 'success' && liveSource.txHash) {
+            await updateBridgePending(userId, existingSourceIntent.approval.id, {
+              ...existingSourceIntent.details,
+              sourceUserOpHash: storedHash,
+              burnTxHash: liveSource.txHash,
+              sourceChainKey: executionChainKey(route.fromKey),
+              settlementPhase: 'source_confirmed',
+              settlementStatus: 'source_confirmed',
+            }, 'pending_confirmation', { txHash: liveSource.txHash, userOpHash: storedHash, explorerUrl: liveSource.explorerUrl })
+            return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: true, sourceSubmitted: true, approvalId: existingSourceIntent.approval.id, burnTxHash: liveSource.txHash, userOpHash: storedHash, safeToRetry: false, reason: 'source_confirmed_needs_settlement', message: 'Source burn sudah terkonfirmasi. Lanjutkan status bridge untuk attestation dan mint; jangan burn ulang.' }) }] }
+          }
+          if (liveSource.status === 'error' && ['reverted', '0x0', 0, false].includes(liveSource.receipt?.receipt?.status)) {
+            await updateBridgePending(userId, existingSourceIntent.approval.id, existingSourceIntent.details, 'error', { userOpHash: storedHash, error: 'Source UserOperation reverted; no burn retry was sent.' })
+            executionQuotes.delete(params.previewId)
+            return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, approvalId: existingSourceIntent.approval.id, reason: 'source_user_operation_reverted', safeToRetry: true, message: 'Source UserOperation reverted. Buat quote baru sebelum mencoba lagi.' }) }] }
+          }
+        }
+        return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: false, approvalId: existingSourceIntent.approval.id, safeToRetry: false, reason: 'source_submission_unknown', message: 'Bridge intent sumber sudah tersimpan tetapi hasil UserOperation belum diketahui. Jangan mengirim burn ulang; rekonsiliasi status intent ini terlebih dahulu.' }) }] }
+      }
+      let approvalId = null
+      try {
+        approvalId = await recordBridgePending(userId, {
+          agent: requestAgent,
+          amount: params.amount,
+          fromChain: route.fromKey,
+          toChain: route.toKey,
+          previewId: params.previewId,
+          sourceChainKey: executionChainKey(route.fromKey),
+          sourceExplorerUrl: route.source.explorer,
+          walletAddress: info.walletAddress,
+          settlementPhase: 'source_intent_created',
+        })
+      } catch (intentError) {
+        return { content: [{ type: 'text', text: jsonText({ status: 'bridge_error', executed: false, reason: 'source_intent_persist_failed', error: intentError?.message || 'Could not persist source bridge intent' }) }] }
+      }
+      executionQuotes.delete(params.previewId)
       const { executeViaSession } = await import('./sessionKeyService.mjs')
-      const result = await executeViaSession(userId, calls, { paymaster: true, chainKey: executionChainKey(route.fromKey), explorerBaseUrl: route.source.explorer, requireTransactionHash: true })
-      if (result.status !== 'success') return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, error: result.reason || 'Bridge UserOperation gagal', userOpHash: result.userOpHash }) }] }
+      let result
+      try {
+        result = await executeViaSession(userId, calls, { paymaster: true, chainKey: executionChainKey(route.fromKey), feeProfile: route.fromKey === 'Arc_Testnet' && route.toKey === 'Arbitrum_Sepolia' ? 'arbitrum-destination' : route.fromKey === 'Arc_Testnet' ? 'arc-bridge' : undefined, explorerBaseUrl: route.source.explorer, requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+      } catch (submissionError) {
+        await updateBridgePending(userId, approvalId, {
+          fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId,
+          sourceChainKey: executionChainKey(route.fromKey), settlementPhase: 'source_submission_unknown',
+          settlementStatus: 'pending_confirmation',
+        }, 'pending_confirmation', { error: submissionError?.message || 'Source UserOperation submission status unknown' })
+        return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: false, approvalId, safeToRetry: false, reason: 'source_submission_unknown', message: 'Bundler response sumber tidak pasti. Intent disimpan untuk rekonsiliasi; jangan ulangi bridge.' }) }] }
+      }
+      const sourceSucceeded = result.status === 'success'
+      const sourcePending = result.status === 'pending_confirmation'
+      const sourceFailed = result.status === 'error'
+      await updateBridgePending(userId, approvalId, {
+        fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId,
+        sourceUserOpHash: result.userOpHash || null,
+        burnTxHash: sourceSucceeded ? result.txHash : null,
+        sourceChainKey: executionChainKey(route.fromKey),
+        settlementPhase: sourceSucceeded ? 'source_confirmed' : sourcePending ? 'source_submitted' : 'source_submission_failed',
+        settlementStatus: sourceSucceeded ? 'source_confirmed' : sourcePending ? 'pending_confirmation' : 'error',
+        userOpAccepted: result.userOpAccepted || (result.userOpHash ? 'yes' : sourceFailed ? 'unknown' : null),
+        safeToRetry: result.safeToRetry === true,
+      }, sourceFailed ? 'error' : 'pending_confirmation', { txHash: sourceSucceeded ? result.txHash : undefined, userOpHash: result.userOpHash, explorerUrl: result.explorerUrl, error: result.error })
+      if (result.status === 'pending_confirmation') {
+        let auditPending = false
+        try {
+          await updateBridgePending(userId, approvalId, {
+            agent: requestAgent,
+            amount: params.amount,
+            fromChain: route.fromKey,
+            toChain: route.toKey,
+            previewId: params.previewId,
+            sourceUserOpHash: result.userOpHash,
+            sourceChainKey: executionChainKey(route.fromKey),
+            sourceExplorerUrl: result.explorerUrl,
+            error: result.error,
+          })
+        } catch (auditError) {
+          auditPending = true
+          console.error('[mcp-bridge] pending source audit record failed:', auditError?.message || auditError)
+        }
+        return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: true, approvalId: auditPending ? null : approvalId, auditPending, sourceChain: executionChainKey(route.fromKey), userOpHash: result.userOpHash, userOpExplorerUrl: result.explorerUrl || null, reason: result.reason || 'user_operation_pending', safeToRetry: false, message: 'UserOperation sudah diterima bundler tetapi receipt belum tersedia. Jangan ulangi bridge; poll UserOperation/status sebelum melanjutkan.' }) }] }
+      }
+      if (result.status !== 'success') return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, approvalId, error: result.reason || 'Bridge UserOperation gagal', userOpHash: result.userOpHash || null, safeToRetry: result.safeToRetry === true, userOpAccepted: result.userOpAccepted || (result.userOpHash ? 'yes' : 'unknown') }) }] }
       const burnProof = await verifyBridgeBurn({ burnTxHash: result.txHash, route, walletAddress: info.walletAddress, amount })
       if (!burnProof.ok) return { content: [{ type: 'text', text: jsonText({ status: 'burn_submitted', executed: true, verified: false, burnTxHash: result.txHash, userOpHash: result.userOpHash, reason: burnProof.reason, message: 'Source UserOperation berhasil tetapi bukti event router belum terverifikasi. Jangan ulangi burn; periksa transaksi ini secara read-only.' }) }] }
       const bridgeStatus = await waitForCctpBridgeStatus({
@@ -1727,6 +2177,16 @@ export function createMcpServer(userId, context = {}) {
         walletAddress: info.walletAddress,
         route,
         expectedBurnAmount: burnProof.args ? BigInt(burnProof.args.amount) - BigInt(burnProof.args.fee) : undefined,
+      }, {
+        onPending: async () => {
+          const queued = await apiPost('/api/auto-mint/register', {
+            burnTxHash: result.txHash,
+            fromChain: route.fromKey,
+            toChain: route.toKey,
+          }, info.walletAddress)
+          if (queued?._httpStatus < 200 || queued?._httpStatus >= 300 || queued?.error) throw new Error(queued?.error || `auto-mint register HTTP ${queued?._httpStatus}`)
+          return true
+        },
       })
       if (bridgeStatus.status === 'rejected') {
         // The source burn is irreversible even when CCTP binding is rejected.
@@ -1734,26 +2194,12 @@ export function createMcpServer(userId, context = {}) {
         // approved or attempting any destination transaction.
         try {
           const vault = await import('./vaultStore.mjs')
-          const approval = vault.createApproval(userId, {
-            agent: requestAgent,
-            action: 'bridge',
-            amount: params.amount,
-            token: 'USDC',
-            source: 'session',
-            details: jsonText({
-              fromChain: route.fromKey,
-              toChain: route.toKey,
-              previewId: params.previewId,
-              settlementStatus: 'rejected',
-              reason: bridgeStatus.reason,
-            }),
-            forcePending: true,
-          })
-          vault.updateApprovalStatus(userId, approval.id, 'error', {
+          vault.updateApprovalStatus(userId, approvalId, 'error', {
             txHash: result.txHash,
             explorerUrl: result.explorerUrl,
             userOpHash: result.userOpHash,
             error: bridgeStatus.reason || 'CCTP binding rejected',
+            details: jsonText({ settlementStatus: 'rejected', reason: bridgeStatus.reason }),
           })
         } catch (auditError) {
           console.error('[mcp-bridge] rejected burn audit record failed:', auditError?.message || auditError)
@@ -1771,24 +2217,67 @@ export function createMcpServer(userId, context = {}) {
           message: 'Burn sudah terjadi, tetapi binding CCTP tidak cocok. Mint dan retry diblokir; jangan burn ulang.',
         }) }] }
       }
-      const mint = bridgeStatus.verified
-        ? await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress }).catch(error => ({ success: false, error: error?.message || 'Destination MSCA mint request failed' }))
-        : { success: false, error: 'Attestation belum ready' }
       let auditPending = false
-      try {
-        await recordAutoExec(userId, {
-          agent: requestAgent, action: 'bridge', amount: params.amount, token: 'USDC',
-          source: 'session', details: jsonText({ fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId, destinationMint: mint.success }),
-          txHash: result.txHash, explorerUrl: result.explorerUrl,
-        })
-      } catch (auditError) {
-        auditPending = true
-        console.error('[mcp-bridge] audit record failed after burn:', auditError?.message || auditError)
+      const mint = bridgeStatus.verified
+        ? await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress, userId, approvalId }).catch(error => ({ success: false, error: error?.message || 'Destination MSCA mint request failed', approvalId, safeToRetry: false }))
+        : { success: false, error: 'Attestation belum ready', approvalId, safeToRetry: false }
+      approvalId = mint.approvalId || approvalId
+      if (!mint.success && mint.userOpHash && mint.safeToRetry === false) {
+        try {
+          approvalId = mint.approvalId || approvalId || await recordBridgePending(userId, {
+            agent: requestAgent,
+            amount: params.amount,
+            fromChain: route.fromKey,
+            toChain: route.toKey,
+            previewId: params.previewId,
+            burnTxHash: result.txHash,
+            sourceUserOpHash: result.userOpHash,
+            sourceChainKey: executionChainKey(route.fromKey),
+            sourceExplorerUrl: result.explorerUrl,
+            destinationUserOpHash: mint.userOpHash,
+            destinationChainKey: executionChainKey(route.toKey),
+            settlementPhase: 'destination_pending',
+            error: mint.error,
+          })
+        } catch (auditError) {
+          auditPending = true
+          console.error('[mcp-bridge] pending destination audit record failed:', auditError?.message || auditError)
+        }
+      } else if (mint.success) {
+        try {
+          await recordAutoExec(userId, {
+            agent: requestAgent, action: 'bridge', amount: params.amount, token: 'USDC',
+            source: 'session', details: jsonText({ fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId, burnTxHash: result.txHash, destinationMint: true }),
+            txHash: result.txHash, explorerUrl: result.explorerUrl,
+          })
+        } catch (auditError) {
+          auditPending = true
+          console.error('[mcp-bridge] audit record failed after burn:', auditError?.message || auditError)
+        }
+      } else {
+        try {
+          await updateBridgePending(userId, approvalId, {
+            fromChain: route.fromKey,
+            toChain: route.toKey,
+            previewId: params.previewId,
+            burnTxHash: result.txHash,
+            sourceUserOpHash: result.userOpHash,
+            sourceChainKey: executionChainKey(route.fromKey),
+            sourceExplorerUrl: result.explorerUrl,
+            settlementPhase: 'destination_pending',
+            settlementStatus: 'pending_confirmation',
+          }, 'pending_confirmation', { txHash: result.txHash, userOpHash: result.userOpHash, error: mint.error })
+        } catch (auditError) {
+          auditPending = true
+          console.error('[mcp-bridge] pending bridge audit record failed:', auditError?.message || auditError)
+        }
       }
       return { content: [{ type: 'text', text: jsonText({
         status: mint.success ? 'executed' : 'settlement_pending',
         executed: true,
-        safeToRetry: mint.success ? false : (mint.safeToRetry ?? true),
+        autoMintQueued: Boolean(bridgeStatus.autoMintQueued),
+        safeToRetry: mint.success ? false : (mint.safeToRetry ?? false),
+        approvalId: (!mint.success && mint.userOpHash && mint.safeToRetry === false && !auditPending) ? approvalId : null,
         destinationMintStatus: mint.success ? 'minted' : (mint.error === 'destination_nonce_check_unavailable' ? 'unknown' : 'pending'),
         destinationMintIdempotent: Boolean(mint.idempotent),
         auditPending,
@@ -1810,7 +2299,9 @@ export function createMcpServer(userId, context = {}) {
         fee: { platformFeeBaseUnits: fee.fee.toString(), netBurnBaseUnits: fee.netAmount.toString(), totalDebitBaseUnits: amount.toString(), cctpMaxFeeBaseUnits: BRIDGE_MAX_FEE.toString() },
         message: mint.success
           ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya; tidak ada UserOperation ulang.' : 'Bridge MSCA berhasil sampai destination.')
-          : 'Burn MSCA berhasil; destination mint masih pending. Jalankan arcox_bridge_status lalu retry setelah attestation siap.',
+          : (bridgeStatus.autoMintQueued
+            ? 'Burn MSCA berhasil; attestation >30 detik sudah dimasukkan ke auto-mint worker. Manual arcox_bridge_status/arcox_retry_bridge_mint tetap tersedia setelah attestation siap.'
+            : 'Burn MSCA berhasil; destination mint masih pending. Jalankan arcox_bridge_status lalu retry setelah attestation siap.'),
       }) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ status: 'bridge_error', executed: false, error: e?.message || 'MSCA bridge gagal' }) }] }
@@ -1862,11 +2353,11 @@ export function createMcpServer(userId, context = {}) {
         status: 'settlement_pending',
         destinationMintStatus: 'unknown',
         reason: destinationMint.reason || 'destination_nonce_check_unavailable',
-        safeToRetry: true,
+        safeToRetry: false,
         walletAddress: info.walletAddress,
         walletType: 'MSCA',
         source: route.fromKey,
-        note: 'Nonce destination belum dapat diverifikasi. MCP tidak mengirim transaksi baru; ulangi status setelah RPC pulih.',
+        note: 'Nonce destination belum dapat diverifikasi. MCP tidak mengirim transaksi baru; retry ditahan sampai RPC membuktikan status nonce.',
       }) }] }
     }
     if (nonceDecision === 'minted') {
@@ -1934,7 +2425,7 @@ export function createMcpServer(userId, context = {}) {
           status: 'settlement_pending', executed: false, burnTxHash: params.burnTxHash,
           walletAddress: info.walletAddress, walletType: 'MSCA',
           destinationMintStatus: 'unknown', reason: destinationMint.reason || 'destination_nonce_check_unavailable',
-          safeToRetry: true, message: 'Nonce destination belum dapat diverifikasi. Tidak ada UserOperation baru yang dikirim.',
+          safeToRetry: false, message: 'Nonce destination belum dapat diverifikasi. Tidak ada UserOperation baru yang dikirim; retry ditahan sampai RPC membuktikan status nonce.',
         }) }] }
       }
       if (nonceDecision === 'minted') {
@@ -1945,8 +2436,8 @@ export function createMcpServer(userId, context = {}) {
           error: null, message: 'Destination mint sudah selesai sebelumnya. Tidak mengirim UserOperation ulang.',
         }) }] }
       }
-      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress })
-      return { content: [{ type: 'text', text: jsonText({        status: mint.success ? 'minted' : 'mint_failed', executed: mint.success && !mint.idempotent, idempotent: Boolean(mint.idempotent), burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, destinationMintStatus: mint.success ? 'minted' : 'unknown', safeToRetry: mint.success ? false : (mint.safeToRetry ?? true), error: mint.success ? null : mint.error, message: mint.success ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya.' : 'Destination receiveMessage berhasil via MSCA UserOperation.') : 'Destination mint gagal; pastikan MSCA deployed dan session destination chain telah diotorisasi.' }) }] }
+      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress, userId })
+      return { content: [{ type: 'text', text: jsonText({        status: mint.success ? 'minted' : (mint.error === 'destination_mint_in_flight' || mint.error === 'destination_nonce_check_unavailable' ? 'settlement_pending' : 'mint_failed'), executed: mint.success && !mint.idempotent, idempotent: Boolean(mint.idempotent), burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, destinationMintStatus: mint.success ? 'minted' : 'pending', safeToRetry: mint.success ? false : (mint.safeToRetry ?? false), error: mint.success ? null : mint.error, message: mint.success ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya.' : 'Destination receiveMessage berhasil via MSCA UserOperation.') : (mint.error === 'destination_mint_in_flight' ? 'Destination mint UserOperation masih pending. Jangan retry sampai status UserOperation final.' : 'Destination mint belum aman untuk diulang; pastikan status UserOperation dan nonce destination sudah final.') }) }] }
 
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ status: 'retry_error', executed: false, burnTxHash: params.burnTxHash, error: e?.message || 'Retry mint gagal' }) }] }
@@ -2092,7 +2583,7 @@ export function createMcpServer(userId, context = {}) {
           execution_guide: {
             swap: ['arcox_quote_swap → show preview → user ya → arcox_execute_swap (source=session)'],
             bridge: ENABLE_MSCA_CCTP_BRIDGE
-              ? ['arcox_quote_bridge → show preview → user ya → arcox_execute_bridge → jika pending, arcox_bridge_status. Source Arc Testnet USDC, destination EVM CCTP yang didukung.']
+              ? ['arcox_quote_bridge → show preview → user ya → arcox_execute_bridge → jika pending, arcox_bridge_status. Supported MSCA routes: Arc↔Base Sepolia and Arc↔Arbitrum Sepolia USDC via verified ArcoxRouter deployments.']
               : ['arcox_route_status(action=bridge) → bridge MSCA masih disabled sampai ArcoxRouter, destination relayer, dan CCTP route tervalidasi. Tidak ada dana yang dipindahkan.'],
             send: ['arcox_quote_send → show preview → user ya → arcox_execute_send (source=session)'],
             intel_x402: ['arcox_intel_get_* → jika paymentRequired → arcox_x402_pay_invoice (tanpa confirmed) preview → user ya → confirmed=true → retry intel tool dengan paymentId yang sama'],
@@ -2136,6 +2627,8 @@ export function createMcpServer(userId, context = {}) {
     const a = approvals.find(x => x.id === params.approvalId)
     if (!a) return { content: [{ type: 'text', text: jsonText({ status: 'not_found', error: 'Approval/request ID not found' }) }] }
 
+    let details = null
+    try { details = JSON.parse(a.details || '{}') } catch { /* legacy details */ }
     const response = {
       id: a.id,
       status: a.status,
@@ -2146,28 +2639,94 @@ export function createMcpServer(userId, context = {}) {
       txHash: a.txHash || null,
       explorerUrl: a.explorerUrl || null,
       userOpHash: a.userOpHash || null,
+      sourceUserOpHash: details?.sourceUserOpHash || null,
+      sourceChainKey: details?.sourceChainKey || details?.fromChain || null,
+      destinationUserOpHash: details?.destinationUserOpHash || null,
+      destinationChainKey: details?.destinationChainKey || null,
       createdAt: a.createdAt,
       approvedAt: a.approvedAt || null,
       completedAt: a.completedAt || null,
       error: a.error || null,
     }
 
-    // If there's a userOpHash and status is pending, try to check on-chain
+    // A hashless source submission cannot be queried by UserOperation hash.
+    // Keep it explicitly retry-blocked and tell the agent what read-only
+    // evidence is required; never turn an unknown result into a fresh burn.
+    const hashlessUnknownSource = a.action === 'bridge'
+      && details?.settlementPhase === 'source_submission_unknown'
+      && !details?.sourceUserOpHash
+      && ['pending_confirmation', 'pending_signature'].includes(a.status)
+    const unknownPrecheckSource = a.action === 'bridge'
+      && details?.settlementPhase === 'source_submission_failed'
+      && details?.userOpAccepted === 'unknown'
+      && details?.safeToRetry !== true
+    if (hashlessUnknownSource || unknownPrecheckSource) {
+      response.status = a.status
+      response.safeToRetry = false
+      response.userOpAccepted = 'unknown'
+      response.reason = 'source_user_operation_reconciliation_required'
+      response.reconciliationRequired = true
+      response.message = 'UserOperation sumber tidak memiliki hash atau hasil acceptance yang pasti. Rekonsiliasi bundler/receipt secara read-only terlebih dahulu; burn tidak boleh diulang.'
+      return { content: [{ type: 'text', text: jsonText(response) }] }
+    }
+
+    // Poll the exact UserOperation on the chain where it was submitted. For a
+    // bridge source timeout, a successful source UserOp is only an intermediate
+    // milestone: continue burn proof → attestation → destination mint instead
+    // of incorrectly marking the approval complete.
     if (a.userOpHash && ['pending_signature', 'pending_confirmation'].includes(a.status)) {
       try {
         const { getUserOpStatus } = await import('./sessionKeyService.mjs')
-        const liveStatus = await getUserOpStatus(userId, a.userOpHash)
-        if (liveStatus.status !== a.status) {
-          const { updateApprovalStatus } = await import('./vaultStore.mjs')
-          updateApprovalStatus(userId, a.id, liveStatus.status, { txHash: liveStatus.txHash, explorerUrl: liveStatus.explorerUrl })
-          const refreshed = listApprovals(userId).find(item => item.id === a.id)
-          response.status = liveStatus.status
-          response.approvedAt = refreshed?.approvedAt || response.approvedAt
-          response.completedAt = refreshed?.completedAt || response.completedAt
-          response.txHash = liveStatus.txHash || response.txHash
-          response.explorerUrl = liveStatus.explorerUrl || response.explorerUrl
+        const trackedChainKey = details?.destinationUserOpHash
+          ? details.destinationChainKey
+          : (details?.sourceChainKey || details?.fromChain)
+        const liveStatus = await getUserOpStatus(userId, a.userOpHash, trackedChainKey)
+        const isBridge = a.action === 'bridge' && Boolean(details?.fromChain && details?.toChain)
+        let nextStatus = liveStatus.status
+        let nextExtra = { txHash: liveStatus.txHash, explorerUrl: liveStatus.explorerUrl, userOpHash: liveStatus.txHash ? a.userOpHash : undefined }
+        let nextDetails = details
+
+        if (isBridge && liveStatus.status === 'success') {
+          const resumed = await resumePendingBridgeApproval(userId, a, {
+            ...details,
+            burnTxHash: details.burnTxHash || liveStatus.txHash,
+          }, await (await import('./vaultStore.mjs')).getSessionKeyInfo(userId))
+          if (resumed.status === 'success') {
+            nextStatus = 'success'
+            nextExtra = {
+              txHash: resumed.destinationTxHash || liveStatus.txHash,
+              explorerUrl: resumed.destinationExplorerUrl || liveStatus.explorerUrl,
+              userOpHash: resumed.destinationUserOpHash || a.userOpHash,
+            }
+            nextDetails = { ...details, burnTxHash: resumed.burnTxHash || details.burnTxHash || liveStatus.txHash, settlementStatus: 'success', destinationUserOpHash: resumed.destinationUserOpHash || details.destinationUserOpHash || null, destinationChainKey: details.destinationChainKey || null }
+          } else if (resumed.status === 'error') {
+            nextStatus = 'error'
+            nextExtra = { txHash: resumed.burnTxHash || liveStatus.txHash, explorerUrl: liveStatus.explorerUrl, userOpHash: a.userOpHash, error: resumed.reason }
+            nextDetails = { ...details, burnTxHash: resumed.burnTxHash || details.burnTxHash || liveStatus.txHash, settlementStatus: 'error', reason: resumed.reason }
+          } else {
+            nextStatus = 'pending_confirmation'
+            nextExtra = { txHash: resumed.burnTxHash || liveStatus.txHash, explorerUrl: liveStatus.explorerUrl, userOpHash: resumed.destinationUserOpHash || a.userOpHash, error: resumed.reason }
+            nextDetails = { ...details, burnTxHash: resumed.burnTxHash || details.burnTxHash || liveStatus.txHash, settlementStatus: 'pending_confirmation', destinationUserOpHash: resumed.destinationUserOpHash || details.destinationUserOpHash || null, destinationChainKey: resumed.destinationChainKey || details.destinationChainKey || null }
+          }
+        } else if (liveStatus.status !== 'pending_confirmation') {
+          nextStatus = liveStatus.status
         }
-      } catch { /* polling failed, return stored status */ }
+
+          const { updateApprovalStatus, listApprovals } = await import('./vaultStore.mjs')
+        updateApprovalStatus(userId, a.id, nextStatus, { ...nextExtra, details: jsonText(nextDetails) })
+        const refreshed = listApprovals(userId).find(item => item.id === a.id)
+        response.status = nextStatus
+        response.approvedAt = refreshed?.approvedAt || response.approvedAt
+        response.completedAt = refreshed?.completedAt || response.completedAt
+        response.txHash = refreshed?.txHash || nextExtra.txHash || response.txHash
+        response.explorerUrl = refreshed?.explorerUrl || nextExtra.explorerUrl || response.explorerUrl
+        response.userOpHash = refreshed?.userOpHash || nextExtra.userOpHash || response.userOpHash
+        response.sourceUserOpHash = nextDetails.sourceUserOpHash || response.sourceUserOpHash
+        response.sourceChainKey = nextDetails.sourceChainKey || response.sourceChainKey
+        response.destinationUserOpHash = nextDetails.destinationUserOpHash || response.destinationUserOpHash
+        response.destinationChainKey = nextDetails.destinationChainKey || response.destinationChainKey
+        response.error = refreshed?.error || nextExtra.error || response.error
+      } catch { /* polling/recovery failed, return stored status */ }
     }
 
     return { content: [{ type: 'text', text: jsonText(response) }] }

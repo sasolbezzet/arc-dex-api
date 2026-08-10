@@ -19,7 +19,7 @@ import '../polyfill-node.mjs'
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
 import { createPublicClient, createWalletClient, http, encodeFunctionData, getAddress, defineChain, parseUnits } from 'viem'
 import { toModularTransport, toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
-import { sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
+import { getPaymasterData, getPaymasterStubData, sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
 import { encrypt, decrypt } from './crypto.mjs'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { getLimits } from './vaultStore.mjs'
@@ -42,15 +42,25 @@ const ADD_OWNERS_ABI = [{
 const CLIENT_URL = process.env.CIRCLE_CLIENT_URL || ''
 const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
 const SESSION_INACTIVITY_MS = 24 * 60 * 60 * 1000
+const ARBITRUM_BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 function configuredArbitrumPriorityFloor() {
   try {
-    const value = BigInt(process.env.ARBITRUM_MIN_PRIORITY_FEE_WEI || '2000000')
-    return value > 0n ? value : 2_000_000n
+    const configured = BigInt(process.env.ARBITRUM_MIN_PRIORITY_FEE_WEI || '0')
+    // Arbitrum Sepolia bundlers currently reject tips below 1 gwei. Treat a
+    // lower env override as invalid rather than allowing a paymaster/RPC
+    // suggestion such as 400m wei to reach eth_sendUserOperation.
+    return configured >= ARBITRUM_BUNDLER_MIN_PRIORITY_FEE_WEI
+      ? configured
+      : ARBITRUM_BUNDLER_MIN_PRIORITY_FEE_WEI
   } catch {
-    return 2_000_000n
+    return ARBITRUM_BUNDLER_MIN_PRIORITY_FEE_WEI
   }
 }
+// Arc's bundler also rejects sub-1-gwei priority fees (observed as
+// maxPriorityFeePerGas=400000000 during the active-session bridge E2E).
+// Keep one conservative floor for both Circle-supported rollup transports.
 const ARBITRUM_MIN_PRIORITY_FEE_WEI = configuredArbitrumPriorityFloor()
+const ARC_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 
 // Resolve on each store operation so tests and controlled runtime configuration
 // can switch the backing file without retaining a stale path from module load.
@@ -93,8 +103,57 @@ function activityTimestampMs(value) {
   return null
 }
 
-/** Normalize fee suggestions before they enter an Arbitrum UserOperation. */
-export function normalizeArbitrumUserOperationFees({ maxFeePerGas = 0n, maxPriorityFeePerGas = 0n } = {}) {
+/** Normalize fee suggestions before they enter an MSCA UserOperation. */
+function parseFeeQuantity(value) {
+  try {
+    if (typeof value === 'string' && /^0x[0-9a-f]+$/i.test(value.trim())) return BigInt(value)
+    if (typeof value === 'string' && /^\d+$/.test(value.trim())) return BigInt(value)
+    if (typeof value === 'bigint') return value
+    if (typeof value === 'number' && Number.isSafeInteger(value)) return BigInt(value)
+  } catch { /* invalid fee is handled by the caller */ }
+  return null
+}
+
+/**
+ * Validate a browser-signed Arbitrum UserOperation without mutating it.
+ * Fee changes after signing invalidate the account signature, so the relay
+ * must reject an invalid envelope and require the browser to sign again.
+ */
+export function validateSignedUserOperationFees({ chainKey, signedUserOp } = {}) {
+  if (chainKey !== 'arbitrum-sepolia') return { ok: true }
+  const maxFeePerGas = parseFeeQuantity(signedUserOp?.maxFeePerGas)
+  const maxPriorityFeePerGas = parseFeeQuantity(signedUserOp?.maxPriorityFeePerGas)
+  if (maxPriorityFeePerGas === null || maxPriorityFeePerGas < ARBITRUM_MIN_PRIORITY_FEE_WEI) {
+    return { ok: false, reason: 'user_operation_priority_fee_too_low', requiredMinPriorityFeePerGas: ARBITRUM_MIN_PRIORITY_FEE_WEI.toString() }
+  }
+  if (maxFeePerGas === null || maxFeePerGas < maxPriorityFeePerGas) {
+    return { ok: false, reason: 'user_operation_max_fee_invalid', requiredMinMaxFeePerGas: maxPriorityFeePerGas.toString() }
+  }
+  return { ok: true, maxFeePerGas, maxPriorityFeePerGas }
+}
+
+export function shouldUseSessionPaymaster({ chainKey, feeProfile, paymaster } = {}) {
+  // Arc native gas is USDC. For bridge settlement on Arc, use the MSCA's
+  // native balance instead of Circle's currently unstaked paymaster, which
+  // rejects after its per-account operation limit is reached.
+  const arcBridge = chainKey === 'arc-testnet'
+    && ['arc-bridge', 'arbitrum-destination'].includes(String(feeProfile || ''))
+  return paymaster === true && !arcBridge
+}
+
+export function classifyUserOperationPrecheckError(error) {
+  const message = String(error?.message || error || '')
+  if (/max operations .*reached for account|account.*unstaked/i.test(message)) return 'bundler_account_reputation_limit'
+  if (/paymaster.*stake|signature aggregator.*stake|unstaked/i.test(message)) return 'bundler_stake_requirement'
+  if (/precheck failed|maxPriorityFeePerGas|missing or invalid parameters/i.test(message)) return 'user_operation_precheck_failed'
+  return null
+}
+
+export function isKnownPreSubmissionError(error) {
+  return classifyUserOperationPrecheckError(error) !== null
+}
+
+export function normalizeArbitrumUserOperationFees({ maxFeePerGas = 0n, maxPriorityFeePerGas = 0n, minPriorityFeePerGas = ARBITRUM_MIN_PRIORITY_FEE_WEI } = {}) {
   let observedMaxFee
   let observedPriority
   try {
@@ -106,9 +165,10 @@ export function normalizeArbitrumUserOperationFees({ maxFeePerGas = 0n, maxPrior
   }
   if (observedMaxFee < 0n) observedMaxFee = 0n
   if (observedPriority < 0n) observedPriority = 0n
-  const priority = observedPriority >= ARBITRUM_MIN_PRIORITY_FEE_WEI
+  const minimumPriority = BigInt(minPriorityFeePerGas || ARBITRUM_MIN_PRIORITY_FEE_WEI)
+  const priority = observedPriority >= minimumPriority
     ? observedPriority
-    : ARBITRUM_MIN_PRIORITY_FEE_WEI
+    : minimumPriority
   // `eth_gasPrice` is the current base-fee-inclusive suggestion on Arbitrum;
   // add the priority floor rather than merely doubling the floor. This keeps
   // maxFeePerGas above the current network price when the RPC is healthy, while
@@ -638,20 +698,69 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
 }
 
 /** Build the exact UserOperation parameters used by sendUserOperation. */
-export async function buildUserOperationParams({ account, calls, chainKey, baseClient }) {
+export async function buildUserOperationParams({ account, calls, chainKey, baseClient, feeProfile } = {}) {
   const params = { account, calls }
-  if (chainKey === 'arbitrum-sepolia') {
+  // Circle's Arc and Arbitrum bundlers require a non-trivial priority fee.
+  // Normalize only those chains when they are used by bridge settlement;
+  // ordinary Arc send/swap/x402 operations retain their established path.
+  const bridgeRollupProfile = ['arc-bridge', 'arbitrum-destination'].includes(String(feeProfile || ''))
+  if (chainKey === 'arbitrum-sepolia' || (chainKey === 'arc-testnet' && bridgeRollupProfile)) {
     const gasPrice = await baseClient.getGasPrice().catch(() => 0n)
     const suggestedPriority = await baseClient.request({ method: 'eth_maxPriorityFeePerGas' }).catch(() => 0n)
     const normalizedFees = normalizeArbitrumUserOperationFees({
       maxFeePerGas: gasPrice,
       maxPriorityFeePerGas: suggestedPriority,
+      minPriorityFeePerGas: chainKey === 'arc-testnet' ? ARC_MIN_PRIORITY_FEE_WEI : ARBITRUM_MIN_PRIORITY_FEE_WEI,
     })
     params.maxFeePerGas = normalizedFees.maxFeePerGas
     params.maxPriorityFeePerGas = normalizedFees.maxPriorityFeePerGas
   }
   return params
 }
+
+/**
+ * Keep the fee envelope authoritative when a paymaster response is merged into
+ * the UserOperation. Some Circle/Arbitrum paymaster responses echo a zero tip;
+ * returning those fields would overwrite the validated request immediately
+ * before signing/submission. Fee fields are intentionally omitted from the
+ * paymaster response because prepareUserOperation retains the request values.
+ */
+export function stripPaymasterFeeOverrides(response = {}) {
+  const { maxFeePerGas: _maxFeePerGas, maxPriorityFeePerGas: _maxPriorityFeePerGas, ...paymasterFields } = response || {}
+  return paymasterFields
+}
+
+/**
+ * Re-attach the validated fee envelope after a paymaster response. This is
+ * deliberately explicit: viem merges paymaster fields into the prepared
+ * request, so a Circle response containing zero fee fields must never win.
+ */
+export function preserveArbitrumFeeEnvelope(response = {}, fees = {}) {
+  const paymasterFields = stripPaymasterFeeOverrides(response)
+  const maxFeePerGas = BigInt(fees?.maxFeePerGas || 0)
+  const maxPriorityFeePerGas = BigInt(fees?.maxPriorityFeePerGas || 0)
+  if (maxPriorityFeePerGas <= 0n || maxFeePerGas < maxPriorityFeePerGas) {
+    throw new Error('Complete non-zero Arbitrum UserOperation fee envelope required')
+  }
+  return { ...paymasterFields, maxFeePerGas, maxPriorityFeePerGas }
+}
+
+/** Build a paymaster adapter that cannot reintroduce a lower fee envelope. */
+export function paymasterWithFeeOverrides(client, fees) {
+  const maxFeePerGas = BigInt(fees?.maxFeePerGas || 0)
+  const maxPriorityFeePerGas = BigInt(fees?.maxPriorityFeePerGas || 0)
+  if (maxPriorityFeePerGas <= 0n || maxFeePerGas < maxPriorityFeePerGas) {
+    throw new Error('Complete non-zero UserOperation fee envelope required')
+  }
+  const requestWithFees = request => ({ ...request, maxFeePerGas, maxPriorityFeePerGas })
+  return {
+    getPaymasterStubData: async request => preserveArbitrumFeeEnvelope(await getPaymasterStubData(client, requestWithFees(request)), fees),
+    getPaymasterData: async request => preserveArbitrumFeeEnvelope(await getPaymasterData(client, requestWithFees(request)), fees),
+  }
+}
+
+// Backward-compatible export for callers/tests that use the old name.
+export const arbitrumPaymasterWithFeeOverrides = paymasterWithFeeOverrides
 
 /**
  * Execute calls via the MSCA using the session/delegate key.
@@ -694,27 +803,70 @@ export async function executeViaSession(userId, calls, options = {}) {
   })
 
   // Submit UserOperation with optional paymaster sponsorship
-  const userOpParams = await buildUserOperationParams({ account: smartAccount, calls: normalizedCalls, chainKey, baseClient })
+  const userOpParams = await buildUserOperationParams({ account: smartAccount, calls: normalizedCalls, chainKey, baseClient, feeProfile: options.feeProfile })
 
-  // Arbitrum bundlers/paymasters reject a UserOperation whose priority fee is
-  // zero, even when the RPC's fee suggestion reports zero. Read the current
-  // gas price and apply a small non-zero floor so CCTP receiveMessage mints do
-  // not fail at bundler precheck. Other chains retain viem/Circle defaults.
-  // ponytail: paymaster support — pass paymaster data when Gas Station is
-  // configured. For now, user pays gas in USDC (Arc native token).
-  // Upgrade: add paymaster: true when Circle Gas Station policy is set up.
-  if (options.paymaster) {
-    userOpParams.paymaster = true
+  // Bridge settlement on Arc uses the MSCA's native USDC gas balance instead
+  // of the currently unstaked Circle paymaster. Arbitrum and ordinary
+  // non-bridge operations retain their existing sponsorship behavior.
+  const rollupFeeProfile = chainKey === 'arbitrum-sepolia' || (chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || '')))
+  const arcBridgeProfile = chainKey === 'arc-testnet'
+    && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
+  if (arcBridgeProfile && options.paymaster) {
+    // `undefined` would inherit the Circle modular client's default paymaster.
+    // Use an explicit false sentinel so viem prepares an unsponsored UserOp
+    // paid from the Arc MSCA's native USDC balance.
+    userOpParams.paymaster = false
+  } else if (shouldUseSessionPaymaster({ chainKey, feeProfile: options.feeProfile, paymaster: options.paymaster })) {
+    userOpParams.paymaster = rollupFeeProfile
+      ? paymasterWithFeeOverrides(modularClient, userOpParams)
+      : true
   }
 
-  const userOpHash = await sendUserOperation(modularClient, userOpParams)
+  let userOpHash
+  try {
+    userOpHash = await sendUserOperation(modularClient, userOpParams)
+  } catch (error) {
+    const message = String(error?.message || error)
+    // These errors are emitted by paymaster/bundler prechecks before a
+    // UserOperation hash exists. They are safe to retry with a fresh quote.
+    // Unknown transport failures remain thrown so bridge callers stay
+    // fail-closed and do not accidentally duplicate a potentially accepted op.
+    const precheckReason = classifyUserOperationPrecheckError(error)
+    if (precheckReason) {
+      return { status: 'error', reason: precheckReason, safeToRetry: false, userOpAccepted: 'unknown', error: message }
+    }
+    throw error
+  }
+  const explorerBase = String(options.explorerBaseUrl || chain.explorerUrl + '/tx/').replace(/\/?$/, '/')
 
-  // Wait for receipt — Arc has sub-second finality so this is fast
-  const receipt = await waitForUserOperationReceipt(modularClient, { hash: userOpHash })
+  // Bundlers can accept a UserOperation before the receipt indexer catches up.
+  // Preserve the hash on timeout so callers can poll instead of submitting a
+  // duplicate operation (which is especially dangerous for bridge burns).
+  let receipt
+  try {
+    receipt = await waitForUserOperationReceipt(modularClient, { hash: userOpHash })
+  } catch (error) {
+    const message = String(error?.message || '')
+    if (/timed out|timeout|timed-out/i.test(message)) {
+      return {
+        status: 'pending_confirmation',
+        reason: 'user_operation_pending',
+        userOpHash,
+        explorerUrl: `${explorerBase}${userOpHash}`,
+        error: message,
+      }
+    }
+    throw error
+  }
 
   const receiptTxHash = receipt?.receipt?.transactionHash || null
-  const success = receipt?.success === true
-  if (success && options.requireTransactionHash === true && !receiptTxHash) {
+  const transactionStatus = receipt?.receipt?.status
+  const transactionSucceeded = transactionStatus === 'success' || transactionStatus === '0x1' || transactionStatus === 1 || transactionStatus === true
+  const success = receipt?.success === true && (options.requireSuccessfulTransactionReceipt !== true || transactionSucceeded)
+  if (receipt?.success === true && options.requireSuccessfulTransactionReceipt === true && !transactionSucceeded) {
+    return { status: 'pending_confirmation', reason: 'transaction_receipt_status_unavailable_or_failed', userOpHash, receipt }
+  }
+  if (success && (options.requireTransactionHash === true || options.requireSuccessfulTransactionReceipt === true) && !receiptTxHash) {
     return {
       status: 'error',
       reason: 'transaction_hash_unavailable',
@@ -726,7 +878,6 @@ export async function executeViaSession(userId, calls, options = {}) {
   // bridge callers opt into requireTransactionHash because they must query the
   // source receipt and router event before minting on the destination.
   const txHash = receiptTxHash || userOpHash
-  const explorerBase = String(options.explorerBaseUrl || chain.explorerUrl + '/tx/').replace(/\/?$/, '/')
   const explorerUrl = `${explorerBase}${txHash}`
 
   return {
@@ -822,11 +973,16 @@ export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, prep
 /**
  * Get the status of a previously submitted UserOperation.
  */
-export async function getUserOpStatus(userId, userOpHash) {
+export function resolveUserOpChainKey(entry, requestedChainKey) {
+  const chainKey = requestedChainKey || entry?.chain || 'arc-testnet'
+  return { chainKey, explicit: Boolean(requestedChainKey) }
+}
+
+export async function getUserOpStatus(userId, userOpHash, requestedChainKey) {
   const entry = getSessionKey(userId)
   if (!entry || !entry.active) return { status: 'error', reason: 'no_session' }
 
-  const chainKey = entry.chain || 'arc-testnet'
+  const { chainKey } = resolveUserOpChainKey(entry, requestedChainKey)
   const chain = CHAINS[chainKey]
   if (!chain) return { status: 'error', reason: 'unknown_chain' }
   if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) return { status: 'error', reason: 'msca_unsupported_chain', chain: chainKey }
@@ -837,11 +993,21 @@ export async function getUserOpStatus(userId, userOpHash) {
   try {
     const receipt = await modularClient.getUserOperationReceipt({ hash: userOpHash })
     if (!receipt) return { status: 'pending_confirmation' }
-    const txHash = receipt?.receipt?.transactionHash || userOpHash
+    const txHash = receipt?.receipt?.transactionHash || null
+    const transactionStatus = receipt?.receipt?.status
+    const transactionSucceeded = transactionStatus === 'success'
+      || transactionStatus === '0x1'
+      || transactionStatus === 1
+      || transactionStatus === true
+    // A UserOperation hash is not an EVM transaction hash. Without the latter
+    // we cannot prove a source burn exists or safely continue a bridge.
+    if (receipt.success === true && (!txHash || !transactionSucceeded)) {
+      return { status: 'pending_confirmation', reason: 'transaction_hash_unavailable', userOpHash, receipt }
+    }
     return {
       status: receipt.success ? 'success' : 'error',
       txHash,
-      explorerUrl: `${String(chain.explorerUrl || '').replace(/\/?$/, '')}/tx/${txHash}`,
+      explorerUrl: txHash ? `${String(chain.explorerUrl || '').replace(/\/?$/, '')}/tx/${txHash}` : null,
       receipt,
     }
   } catch {
