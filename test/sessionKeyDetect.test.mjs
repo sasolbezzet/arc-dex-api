@@ -328,7 +328,7 @@ test('Arbitrum UserOperation fees never use a zero priority fee', async () => {
   assert.equal(mod.classifyUserOperationPrecheckError(new Error('paymaster stake too low')), 'bundler_stake_requirement')
   assert.equal(mod.classifyUserOperationPrecheckError(new Error('Max operations (4) reached for account: 0xabc due to being unstaked')), 'bundler_account_reputation_limit')
   assert.equal(mod.isKnownPreSubmissionError(new Error('network timeout after submission')), false)
-  assert.equal(mod.shouldUseSessionPaymaster({ chainKey: 'arc-testnet', feeProfile: 'arc-bridge', paymaster: true }), false)
+  assert.equal(mod.shouldUseSessionPaymaster({ chainKey: 'arc-testnet', feeProfile: 'arc-bridge', paymaster: true }), true)
   assert.equal(mod.shouldUseSessionPaymaster({ chainKey: 'arc-testnet', feeProfile: undefined, paymaster: true }), true)
   assert.equal(mod.shouldUseSessionPaymaster({ chainKey: 'arbitrum-sepolia', feeProfile: 'arbitrum-destination', paymaster: true }), true)
   const arcPaymaster = mod.paymasterWithFeeOverrides(fakePaymasterClient, arcParams)

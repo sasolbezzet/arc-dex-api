@@ -133,11 +133,12 @@ export function validateSignedUserOperationFees({ chainKey, signedUserOp } = {})
 }
 
 export function shouldUseSessionPaymaster({ chainKey, feeProfile, paymaster } = {}) {
-  // Circle Gas Station sponsors all supported testnets, including Arc,
-  // Base Sepolia, and Arbitrum Sepolia. A zero MSCA native balance is
-  // therefore valid when the UserOperation includes paymaster sponsorship.
-  // Keep the arguments explicit for callers/tests and future policy routing.
-  return paymaster === true
+  // Arc native gas is USDC. For bridge settlement on Arc, use the MSCA's
+  // native balance instead of Circle's currently unstaked paymaster, which
+  // rejects after its per-account operation limit is reached.
+  const arcBridge = chainKey === 'arc-testnet'
+    && ['arc-bridge', 'arbitrum-destination'].includes(String(feeProfile || ''))
+  return paymaster === true && !arcBridge
 }
 
 export function classifyUserOperationPrecheckError(error) {
@@ -804,12 +805,18 @@ export async function executeViaSession(userId, calls, options = {}) {
   // Submit UserOperation with optional paymaster sponsorship
   const userOpParams = await buildUserOperationParams({ account: smartAccount, calls: normalizedCalls, chainKey, baseClient, feeProfile: options.feeProfile })
 
-  // Circle Gas Station sponsorship is enabled for every supported MSCA
-  // operation when requested. Bridge profiles keep the explicit fee envelope
-  // because Arc and Arbitrum bundlers reject sub-1-gwei tips, and a paymaster
-  // response must not overwrite those validated fees.
+  // Bridge settlement on Arc uses the MSCA's native USDC gas balance instead
+  // of the currently unstaked Circle paymaster. Arbitrum and ordinary
+  // non-bridge operations retain their existing sponsorship behavior.
   const rollupFeeProfile = chainKey === 'arbitrum-sepolia' || (chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || '')))
-  if (shouldUseSessionPaymaster({ chainKey, feeProfile: options.feeProfile, paymaster: options.paymaster })) {
+  const arcBridgeProfile = chainKey === 'arc-testnet'
+    && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
+  if (arcBridgeProfile && options.paymaster) {
+    // `undefined` would inherit the Circle modular client's default paymaster.
+    // Use an explicit false sentinel so viem prepares an unsponsored UserOp
+    // paid from the Arc MSCA's native USDC balance.
+    userOpParams.paymaster = false
+  } else if (shouldUseSessionPaymaster({ chainKey, feeProfile: options.feeProfile, paymaster: options.paymaster })) {
     userOpParams.paymaster = rollupFeeProfile
       ? paymasterWithFeeOverrides(modularClient, userOpParams)
       : true

@@ -511,19 +511,9 @@ export async function resolveActiveMsca(userId) {
     if (!info?.active || !info.walletAddress) return null
     // MCP is MSCA-only. An authenticated identity must resolve through an
     // explicit owner -> MSCA alias; never treat an EOA or an unbound wallet
-    // record as the agent wallet. However, a self-alias (owner == MSCA) is
-    // valid when the wallet is deployed as a smart account on-chain.
-    const isSelfAlias = String(info.walletAddress).toLowerCase() === String(userId).toLowerCase()
-    if (isSelfAlias) {
-      // Self-alias is allowed only if the address is a deployed contract (MSCA)
-      const { createPublicClient, http, defineChain } = await import('viem')
-      const arcRpc = process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network'
-      const client = createPublicClient({ chain: defineChain({ id: 5042002, name: 'Arc Testnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [arcRpc] } } }), transport: http(arcRpc) })
-      const code = await client.getBytecode({ address: info.walletAddress }).catch(() => undefined)
-      if (!code || code === '0x') return null
-    } else if (!hasExplicitSessionAlias(userId, info.walletAddress)) {
-      return null
-    }
+    // record as the agent wallet.
+    if (String(info.walletAddress).toLowerCase() === String(userId).toLowerCase()) return null
+    if (!hasExplicitSessionAlias(userId, info.walletAddress)) return null
     return info
   } catch {
     return null
@@ -2360,10 +2350,9 @@ export function createMcpServer(userId, context = {}) {
       }
       const { executeViaSession } = await import('./sessionKeyService.mjs')
 
-      // Final guarded flow mirrors the proven frontend sequence exactly:
-      // approve → successful receipt → ArcoxRouter bridge call. The router
-      // remains the only source burn path; direct TokenMessenger calls are not
-      // accepted by this MCP flow.
+      // Frontend parity: approve is its own transaction and must be finalized
+      // before the router burn is sent. If approval was already confirmed by a
+      // previous call, skip it and continue directly to the burn UserOp.
       if (!approvalConfirmed) {
         let approvalResult
         try {
