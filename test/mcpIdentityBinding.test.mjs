@@ -283,6 +283,47 @@ test('unresolved source intent helper cannot be bypassed with a new bridge quote
     toChain: 'Base_Sepolia',
     walletAddress: MSCA,
   })?.approval.id, pending.id)
+
+  // A known bundler precheck is terminal before a UserOperation hash exists,
+  // so the route may safely receive a fresh quote.
+  assert.equal(hasUnresolvedSourceBridgeIntent([{
+    id: 'approval-precheck-failed',
+    action: 'bridge',
+    status: 'error',
+    error: 'UserOperation rejected because paymaster stake is too low',
+    details: JSON.stringify({
+      fromChain: 'Arc_Testnet',
+      toChain: 'Base_Sepolia',
+      walletAddress: MSCA,
+      settlementPhase: 'source_submission_failed',
+      reason: 'bundler_stake_requirement',
+      userOpAccepted: 'no',
+      safeToRetry: true,
+    }),
+  }], {
+    fromChain: 'Arc_Testnet',
+    toChain: 'Base_Sepolia',
+    walletAddress: MSCA,
+  }), null)
+
+  // A hashless error without an explicit precheck result remains blocked: absence
+  // of a hash alone is never proof that the bundler did not accept the op.
+  assert.equal(hasUnresolvedSourceBridgeIntent([{
+    id: 'approval-unknown-error',
+    action: 'bridge',
+    status: 'error',
+    error: 'temporary transport failure',
+    details: JSON.stringify({
+      fromChain: 'Arc_Testnet',
+      toChain: 'Base_Sepolia',
+      walletAddress: MSCA,
+      settlementPhase: 'source_submission_failed',
+    }),
+  }], {
+    fromChain: 'Arc_Testnet',
+    toChain: 'Base_Sepolia',
+    walletAddress: MSCA,
+  })?.approval.id, 'approval-unknown-error')
 })
 
 test('multi-chain balance preserves a structured error for an unavailable chain', async () => {

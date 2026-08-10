@@ -1274,11 +1274,13 @@ async function findPendingBridgeMint(userId, burnTxHash, toKey) {
 }
 
 // A new quote must not bypass an unresolved source UserOperation by using a
-// different previewId. Only an explicitly terminal/reverted approval is safe
-// to quote again; pending/unknown source submissions remain blocked per
-// user, MSCA, and route until reconciled.
+// different previewId. Explicitly terminal precheck failures are different:
+// the bundler rejected them before returning a UserOperation hash, so a fresh
+// quote is safe. Any accepted hash, timeout, or hashless record without a
+// proven terminal precheck remains fail-closed.
 export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain, walletAddress } = {}) {
   const pendingPhases = new Set(['source_intent_created', 'source_approval_unknown', 'source_approval_submitted', 'source_approval_confirmed', 'source_submission_unknown', 'source_submitted', 'source_confirmed'])
+  const terminalPrecheckReasons = new Set(['bundler_account_reputation_limit', 'bundler_stake_requirement', 'user_operation_precheck_failed'])
   const expectedFrom = String(fromChain || '').toLowerCase()
   const expectedTo = String(toChain || '').toLowerCase()
   const expectedWallet = String(walletAddress || '').toLowerCase()
@@ -1286,16 +1288,41 @@ export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain,
     if (approval?.action !== 'bridge') continue
     let details
     try { details = JSON.parse(approval.details || '{}') } catch { continue }
-    const unknownSubmission = details?.settlementPhase === 'source_submission_failed'
-      && details?.userOpAccepted === 'unknown'
-      && details?.safeToRetry !== true
-    if (!['pending_confirmation', 'pending_signature'].includes(approval?.status) && !unknownSubmission) continue
-    if (!pendingPhases.has(details?.settlementPhase) && !unknownSubmission) continue
     if (String(details?.fromChain || '').toLowerCase() !== expectedFrom || String(details?.toChain || '').toLowerCase() !== expectedTo) continue
     const storedWallet = String(details?.walletAddress || '').toLowerCase()
     // Missing wallet binding is not evidence that the intent belongs to a
     // different wallet. Fail closed and block the same user's route.
     if (expectedWallet && storedWallet && storedWallet !== expectedWallet) continue
+
+    const sourceHash = details?.sourceUserOpHash || details?.sourceApprovalUserOpHash || approval?.userOpHash
+    const burnHash = details?.burnTxHash || approval?.txHash
+    const errorText = String(details?.reason || approval?.error || '').toLowerCase()
+    const terminalPrecheck = ['source_submission_failed', 'source_approval_failed'].includes(details?.settlementPhase)
+      && !sourceHash && !burnHash
+      // Error text is diagnostic only. A record is retryable only when the
+      // execution path explicitly recorded that the bundler rejected it before
+      // acceptance; this prevents a transport error containing “paymaster”
+      // from being mistaken for proof that no burn was accepted.
+      && details?.userOpAccepted === 'no'
+      && details?.safeToRetry === true
+      && terminalPrecheckReasons.has(String(details?.reason || '').toLowerCase())
+      && [...terminalPrecheckReasons].some(reason => errorText.includes(reason))
+    const unresolvedSourceFailure = ['source_submission_failed', 'source_approval_failed'].includes(details?.settlementPhase)
+      && !terminalPrecheck
+    if (unresolvedSourceFailure) return { approval, details }
+    if (terminalPrecheck) continue
+
+    // Legacy source failures did not persist acceptance metadata. If they are
+    // hashless and not explicitly marked as a terminal precheck, the branch
+    // above already returned them as ambiguous; this fallback covers pending
+    // phases and the legacy unknown marker.
+    const unknownSubmission = details?.settlementPhase === 'source_submission_unknown'
+      || (details?.settlementPhase === 'source_submission_failed'
+        && details?.userOpAccepted !== 'no'
+        && details?.safeToRetry !== true
+        && !sourceHash && !burnHash)
+    if (!['pending_confirmation', 'pending_signature'].includes(approval?.status) && !unknownSubmission) continue
+    if (!pendingPhases.has(details?.settlementPhase) && !unknownSubmission) continue
     return { approval, details }
   }
   return null
@@ -2346,6 +2373,7 @@ export function createMcpServer(userId, context = {}) {
           sourceChainKey: executionChainKey(route.fromKey),
           settlementPhase: approvalSucceeded ? 'source_approval_confirmed' : approvalPending ? 'source_approval_submitted' : 'source_approval_failed',
           settlementStatus: approvalSucceeded ? 'pending_confirmation' : approvalPending ? 'pending_confirmation' : 'error',
+          reason: approvalResult.reason || null,
           userOpAccepted: approvalResult.userOpAccepted || (approvalResult.userOpHash ? 'yes' : approvalResult.status === 'error' ? 'unknown' : null),
           safeToRetry: approvalResult.safeToRetry === true,
         }, approvalSucceeded || approvalPending ? 'pending_confirmation' : 'error', {
@@ -2389,6 +2417,7 @@ export function createMcpServer(userId, context = {}) {
         sourceChainKey: executionChainKey(route.fromChain),
         settlementPhase: sourceSucceeded ? 'source_confirmed' : sourcePending ? 'source_submitted' : 'source_submission_failed',
         settlementStatus: sourceSucceeded ? 'source_confirmed' : sourcePending ? 'pending_confirmation' : 'error',
+        reason: result.reason || null,
         userOpAccepted: result.userOpAccepted || (result.userOpHash ? 'yes' : sourceFailed ? 'unknown' : null),
         safeToRetry: result.safeToRetry === true,
       }, sourceFailed ? 'error' : 'pending_confirmation', { txHash: sourceSucceeded ? result.txHash : undefined, userOpHash: result.userOpHash, explorerUrl: result.explorerUrl, error: result.error })

@@ -833,7 +833,17 @@ export async function executeViaSession(userId, calls, options = {}) {
     // fail-closed and do not accidentally duplicate a potentially accepted op.
     const precheckReason = classifyUserOperationPrecheckError(error)
     if (precheckReason) {
-      return { status: 'error', reason: precheckReason, safeToRetry: false, userOpAccepted: 'unknown', error: message }
+      return {
+        status: 'error',
+        reason: precheckReason,
+        // The bundler rejected this operation during validation, before it
+        // returned a UserOperation hash. It is safe to create a fresh quote;
+        // do not mislabel this as an unknown accepted operation, otherwise a
+        // stale bridge approval can permanently block the route.
+        safeToRetry: true,
+        userOpAccepted: 'no',
+        error: message,
+      }
     }
     throw error
   }
