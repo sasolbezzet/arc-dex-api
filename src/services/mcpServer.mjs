@@ -4,7 +4,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID, createHash } from 'crypto'
 import { z } from 'zod'
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs'
+import { readFileSync, existsSync, writeFileSync, mkdirSync, rmSync, statSync } from 'fs'
+import { dirname } from 'path'
 
 // ── In-memory session store (production: use Redis) ──
 const sessions = new Map() // sessionId -> { transport, server }
@@ -30,6 +31,86 @@ const SERVER_URL = process.env.SERVER_URL || 'https://arcoxdex.vercel.app'
 const TOKEN_TTL = 3600 * 24 // 24 hours
 const OAUTH_PATH = process.env.OAUTH_PATH || './data/oauth-clients.json'
 const OAUTH_TOKENS_PATH = process.env.OAUTH_TOKENS_PATH || './data/oauth-tokens.json'
+const OAUTH_STATE_PATH = process.env.OAUTH_STATE_PATH || './data/oauth-state.json'
+const OAUTH_STATE_LOCK = `${OAUTH_STATE_PATH}.lock`
+const CANONICAL_SERVER_HOST = (() => {
+  try { return new URL(SERVER_URL).host }
+  catch { return 'arcoxdex.vercel.app' }
+})()
+
+// OAuth authorization requests and SIWE challenges must survive a backend
+// restart and must be visible when Vercel/reverse-proxy routing changes the
+// worker handling the next request. They contain only short-lived protocol
+// state; access tokens remain in their existing store.
+function loadOAuthState() {
+  const state = readJsonFile(OAUTH_STATE_PATH, { requests: {}, challenges: {} })
+  return {
+    requests: state?.requests && typeof state.requests === 'object' ? state.requests : {},
+    challenges: state?.challenges && typeof state.challenges === 'object' ? state.challenges : {},
+    codes: state?.codes && typeof state.codes === 'object' ? state.codes : {},
+  }
+}
+function refreshOAuthState() {
+  const state = loadOAuthState()
+  // Disk is authoritative. Removing absent entries is important after expiry
+  // or when another worker has already consumed/cleaned the state.
+  authCodes.clear()
+  oauthRequests.clear()
+  siweChallenges.clear()
+  for (const [key, value] of Object.entries(state.codes)) authCodes.set(key, value)
+  for (const [key, value] of Object.entries(state.requests)) oauthRequests.set(key, value)
+  for (const [key, value] of Object.entries(state.challenges)) siweChallenges.set(key, value)
+  return state
+}
+function refreshOAuthClients() {
+  const clients = loadClients()
+  oauthClients.clear()
+  for (const [key, value] of clients) oauthClients.set(key, value)
+  return clients
+}
+function saveOAuthState() {
+  atomicWriteJsonFile(OAUTH_STATE_PATH, {
+    codes: Object.fromEntries(authCodes),
+    requests: Object.fromEntries(oauthRequests),
+    challenges: Object.fromEntries(siweChallenges),
+  })
+}
+function withOAuthStateLock(fn) {
+  const deadline = Date.now() + 15000
+  const staleAfter = 10000
+  const ownerToken = `${process.pid}:${randomUUID()}`
+  const ownerPath = `${OAUTH_STATE_LOCK}/owner`
+  const sleeper = new Int32Array(new SharedArrayBuffer(4))
+  mkdirSync(dirname(OAUTH_STATE_LOCK), { recursive: true })
+  while (true) {
+    try {
+      mkdirSync(OAUTH_STATE_LOCK)
+      writeFileSync(ownerPath, JSON.stringify({ token: ownerToken, acquiredAt: Date.now() }), { mode: 0o600 })
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      try {
+        const owner = JSON.parse(readFileSync(ownerPath, 'utf8'))
+        if (Date.now() - Number(owner?.acquiredAt || 0) > staleAfter) rmSync(OAUTH_STATE_LOCK, { recursive: true, force: true })
+      } catch {
+        try {
+          if (Date.now() - statSync(OAUTH_STATE_LOCK).mtimeMs > staleAfter) rmSync(OAUTH_STATE_LOCK, { recursive: true, force: true })
+        } catch { /* another worker may be acquiring or recovering the lock */ }
+      }
+      if (Date.now() >= deadline) throw new Error('OAuth state lock timeout')
+      Atomics.wait(sleeper, 0, 0, 10)
+    }
+  }
+  try {
+    refreshOAuthState()
+    return fn()
+  } finally {
+    try {
+      const owner = JSON.parse(readFileSync(ownerPath, 'utf8'))
+      if (owner?.token === ownerToken) rmSync(OAUTH_STATE_LOCK, { recursive: true, force: true })
+    } catch { /* stale recovery or another worker owns the lock */ }
+  }
+}
 
 // ── Persistent OAuth client store ──
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
@@ -44,6 +125,7 @@ function saveClients(map) {
 }
 
 const oauthClients = loadClients()
+refreshOAuthState()
 
 function loadTokens() {
   const d = readJsonFile(OAUTH_TOKENS_PATH, { tokens: {} })
@@ -52,23 +134,38 @@ function loadTokens() {
 function saveTokens() {
   atomicWriteJsonFile(OAUTH_TOKENS_PATH, { tokens: Object.fromEntries(accessTokens) })
 }
-for (const [token, auth] of loadTokens()) {
-  if (auth?.expires > Date.now()) accessTokens.set(token, auth)
+function refreshAccessTokens() {
+  accessTokens.clear()
+  for (const [token, auth] of loadTokens()) {
+    if (auth?.expires > Date.now()) accessTokens.set(token, auth)
+  }
 }
+refreshAccessTokens()
 
 // ── OAuth helpers ──
 export function registerOAuthClient({ clientName, redirectUris = [] }) {
-  const clientId = 'arcox_' + randomUUID().slice(0, 12)
-  const clientSecret = randomUUID()
-  oauthClients.set(clientId, { clientSecret, redirectUris, clientName })
-  saveClients(oauthClients)
-  return { clientId, clientSecret, clientName, redirectUris }
+  return withOAuthStateLock(() => {
+    refreshOAuthClients()
+    const clientId = 'arcox_' + randomUUID().slice(0, 12)
+    const clientSecret = randomUUID()
+    oauthClients.set(clientId, { clientSecret, redirectUris, clientName })
+    saveClients(oauthClients)
+    return { clientId, clientSecret, clientName, redirectUris }
+  })
 }
 
-export function createAuthCode(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce } = {}) {
+function createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce } = {}) {
   const code = randomUUID()
   authCodes.set(code, { clientId, userId, redirectUri, codeChallenge, state: state || '', requestId: requestId || null, challengeNonce: challengeNonce || null, expires: Date.now() + 600000 }) // 10 min
   return code
+}
+
+export function createAuthCode(clientId, userId, options = {}) {
+  return withOAuthStateLock(() => {
+    const code = createAuthCodeUnsafe(clientId, userId, options)
+    saveOAuthState()
+    return code
+  })
 }
 
 // A repeated SIWE verification can happen when a wallet returns successfully
@@ -91,44 +188,54 @@ export function findExistingAuthCode(clientId, userId, { redirectUri, codeChalle
 }
 
 export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, codeVerifier) {
-  const auth = authCodes.get(code)
-  if (!auth) return { error: 'invalid_grant', error_description: 'Invalid authorization code' }
-  if (Date.now() > auth.expires) return { error: 'invalid_grant', error_description: 'Code expired' }
-  if (auth.clientId !== clientId) return { error: 'invalid_grant', error_description: 'client_id mismatch' }
-  if (!redirectUri || auth.redirectUri !== redirectUri) return { error: 'invalid_grant', error_description: 'redirect_uri mismatch' }
-  if (!auth.codeChallenge || !codeVerifier || createHash('sha256').update(codeVerifier).digest('base64url') !== auth.codeChallenge) {
-    return { error: 'invalid_grant', error_description: 'PKCE verification failed' }
-  }
-  const client = oauthClients.get(clientId)
-  if (!client) return { error: 'invalid_client', error_description: 'Unknown client_id' }
-  // If client registered with token_endpoint_auth_method=none, skip secret check
-  if (clientSecret !== undefined && clientSecret !== '') {
-    if (client.clientSecret !== clientSecret) return { error: 'invalid_client', error_description: 'Invalid client_secret' }
-  }
-  authCodes.delete(code)
-  if (auth.challengeNonce) {
-    const challenge = siweChallenges.get(auth.challengeNonce)
-    if (challenge) challenge.consumed = true
-  }
-  const token = 'arx_at_' + randomUUID().replace(/-/g, '')
-  accessTokens.set(token, { userId: auth.userId, clientId, expires: Date.now() + TOKEN_TTL * 1000 })
-  saveTokens()
-  return {
-    access_token: token,
-    token_type: 'Bearer',
-    expires_in: TOKEN_TTL,
-    scope: 'mcp:tools',
-  }
+  return withOAuthStateLock(() => {
+    refreshOAuthClients()
+    const auth = authCodes.get(code)
+    if (!auth) return { error: 'invalid_grant', error_description: 'Invalid authorization code' }
+    if (Date.now() > auth.expires) return { error: 'invalid_grant', error_description: 'Code expired' }
+    if (auth.clientId !== clientId) return { error: 'invalid_grant', error_description: 'client_id mismatch' }
+    if (!redirectUri || auth.redirectUri !== redirectUri) return { error: 'invalid_grant', error_description: 'redirect_uri mismatch' }
+    if (!auth.codeChallenge || !codeVerifier || createHash('sha256').update(codeVerifier).digest('base64url') !== auth.codeChallenge) {
+      return { error: 'invalid_grant', error_description: 'PKCE verification failed' }
+    }
+    const client = oauthClients.get(clientId)
+    if (!client) return { error: 'invalid_client', error_description: 'Unknown client_id' }
+    // If client registered with token_endpoint_auth_method=none, skip secret check
+    if (clientSecret !== undefined && clientSecret !== '') {
+      if (client.clientSecret !== clientSecret) return { error: 'invalid_client', error_description: 'Invalid client_secret' }
+    }
+    authCodes.delete(code)
+    if (auth.challengeNonce) {
+      const challenge = siweChallenges.get(auth.challengeNonce)
+      if (challenge) challenge.consumed = true
+    }
+    // Persist single-use consumption before returning so another worker cannot
+    // redeem the same code or replay its SIWE challenge.
+    saveOAuthState()
+    // Merge the latest shared token file while holding the OAuth lock before
+    // adding this token; otherwise a worker with a stale cache could erase a
+    // token issued concurrently by another worker.
+    refreshAccessTokens()
+    const token = 'arx_at_' + randomUUID().replace(/-/g, '')
+    accessTokens.set(token, { userId: auth.userId, clientId, expires: Date.now() + TOKEN_TTL * 1000 })
+    saveTokens()
+    return {
+      access_token: token,
+      token_type: 'Bearer',
+      expires_in: TOKEN_TTL,
+      scope: 'mcp:tools',
+    }
+  })
 }
 
 export function validateAccessToken(token) {
+  // Tokens are persisted because the next MCP request may land on another
+  // worker than the one that completed `/token`. Refresh the local cache on
+  // every validation; the file store is authoritative for this short-lived
+  // OAuth state.
+  refreshAccessTokens()
   const auth = accessTokens.get(token)
   if (!auth) return null
-  if (Date.now() > auth.expires) {
-    accessTokens.delete(token)
-    saveTokens()
-    return null
-  }
   return auth
 }
 
@@ -137,13 +244,22 @@ export function validateAccessToken(token) {
 // gradual memory pressure / OOM kills.
 const _authSweep = setInterval(() => {
   const now = Date.now()
-  let changed = false
-  for (const [code, v] of authCodes) if (now > v.expires) authCodes.delete(code)
-  for (const [requestId, v] of oauthRequests) if (now > v.expires) oauthRequests.delete(requestId)
-  for (const [nonce, v] of siweChallenges) if (now > v.expires) siweChallenges.delete(nonce)
-  for (const [tok, v] of accessTokens) if (now > v.expires) { accessTokens.delete(tok); changed = true }
-
-  if (changed) saveTokens()
+  try {
+    withOAuthStateLock(() => {
+      for (const [code, v] of authCodes) if (now > v.expires) authCodes.delete(code)
+      for (const [requestId, v] of oauthRequests) if (now > v.expires) oauthRequests.delete(requestId)
+      for (const [nonce, v] of siweChallenges) if (now > v.expires) siweChallenges.delete(nonce)
+      saveOAuthState()
+      // Token cleanup shares the OAuth lock, so a sweep cannot overwrite a
+      // token issued concurrently by another worker.
+      refreshAccessTokens()
+      let changed = false
+      for (const [token, auth] of accessTokens) {
+        if (now > auth.expires) { accessTokens.delete(token); changed = true }
+      }
+      if (changed) saveTokens()
+    })
+  } catch { /* retry on the next sweep */ }
 }, 10 * 60 * 1000)
 if (_authSweep.unref) _authSweep.unref()
 
@@ -151,6 +267,7 @@ if (_authSweep.unref) _authSweep.unref()
 // 'chatgpt' so the frontend StatusDot matching works). Falls back to the
 // registered client name, then to a generic label.
 export function resolveAgentName(clientId) {
+  refreshOAuthClients()
   const client = oauthClients.get(clientId)
   const name = (client?.clientName || '').toLowerCase()
   if (name.includes('claude')) return 'claude-mcp'
@@ -196,6 +313,7 @@ export function protectedResourceHandler(req, res) {
 // ── OAuth Authorize endpoint ──
 // GET /api/auth/authorize?response_type=code&client_id=...&redirect_uri=...&state=...&code_challenge=...
 export function oauthAuthorizeHandler(req, res) {
+  refreshOAuthClients()
   const { response_type, client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.query
   if (response_type !== 'code') return res.status(400).json({ error: 'unsupported_response_type' })
   const client = oauthClients.get(client_id)
@@ -208,13 +326,21 @@ export function oauthAuthorizeHandler(req, res) {
   // values, but it must not be able to change the redirect, state, or PKCE
   // binding before SIWE verification completes.
   const requestId = randomUUID()
-  oauthRequests.set(requestId, {
-    clientId: client_id,
-    redirectUri: redirect_uri,
-    state,
-    codeChallenge: code_challenge,
-    expires: Date.now() + 600000,
-  })
+  try {
+    withOAuthStateLock(() => {
+      refreshOAuthClients()
+      oauthRequests.set(requestId, {
+        clientId: client_id,
+        redirectUri: redirect_uri,
+        state,
+        codeChallenge: code_challenge,
+        expires: Date.now() + 600000,
+      })
+      saveOAuthState()
+    })
+  } catch (error) {
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
 
   // Redirect to frontend Plugin page with OAuth params
   // Frontend handles SIWE login + approval, then redirects back to ChatGPT
@@ -231,22 +357,33 @@ export function oauthAuthorizeHandler(req, res) {
 
 // ── SIWE message generation ──
 export function siweMessageHandler(req, res) {
+  refreshOAuthClients()
   const { address, client_id, request_id } = req.query
   if (!address) return res.status(400).json({ error: 'address required' })
-  const client = oauthClients.get(client_id)
-  const request = oauthRequests.get(request_id)
-  if (!client || !request || request.clientId !== client_id || Date.now() > request.expires) return res.status(400).json({ error: 'invalid_authorization_request' })
-  const domain = req.headers.host || 'arcoxdex.vercel.app'
-  const nonce = randomUUID().slice(0, 8)
-  const message = `${domain} wants you to sign in with your Ethereum account:\n${address}\n\nAuthorize ARCOX MCP Server\n\nURI: ${SERVER_URL}\nVersion: 1\nChain ID: 5042002\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`
-  siweChallenges.set(nonce, {
-    address: String(address).toLowerCase(),
-    clientId: client_id,
-    requestId: request_id,
-    message,
-    expires: Date.now() + 300000,
-  })
-  res.json({ message, nonce })
+  let result
+  try {
+    result = withOAuthStateLock(() => {
+      refreshOAuthClients()
+      const client = oauthClients.get(client_id)
+      const request = oauthRequests.get(request_id)
+      if (!client || !request || request.clientId !== client_id || Date.now() > request.expires) return { error: 'invalid_authorization_request' }
+      const nonce = randomUUID().slice(0, 8)
+      const message = `${CANONICAL_SERVER_HOST} wants you to sign in with your Ethereum account:\n${address}\n\nAuthorize ARCOX MCP Server\n\nURI: ${SERVER_URL}\nVersion: 1\nChain ID: 5042002\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`
+      siweChallenges.set(nonce, {
+        address: String(address).toLowerCase(),
+        clientId: client_id,
+        requestId: request_id,
+        message,
+        expires: Date.now() + 300000,
+      })
+      saveOAuthState()
+      return { message, nonce }
+    })
+  } catch (error) {
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
+  if (result.error) return res.status(400).json(result)
+  res.json(result)
 }
 
 // ── SIWE verify + issue auth code ──
@@ -254,15 +391,26 @@ import { createPublicClient, decodeEventLog, defineChain, encodeFunctionData, fa
 export async function siweVerifyHandler(req, res) {
   const { address, message, signature, clientId, redirectUri, state, codeChallenge, requestId } = req.body || {}
   if (!address || !message || !clientId || !requestId) return res.status(400).json({ error: 'missing_fields' })
-  
   if (!redirectUri || !codeChallenge) return res.status(400).json({ error: 'missing_pkce_or_redirect_uri' })
-  const client = oauthClients.get(clientId)
-  const request = oauthRequests.get(requestId)
-  if (!client || !request || request.clientId !== clientId || Date.now() > request.expires) return res.status(400).json({ error: 'invalid_authorization_request' })
-  if (request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri)) return res.status(400).json({ error: 'authorization_request_mismatch' })
-  const nonceMatch = String(message).match(/\nNonce: ([^\n]+)\n/)
-  const challenge = nonceMatch ? siweChallenges.get(nonceMatch[1]) : null
-  if (!challenge || Date.now() > challenge.expires || challenge.consumed || challenge.requestId !== requestId || challenge.clientId !== clientId || challenge.address !== String(address).toLowerCase() || challenge.message !== message) return res.status(400).json({ error: 'invalid_or_expired_siwe_challenge' })
+
+  let initial
+  try {
+    initial = withOAuthStateLock(() => {
+      refreshOAuthClients()
+      const client = oauthClients.get(clientId)
+      const request = oauthRequests.get(requestId)
+      if (!client || !request || request.clientId !== clientId || Date.now() > request.expires) return { error: 'invalid_authorization_request' }
+      if (request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri)) return { error: 'authorization_request_mismatch' }
+      const nonceMatch = String(message).match(/\nNonce: ([^\n]+)\n/)
+      const challenge = nonceMatch ? siweChallenges.get(nonceMatch[1]) : null
+      if (!challenge || Date.now() > challenge.expires || challenge.consumed || challenge.requestId !== requestId || challenge.clientId !== clientId || challenge.address !== String(address).toLowerCase() || challenge.message !== message) return { error: 'invalid_or_expired_siwe_challenge' }
+      return { nonce: nonceMatch[1] }
+    })
+  } catch (error) {
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
+  if (initial.error) return res.status(400).json(initial)
+
   try {
     const valid = await verifyMessage({ address, message, signature })
     if (!valid) return res.status(401).json({ error: 'invalid_signature' })
@@ -270,25 +418,46 @@ export async function siweVerifyHandler(req, res) {
     return res.status(401).json({ error: 'signature_verification_failed' })
   }
 
-  const userId = address.toLowerCase()
-  const existingCode = findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state })
-  const code = existingCode || createAuthCode(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce: nonceMatch[1] })
-  challenge.completedCode = code
-  challenge.signature = String(signature).toLowerCase()
+  let grant
+  try {
+    grant = withOAuthStateLock(() => {
+      refreshOAuthClients()
+      const client = oauthClients.get(clientId)
+      const request = oauthRequests.get(requestId)
+      const challenge = siweChallenges.get(initial.nonce)
+      if (!client || !request || !challenge || request.clientId !== clientId || request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri) || Date.now() > request.expires || Date.now() > challenge.expires || challenge.consumed || challenge.requestId !== requestId || challenge.clientId !== clientId || challenge.address !== String(address).toLowerCase() || challenge.message !== message) return { error: 'invalid_or_expired_siwe_challenge' }
+      const userId = address.toLowerCase()
+      const existingCode = findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state })
+      const code = existingCode || createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce: initial.nonce })
+      challenge.completedCode = code
+      challenge.signature = String(signature).toLowerCase()
+      saveOAuthState()
+      return { code }
+    })
+  } catch (error) {
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
+  if (grant.error) return res.status(400).json(grant)
+
   // Keep the challenge around until expiry so a lost HTTP response can be
   // retried with the same signed message and receive the same authorization
   // code. The code itself remains single-use at token exchange.
   const redirectUrl = new URL(redirectUri)
-  redirectUrl.searchParams.set('code', code)
+  redirectUrl.searchParams.set('code', grant.code)
   if (state) redirectUrl.searchParams.set('state', state)
-  res.json({ redirect: redirectUrl.toString(), code, state: state || '' })
+  res.json({ redirect: redirectUrl.toString(), code: grant.code, state: state || '' })
 }
 
 // ── Token endpoint ──
 export function oauthTokenHandler(req, res) {
   const { grant_type, code, client_id, client_secret, redirect_uri, code_verifier } = req.body || {}
   if (grant_type === 'authorization_code') {
-    const result = exchangeCodeForToken(code, client_id, client_secret, redirect_uri, code_verifier)
+    let result
+    try {
+      result = exchangeCodeForToken(code, client_id, client_secret, redirect_uri, code_verifier)
+    } catch (error) {
+      return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+    }
     if (result.error) return res.status(400).json(result)
     return res.json(result)
   }
@@ -299,7 +468,12 @@ export function oauthTokenHandler(req, res) {
 // ── Dynamic Client Registration ──
 export function oauthRegisterHandler(req, res) {
   const { client_name, redirect_uris = [], grant_types = ['authorization_code'], response_types = ['code'], token_endpoint_auth_method = 'none' } = req.body || {}
-  const client = registerOAuthClient({ clientName: client_name || 'mcp-client', redirectUris: redirect_uris })
+  let client
+  try {
+    client = registerOAuthClient({ clientName: client_name || 'mcp-client', redirectUris: redirect_uris })
+  } catch (error) {
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
   res.status(201).json({
     client_id: client.clientId,
     client_secret: client.clientSecret,
@@ -1104,7 +1278,7 @@ async function findPendingBridgeMint(userId, burnTxHash, toKey) {
 // to quote again; pending/unknown source submissions remain blocked per
 // user, MSCA, and route until reconciled.
 export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain, walletAddress } = {}) {
-  const pendingPhases = new Set(['source_intent_created', 'source_submission_unknown', 'source_submitted', 'source_confirmed'])
+  const pendingPhases = new Set(['source_intent_created', 'source_approval_unknown', 'source_approval_submitted', 'source_approval_confirmed', 'source_submission_unknown', 'source_submitted', 'source_confirmed'])
   const expectedFrom = String(fromChain || '').toLowerCase()
   const expectedTo = String(toChain || '').toLowerCase()
   const expectedWallet = String(walletAddress || '').toLowerCase()
@@ -1134,12 +1308,20 @@ async function findPendingSourceIntent(userId, { fromChain, toChain, previewId, 
       if (!['pending_confirmation', 'pending_signature'].includes(approval.status)) continue
       let details
       try { details = JSON.parse(approval.details || '{}') } catch { details = null }
-      if (!['source_intent_created', 'source_submission_unknown', 'source_submitted', 'source_confirmed'].includes(details?.settlementPhase)) continue
+      if (!['source_intent_created', 'source_approval_unknown', 'source_approval_submitted', 'source_approval_confirmed', 'source_submission_unknown', 'source_submitted', 'source_confirmed'].includes(details?.settlementPhase)) continue
       if (details?.fromChain !== fromChain || details?.toChain !== toChain || details?.previewId !== previewId) continue
       if (walletAddress && details?.walletAddress && String(details.walletAddress).toLowerCase() !== String(walletAddress).toLowerCase()) continue
       return { approval, details }
     }
   } catch { /* source intent recovery remains fail-closed */ }
+  return null
+}
+
+// Frontend-parity source lifecycle: approve and burn are separate UserOps.
+// Prefer the burn hash once it exists; otherwise poll the approval hash.
+export function sourceBridgePendingOperation(details = {}) {
+  if (details.sourceUserOpHash) return { kind: 'burn', hash: details.sourceUserOpHash, phase: 'source_submitted' }
+  if (details.sourceApprovalUserOpHash) return { kind: 'approval', hash: details.sourceApprovalUserOpHash, phase: 'source_approval_submitted' }
   return null
 }
 
@@ -1159,7 +1341,7 @@ async function findPendingBridgeIntent(userId, burnTxHash, toKey) {
 }
 
 async function recordBridgePending(userId, {
-  agent, amount, fromChain, toChain, previewId, burnTxHash, sourceUserOpHash,
+  agent, amount, fromChain, toChain, previewId, burnTxHash, sourceApprovalUserOpHash, sourceUserOpHash,
   sourceChainKey, sourceExplorerUrl, walletAddress, destinationUserOpHash, destinationChainKey, settlementPhase, error,
 } = {}) {
   const vault = await import('./vaultStore.mjs')
@@ -1167,6 +1349,7 @@ async function recordBridgePending(userId, {
     agent: agent || 'mcp-agent', action: 'bridge', amount, token: 'USDC', source: 'session',
     details: jsonText({
       fromChain, toChain, previewId, amount: String(amount ?? ''), burnTxHash: burnTxHash || null,
+      sourceApprovalUserOpHash: sourceApprovalUserOpHash || null,
       sourceUserOpHash: sourceUserOpHash || null,
       sourceChainKey: sourceChainKey || null,
       walletAddress: walletAddress || null,
@@ -1180,7 +1363,7 @@ async function recordBridgePending(userId, {
   vault.updateApprovalStatus(userId, approval.id, 'pending_confirmation', {
     txHash: burnTxHash,
     explorerUrl: sourceExplorerUrl,
-    userOpHash: destinationUserOpHash || sourceUserOpHash,
+    userOpHash: destinationUserOpHash || sourceUserOpHash || sourceApprovalUserOpHash,
     error,
   })
   return approval.id
@@ -2072,42 +2255,50 @@ export function createMcpServer(userId, context = {}) {
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'quote_fee_changed', message: 'Router fee berubah setelah preview. Buat quote bridge baru.' }) }] }
       }
       const calls = buildMscaRouterBridgeCalls({ route, amount, mintRecipient: info.walletAddress, minFinalityThreshold: bridgeFinalityThreshold(route) })
+      const [approveCall, burnCall] = calls
       const existingSourceIntent = await findPendingSourceIntent(userId, {
         fromChain: route.fromKey,
         toChain: route.toKey,
         previewId: params.previewId,
         walletAddress: info.walletAddress,
       })
+      let approvalId = null
+      let sourceApprovalUserOpHash = existingSourceIntent?.details?.sourceApprovalUserOpHash || null
+      let approvalConfirmed = false
       if (existingSourceIntent) {
-        const storedHash = existingSourceIntent.details?.sourceUserOpHash
+        approvalId = existingSourceIntent.approval.id
+        const details = existingSourceIntent.details || {}
+        const storedBurnHash = details.sourceUserOpHash
+        const storedApprovalHash = details.sourceApprovalUserOpHash
+        const storedHash = storedBurnHash || storedApprovalHash
         if (storedHash) {
           const { getUserOpStatus } = await import('./sessionKeyService.mjs')
           const liveSource = await getUserOpStatus(userId, storedHash, executionChainKey(route.fromKey))
           if (liveSource.status === 'pending_confirmation') {
-            return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: true, approvalId: existingSourceIntent.approval.id, userOpHash: storedHash, safeToRetry: false, reason: 'source_user_operation_pending', message: 'Source UserOperation masih pending. Jangan mengirim burn ulang.' }) }] }
+            return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: Boolean(storedBurnHash), approvalSubmitted: Boolean(storedApprovalHash), approvalId, userOpHash: storedHash, sourceApprovalUserOpHash: storedApprovalHash || null, sourceUserOpHash: storedBurnHash || null, safeToRetry: false, reason: storedBurnHash ? 'source_user_operation_pending' : 'source_approval_pending', message: 'Source UserOperation masih pending. Jangan mengirim approval atau burn ulang.' }) }] }
           }
           if (liveSource.status === 'success' && liveSource.txHash) {
-            await updateBridgePending(userId, existingSourceIntent.approval.id, {
-              ...existingSourceIntent.details,
-              sourceUserOpHash: storedHash,
-              burnTxHash: liveSource.txHash,
-              sourceChainKey: executionChainKey(route.fromKey),
-              settlementPhase: 'source_confirmed',
-              settlementStatus: 'source_confirmed',
-            }, 'pending_confirmation', { txHash: liveSource.txHash, userOpHash: storedHash, explorerUrl: liveSource.explorerUrl })
-            return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: true, sourceSubmitted: true, approvalId: existingSourceIntent.approval.id, burnTxHash: liveSource.txHash, userOpHash: storedHash, safeToRetry: false, reason: 'source_confirmed_needs_settlement', message: 'Source burn sudah terkonfirmasi. Lanjutkan status bridge untuk attestation dan mint; jangan burn ulang.' }) }] }
-          }
-          if (liveSource.status === 'error' && ['reverted', '0x0', 0, false].includes(liveSource.receipt?.receipt?.status)) {
-            await updateBridgePending(userId, existingSourceIntent.approval.id, existingSourceIntent.details, 'error', { userOpHash: storedHash, error: 'Source UserOperation reverted; no burn retry was sent.' })
+            if (storedBurnHash) {
+              await updateBridgePending(userId, approvalId, { ...details, sourceUserOpHash: storedBurnHash, burnTxHash: liveSource.txHash, sourceChainKey: executionChainKey(route.fromKey), settlementPhase: 'source_confirmed', settlementStatus: 'source_confirmed' }, 'pending_confirmation', { txHash: liveSource.txHash, userOpHash: storedBurnHash, explorerUrl: liveSource.explorerUrl })
+              return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: true, sourceSubmitted: true, approvalId, burnTxHash: liveSource.txHash, userOpHash: storedBurnHash, safeToRetry: false, reason: 'source_confirmed_needs_settlement', message: 'Source burn sudah terkonfirmasi. Lanjutkan status bridge; jangan burn ulang.' }) }] }
+            }
+            await updateBridgePending(userId, approvalId, { ...details, sourceApprovalUserOpHash: storedApprovalHash, sourceChainKey: executionChainKey(route.fromKey), settlementPhase: 'source_approval_confirmed', settlementStatus: 'pending_confirmation' }, 'pending_confirmation', { userOpHash: storedApprovalHash, explorerUrl: liveSource.explorerUrl })
+            approvalConfirmed = true
+          } else if (liveSource.status === 'error' && ['reverted', '0x0', 0, false].includes(liveSource.receipt?.receipt?.status)) {
+            await updateBridgePending(userId, approvalId, { ...details, settlementPhase: storedBurnHash ? 'source_submission_failed' : 'source_approval_failed', settlementStatus: 'error', safeToRetry: true }, 'error', { userOpHash: storedHash, error: storedBurnHash ? 'Source burn UserOperation reverted.' : 'Source approval UserOperation reverted.' })
             executionQuotes.delete(params.previewId)
-            return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, approvalId: existingSourceIntent.approval.id, reason: 'source_user_operation_reverted', safeToRetry: true, message: 'Source UserOperation reverted. Buat quote baru sebelum mencoba lagi.' }) }] }
+            return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, approvalId, reason: storedBurnHash ? 'source_user_operation_reverted' : 'source_approval_reverted', safeToRetry: true, message: 'Source UserOperation reverted. Buat quote baru sebelum mencoba lagi.' }) }] }
+          } else {
+            return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: Boolean(storedBurnHash), approvalSubmitted: Boolean(storedApprovalHash), approvalId, userOpHash: storedHash, safeToRetry: false, reason: 'source_submission_unknown', message: 'Hasil source UserOperation belum diketahui. Jangan mengirim ulang; rekonsiliasi status terlebih dahulu.' }) }] }
           }
+        } else if (details.settlementPhase !== 'source_approval_confirmed') {
+          return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: false, approvalSubmitted: false, approvalId, safeToRetry: false, reason: 'source_submission_unknown', message: 'Bridge intent sumber sudah tersimpan tetapi hasil UserOperation belum diketahui. Jangan mengirim ulang.' }) }] }
+        } else {
+          approvalConfirmed = true
         }
-        return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: false, approvalId: existingSourceIntent.approval.id, safeToRetry: false, reason: 'source_submission_unknown', message: 'Bridge intent sumber sudah tersimpan tetapi hasil UserOperation belum diketahui. Jangan mengirim burn ulang; rekonsiliasi status intent ini terlebih dahulu.' }) }] }
       }
-      let approvalId = null
       try {
-        approvalId = await recordBridgePending(userId, {
+        approvalId = approvalId || await recordBridgePending(userId, {
           agent: requestAgent,
           amount: params.amount,
           fromChain: route.fromKey,
@@ -2121,53 +2312,91 @@ export function createMcpServer(userId, context = {}) {
       } catch (intentError) {
         return { content: [{ type: 'text', text: jsonText({ status: 'bridge_error', executed: false, reason: 'source_intent_persist_failed', error: intentError?.message || 'Could not persist source bridge intent' }) }] }
       }
-      executionQuotes.delete(params.previewId)
+
+      const executionOptions = {
+        paymaster: true,
+        chainKey: executionChainKey(route.fromKey),
+        feeProfile: route.fromKey === 'Arc_Testnet' && route.toKey === 'Arbitrum_Sepolia' ? 'arbitrum-destination' : route.fromKey === 'Arc_Testnet' ? 'arc-bridge' : undefined,
+        explorerBaseUrl: route.source.explorer,
+        requireTransactionHash: true,
+        requireSuccessfulTransactionReceipt: true,
+      }
       const { executeViaSession } = await import('./sessionKeyService.mjs')
+
+      // Frontend parity: approve is its own transaction and must be finalized
+      // before the router burn is sent. If approval was already confirmed by a
+      // previous call, skip it and continue directly to the burn UserOp.
+      if (!approvalConfirmed) {
+        let approvalResult
+        try {
+          approvalResult = await executeViaSession(userId, [approveCall], executionOptions)
+        } catch (submissionError) {
+          await updateBridgePending(userId, approvalId, {
+            fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId,
+            sourceChainKey: executionChainKey(route.fromKey), settlementPhase: 'source_approval_unknown',
+            settlementStatus: 'pending_confirmation',
+          }, 'pending_confirmation', { error: submissionError?.message || 'Source approval UserOperation status unknown' })
+          return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, approvalSubmitted: false, approvalId, safeToRetry: false, reason: 'source_approval_unknown', message: 'Approval UserOperation sumber tidak pasti. Jangan kirim approval atau burn ulang; rekonsiliasi status terlebih dahulu.' }) }] }
+        }
+        const approvalSucceeded = approvalResult.status === 'success'
+        const approvalPending = approvalResult.status === 'pending_confirmation'
+        await updateBridgePending(userId, approvalId, {
+          fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId,
+          sourceApprovalUserOpHash: approvalResult.userOpHash || null,
+          sourceChainKey: executionChainKey(route.fromKey),
+          settlementPhase: approvalSucceeded ? 'source_approval_confirmed' : approvalPending ? 'source_approval_submitted' : 'source_approval_failed',
+          settlementStatus: approvalSucceeded ? 'pending_confirmation' : approvalPending ? 'pending_confirmation' : 'error',
+          userOpAccepted: approvalResult.userOpAccepted || (approvalResult.userOpHash ? 'yes' : approvalResult.status === 'error' ? 'unknown' : null),
+          safeToRetry: approvalResult.safeToRetry === true,
+        }, approvalSucceeded || approvalPending ? 'pending_confirmation' : 'error', {
+          userOpHash: approvalResult.userOpHash,
+          explorerUrl: approvalResult.explorerUrl,
+          error: approvalResult.error || approvalResult.reason,
+        })
+        sourceApprovalUserOpHash = approvalResult.userOpHash || sourceApprovalUserOpHash
+        if (approvalPending) {
+          return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, approvalSubmitted: true, approvalId, sourceApprovalUserOpHash: approvalResult.userOpHash, userOpHash: approvalResult.userOpHash, userOpExplorerUrl: approvalResult.explorerUrl || null, reason: approvalResult.reason || 'source_approval_pending', safeToRetry: false, message: 'Approval MSCA sudah diterima bundler tetapi receipt belum tersedia. Tunggu approval selesai sebelum burn; lanjutkan dengan previewId yang sama setelah status success.' }) }] }
+        }
+        if (!approvalSucceeded) {
+          executionQuotes.delete(params.previewId)
+          return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, approvalId, approvalSubmitted: Boolean(approvalResult.userOpHash), sourceApprovalUserOpHash: approvalResult.userOpHash || null, error: approvalResult.reason || 'Source approval UserOperation gagal', safeToRetry: approvalResult.safeToRetry === true, userOpAccepted: approvalResult.userOpAccepted || (approvalResult.userOpHash ? 'yes' : 'unknown') }) }] }
+        }
+      }
+
+      // The approval receipt is now successful. Submit only the burn call as a
+      // second MSCA UserOperation, matching BridgePanel's approve -> wait ->
+      // bridgeUsdcWithFee sequence exactly.
       let result
       try {
-        result = await executeViaSession(userId, calls, { paymaster: true, chainKey: executionChainKey(route.fromKey), feeProfile: route.fromKey === 'Arc_Testnet' && route.toKey === 'Arbitrum_Sepolia' ? 'arbitrum-destination' : route.fromKey === 'Arc_Testnet' ? 'arc-bridge' : undefined, explorerBaseUrl: route.source.explorer, requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+        result = await executeViaSession(userId, [burnCall], executionOptions)
       } catch (submissionError) {
         await updateBridgePending(userId, approvalId, {
           fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId,
-          sourceChainKey: executionChainKey(route.fromKey), settlementPhase: 'source_submission_unknown',
+          sourceApprovalUserOpHash,
+          sourceChainKey: executionChainKey(route.fromChain), settlementPhase: 'source_submission_unknown',
           settlementStatus: 'pending_confirmation',
-        }, 'pending_confirmation', { error: submissionError?.message || 'Source UserOperation submission status unknown' })
-        return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: false, approvalId, safeToRetry: false, reason: 'source_submission_unknown', message: 'Bundler response sumber tidak pasti. Intent disimpan untuk rekonsiliasi; jangan ulangi bridge.' }) }] }
+        }, 'pending_confirmation', { error: submissionError?.message || 'Source burn UserOperation submission status unknown' })
+        return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, approvalSubmitted: true, sourceSubmitted: false, approvalId, safeToRetry: false, reason: 'source_submission_unknown', message: 'Approval sudah selesai tetapi hasil burn UserOperation tidak pasti. Jangan kirim burn ulang; rekonsiliasi status terlebih dahulu.' }) }] }
       }
       const sourceSucceeded = result.status === 'success'
       const sourcePending = result.status === 'pending_confirmation'
       const sourceFailed = result.status === 'error'
       await updateBridgePending(userId, approvalId, {
         fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId,
+        sourceApprovalUserOpHash,
         sourceUserOpHash: result.userOpHash || null,
         burnTxHash: sourceSucceeded ? result.txHash : null,
-        sourceChainKey: executionChainKey(route.fromKey),
+        sourceChainKey: executionChainKey(route.fromChain),
         settlementPhase: sourceSucceeded ? 'source_confirmed' : sourcePending ? 'source_submitted' : 'source_submission_failed',
         settlementStatus: sourceSucceeded ? 'source_confirmed' : sourcePending ? 'pending_confirmation' : 'error',
         userOpAccepted: result.userOpAccepted || (result.userOpHash ? 'yes' : sourceFailed ? 'unknown' : null),
         safeToRetry: result.safeToRetry === true,
       }, sourceFailed ? 'error' : 'pending_confirmation', { txHash: sourceSucceeded ? result.txHash : undefined, userOpHash: result.userOpHash, explorerUrl: result.explorerUrl, error: result.error })
+      executionQuotes.delete(params.previewId)
       if (result.status === 'pending_confirmation') {
-        let auditPending = false
-        try {
-          await updateBridgePending(userId, approvalId, {
-            agent: requestAgent,
-            amount: params.amount,
-            fromChain: route.fromKey,
-            toChain: route.toKey,
-            previewId: params.previewId,
-            sourceUserOpHash: result.userOpHash,
-            sourceChainKey: executionChainKey(route.fromKey),
-            sourceExplorerUrl: result.explorerUrl,
-            error: result.error,
-          })
-        } catch (auditError) {
-          auditPending = true
-          console.error('[mcp-bridge] pending source audit record failed:', auditError?.message || auditError)
-        }
-        return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: true, approvalId: auditPending ? null : approvalId, auditPending, sourceChain: executionChainKey(route.fromKey), userOpHash: result.userOpHash, userOpExplorerUrl: result.explorerUrl || null, reason: result.reason || 'user_operation_pending', safeToRetry: false, message: 'UserOperation sudah diterima bundler tetapi receipt belum tersedia. Jangan ulangi bridge; poll UserOperation/status sebelum melanjutkan.' }) }] }
+        return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, approvalSubmitted: true, sourceSubmitted: true, approvalId, sourceApprovalUserOpHash, userOpHash: result.userOpHash, userOpExplorerUrl: result.explorerUrl || null, reason: result.reason || 'user_operation_pending', safeToRetry: false, message: 'Approval berhasil dan burn UserOperation sudah diterima bundler tetapi receipt belum tersedia. Jangan ulangi burn.' }) }] }
       }
-      if (result.status !== 'success') return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, approvalId, error: result.reason || 'Bridge UserOperation gagal', userOpHash: result.userOpHash || null, safeToRetry: result.safeToRetry === true, userOpAccepted: result.userOpAccepted || (result.userOpHash ? 'yes' : 'unknown') }) }] }
+      if (result.status !== 'success') return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, approvalId, approvalSubmitted: true, sourceSubmitted: Boolean(result.userOpHash), error: result.reason || 'Bridge burn UserOperation gagal', userOpHash: result.userOpHash || null, safeToRetry: result.safeToRetry === true, userOpAccepted: result.userOpAccepted || (result.userOpHash ? 'yes' : 'unknown') }) }] }
       const burnProof = await verifyBridgeBurn({ burnTxHash: result.txHash, route, walletAddress: info.walletAddress, amount })
       if (!burnProof.ok) return { content: [{ type: 'text', text: jsonText({ status: 'burn_submitted', executed: true, verified: false, burnTxHash: result.txHash, userOpHash: result.userOpHash, reason: burnProof.reason, message: 'Source UserOperation berhasil tetapi bukti event router belum terverifikasi. Jangan ulangi burn; periksa transaksi ini secara read-only.' }) }] }
       const bridgeStatus = await waitForCctpBridgeStatus({
@@ -2639,6 +2868,7 @@ export function createMcpServer(userId, context = {}) {
       txHash: a.txHash || null,
       explorerUrl: a.explorerUrl || null,
       userOpHash: a.userOpHash || null,
+      sourceApprovalUserOpHash: details?.sourceApprovalUserOpHash || null,
       sourceUserOpHash: details?.sourceUserOpHash || null,
       sourceChainKey: details?.sourceChainKey || details?.fromChain || null,
       destinationUserOpHash: details?.destinationUserOpHash || null,
@@ -2668,6 +2898,56 @@ export function createMcpServer(userId, context = {}) {
       response.reconciliationRequired = true
       response.message = 'UserOperation sumber tidak memiliki hash atau hasil acceptance yang pasti. Rekonsiliasi bundler/receipt secara read-only terlebih dahulu; burn tidak boleh diulang.'
       return { content: [{ type: 'text', text: jsonText(response) }] }
+    }
+
+    // Approval and burn are separate source UserOperations. A successful
+    // approval is only an intermediate milestone; it must never be fed into
+    // burn proof/attestation logic as if it were a burn transaction.
+    const pendingSourceOperation = sourceBridgePendingOperation(details)
+    const approvalOnlySource = a.action === 'bridge'
+      && pendingSourceOperation?.kind === 'approval'
+      && ['source_approval_unknown', 'source_approval_submitted', 'source_approval_confirmed'].includes(details?.settlementPhase)
+    if (approvalOnlySource && a.userOpHash && ['pending_signature', 'pending_confirmation'].includes(a.status)) {
+      try {
+        const { getUserOpStatus } = await import('./sessionKeyService.mjs')
+        const liveApproval = await getUserOpStatus(userId, pendingSourceOperation.hash, details.sourceChainKey || details.fromChain)
+        if (liveApproval.status === 'success') {
+          const nextDetails = { ...details, settlementPhase: 'source_approval_confirmed', settlementStatus: 'pending_confirmation' }
+          const { updateApprovalStatus, listApprovals } = await import('./vaultStore.mjs')
+          updateApprovalStatus(userId, a.id, 'pending_confirmation', { txHash: undefined, explorerUrl: liveApproval.explorerUrl, userOpHash: pendingSourceOperation.hash, details: jsonText(nextDetails) })
+          const refreshed = listApprovals(userId).find(item => item.id === a.id)
+          response.status = 'pending_confirmation'
+          response.sourceApprovalUserOpHash = pendingSourceOperation.hash
+          response.sourceUserOpHash = null
+          response.userOpHash = pendingSourceOperation.hash
+          response.txHash = null
+          response.explorerUrl = refreshed?.explorerUrl || liveApproval.explorerUrl || null
+          response.settlementPhase = 'source_approval_confirmed'
+          response.safeToRetry = false
+          response.message = 'Approval MSCA sudah terkonfirmasi. Belum ada burn; lanjutkan arcox_execute_bridge dengan previewId yang sama.'
+          return { content: [{ type: 'text', text: jsonText(response) }] }
+        }
+        if (liveApproval.status === 'error' && liveApproval.receipt && ['reverted', '0x0', 0, false].includes(liveApproval.receipt?.receipt?.status)) {
+          const { updateApprovalStatus } = await import('./vaultStore.mjs')
+          updateApprovalStatus(userId, a.id, 'error', { userOpHash: pendingSourceOperation.hash, error: liveApproval.reason || 'Source approval UserOperation reverted', details: jsonText({ ...details, settlementPhase: 'source_approval_failed', settlementStatus: 'error', safeToRetry: true }) })
+          response.status = 'error'
+          response.safeToRetry = true
+          response.reason = 'source_approval_reverted'
+          response.message = 'Approval MSCA gagal. Belum ada burn; buat quote baru.'
+          return { content: [{ type: 'text', text: jsonText(response) }] }
+        }
+        response.status = 'pending_confirmation'
+        response.safeToRetry = false
+        response.reason = 'source_approval_pending'
+        response.message = 'Approval MSCA masih pending. Burn belum dikirim.'
+        return { content: [{ type: 'text', text: jsonText(response) }] }
+      } catch {
+        response.status = 'pending_confirmation'
+        response.safeToRetry = false
+        response.reason = 'source_approval_status_unavailable'
+        response.message = 'Status approval belum dapat diverifikasi; burn tetap ditahan.'
+        return { content: [{ type: 'text', text: jsonText(response) }] }
+      }
     }
 
     // Poll the exact UserOperation on the chain where it was submitted. For a
@@ -2721,6 +3001,7 @@ export function createMcpServer(userId, context = {}) {
         response.txHash = refreshed?.txHash || nextExtra.txHash || response.txHash
         response.explorerUrl = refreshed?.explorerUrl || nextExtra.explorerUrl || response.explorerUrl
         response.userOpHash = refreshed?.userOpHash || nextExtra.userOpHash || response.userOpHash
+        response.sourceApprovalUserOpHash = nextDetails.sourceApprovalUserOpHash || response.sourceApprovalUserOpHash
         response.sourceUserOpHash = nextDetails.sourceUserOpHash || response.sourceUserOpHash
         response.sourceChainKey = nextDetails.sourceChainKey || response.sourceChainKey
         response.destinationUserOpHash = nextDetails.destinationUserOpHash || response.destinationUserOpHash

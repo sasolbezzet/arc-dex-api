@@ -351,3 +351,12 @@ test('Iris non-2xx and pending confirmations remain retryable', async () => {
     globalThis.fetch = previousFetch
   }
 })
+
+test('source bridge pending operation distinguishes approval from burn', async () => {
+  const { sourceBridgePendingOperation } = await import('../src/services/mcpServer.mjs?source-operation-phase-' + Date.now() + '-' + Math.random())
+  const approvalHash = '0x' + 'a'.repeat(64)
+  const burnHash = '0x' + 'b'.repeat(64)
+  assert.deepEqual(sourceBridgePendingOperation({ sourceApprovalUserOpHash: approvalHash }), { kind: 'approval', hash: approvalHash, phase: 'source_approval_submitted' })
+  assert.deepEqual(sourceBridgePendingOperation({ sourceApprovalUserOpHash: approvalHash, sourceUserOpHash: burnHash }), { kind: 'burn', hash: burnHash, phase: 'source_submitted' })
+  assert.equal(sourceBridgePendingOperation({}), null)
+})
