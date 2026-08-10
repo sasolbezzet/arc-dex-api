@@ -41,6 +41,16 @@ const ADD_OWNERS_ABI = [{
 
 const CLIENT_URL = process.env.CIRCLE_CLIENT_URL || ''
 const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
+const SESSION_INACTIVITY_MS = 24 * 60 * 60 * 1000
+function configuredArbitrumPriorityFloor() {
+  try {
+    const value = BigInt(process.env.ARBITRUM_MIN_PRIORITY_FEE_WEI || '2000000')
+    return value > 0n ? value : 2_000_000n
+  } catch {
+    return 2_000_000n
+  }
+}
+const ARBITRUM_MIN_PRIORITY_FEE_WEI = configuredArbitrumPriorityFloor()
 
 // Resolve on each store operation so tests and controlled runtime configuration
 // can switch the backing file without retaining a stale path from module load.
@@ -73,6 +83,83 @@ function saveStore(data) {
   atomicWriteJsonFile(sessionKeysPath(), data)
 }
 
+function activityTimestampMs(value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric) || numeric <= 0) return null
+  // Accept legacy Unix-second timestamps and normalize them in memory. Tiny
+  // synthetic fixtures (1, 2, 1000) are treated as missing rather than stale.
+  if (numeric >= 1_000_000_000 && numeric < 100_000_000_000) return numeric * 1000
+  if (numeric >= 100_000_000_000) return numeric
+  return null
+}
+
+/** Normalize fee suggestions before they enter an Arbitrum UserOperation. */
+export function normalizeArbitrumUserOperationFees({ maxFeePerGas = 0n, maxPriorityFeePerGas = 0n } = {}) {
+  let observedMaxFee
+  let observedPriority
+  try {
+    observedMaxFee = BigInt(maxFeePerGas || 0)
+    observedPriority = BigInt(maxPriorityFeePerGas || 0)
+  } catch {
+    observedMaxFee = 0n
+    observedPriority = 0n
+  }
+  if (observedMaxFee < 0n) observedMaxFee = 0n
+  if (observedPriority < 0n) observedPriority = 0n
+  const priority = observedPriority >= ARBITRUM_MIN_PRIORITY_FEE_WEI
+    ? observedPriority
+    : ARBITRUM_MIN_PRIORITY_FEE_WEI
+  // `eth_gasPrice` is the current base-fee-inclusive suggestion on Arbitrum;
+  // add the priority floor rather than merely doubling the floor. This keeps
+  // maxFeePerGas above the current network price when the RPC is healthy, while
+  // still producing a valid non-zero pair when the RPC reports zero.
+  const max = observedMaxFee > 0n
+    ? observedMaxFee + priority
+    : priority * 2n
+  return { maxFeePerGas: max, maxPriorityFeePerGas: priority }
+}
+
+/**
+ * Revoke sessions that have not been used by an agent for 24 hours.
+ * The store is persistent, so this check also protects deployments after a
+ * restart; the interval below is only a prompt cleanup mechanism.
+ *
+ * Legacy active records without an activity timestamp are migrated to "now"
+ * rather than guessed as stale. New records always write lastUsedAt.
+ */
+export function sweepInactiveSessions(now = Date.now()) {
+  const store = loadStore()
+  let changed = false
+  let revoked = 0
+  for (const entry of Object.values(store.users || {})) {
+    if (!entry || entry.active !== true) continue
+    // Old records did not persist activity. Do not infer 24h of inactivity
+    // from an unrelated creation timestamp; establish a safe migration
+    // baseline and let the next 24h of real activity be measured.
+    const rawLastActivity = entry.lastUsedAt ?? entry.activatedAt
+    const lastActivity = activityTimestampMs(rawLastActivity)
+    if (lastActivity === null) {
+      entry.lastUsedAt = now
+      changed = true
+      continue
+    }
+    if (lastActivity !== Number(rawLastActivity)) {
+      entry.lastUsedAt = lastActivity
+      changed = true
+    }
+    if (now - lastActivity >= SESSION_INACTIVITY_MS) {
+      entry.active = false
+      entry.revokedAt = now
+      entry.revokeReason = 'inactivity_24h'
+      entry.pendingAuthorization = false
+      changed = true
+      revoked++
+    }
+  }
+  if (changed) saveStore(store)
+  return { revoked, changed }
+}
+
 /**
  * Get session key info for a user.
  * Returns { walletAddress, delegateAddress, delegatePrivateKey, createdAt, active }
@@ -94,6 +181,9 @@ function storeAliasWallet(owner) {
 }
 
 export function getSessionKey(userId) {
+  // Enforce inactivity expiry on every authorization/read path, not only on
+  // the background timer. This remains fail-closed after a process restart.
+  sweepInactiveSessions()
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
   let entry = null
@@ -203,6 +293,7 @@ export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet'
     createdAt: Date.now(),
     active: false,
     pendingAuthorization: true,
+    lastUsedAt: Date.now(),
   }
   if (!store.aliases) store.aliases = {}
   store.aliases[String(userId || '').toLowerCase()] = wallet
@@ -286,6 +377,7 @@ export function activateReservedSessionKey(userId, { walletAddress, delegateAddr
   entry.authorizationUserOpHash = authorizationUserOpHash
   entry.authorizationUserOpHashes = { ...(entry.authorizationUserOpHashes || {}), [entry.chain || 'arc-testnet']: authorizationUserOpHash }
   entry.activatedAt = Date.now()
+  entry.lastUsedAt = entry.activatedAt
   saveStore(store)
   return entry
 }
@@ -331,6 +423,7 @@ export function listRelatedAddresses(userId) {
  * identity must have an explicit alias to an MSCA before it can execute.
  */
 export function touchSessionKey(userId) {
+  sweepInactiveSessions()
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
   let entry = store.users[key]?.active === true ? store.users[key] : null
@@ -381,6 +474,7 @@ export function storeSessionKey(userId, { walletAddress, delegateAddress, delega
     active: true,
     authorizationUserOpHash: '',
     authorizationUserOpHashes: {},
+    lastUsedAt: Date.now(),
   }
   // Alias mapping: EOA (OAuth identity) -> MSCA walletAddress. Lets MCP sessions
   // authenticated as the EOA resolve the MSCA-owned session key.
@@ -430,10 +524,12 @@ export function completePendingTx(txId, { signedUserOp, txHash, explorerUrl, err
   return tx
 }
 
-// Sweep expired pending txs
+// Sweep expired pending txs and inactive sessions. The persistent check in
+// getSessionKey/touchSessionKey is authoritative if this timer is delayed.
 const _pendingSweep = setInterval(() => {
   const now = Date.now()
   for (const [txId, tx] of pendingTxs) if (now - tx.createdAt > PENDING_TX_TTL) pendingTxs.delete(txId)
+  try { sweepInactiveSessions(now) } catch { /* retry on the next interval */ }
 }, 60_000)
 if (_pendingSweep.unref) _pendingSweep.unref()
 
@@ -538,7 +634,23 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
     owner: ownerAccount,
   })
 
-  return { smartAccount, modularClient }
+  return { smartAccount, modularClient, baseClient }
+}
+
+/** Build the exact UserOperation parameters used by sendUserOperation. */
+export async function buildUserOperationParams({ account, calls, chainKey, baseClient }) {
+  const params = { account, calls }
+  if (chainKey === 'arbitrum-sepolia') {
+    const gasPrice = await baseClient.getGasPrice().catch(() => 0n)
+    const suggestedPriority = await baseClient.request({ method: 'eth_maxPriorityFeePerGas' }).catch(() => 0n)
+    const normalizedFees = normalizeArbitrumUserOperationFees({
+      maxFeePerGas: gasPrice,
+      maxPriorityFeePerGas: suggestedPriority,
+    })
+    params.maxFeePerGas = normalizedFees.maxFeePerGas
+    params.maxPriorityFeePerGas = normalizedFees.maxPriorityFeePerGas
+  }
+  return params
 }
 
 /**
@@ -562,7 +674,7 @@ export async function executeViaSession(userId, calls, options = {}) {
   if (!isSessionAuthorizedForChain(userId, chainKey)) {
     throw new Error(`Session not authorized for chain: ${chainKey}`)
   }
-  const { smartAccount, modularClient } = await buildSmartAccountClient(entry.walletAddress, entry.delegatePrivateKey, chainKey)
+  const { smartAccount, modularClient, baseClient } = await buildSmartAccountClient(entry.walletAddress, entry.delegatePrivateKey, chainKey)
 
   // Override: skip factory initCode when wallet is not yet deployed on-chain.
   // The backend doesn't have the original passkey owner data needed to generate
@@ -582,11 +694,12 @@ export async function executeViaSession(userId, calls, options = {}) {
   })
 
   // Submit UserOperation with optional paymaster sponsorship
-  const userOpParams = {
-    account: smartAccount,
-    calls: normalizedCalls,
-  }
+  const userOpParams = await buildUserOperationParams({ account: smartAccount, calls: normalizedCalls, chainKey, baseClient })
 
+  // Arbitrum bundlers/paymasters reject a UserOperation whose priority fee is
+  // zero, even when the RPC's fee suggestion reports zero. Read the current
+  // gas price and apply a small non-zero floor so CCTP receiveMessage mints do
+  // not fail at bundler precheck. Other chains retain viem/Circle defaults.
   // ponytail: paymaster support — pass paymaster data when Gas Station is
   // configured. For now, user pays gas in USDC (Arc native token).
   // Upgrade: add paymaster: true when Circle Gas Station policy is set up.

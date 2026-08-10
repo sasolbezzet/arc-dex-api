@@ -2327,7 +2327,37 @@ export async function mcpHttpHandler(req, res) {
   // the Plugin page can show which agent is actually connected.
   const { registerMcpSession, listMcpSessions } = await import('./vaultStore.mjs')
   const agentName = resolveAgentName(auth.clientId)
-  registerMcpSession(auth.userId, auth.clientId, agentName)
+  // Keep both the MCP connection indicator and the MSCA inactivity clock tied
+  // to real agent requests. A tools/list or tools/call keeps the agent session
+  // alive; no request for 24h makes it inactive and the session-key store will
+  // reject subsequent execution.
+  let sessionKeyTouched = false
+  let expiredSession = false
+  try {
+    const { getSessionKey, touchSessionKey } = await import('./sessionKeyService.mjs')
+    const beforeTouch = getSessionKey(auth.userId)
+    sessionKeyTouched = Boolean(touchSessionKey(auth.userId))
+    expiredSession = beforeTouch?.revokeReason === 'inactivity_24h' && !sessionKeyTouched
+  } catch {
+    // A read-only MCP request must still work when no MSCA session is linked.
+  }
+  if (expiredSession) {
+    // Close the existing Streamable HTTP transport as well as disabling the
+    // signer, so an already-open Claude/ChatGPT MCP connection is actually
+    // disconnected instead of remaining usable for another 30 minutes.
+    const expiredSessionId = req.headers['mcp-session-id']
+    const expiredMcpSession = expiredSessionId ? sessions.get(expiredSessionId) : null
+    if (expiredSessionId) sessions.delete(expiredSessionId)
+    try { await expiredMcpSession?.server?.close?.() } catch { /* already closed */ }
+    return res.status(401).json({
+      error: 'session_expired',
+      error_description: 'Agent session terputus setelah 24 jam tanpa aktivitas. Hubungkan kembali Agent Wallet untuk mengaktifkannya.',
+    })
+  }
+  // Do not let a request after the 24-hour inactivity cutoff reactivate the
+  // connection indicator. Reauthorization/reconnect must establish a new
+  // active session-key record first.
+  registerMcpSession(auth.userId, auth.clientId, agentName, sessionKeyTouched)
   mcpSessionsRef = listMcpSessions
 
   // Handle MCP initialize and tool calls via Streamable HTTP

@@ -66,20 +66,29 @@ export function consumeChallenge(nonce) {
 }
 
 // ── MCP session tracking ──
+const MCP_SESSION_INACTIVITY_MS = 24 * 60 * 60 * 1000
 const mcpSessions = new Map() // userId -> [{ clientId, agent, connectedAt, lastActivity }]
-export function registerMcpSession(userId, clientId, agent) {
+export function registerMcpSession(userId, clientId, agent, active = true) {
   if (!mcpSessions.has(userId)) mcpSessions.set(userId, [])
   const sessions = mcpSessions.get(userId)
+  const now = Date.now()
   const existing = sessions.find(s => s.clientId === clientId)
   if (existing) {
-    existing.lastActivity = Date.now()
-    existing.active = true
+    existing.lastActivity = now
+    existing.active = active === true
   } else {
-    sessions.push({ clientId, agent, connectedAt: Date.now(), lastActivity: Date.now(), active: true })
+    sessions.push({ clientId, agent, connectedAt: now, lastActivity: now, active: active === true })
   }
 }
 export function listMcpSessions(userId) {
-  return mcpSessions.get(userId) || []
+  const sessions = mcpSessions.get(userId) || []
+  const now = Date.now()
+  for (const session of sessions) {
+    if (session.active !== false && now - Number(session.lastActivity || session.connectedAt || 0) >= MCP_SESSION_INACTIVITY_MS) {
+      session.active = false
+    }
+  }
+  return sessions
 }
 
 // ── Helpers ──

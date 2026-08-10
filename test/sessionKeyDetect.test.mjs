@@ -238,3 +238,65 @@ test('canExecuteViaSession parses human amounts tolerantly and rejects bad ones'
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('Arbitrum UserOperation fees never use a zero priority fee', async () => {
+  const mod = await import('../src/services/sessionKeyService.mjs?fee-floor-' + Date.now())
+  const normalized = mod.normalizeArbitrumUserOperationFees({ maxFeePerGas: 0n, maxPriorityFeePerGas: 0n })
+  assert.ok(normalized.maxPriorityFeePerGas > 0n)
+  assert.ok(normalized.maxFeePerGas >= normalized.maxPriorityFeePerGas * 2n)
+
+  const observed = mod.normalizeArbitrumUserOperationFees({ maxFeePerGas: 100_000_000n, maxPriorityFeePerGas: 3_000_000n })
+  assert.equal(observed.maxPriorityFeePerGas, 3_000_000n)
+  assert.equal(observed.maxFeePerGas, 103_000_000n)
+  const malformed = mod.normalizeArbitrumUserOperationFees({ maxFeePerGas: 'not-a-number', maxPriorityFeePerGas: '-1' })
+  assert.ok(malformed.maxPriorityFeePerGas > 0n)
+
+  const fakeClient = {
+    getGasPrice: async () => 0n,
+    request: async () => 0n,
+  }
+  const params = await mod.buildUserOperationParams({ account: {}, calls: [], chainKey: 'arbitrum-sepolia', baseClient: fakeClient })
+  assert.ok(params.maxPriorityFeePerGas > 0n)
+  assert.ok(params.maxFeePerGas >= params.maxPriorityFeePerGas)
+
+  const secondBased = mod.sweepInactiveSessions(Date.now())
+  assert.equal(typeof secondBased.revoked, 'number')
+})
+
+test('session is automatically revoked after 24 hours without agent activity', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
+  const path = join(dir, 'session-keys.json')
+  const MSCA = '0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5'
+  const now = Date.now()
+  await writeFile(path, JSON.stringify({
+    users: {
+      [MSCA]: {
+        walletAddress: MSCA,
+        delegateAddress: MSCA,
+        chain: 'arbitrum-sepolia',
+        createdAt: now - (48 * 60 * 60 * 1000),
+        activatedAt: now - (25 * 60 * 60 * 1000),
+        lastUsedAt: now - (24 * 60 * 60 * 1000),
+        active: true,
+        authorizationUserOpHash: '0x' + '88'.repeat(32),
+      },
+    },
+    aliases: {},
+  }))
+  const prev = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  process.env.SESSION_KEY_ENCRYPTION_KEY = 'test'
+  try {
+    const mod = await import('../src/services/sessionKeyService.mjs?expiry-' + Date.now())
+    const entry = mod.getSessionKey(MSCA)
+    assert.equal(entry?.active, false)
+    const after = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8'))
+    assert.equal(after.users[MSCA].revokeReason, 'inactivity_24h')
+    assert.ok(after.users[MSCA].revokedAt >= now)
+    assert.equal(mod.canExecuteViaSession(MSCA, '1', 'arbitrum-sepolia').reason, 'no_session')
+  } finally {
+    if (prev === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = prev
+    await rm(dir, { recursive: true, force: true })
+  }
+})
