@@ -17,6 +17,8 @@
 // its HTTP transport retry logic.  Must run before any @circle-fin import.
 import '../polyfill-node.mjs'
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { createPublicClient, createWalletClient, http, encodeFunctionData, getAddress, defineChain, parseUnits } from 'viem'
 import { toModularTransport, toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
 import { getPaymasterData, getPaymasterStubData, sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
@@ -361,6 +363,68 @@ export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet'
   return { address: getAddress(generated.address), walletAddress: wallet, pending: true }
 }
 
+/**
+ * Persist a submitted authorization hash without activating the signer.
+ * This closes the browser/backend race where the browser receives a hash but
+ * times out waiting for its receipt before /api/session/setup is called.
+ * A different hash can never replace an existing attempt for the same delegate.
+ */
+function withSessionStoreLock(fn) {
+  const lockPath = `${sessionKeysPath()}.lock`
+  const ownerToken = `${process.pid}:${randomUUID()}`
+  const ownerPath = `${lockPath}/owner`
+  const deadline = Date.now() + 5000
+  const sleeper = new Int32Array(new SharedArrayBuffer(4))
+  mkdirSync(dirname(lockPath), { recursive: true })
+  while (true) {
+    try {
+      mkdirSync(lockPath)
+      writeFileSync(ownerPath, JSON.stringify({ token: ownerToken, acquiredAt: Date.now() }), { mode: 0o600 })
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      try {
+        const owner = JSON.parse(readFileSync(ownerPath, 'utf8'))
+        if (Date.now() - Number(owner?.acquiredAt || 0) > 15000) rmSync(lockPath, { recursive: true, force: true })
+      } catch {
+        try { if (Date.now() - statSync(lockPath).mtimeMs > 15000) rmSync(lockPath, { recursive: true, force: true }) } catch { /* another worker owns/acquires it */ }
+      }
+      if (Date.now() >= deadline) throw new Error('Session authorization lock timeout')
+      Atomics.wait(sleeper, 0, 0, 10)
+    }
+  }
+  try { return fn() } finally {
+    try {
+      const owner = JSON.parse(readFileSync(ownerPath, 'utf8'))
+      if (owner?.token === ownerToken) rmSync(lockPath, { recursive: true, force: true })
+    } catch { /* stale recovery or another worker owns the lock */ }
+  }
+}
+
+export function recordSessionAuthorizationAttempt(userId, { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = 'arc-testnet', previousAuthorizationUserOpHash, previousOutcome = 'unknown' } = {}) {
+  return withSessionStoreLock(() => {
+    const store = loadStore()
+    const wallet = getAddress(walletAddress)
+    const delegate = getAddress(delegateAddress)
+    if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
+    if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(String(chainKey))) throw new Error(`MSCA unsupported authorization chain: ${chainKey}`)
+    const entry = store.users[wallet.toLowerCase()]
+    if (!entry?.pendingAuthorization && !entry?.active) throw new Error('No active automation signer reservation')
+    if (getAddress(entry.delegateAddress) !== delegate) throw new Error('Automation signer mismatch')
+    const existingHash = String(entry.authorizationUserOpHashes?.[chainKey] || (chainKey === (entry.chain || 'arc-testnet') ? entry.authorizationUserOpHash || '' : ''))
+    if (existingHash && existingHash.toLowerCase() !== authorizationUserOpHash.toLowerCase()) {
+      if (!previousAuthorizationUserOpHash || existingHash.toLowerCase() !== String(previousAuthorizationUserOpHash).toLowerCase() || previousOutcome !== 'failed') {
+        throw new Error('A different authorization UserOperation is already recorded')
+      }
+    }
+    entry.authorizationUserOpHashes = { ...(entry.authorizationUserOpHashes || {}), [chainKey]: authorizationUserOpHash }
+    if (chainKey === (entry.chain || 'arc-testnet')) entry.authorizationUserOpHash = authorizationUserOpHash
+    entry.authorizationAttemptAt = entry.authorizationAttemptAt || Date.now()
+    saveStore(store)
+    return { walletAddress: wallet, delegateAddress: delegate, chainKey, authorizationUserOpHash }
+  })
+}
+
 /** Activate only the exact reserved signer after passkey authorization. */
 export function validateAuthorizationUserOperation({ walletAddress, delegateAddress, authorizationUserOpHash, receipt, operation } = {}) {
   const wallet = getAddress(walletAddress)
@@ -386,6 +450,24 @@ export function validateAuthorizationUserOperation({ walletAddress, delegateAddr
   // ABI, substring matching could authorize an unrelated operation.
   if (!callData || callData !== expectedAddOwners) return { ok: false, reason: 'delegate authorization calldata mismatch' }
   return { ok: true, walletAddress: wallet, delegateAddress: delegate, userOpHash: authorizationUserOpHash }
+}
+
+export async function getAuthorizationUserOperationOutcome(userOpHash, chainKey = 'arc-testnet') {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(String(userOpHash || ''))) return 'unknown'
+  const chain = CHAINS[chainKey]
+  if (!chain || !CLIENT_URL || !CLIENT_KEY) return 'unknown'
+  const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+  const client = createPublicClient({ chain: buildViemChain(chainKey), transport })
+  try {
+    const receipt = await client.request({ method: 'eth_getUserOperationReceipt', params: [userOpHash] })
+    if (!receipt) return 'unknown'
+    const status = receipt.receipt?.status
+    if (receipt.success === true && ['success', '0x1', 1, true].includes(status)) return 'success'
+    if (receipt.success === false && ['reverted', 'failed', '0x0', 0, false].includes(status)) return 'failed'
+    return 'unknown'
+  } catch {
+    return 'unknown'
+  }
 }
 
 export async function verifySessionAuthorization(userId, { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = 'arc-testnet' } = {}) {

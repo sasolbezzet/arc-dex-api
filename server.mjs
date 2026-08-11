@@ -169,6 +169,39 @@ app.post('/api/session/generate-key', apiLimiter, requireAuth, async (req, res) 
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
+app.post('/api/session/authorization-attempt', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = 'arc-testnet' } = req.body || {}
+    if (!walletAddress || !delegateAddress || !isAddress(walletAddress) || !isAddress(delegateAddress)) {
+      return res.status(400).json({ error: 'Valid walletAddress and delegateAddress required' })
+    }
+    if (getAddress(walletAddress).toLowerCase() !== req.owner) {
+      return res.status(403).json({ error: 'walletAddress must match the authenticated MSCA' })
+    }
+    const { getSessionKey, getAuthorizationUserOperationOutcome, recordSessionAuthorizationAttempt } = await import('./src/services/sessionKeyService.mjs')
+    const current = getSessionKey(walletAddress)
+    const previousAuthorizationUserOpHash = current?.authorizationUserOpHashes?.[chainKey]
+      || (chainKey === (current?.chain || 'arc-testnet') ? current?.authorizationUserOpHash : '')
+    const replacingDifferentHash = Boolean(previousAuthorizationUserOpHash && String(previousAuthorizationUserOpHash).toLowerCase() !== String(authorizationUserOpHash).toLowerCase())
+    let previousOutcome = 'unknown'
+    if (replacingDifferentHash) {
+      previousOutcome = await getAuthorizationUserOperationOutcome(previousAuthorizationUserOpHash, chainKey)
+      if (previousOutcome !== 'failed') {
+        return res.status(409).json({ error: `A different authorization UserOperation is already recorded (${previousOutcome}); retry remains blocked until it is finalized.` })
+      }
+    }
+    const recorded = recordSessionAuthorizationAttempt(req.owner, {
+      walletAddress,
+      delegateAddress,
+      authorizationUserOpHash,
+      chainKey,
+      previousAuthorizationUserOpHash,
+      previousOutcome,
+    })
+    res.json({ success: true, recorded: true, ...recorded })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
 app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { walletAddress, delegateAddress, delegatePrivateKey, ownerAddress, authorizationUserOpHash } = req.body

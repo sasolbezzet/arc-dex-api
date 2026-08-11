@@ -5,6 +5,38 @@ const walletAddress = '0x1111111111111111111111111111111111111111'
 const delegateAddress = '0x2222222222222222222222222222222222222222'
 const userOpHash = `0x${'11'.repeat(32)}`
 
+test('records one submitted authorization hash without activating the reservation', async () => {
+  const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-auth-attempt-'))
+  const path = join(dir, 'session-keys.json')
+  await writeFile(path, JSON.stringify({ users: { [walletAddress.toLowerCase()]: { walletAddress, delegateAddress, chain: 'arc-testnet', active: false, pendingAuthorization: true } }, aliases: {} }))
+  const previousPath = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  try {
+    const { recordSessionAuthorizationAttempt } = await import('../src/services/sessionKeyService.mjs?auth-test-record-' + Date.now())
+    const result = recordSessionAuthorizationAttempt(walletAddress, { walletAddress, delegateAddress, authorizationUserOpHash: userOpHash })
+    assert.equal(result.authorizationUserOpHash, userOpHash)
+    const saved = JSON.parse(await readFile(path, 'utf8'))
+    assert.equal(saved.users[walletAddress.toLowerCase()].active, false)
+    assert.equal(saved.users[walletAddress.toLowerCase()].authorizationUserOpHash, userOpHash)
+    assert.throws(() => recordSessionAuthorizationAttempt(walletAddress, { walletAddress, delegateAddress, authorizationUserOpHash: '0x' + '22'.repeat(32) }), /different authorization/)
+    const replaced = recordSessionAuthorizationAttempt(walletAddress, {
+      walletAddress,
+      delegateAddress,
+      authorizationUserOpHash: '0x' + '22'.repeat(32),
+      previousAuthorizationUserOpHash: userOpHash,
+      previousOutcome: 'failed',
+    })
+    assert.equal(replaced.authorizationUserOpHash, '0x' + '22'.repeat(32))
+  } finally {
+    if (previousPath === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = previousPath
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('authorization validation rejects a successful operation from another MSCA', async () => {
   const { validateAuthorizationUserOperation } = await import('../src/services/sessionKeyService.mjs?auth-test-1')
   const result = validateAuthorizationUserOperation({
