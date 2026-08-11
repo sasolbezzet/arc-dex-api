@@ -377,9 +377,11 @@ export function validateAuthorizationUserOperation({ walletAddress, delegateAddr
   const expectedAddOwners = encodeFunctionData({
     abi: ADD_OWNERS_ABI,
     functionName: 'addOwners',
-    args: [[delegate], [1n], [], [], 0n],
+    args: [[delegate], [1n], [], [], 1n],
   }).toLowerCase()
   // The SDK's recovery action submits the plugin addOwners calldata directly.
+  // Keep this exact payload binding, including threshold weight 1; threshold 0
+  // is invalid for the weighted owner plugin and reverts during simulation.
   // Fail closed for wrappers or concatenated payloads: without a known wrapper
   // ABI, substring matching could authorize an unrelated operation.
   if (!callData || callData !== expectedAddOwners) return { ok: false, reason: 'delegate authorization calldata mismatch' }

@@ -31,6 +31,29 @@ test('authorization validation requires addOwners calldata for the reserved dele
   assert.equal(result.reason, 'delegate authorization calldata mismatch')
 })
 
+test('authorization validation rejects an invalid zero-threshold addOwners payload', async () => {
+  const { encodeFunctionData } = await import('viem')
+  const { validateAuthorizationUserOperation } = await import('../src/services/sessionKeyService.mjs?auth-test-zero-threshold')
+  const abi = [{
+    type: 'function', name: 'addOwners', stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'ownersToAdd', type: 'address[]' }, { name: 'weightsToAdd', type: 'uint256[]' },
+      { name: 'publicKeyOwnersToAdd', type: 'tuple[]', components: [{ name: 'x', type: 'uint256' }, { name: 'y', type: 'uint256' }] },
+      { name: 'publicKeyWeightsToAdd', type: 'uint256[]' }, { name: 'newThresholdWeight', type: 'uint256' },
+    ], outputs: [],
+  }]
+  const callData = encodeFunctionData({ abi, functionName: 'addOwners', args: [[delegateAddress], [1n], [], [], 0n] })
+  const result = validateAuthorizationUserOperation({
+    walletAddress,
+    delegateAddress,
+    authorizationUserOpHash: userOpHash,
+    receipt: { success: true, sender: walletAddress, receipt: { status: 'success' } },
+    operation: { sender: walletAddress, callData },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'delegate authorization calldata mismatch')
+})
+
 test('authorization validation accepts exact successful addOwners calldata', async () => {
   const { encodeFunctionData } = await import('viem')
   const { validateAuthorizationUserOperation } = await import('../src/services/sessionKeyService.mjs?auth-test-3')
@@ -42,7 +65,7 @@ test('authorization validation accepts exact successful addOwners calldata', asy
       { name: 'publicKeyWeightsToAdd', type: 'uint256[]' }, { name: 'newThresholdWeight', type: 'uint256' },
     ], outputs: [],
   }]
-  const callData = encodeFunctionData({ abi, functionName: 'addOwners', args: [[delegateAddress], [1n], [], [], 0n] })
+  const callData = encodeFunctionData({ abi, functionName: 'addOwners', args: [[delegateAddress], [1n], [], [], 1n] })
   const result = validateAuthorizationUserOperation({
     walletAddress,
     delegateAddress,
