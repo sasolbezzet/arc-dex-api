@@ -26,6 +26,7 @@ import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
 import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus } from './src/services/circleWalletWebhookService.mjs'
+import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod } from './src/services/circleModularProxy.mjs'
 
 process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -109,19 +110,22 @@ app.use('/api/vault', apiLimiter, vaultRoutes)
 // (mobile networks, ad-block, captive portals often block it).
 const CIRCLE_MODULAR_KEY = process.env.CIRCLE_CLIENT_KEY || process.env.VITE_CIRCLE_CLIENT_KEY || ''
 const CIRCLE_MODULAR_BASE_URL = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc').replace(/\/+$/, '')
-app.use('/api/circle-modular', express.json({ limit: '128kb' }), async (req, res) => {
+app.use('/api/circle-modular', apiLimiter, express.json({ limit: '128kb' }), async (req, res) => {
   try {
-    // Express leaves the mounted middleware path in req.url and preserves the
-    // query string, so forward both without introducing duplicate slashes.
-    const tail = req.url.replace(/^\/+/, '')
-    const target = tail ? `${CIRCLE_MODULAR_BASE_URL}/${tail}` : CIRCLE_MODULAR_BASE_URL
+    const method = req.body?.method
+    if (!isAllowedCircleModularMethod(method)) {
+      return res.status(400).json({ jsonrpc: '2.0', id: req.body?.id ?? null, error: { code: -32601, message: 'Circle Modular RPC method is not allowed' } })
+    }
+    // Express leaves the mounted middleware path in req.url. The configured
+    // URL may already include /w3s/buidl, so join idempotently; otherwise the
+    // old concatenation produced /w3s/buidl/w3s/buidl and Circle returned 404.
+    const target = buildCircleModularTarget(CIRCLE_MODULAR_BASE_URL, req.url)
     const upstream = await fetch(target, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': req.headers['authorization'] || `Bearer ${CIRCLE_MODULAR_KEY}`,
-        'X-AppInfo': req.headers['x-appinfo'] || 'platform=web;version=1.0.15;uri=arcoxdex.vercel.app',
-      },
+      headers: circleModularProxyHeaders(
+        CIRCLE_MODULAR_KEY,
+        req.headers['x-appinfo'] || 'platform=web;version=1.0.15;uri=arcoxdex.vercel.app',
+      ),
       body: JSON.stringify(req.body || {}),
     })
     res.status(upstream.status)
