@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { createAuthCode, exchangeCodeForToken, findExistingAuthCode, registerOAuthClient } from '../src/services/mcpServer.mjs'
+import { createAuthCode, exchangeCodeForToken, findExistingAuthCode, oauthRegisterHandler, registerOAuthClient } from '../src/services/mcpServer.mjs'
 
 test('repeated SIWE verification reuses the same pending authorization code', () => {
   const redirectUri = 'https://client.example/callback'
@@ -93,4 +93,31 @@ test('OAuth authorization code requires matching PKCE verifier and redirect URI'
   const token = exchangeCodeForToken(code, client.clientId, '', redirectUri, verifier)
   assert.match(token.access_token, /^arx_at_/)
   assert.equal(token.token_type, 'Bearer')
+  assert.equal(token.scope, 'mcp:tools')
+})
+
+test('OAuth resource indicator is bound to the authorization code and token', () => {
+  const redirectUri = 'https://client.example/callback'
+  const verifier = 'mcp-resource-verifier-1234567890'
+  const challenge = createHash('sha256').update(verifier).digest('base64url')
+  const resource = 'https://arcoxdex.vercel.app/mcp'
+  const client = registerOAuthClient({ clientName: 'mcp-resource-test', redirectUris: [redirectUri] })
+  const code = createAuthCode(client.clientId, '0x4444444444444444444444444444444444444444', { redirectUri, codeChallenge: challenge, resource })
+
+  assert.equal(exchangeCodeForToken(code, client.clientId, '', redirectUri, verifier, 'https://attacker.example/mcp').error, 'invalid_target')
+  const token = exchangeCodeForToken(code, client.clientId, '', redirectUri, verifier, resource)
+  assert.equal(token.error, undefined)
+  assert.equal(token.token_type, 'Bearer')
+})
+
+
+test('Dynamic client registration rejects malformed redirect URI metadata', () => {
+  const capture = {}
+  const response = {
+    status(code) { capture.status = code; return this },
+    json(body) { capture.body = body; return this },
+  }
+  oauthRegisterHandler({ body: { client_name: 'bad-client', redirect_uris: 'https://client.example/callback' } }, response)
+  assert.equal(capture.status, 400)
+  assert.equal(capture.body.error, 'invalid_client_metadata')
 })

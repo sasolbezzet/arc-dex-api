@@ -28,7 +28,12 @@ function jsonText(value) {
 }
 
 const SERVER_URL = process.env.SERVER_URL || 'https://arcoxdex.vercel.app'
+const MCP_RESOURCE_URL = `${SERVER_URL}/mcp`
 const TOKEN_TTL = 3600 * 24 // 24 hours
+
+function validResourceIndicator(resource) {
+  return !resource || String(resource) === MCP_RESOURCE_URL
+}
 const OAUTH_PATH = process.env.OAUTH_PATH || './data/oauth-clients.json'
 const OAUTH_TOKENS_PATH = process.env.OAUTH_TOKENS_PATH || './data/oauth-tokens.json'
 const OAUTH_STATE_PATH = process.env.OAUTH_STATE_PATH || './data/oauth-state.json'
@@ -154,9 +159,9 @@ export function registerOAuthClient({ clientName, redirectUris = [] }) {
   })
 }
 
-function createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce } = {}) {
+function createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce, resource } = {}) {
   const code = randomUUID()
-  authCodes.set(code, { clientId, userId, redirectUri, codeChallenge, state: state || '', requestId: requestId || null, challengeNonce: challengeNonce || null, expires: Date.now() + 600000 }) // 10 min
+  authCodes.set(code, { clientId, userId, redirectUri, codeChallenge, state: state || '', requestId: requestId || null, challengeNonce: challengeNonce || null, resource: resource || MCP_RESOURCE_URL, expires: Date.now() + 600000 }) // 10 min
   return code
 }
 
@@ -173,21 +178,21 @@ export function createAuthCode(clientId, userId, options = {}) {
 // instead of issuing competing codes and leaving the MCP client waiting on a
 // stale callback. The signature itself is verified by the caller before this
 // helper is used.
-export function findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state } = {}) {
+export function findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state, resource } = {}) {
   const now = Date.now()
   for (const [code, auth] of authCodes) {
     if (now > auth.expires) {
       authCodes.delete(code)
       continue
     }
-    if (auth.clientId === clientId && auth.userId === userId && auth.redirectUri === redirectUri && auth.codeChallenge === codeChallenge && (auth.state || '') === (state || '')) {
+    if (auth.clientId === clientId && auth.userId === userId && auth.redirectUri === redirectUri && auth.codeChallenge === codeChallenge && (auth.state || '') === (state || '') && (auth.resource || MCP_RESOURCE_URL) === (resource || MCP_RESOURCE_URL)) {
       return code
     }
   }
   return null
 }
 
-export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, codeVerifier) {
+export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, codeVerifier, resource) {
   return withOAuthStateLock(() => {
     refreshOAuthClients()
     const auth = authCodes.get(code)
@@ -195,6 +200,8 @@ export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, 
     if (Date.now() > auth.expires) return { error: 'invalid_grant', error_description: 'Code expired' }
     if (auth.clientId !== clientId) return { error: 'invalid_grant', error_description: 'client_id mismatch' }
     if (!redirectUri || auth.redirectUri !== redirectUri) return { error: 'invalid_grant', error_description: 'redirect_uri mismatch' }
+    if (resource && !validResourceIndicator(resource)) return { error: 'invalid_target', error_description: 'resource must identify the ARCOX MCP endpoint' }
+    if (resource && resource !== (auth.resource || MCP_RESOURCE_URL)) return { error: 'invalid_target', error_description: 'resource does not match the authorization code' }
     if (!auth.codeChallenge || !codeVerifier || createHash('sha256').update(codeVerifier).digest('base64url') !== auth.codeChallenge) {
       return { error: 'invalid_grant', error_description: 'PKCE verification failed' }
     }
@@ -217,7 +224,7 @@ export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, 
     // token issued concurrently by another worker.
     refreshAccessTokens()
     const token = 'arx_at_' + randomUUID().replace(/-/g, '')
-    accessTokens.set(token, { userId: auth.userId, clientId, expires: Date.now() + TOKEN_TTL * 1000 })
+    accessTokens.set(token, { userId: auth.userId, clientId, resource: auth.resource || MCP_RESOURCE_URL, expires: Date.now() + TOKEN_TTL * 1000 })
     saveTokens()
     return {
       access_token: token,
@@ -288,6 +295,7 @@ export function oauthMetadataHandler(req, res) {
     grant_types_supported: ['authorization_code', 'refresh_token'],
     token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
     code_challenge_methods_supported: ['S256'],
+    resource_indicators_supported: true,
     scopes_supported: ['mcp:tools'],
     subject_types_supported: ['public'],
     id_token_signing_alg_values_supported: ['none'],
@@ -299,8 +307,6 @@ export function oauthMetadataHandler(req, res) {
 // document lives at /.well-known/oauth-protected-resource[/<resource-path>].
 // We serve both the root and the /mcp-suffixed variant so Claude/ChatGPT can
 // discover it regardless of how they compute the metadata URL.
-const MCP_RESOURCE_URL = `${SERVER_URL}/mcp`
-
 export function protectedResourceHandler(req, res) {
   res.json({
     resource: MCP_RESOURCE_URL,
@@ -314,15 +320,17 @@ export function protectedResourceHandler(req, res) {
 // GET /api/auth/authorize?response_type=code&client_id=...&redirect_uri=...&state=...&code_challenge=...
 export function oauthAuthorizeHandler(req, res) {
   refreshOAuthClients()
-  const { response_type, client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.query
+  const { response_type, client_id, redirect_uri, state, code_challenge, code_challenge_method, resource } = req.query
   if (response_type !== 'code') return res.status(400).json({ error: 'unsupported_response_type' })
   const client = oauthClients.get(client_id)
   if (!client) return res.status(400).json({ error: 'invalid_client', error_description: 'Unknown client_id' })
   if (!redirect_uri || !client.redirectUris.includes(redirect_uri)) return res.status(400).json({ error: 'invalid_redirect_uri' })
   if (!state) return res.status(400).json({ error: 'invalid_request', error_description: 'state required' })
   if (!code_challenge || code_challenge_method !== 'S256') return res.status(400).json({ error: 'invalid_request', error_description: 'S256 PKCE required' })
+  if (!validResourceIndicator(resource)) return res.status(400).json({ error: 'invalid_target', error_description: 'resource must identify the ARCOX MCP endpoint' })
 
-  // Keep the original request server-side. The browser may display these
+  // Keep the original request server-side.
+  // The browser may display these
   // values, but it must not be able to change the redirect, state, or PKCE
   // binding before SIWE verification completes.
   const requestId = randomUUID()
@@ -334,6 +342,7 @@ export function oauthAuthorizeHandler(req, res) {
         redirectUri: redirect_uri,
         state,
         codeChallenge: code_challenge,
+        resource: resource || MCP_RESOURCE_URL,
         expires: Date.now() + 600000,
       })
       saveOAuthState()
@@ -351,6 +360,7 @@ export function oauthAuthorizeHandler(req, res) {
     redirect_uri,
     state,
     code_challenge,
+    ...(resource ? { resource } : {}),
   })
   res.redirect(302, `${SERVER_URL}/arc-dex/plugin?${params.toString()}`)
 }
@@ -389,9 +399,10 @@ export function siweMessageHandler(req, res) {
 // ── SIWE verify + issue auth code ──
 import { createPublicClient, decodeEventLog, defineChain, encodeFunctionData, fallback, formatUnits, getAddress, http, parseUnits, verifyMessage } from 'viem'
 export async function siweVerifyHandler(req, res) {
-  const { address, message, signature, clientId, redirectUri, state, codeChallenge, requestId } = req.body || {}
+  const { address, message, signature, clientId, redirectUri, state, codeChallenge, requestId, resource } = req.body || {}
   if (!address || !message || !clientId || !requestId) return res.status(400).json({ error: 'missing_fields' })
   if (!redirectUri || !codeChallenge) return res.status(400).json({ error: 'missing_pkce_or_redirect_uri' })
+  if (!validResourceIndicator(resource)) return res.status(400).json({ error: 'invalid_target', error_description: 'resource must identify the ARCOX MCP endpoint' })
 
   let initial
   try {
@@ -400,7 +411,7 @@ export async function siweVerifyHandler(req, res) {
       const client = oauthClients.get(clientId)
       const request = oauthRequests.get(requestId)
       if (!client || !request || request.clientId !== clientId || Date.now() > request.expires) return { error: 'invalid_authorization_request' }
-      if (request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri)) return { error: 'authorization_request_mismatch' }
+      if (request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri) || (resource && request.resource !== resource)) return { error: 'authorization_request_mismatch' }
       const nonceMatch = String(message).match(/\nNonce: ([^\n]+)\n/)
       const challenge = nonceMatch ? siweChallenges.get(nonceMatch[1]) : null
       if (!challenge || Date.now() > challenge.expires || challenge.consumed || challenge.requestId !== requestId || challenge.clientId !== clientId || challenge.address !== String(address).toLowerCase() || challenge.message !== message) return { error: 'invalid_or_expired_siwe_challenge' }
@@ -427,8 +438,8 @@ export async function siweVerifyHandler(req, res) {
       const challenge = siweChallenges.get(initial.nonce)
       if (!client || !request || !challenge || request.clientId !== clientId || request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri) || Date.now() > request.expires || Date.now() > challenge.expires || challenge.consumed || challenge.requestId !== requestId || challenge.clientId !== clientId || challenge.address !== String(address).toLowerCase() || challenge.message !== message) return { error: 'invalid_or_expired_siwe_challenge' }
       const userId = address.toLowerCase()
-      const existingCode = findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state })
-      const code = existingCode || createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce: initial.nonce })
+      const existingCode = findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state, resource: request.resource || resource || MCP_RESOURCE_URL })
+      const code = existingCode || createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce: initial.nonce, resource: request.resource || resource || MCP_RESOURCE_URL })
       challenge.completedCode = code
       challenge.signature = String(signature).toLowerCase()
       saveOAuthState()
@@ -450,11 +461,12 @@ export async function siweVerifyHandler(req, res) {
 
 // ── Token endpoint ──
 export function oauthTokenHandler(req, res) {
-  const { grant_type, code, client_id, client_secret, redirect_uri, code_verifier } = req.body || {}
+  const { grant_type, code, client_id, client_secret, redirect_uri, code_verifier, resource } = req.body || {}
   if (grant_type === 'authorization_code') {
+
     let result
     try {
-      result = exchangeCodeForToken(code, client_id, client_secret, redirect_uri, code_verifier)
+      result = exchangeCodeForToken(code, client_id, client_secret, redirect_uri, code_verifier, resource)
     } catch (error) {
       return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
     }
@@ -468,6 +480,9 @@ export function oauthTokenHandler(req, res) {
 // ── Dynamic Client Registration ──
 export function oauthRegisterHandler(req, res) {
   const { client_name, redirect_uris = [], grant_types = ['authorization_code'], response_types = ['code'], token_endpoint_auth_method = 'none' } = req.body || {}
+  if (!Array.isArray(redirect_uris) || redirect_uris.length === 0 || redirect_uris.some(uri => typeof uri !== 'string' || !uri)) {
+    return res.status(400).json({ error: 'invalid_client_metadata', error_description: 'redirect_uris must be a non-empty array of URI strings' })
+  }
   let client
   try {
     client = registerOAuthClient({ clientName: client_name || 'mcp-client', redirectUris: redirect_uris })
@@ -3200,6 +3215,10 @@ export async function mcpHttpHandler(req, res) {
   if (!auth) {
     res.setHeader('WWW-Authenticate', `Bearer realm="ARCOX MCP", error="invalid_token", resource_metadata="${SERVER_URL}/.well-known/oauth-protected-resource"`)
     return res.status(401).json({ error: 'invalid_token', error_description: 'Token expired or invalid' })
+  }
+  if ((auth.resource || MCP_RESOURCE_URL) !== MCP_RESOURCE_URL) {
+    res.setHeader('WWW-Authenticate', `Bearer realm="ARCOX MCP", error="invalid_token", error_description="wrong resource"`)
+    return res.status(401).json({ error: 'invalid_token', error_description: 'Token is not valid for this MCP resource' })
   }
 
   // Track MCP session for connection status — derive the REAL agent name from

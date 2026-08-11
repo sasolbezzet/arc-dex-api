@@ -45,6 +45,10 @@ test('Circle Modular proxy always uses the server-owned credential', () => {
   })
 })
 
+test('Circle Modular proxy allows the MSCA address resolution used after passkey login', () => {
+  assert.equal(isAllowedCircleModularMethod('circle_getAddress'), true)
+})
+
 test('Circle Modular proxy allows passkey and required wallet methods only', () => {
   assert.equal(isAllowedCircleModularMethod('rp_getLoginOptions'), true)
   assert.equal(isAllowedCircleModularMethod('eth_getUserOperationReceipt'), true)

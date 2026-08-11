@@ -67,6 +67,10 @@ const CIRCLE_MODULAR_ETH_METHODS = new Set([
   'eth_getUserOperationReceipt',
   'eth_sendUserOperation',
   'eth_supportedEntryPoints',
+  // Used by toCircleSmartAccount after WebAuthn login to resolve the
+  // deterministic MSCA address. Keep this explicit rather than allowing a
+  // broad circle_* wildcard on the public proxy.
+  'circle_getAddress',
   'circle_getAddressMapping',
   'circle_createAddressMapping',
   'circle_getUserOperationGasPrice',
