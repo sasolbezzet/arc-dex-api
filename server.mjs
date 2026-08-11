@@ -2862,8 +2862,8 @@ app.post('/api/bridge', apiLimiter, requireAuth, async (req, res) => {
     const toChain = req.body.toChain
     const token = normalizeArcToken(req.body.token || 'USDC')
     if (!metamaskAddress || !amount || !fromChain || !toChain) return res.status(400).json({ error: 'Missing params' })
-    if (source === 'eoa') {
-      return res.status(400).json({ error: 'EOA bridge harus ditandatangani langsung dari wallet browser.' })
+    if (source !== 'circle') {
+      return res.status(400).json({ error: 'Circle bridge membutuhkan source="circle". EOA bridge harus ditandatangani langsung dari wallet browser.' })
     }
     if (token !== 'USDC') {
       return res.status(400).json({ error: 'Circle bridge hanya mendukung USDC. Token lain perlu di-swap ke USDC dulu.' })
@@ -2885,20 +2885,30 @@ app.post('/api/bridge', apiLimiter, requireAuth, async (req, res) => {
       token: 'USDC',
     })
     const safe = (o) => JSON.parse(JSON.stringify(o, (k, v) => typeof v === 'bigint' ? v.toString() : v))
-    const steps = result?.steps || []
-    const burnStep = steps.find(s => s.name === 'burn')
-    const mintStep = steps.find(s => s.name === 'mint')
+    const steps = Array.isArray(result?.steps) ? result.steps : []
+    const burnStep = steps.find(s => String(s?.name || '').toLowerCase() === 'burn')
+    const mintStep = steps.find(s => String(s?.name || '').toLowerCase() === 'mint')
+    const failedStep = steps.find(s => ['error', 'failed'].includes(String(s?.state || '').toLowerCase()))
+    const bridgeError = failedStep?.errorMessage || failedStep?.error?.message || result?.errorMessage || result?.error?.message
     const explorerUrl = mintStep?.txHash ? (CCTP[toChain]?.explorer + mintStep.txHash) : (burnStep?.txHash ? (CCTP[fromChain]?.explorer + burnStep.txHash) : undefined)
-    res.json({
+    const response = {
       success: result?.state === 'success',
       state: result?.state,
+      errorMessage: bridgeError,
       txHash: mintStep?.txHash || burnStep?.txHash,
       burnTxHash: burnStep?.txHash,
       mintTxHash: mintStep?.txHash,
       explorerUrl,
       result: safe(result),
-    })
-  } catch(e) { console.error('[bridge]', e.message); res.status(500).json({ error: e.message }) }
+    }
+    // Return a structured SDK failure as JSON so the UI can show the real
+    // reason. HTTP 200 is intentional: a burn may already be submitted and
+    // must be reconciled rather than blindly retried as a new bridge.
+    res.json(response)
+  } catch(e) {
+    console.error('[bridge]', e?.message || e)
+    res.status(500).json({ error: e?.message || String(e), errorName: e?.name, errorCode: e?.code, recoverability: e?.recoverability })
+  }
 })
 
 app.get('/api/tx-history', apiLimiter, requireAuth, async (req, res) => {
