@@ -2874,7 +2874,9 @@ app.post('/api/bridge', apiLimiter, requireAuth, async (req, res) => {
     // Recipient on destination = the user's own EOA (owner), funded from their Circle wallet on source.
     const result = await kit.bridge({
       from: { adapter: circleAdapter, chain: fromDef, address: wallet.address },
-      to: { adapter: circleAdapter, chain: toDef, address: owner, recipientAddress: owner, useForwarder: true },
+      // Forwarder mode owns destination settlement; do not pass a wallet
+      // adapter here or the SDK may try wallet_switchEthereumChain on a raw RPC.
+      to: { chain: toDef, recipientAddress: owner, useForwarder: true },
       amount: safeAmount,
       token: 'USDC',
     })
