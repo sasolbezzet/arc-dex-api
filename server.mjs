@@ -26,7 +26,7 @@ import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
 import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus } from './src/services/circleWalletWebhookService.mjs'
-import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod } from './src/services/circleModularProxy.mjs'
+import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 
 process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -128,12 +128,21 @@ app.use('/api/circle-modular', apiLimiter, express.json({ limit: '128kb' }), asy
       ),
       body: JSON.stringify(req.body || {}),
     })
-    res.status(upstream.status)
     const text = await upstream.text()
-    res.set('Content-Type', upstream.headers.get('content-type') || 'application/json')
-    res.send(text)
+    const contentType = upstream.headers.get('content-type') || ''
+    const normalized = normalizeCircleModularResponse({
+      status: upstream.status,
+      contentType,
+      text,
+      id: req.body?.id ?? null,
+    })
+    res.status(normalized.status).type('application/json').json(normalized.body)
   } catch (e) {
-    res.status(502).json({ error: 'circle_modular_proxy_failed', message: e?.message || String(e) })
+    res.status(502).type('application/json').json({
+      jsonrpc: '2.0',
+      id: req.body?.id ?? null,
+      error: { code: -32001, message: 'Circle Modular proxy request failed' },
+    })
   }
 })
 

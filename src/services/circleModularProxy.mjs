@@ -82,3 +82,44 @@ export function isAllowedCircleModularMethod(method) {
   return CIRCLE_MODULAR_ETH_METHODS.has(String(method || ''))
     || /^rp_(getLoginOptions|getLoginVerification|getRegistrationOptions|getRegistrationVerification)$/.test(String(method || ''))
 }
+
+// Upstream Circle failures have occasionally arrived as HTML from an nginx
+// gateway, or as malformed text with an application/json content type. Viem's
+// JSON-RPC transport cannot parse either form. Normalize every upstream body at
+// the proxy boundary so the client always receives a JSON-RPC-shaped response.
+export function normalizeCircleModularResponse({ status, contentType = '', text = '', id = null } = {}) {
+  const rawStatus = Number(status)
+  const upstreamStatus = Number.isFinite(rawStatus) ? rawStatus : 502
+  let parsed
+  try { parsed = JSON.parse(String(text || '')) } catch { parsed = null }
+  const validJsonRpc = parsed
+    && typeof parsed === 'object'
+    && !Array.isArray(parsed)
+    && parsed.jsonrpc === '2.0'
+    && (Object.prototype.hasOwnProperty.call(parsed, 'result') || Object.prototype.hasOwnProperty.call(parsed, 'error'))
+  if (validJsonRpc) {
+    // HTTP 204/304 cannot carry a response body. JSON-RPC clients need the
+    // envelope, so use 200 for these otherwise-invalid body/status combinations.
+    const bodyStatus = upstreamStatus === 204 || upstreamStatus === 304 ? 200 : upstreamStatus
+    return { status: bodyStatus, body: parsed, passthrough: true }
+  }
+  return {
+    // Invalid upstream content is a proxy failure regardless of whether the
+    // gateway used a 2xx or 4xx status; never present HTML as an application
+    // error to the JSON-RPC client.
+    status: 502,
+    body: {
+      jsonrpc: '2.0',
+      id,
+      error: {
+        code: -32000,
+        message: `Circle Modular upstream returned invalid JSON-RPC (HTTP ${upstreamStatus})`,
+        data: {
+          upstreamStatus,
+          upstreamContentType: String(contentType || '').slice(0, 120) || null,
+        },
+      },
+    },
+    passthrough: false,
+  }
+}
