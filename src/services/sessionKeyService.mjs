@@ -21,7 +21,7 @@ import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:f
 import { dirname } from 'node:path'
 import { createPublicClient, createWalletClient, http, encodeFunctionData, getAddress, defineChain, parseUnits } from 'viem'
 import { toModularTransport, toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
-import { getPaymasterData, getPaymasterStubData, sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
+import { sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
 import { encrypt, decrypt } from './crypto.mjs'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { getLimits } from './vaultStore.mjs'
@@ -44,25 +44,6 @@ const ADD_OWNERS_ABI = [{
 const CLIENT_URL = process.env.CIRCLE_CLIENT_URL || ''
 const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
 const SESSION_INACTIVITY_MS = 24 * 60 * 60 * 1000
-const ARBITRUM_BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
-function configuredArbitrumPriorityFloor() {
-  try {
-    const configured = BigInt(process.env.ARBITRUM_MIN_PRIORITY_FEE_WEI || '0')
-    // Arbitrum Sepolia bundlers currently reject tips below 1 gwei. Treat a
-    // lower env override as invalid rather than allowing a paymaster/RPC
-    // suggestion such as 400m wei to reach eth_sendUserOperation.
-    return configured >= ARBITRUM_BUNDLER_MIN_PRIORITY_FEE_WEI
-      ? configured
-      : ARBITRUM_BUNDLER_MIN_PRIORITY_FEE_WEI
-  } catch {
-    return ARBITRUM_BUNDLER_MIN_PRIORITY_FEE_WEI
-  }
-}
-// Arc's bundler also rejects sub-1-gwei priority fees (observed as
-// maxPriorityFeePerGas=400000000 during the active-session bridge E2E).
-// Keep one conservative floor for both Circle-supported rollup transports.
-const ARBITRUM_MIN_PRIORITY_FEE_WEI = configuredArbitrumPriorityFloor()
-const ARC_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 
 // Resolve on each store operation so tests and controlled runtime configuration
 // can switch the backing file without retaining a stale path from module load.
@@ -105,79 +86,32 @@ function activityTimestampMs(value) {
   return null
 }
 
-/** Normalize fee suggestions before they enter an MSCA UserOperation. */
-function parseFeeQuantity(value) {
-  try {
-    if (typeof value === 'string' && /^0x[0-9a-f]+$/i.test(value.trim())) return BigInt(value)
-    if (typeof value === 'string' && /^\d+$/.test(value.trim())) return BigInt(value)
-    if (typeof value === 'bigint') return value
-    if (typeof value === 'number' && Number.isSafeInteger(value)) return BigInt(value)
-  } catch { /* invalid fee is handled by the caller */ }
-  return null
-}
-
-/**
- * Validate a browser-signed Arbitrum UserOperation without mutating it.
- * Fee changes after signing invalidate the account signature, so the relay
- * must reject an invalid envelope and require the browser to sign again.
+/** Convert Circle transport authentication failures into an actionable error.
+ * Without this normalization, a 401 from the Modular Wallet endpoint is
+ * swallowed by receipt polling and the UI incorrectly reports a generic
+ * inactive/pending session. Circle requires a Client Key (not CIRCLE_API_KEY)
+ * bound to the application's web domain.
  */
-export function validateSignedUserOperationFees({ chainKey, signedUserOp } = {}) {
-  if (chainKey !== 'arbitrum-sepolia') return { ok: true }
-  const maxFeePerGas = parseFeeQuantity(signedUserOp?.maxFeePerGas)
-  const maxPriorityFeePerGas = parseFeeQuantity(signedUserOp?.maxPriorityFeePerGas)
-  if (maxPriorityFeePerGas === null || maxPriorityFeePerGas < ARBITRUM_MIN_PRIORITY_FEE_WEI) {
-    return { ok: false, reason: 'user_operation_priority_fee_too_low', requiredMinPriorityFeePerGas: ARBITRUM_MIN_PRIORITY_FEE_WEI.toString() }
+export function classifyCircleModularError(error) {
+  const messages = []
+  const seen = new Set()
+  let current = error
+  for (let depth = 0; current && depth < 6 && !seen.has(current); depth++) {
+    seen.add(current)
+    messages.push(String(current?.shortMessage || current?.message || current || ''))
+    current = current?.cause
   }
-  if (maxFeePerGas === null || maxFeePerGas < maxPriorityFeePerGas) {
-    return { ok: false, reason: 'user_operation_max_fee_invalid', requiredMinMaxFeePerGas: maxPriorityFeePerGas.toString() }
+  const message = messages.join(' ')
+  if (/\b401\b|invalid credentials|malformed authorization|client key|domain.*bound|unauthorized/i.test(message)) {
+    return 'circle_modular_client_key_invalid'
   }
-  return { ok: true, maxFeePerGas, maxPriorityFeePerGas }
-}
-
-export function shouldUseSessionPaymaster({ chainKey, feeProfile, paymaster } = {}) {
-  // Circle Gas Station sponsors all supported testnets, including Arc,
-  // Base Sepolia, and Arbitrum Sepolia. A zero MSCA native balance is
-  // therefore valid when the UserOperation includes paymaster sponsorship.
-  // Keep the arguments explicit for callers/tests and future policy routing.
-  return paymaster === true
-}
-
-export function classifyUserOperationPrecheckError(error) {
-  const message = String(error?.message || error || '')
-  if (/max operations .*reached for account|account.*unstaked/i.test(message)) return 'bundler_account_reputation_limit'
-  if (/paymaster.*stake|signature aggregator.*stake|unstaked/i.test(message)) return 'bundler_stake_requirement'
-  if (/precheck failed|maxPriorityFeePerGas|missing or invalid parameters/i.test(message)) return 'user_operation_precheck_failed'
   return null
 }
 
-export function isKnownPreSubmissionError(error) {
-  return classifyUserOperationPrecheckError(error) !== null
-}
-
-export function normalizeArbitrumUserOperationFees({ maxFeePerGas = 0n, maxPriorityFeePerGas = 0n, minPriorityFeePerGas = ARBITRUM_MIN_PRIORITY_FEE_WEI } = {}) {
-  let observedMaxFee
-  let observedPriority
-  try {
-    observedMaxFee = BigInt(maxFeePerGas || 0)
-    observedPriority = BigInt(maxPriorityFeePerGas || 0)
-  } catch {
-    observedMaxFee = 0n
-    observedPriority = 0n
-  }
-  if (observedMaxFee < 0n) observedMaxFee = 0n
-  if (observedPriority < 0n) observedPriority = 0n
-  const minimumPriority = BigInt(minPriorityFeePerGas || ARBITRUM_MIN_PRIORITY_FEE_WEI)
-  const priority = observedPriority >= minimumPriority
-    ? observedPriority
-    : minimumPriority
-  // `eth_gasPrice` is the current base-fee-inclusive suggestion on Arbitrum;
-  // add the priority floor rather than merely doubling the floor. This keeps
-  // maxFeePerGas above the current network price when the RPC is healthy, while
-  // still producing a valid non-zero pair when the RPC reports zero.
-  const max = observedMaxFee > 0n
-    ? observedMaxFee + priority
-    : priority * 2n
-  return { maxFeePerGas: max, maxPriorityFeePerGas: priority }
+function circleModularConfigurationError(error) {
+  const wrapped = new Error('Circle Modular Client Key invalid/expired or domain belum terdaftar di Circle Console; gunakan CIRCLE_CLIENT_KEY (Client Key), bukan CIRCLE_API_KEY.', { cause: error })
+  wrapped.code = 'circle_modular_client_key_invalid'
+  return wrapped
 }
 
 /**
@@ -241,10 +175,11 @@ function storeAliasWallet(owner) {
   return String(store.aliases?.[String(owner || '').toLowerCase()] || '').toLowerCase()
 }
 
-export function getSessionKey(userId) {
-  // Enforce inactivity expiry on every authorization/read path, not only on
-  // the background timer. This remains fail-closed after a process restart.
-  sweepInactiveSessions()
+export function getSessionKey(userId, { sweep = true } = {}) {
+  // Enforce inactivity expiry on every authorization/execution path, not only
+  // on the background timer. Status metadata can opt out of persistence and
+  // report the same expiry without mutating the store during a GET request.
+  if (sweep) sweepInactiveSessions()
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
   let entry = null
@@ -265,6 +200,15 @@ export function getSessionKey(userId) {
   // when no explicit alias exists.
   if (!entry && exact) entry = exact
   if (!entry) return null
+  // Status reads may opt out of persistence. Still present an inactivity-expired
+  // record as inactive to callers, while leaving the durable revoke marker to
+  // the explicit sweep/execute path.
+  if (!sweep && entry.active === true) {
+    const lastActivity = activityTimestampMs(entry.lastUsedAt ?? entry.activatedAt)
+    if (lastActivity !== null && Date.now() - lastActivity >= SESSION_INACTIVITY_MS) {
+      return { ...entry, active: false, revokeReason: 'inactivity_24h', stale: true }
+    }
+  }
   // Do not promote an inactive record through walletAddress alone. Only the
   // explicit alias above may cross an OAuth/EOA → MSCA identity boundary.
   // Likewise, reject a stale exact record before considering any related data;
@@ -279,13 +223,22 @@ export function getSessionKey(userId) {
       entry._decrypted = true
     } catch { /* key was stored pre-encryption or corrupted */ }
   }
-  // A signer is executable only after the new setup flow records an
-  // authorization UserOperation hash. Legacy entries remain visible but are
-  // denied until re-authorized through the passkey flow.
-  if (entry.active === true && !/^0x[0-9a-fA-F]{64}$/.test(String(entry.authorizationUserOpHash || ''))) {
-    return { ...entry, active: false, staleAuthorization: true }
-  }
   return entry
+}
+
+/** Resolve the authorization proof for exactly one chain. Legacy fallback is
+ * allowed only on the session's original chain; a destination chain must have
+ * its own recorded UserOperation hash. */
+export function resolveAuthorizationUserOpHash(entry, chainKey = 'arc-testnet') {
+  if (!entry) return ''
+  const key = String(chainKey)
+  // `authorizationUserOpHash` is the legacy Arc authorization field. It must
+  // never be reused as proof for Base/Arbitrum destination authorization,
+  // even when an old record happens to have `chain` set to that destination.
+  if (key === 'arc-testnet') {
+    return String(entry.authorizationUserOpHashes?.[key] || entry.authorizationUserOpHash || '')
+  }
+  return String(entry.authorizationUserOpHashes?.[key] || '')
 }
 
 /** Return whether the active delegate was explicitly authorized on a chain. */
@@ -294,8 +247,7 @@ export function isSessionAuthorizedForChain(userId, chainKey = 'arc-testnet') {
   const entry = getSessionKey(userId)
   if (!entry?.active) return false
   const key = String(chainKey)
-  if (key === 'arc-testnet') return /^0x[0-9a-fA-F]{64}$/.test(String(entry.authorizationUserOpHashes?.[key] || entry.authorizationUserOpHash || ''))
-  return /^0x[0-9a-fA-F]{64}$/.test(String(entry.authorizationUserOpHashes?.[key] || ''))
+  return /^0x[0-9a-fA-F]{64}$/.test(resolveAuthorizationUserOpHash(entry, key))
 }
 
 /** Record a passkey-confirmed authorization for an additional destination chain. */
@@ -329,13 +281,32 @@ export function generateSessionKey() {
  * it on-chain. The private key never returns to the browser; it is encrypted
  * at rest and remains inactive until activateReservedSessionKey is called.
  */
-export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet', ownerAddress } = {}) {
+export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet' } = {}) {
   const store = loadStore()
   const wallet = getAddress(walletAddress)
   const key = wallet.toLowerCase()
   const existing = store.users[key]
   if (existing?.active && /^0x[0-9a-fA-F]{64}$/.test(String(existing.authorizationUserOpHash || ''))) {
     return { address: existing.delegateAddress, walletAddress: wallet, pending: false }
+  }
+  // A manually revoked record is still eligible for an explicit fresh
+  // passkey authorization. The browser must authorize the exact reserved
+  // delegate again; no status read or backend boolean can resurrect it.
+  // A manual revoke must never be silently resurrected by a passkey retry.
+  // Inactivity is different: the on-chain owner is still valid, so the user
+  // may explicitly re-activate that exact delegate after a fresh passkey flow.
+  if (existing?.revokedAt && existing.revokeReason !== 'inactivity_24h') {
+    existing.pendingAuthorization = true
+    existing.revokeReason = undefined
+    existing.revokedAt = undefined
+    saveStore(store)
+    return { address: existing.delegateAddress, walletAddress: wallet, pending: true, reauthorization: true }
+  }
+  // Reuse an inactive delegate with a known authorization proof. Rotating here
+  // would create a second owner attempt and could leave the UI/status split
+  // across two delegates after a lost browser response.
+  if (existing?.delegateAddress && /^0x[0-9a-fA-F]{64}$/.test(String(existing.authorizationUserOpHash || ''))) {
+    return { address: existing.delegateAddress, walletAddress: wallet, pending: false, reactivation: true }
   }
   // Keep every pending reservation stable. A missing UserOperation hash is
   // ambiguous: the browser/backend may have lost the response even though
@@ -357,10 +328,30 @@ export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet'
     lastUsedAt: Date.now(),
   }
   if (!store.aliases) store.aliases = {}
-  store.aliases[String(userId || '').toLowerCase()] = wallet
-  if (ownerAddress) store.aliases[String(ownerAddress).toLowerCase()] = wallet
+  const aliasOwner = String(userId || '').toLowerCase()
+  const boundWallet = String(store.aliases[aliasOwner] || '').toLowerCase()
+  if (boundWallet && boundWallet !== key) throw new Error('Identity is already bound to another MSCA; revoke the old session before rebinding.')
+  if (aliasOwner) store.aliases[aliasOwner] = wallet
   saveStore(store)
   return { address: getAddress(generated.address), walletAddress: wallet, pending: true }
+}
+
+/** Bind an independently authenticated EOA identity to its selected MSCA. */
+export function bindSessionAlias(userId, ownerAddress, walletAddress) {
+  const store = loadStore()
+  const wallet = getAddress(walletAddress)
+  const owner = getAddress(ownerAddress).toLowerCase()
+  const requester = String(userId || '').toLowerCase()
+  const existingOwner = String(store.aliases?.[owner] || '').toLowerCase()
+  const existingRequester = String(store.aliases?.[requester] || '').toLowerCase()
+  if ((existingOwner && existingOwner !== wallet.toLowerCase()) || (existingRequester && existingRequester !== wallet.toLowerCase())) {
+    throw new Error('Identity is already bound to another MSCA; revoke the old session before rebinding.')
+  }
+  if (!store.aliases) store.aliases = {}
+  store.aliases[requester] = wallet
+  store.aliases[owner] = wallet
+  saveStore(store)
+  return { ownerAddress: owner, walletAddress: wallet }
 }
 
 /**
@@ -408,17 +399,25 @@ export function recordSessionAuthorizationAttempt(userId, { walletAddress, deleg
     const delegate = getAddress(delegateAddress)
     if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
     if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(String(chainKey))) throw new Error(`MSCA unsupported authorization chain: ${chainKey}`)
-    const entry = store.users[wallet.toLowerCase()]
-    if (!entry?.pendingAuthorization && !entry?.active) throw new Error('No active automation signer reservation')
-    if (getAddress(entry.delegateAddress) !== delegate) throw new Error('Automation signer mismatch')
-    const existingHash = String(entry.authorizationUserOpHashes?.[chainKey] || (chainKey === (entry.chain || 'arc-testnet') ? entry.authorizationUserOpHash || '' : ''))
+  const entry = store.users[wallet.toLowerCase()]
+  if (!entry?.pendingAuthorization && !entry?.active) throw new Error('No active automation signer reservation')
+  if (getAddress(entry.delegateAddress) !== delegate) throw new Error('Automation signer mismatch')
+  if (String(chainKey) !== 'arc-testnet' && !entry.authorizationUserOpHashes?.[String(chainKey)]) {
+    // Destination-chain attempts require their own explicit reservation state;
+    // an Arc legacy proof must never make Base/Arbitrum appear authorized.
+    if (!entry.pendingAuthorization && !entry.active) throw new Error(`No reservation for authorization chain: ${chainKey}`)
+  }
+    const existingHash = resolveAuthorizationUserOpHash(entry, chainKey)
     if (existingHash && existingHash.toLowerCase() !== authorizationUserOpHash.toLowerCase()) {
       if (!previousAuthorizationUserOpHash || existingHash.toLowerCase() !== String(previousAuthorizationUserOpHash).toLowerCase() || previousOutcome !== 'failed') {
         throw new Error('A different authorization UserOperation is already recorded')
       }
     }
     entry.authorizationUserOpHashes = { ...(entry.authorizationUserOpHashes || {}), [chainKey]: authorizationUserOpHash }
-    if (chainKey === (entry.chain || 'arc-testnet')) entry.authorizationUserOpHash = authorizationUserOpHash
+    // The legacy field is reserved for the original Arc authorization only.
+    // Destination-chain proofs must remain in the per-chain map and must never
+    // become eligible through the legacy lookup path.
+    if (chainKey === 'arc-testnet') entry.authorizationUserOpHash = authorizationUserOpHash
     entry.authorizationAttemptAt = entry.authorizationAttemptAt || Date.now()
     saveStore(store)
     return { walletAddress: wallet, delegateAddress: delegate, chainKey, authorizationUserOpHash }
@@ -441,11 +440,13 @@ export function validateAuthorizationUserOperation({ walletAddress, delegateAddr
   const expectedAddOwners = encodeFunctionData({
     abi: ADD_OWNERS_ABI,
     functionName: 'addOwners',
-    args: [[delegate], [1n], [], [], 1n],
+    // Circle's registerRecoveryAddress action uses zero to mean "leave the
+    // existing weighted-owner threshold unchanged". Passing 1 here changes
+    // the threshold during delegate registration and can revert in Circle's
+    // MSCA simulation. The delegate still receives weight 1.
+    args: [[delegate], [1n], [], [], 0n],
   }).toLowerCase()
   // The SDK's recovery action submits the plugin addOwners calldata directly.
-  // Keep this exact payload binding, including threshold weight 1; threshold 0
-  // is invalid for the weighted owner plugin and reverts during simulation.
   // Fail closed for wrappers or concatenated payloads: without a known wrapper
   // ABI, substring matching could authorize an unrelated operation.
   if (!callData || callData !== expectedAddOwners) return { ok: false, reason: 'delegate authorization calldata mismatch' }
@@ -465,7 +466,8 @@ export async function getAuthorizationUserOperationOutcome(userOpHash, chainKey 
     if (receipt.success === true && ['success', '0x1', 1, true].includes(status)) return 'success'
     if (receipt.success === false && ['reverted', 'failed', '0x0', 0, false].includes(status)) return 'failed'
     return 'unknown'
-  } catch {
+  } catch (error) {
+    if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
     return 'unknown'
   }
 }
@@ -476,7 +478,8 @@ export async function verifySessionAuthorization(userId, { walletAddress, delega
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
   const store = loadStore()
   const entry = store.users[wallet.toLowerCase()]
-  if (!entry || (!entry.pendingAuthorization && !entry.active)) throw new Error('No active automation signer reservation')
+  if (!entry || (!entry.pendingAuthorization && !entry.active && !entry.authorizationUserOpHash)) throw new Error('No active automation signer reservation')
+  if (entry.revokedAt && entry.revokeReason !== 'inactivity_24h') throw new Error('Session key was manually revoked; create a new Agent Wallet or explicitly authorize a new delegate.')
   if (getAddress(entry.delegateAddress) !== delegate) throw new Error('Automation signer mismatch')
   const chain = CHAINS[chainKey]
   if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
@@ -489,38 +492,139 @@ export async function verifySessionAuthorization(userId, { walletAddress, delega
   const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
   const client = createPublicClient({ chain: buildViemChain(chainKey), transport })
   let receipt = null
-  // Circle may expose the UserOperation hash before the receipt is indexed.
-  // Poll briefly rather than activating a signer on a transient null response.
-  for (let attempt = 0; attempt < 20; attempt++) {
-    receipt = await client.request({ method: 'eth_getUserOperationReceipt', params: [authorizationUserOpHash] }).catch(() => null)
-    if (receipt) break
-    await new Promise(resolve => setTimeout(resolve, 500))
+  let receiptFinalized = false
+  // Circle can return the hash before its receipt/status is indexed, and the
+  // browser and backend may hit different bundler replicas. Keep polling the
+  // same official Client Key endpoint long enough for propagation; never
+  // submit another addOwners operation while this hash is unresolved.
+  for (let attempt = 0; attempt < 60; attempt++) {
+    receipt = await client.request({ method: 'eth_getUserOperationReceipt', params: [authorizationUserOpHash] }).catch(error => {
+      if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
+      return null
+    })
+    const status = receipt?.receipt?.status
+    const successfulStatus = status === 'success' || status === '0x1' || status === 1 || status === true
+    const failedStatus = status === 'reverted' || status === 'failed' || status === '0x0' || status === 0 || status === false
+    if (receipt?.success === false || failedStatus) {
+      throw new Error('MSCA authorization UserOperation reverted')
+    }
+    if (receipt?.success === true && successfulStatus) {
+      receiptFinalized = true
+      break
+    }
+    await new Promise(resolve => setTimeout(resolve, attempt < 10 ? 500 : 1000))
   }
-  if (!receipt || receipt.success !== true || receipt.receipt?.status === 'reverted' || receipt.receipt?.status === '0x0') {
-    throw new Error('MSCA authorization UserOperation is not finalized successfully')
-  }
+  if (!receiptFinalized) throw new Error('MSCA authorization UserOperation is not finalized successfully')
+
   // The bundler's indexed UserOperation is required as a second binding check.
-  // The addOwners selector and reserved delegate must both occur in callData;
-  // a successful unrelated MSCA operation cannot activate this reservation.
-  const operation = await client.request({ method: 'eth_getUserOperationByHash', params: [authorizationUserOpHash] }).catch(() => null)
+  // It can lag behind the receipt, so poll it separately. The addOwners
+  // selector and reserved delegate must both occur in callData; a successful
+  // unrelated operation can never activate this reservation.
+  let operation = null
+  for (let attempt = 0; attempt < 20; attempt++) {
+    operation = await client.request({ method: 'eth_getUserOperationByHash', params: [authorizationUserOpHash] }).catch(error => {
+      if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
+      return null
+    })
+    if (operation) break
+    await new Promise(resolve => setTimeout(resolve, 1000))
+  }
   const validation = validateAuthorizationUserOperation({ walletAddress: wallet, delegateAddress: delegate, authorizationUserOpHash, receipt, operation })
   if (!validation.ok) throw new Error(validation.reason)
   return { ...validation, receipt }
+}
+
+/**
+ * Reconcile an inactive record that still contains a previously successful
+ * Arc authorization UserOperation. This is deliberately fail-closed:
+ * - records explicitly revoked for a reason other than inactivity are never
+ *   resurrected by a status read;
+ * - the receipt and indexed operation are checked against the exact MSCA,
+ *   delegate, and addOwners calldata before active is restored;
+ * - missing/unknown bundler data leaves the record inactive.
+ *
+ * This repairs the historical split-brain state where vault.json said active
+ * while the authoritative session-key store said inactive, without trusting
+ * either the browser or stale vault metadata.
+ */
+export async function reconcileSessionKeyActivation(userId) {
+  const store = loadStore()
+  const requested = String(userId || '').toLowerCase()
+  const walletKey = store.users[requested]
+    ? requested
+    : String(store.aliases?.[requested] || '').toLowerCase()
+  const entry = walletKey ? store.users[walletKey] : null
+  if (!entry) return { active: false, reason: 'no_session' }
+  if (entry.active === true) return { active: true, walletAddress: entry.walletAddress, delegateAddress: entry.delegateAddress, reconciled: false }
+  if (entry.revokedAt && entry.revokeReason !== 'inactivity_24h') return { active: false, reason: 'revoked' }
+
+  const chainKey = entry.chain || 'arc-testnet'
+  const hash = resolveAuthorizationUserOpHash(entry, chainKey)
+  if (!/^0x[0-9a-fA-F]{64}$/.test(String(hash || ''))) return { active: false, reason: 'authorization_proof_missing' }
+  const chain = CHAINS[chainKey]
+  if (!chain || !MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey) || !CLIENT_URL || !CLIENT_KEY) {
+    return { active: false, reason: 'authorization_verification_unavailable' }
+  }
+
+  const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+  const client = createPublicClient({ chain: buildViemChain(chainKey), transport })
+  const receipt = await client.request({ method: 'eth_getUserOperationReceipt', params: [hash] }).catch(error => {
+    if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
+    return null
+  })
+  if (!receipt) return { active: false, reason: 'authorization_pending', userOpHash: hash }
+  const operation = await client.request({ method: 'eth_getUserOperationByHash', params: [hash] }).catch(error => {
+    if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
+    return null
+  })
+  const validation = validateAuthorizationUserOperation({
+    walletAddress: entry.walletAddress,
+    delegateAddress: entry.delegateAddress,
+    authorizationUserOpHash: hash,
+    receipt,
+    operation,
+  })
+  if (!validation.ok) return { active: false, reason: validation.reason, userOpHash: hash }
+
+  return withSessionStoreLock(() => {
+    const latest = loadStore()
+    const current = latest.users[walletKey]
+    if (!current || current.active === true) return { active: current?.active === true, reconciled: false }
+    const currentHash = resolveAuthorizationUserOpHash(current, chainKey)
+    if (String(currentHash).toLowerCase() !== String(hash).toLowerCase()) return { active: false, reason: 'authorization_changed' }
+    if (current.revokedAt && current.revokeReason !== 'inactivity_24h') return { active: false, reason: 'revoked' }
+    current.active = true
+    current.pendingAuthorization = false
+    current.activatedAt = current.activatedAt || Date.now()
+    current.lastUsedAt = Date.now()
+    delete current.revokedAt
+    delete current.revokeReason
+    current.reconciledAt = Date.now()
+    saveStore(latest)
+    return { active: true, walletAddress: current.walletAddress, delegateAddress: current.delegateAddress, reconciled: true, userOpHash: hash }
+  })
 }
 
 export function activateReservedSessionKey(userId, { walletAddress, delegateAddress, authorizationUserOpHash } = {}) {
   const store = loadStore()
   const wallet = getAddress(walletAddress)
   const entry = store.users[wallet.toLowerCase()]
-  if (!entry || !entry.pendingAuthorization) throw new Error('No pending automation signer reservation')
+  if (!entry || (!entry.pendingAuthorization && !entry.authorizationUserOpHash)) throw new Error('No pending automation signer reservation')
+  if (entry.revokedAt && entry.revokeReason !== 'inactivity_24h') throw new Error('Session key was manually revoked; create a new Agent Wallet or explicitly authorize a new delegate.')
   if (getAddress(entry.delegateAddress) !== getAddress(delegateAddress)) throw new Error('Automation signer mismatch')
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
   entry.active = true
   entry.pendingAuthorization = false
+  // Session setup is the original Arc authorization flow. Keep the legacy
+  // field Arc-only; Base/Arbitrum authorization is recorded separately by
+  // recordSessionChainAuthorization and never activates the signer here.
+  const authorizationChain = 'arc-testnet'
+  entry.authorizationUserOpHashes = { ...(entry.authorizationUserOpHashes || {}), [authorizationChain]: authorizationUserOpHash }
   entry.authorizationUserOpHash = authorizationUserOpHash
-  entry.authorizationUserOpHashes = { ...(entry.authorizationUserOpHashes || {}), [entry.chain || 'arc-testnet']: authorizationUserOpHash }
   entry.activatedAt = Date.now()
   entry.lastUsedAt = entry.activatedAt
+  delete entry.revokedAt
+  delete entry.revokeReason
   saveStore(store)
   return entry
 }
@@ -690,6 +794,8 @@ export function revokeSessionKey(userId) {
   if (!entry) return null
   entry.active = false
   entry.revokedAt = Date.now()
+  entry.revokeReason = 'manual'
+  entry.pendingAuthorization = false
   saveStore(store)
   return entry
 }
@@ -781,24 +887,10 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
 }
 
 /** Build the exact UserOperation parameters used by sendUserOperation. */
-export async function buildUserOperationParams({ account, calls, chainKey, baseClient, feeProfile } = {}) {
-  const params = { account, calls }
-  // Circle's Arc and Arbitrum bundlers require a non-trivial priority fee.
-  // Normalize only those chains when they are used by bridge settlement;
-  // ordinary Arc send/swap/x402 operations retain their established path.
-  const bridgeRollupProfile = ['arc-bridge', 'arbitrum-destination'].includes(String(feeProfile || ''))
-  if (chainKey === 'arbitrum-sepolia' || (chainKey === 'arc-testnet' && bridgeRollupProfile)) {
-    const gasPrice = await baseClient.getGasPrice().catch(() => 0n)
-    const suggestedPriority = await baseClient.request({ method: 'eth_maxPriorityFeePerGas' }).catch(() => 0n)
-    const normalizedFees = normalizeArbitrumUserOperationFees({
-      maxFeePerGas: gasPrice,
-      maxPriorityFeePerGas: suggestedPriority,
-      minPriorityFeePerGas: chainKey === 'arc-testnet' ? ARC_MIN_PRIORITY_FEE_WEI : ARBITRUM_MIN_PRIORITY_FEE_WEI,
-    })
-    params.maxFeePerGas = normalizedFees.maxFeePerGas
-    params.maxPriorityFeePerGas = normalizedFees.maxPriorityFeePerGas
-  }
-  return params
+export function buildUserOperationParams({ account, calls } = {}) {
+  // Circle's bundler and Gas Station own fee estimation. Do not replace the
+  // official envelope with an application-defined fee floor.
+  return { account, calls }
 }
 
 /**
@@ -808,43 +900,6 @@ export async function buildUserOperationParams({ account, calls, chainKey, baseC
  * before signing/submission. Fee fields are intentionally omitted from the
  * paymaster response because prepareUserOperation retains the request values.
  */
-export function stripPaymasterFeeOverrides(response = {}) {
-  const { maxFeePerGas: _maxFeePerGas, maxPriorityFeePerGas: _maxPriorityFeePerGas, ...paymasterFields } = response || {}
-  return paymasterFields
-}
-
-/**
- * Re-attach the validated fee envelope after a paymaster response. This is
- * deliberately explicit: viem merges paymaster fields into the prepared
- * request, so a Circle response containing zero fee fields must never win.
- */
-export function preserveArbitrumFeeEnvelope(response = {}, fees = {}) {
-  const paymasterFields = stripPaymasterFeeOverrides(response)
-  const maxFeePerGas = BigInt(fees?.maxFeePerGas || 0)
-  const maxPriorityFeePerGas = BigInt(fees?.maxPriorityFeePerGas || 0)
-  if (maxPriorityFeePerGas <= 0n || maxFeePerGas < maxPriorityFeePerGas) {
-    throw new Error('Complete non-zero Arbitrum UserOperation fee envelope required')
-  }
-  return { ...paymasterFields, maxFeePerGas, maxPriorityFeePerGas }
-}
-
-/** Build a paymaster adapter that cannot reintroduce a lower fee envelope. */
-export function paymasterWithFeeOverrides(client, fees) {
-  const maxFeePerGas = BigInt(fees?.maxFeePerGas || 0)
-  const maxPriorityFeePerGas = BigInt(fees?.maxPriorityFeePerGas || 0)
-  if (maxPriorityFeePerGas <= 0n || maxFeePerGas < maxPriorityFeePerGas) {
-    throw new Error('Complete non-zero UserOperation fee envelope required')
-  }
-  const requestWithFees = request => ({ ...request, maxFeePerGas, maxPriorityFeePerGas })
-  return {
-    getPaymasterStubData: async request => preserveArbitrumFeeEnvelope(await getPaymasterStubData(client, requestWithFees(request)), fees),
-    getPaymasterData: async request => preserveArbitrumFeeEnvelope(await getPaymasterData(client, requestWithFees(request)), fees),
-  }
-}
-
-// Backward-compatible export for callers/tests that use the old name.
-export const arbitrumPaymasterWithFeeOverrides = paymasterWithFeeOverrides
-
 /**
  * Execute calls via the MSCA using the session/delegate key.
  * Returns { status, txHash, explorerUrl } or { status: 'pending_signature', ... }.
@@ -888,40 +943,15 @@ export async function executeViaSession(userId, calls, options = {}) {
   // Submit UserOperation with optional paymaster sponsorship
   const userOpParams = await buildUserOperationParams({ account: smartAccount, calls: normalizedCalls, chainKey, baseClient, feeProfile: options.feeProfile })
 
-  // Circle Gas Station sponsorship is enabled for every supported MSCA
-  // operation when requested. Bridge profiles keep the explicit fee envelope
-  // because Arc and Arbitrum bundlers reject sub-1-gwei tips, and a paymaster
-  // response must not overwrite those validated fees.
-  const rollupFeeProfile = chainKey === 'arbitrum-sepolia' || (chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || '')))
-  if (shouldUseSessionPaymaster({ chainKey, feeProfile: options.feeProfile, paymaster: options.paymaster })) {
-    userOpParams.paymaster = rollupFeeProfile
-      ? paymasterWithFeeOverrides(modularClient, userOpParams)
-      : true
-  }
+  // Circle Gas Station owns sponsorship and fee selection when requested.
+  if (options.paymaster === true) userOpParams.paymaster = true
 
   let userOpHash
   try {
     userOpHash = await sendUserOperation(modularClient, userOpParams)
   } catch (error) {
-    const message = String(error?.message || error)
-    // These errors are emitted by paymaster/bundler prechecks before a
-    // UserOperation hash exists. They are safe to retry with a fresh quote.
-    // Unknown transport failures remain thrown so bridge callers stay
-    // fail-closed and do not accidentally duplicate a potentially accepted op.
-    const precheckReason = classifyUserOperationPrecheckError(error)
-    if (precheckReason) {
-      return {
-        status: 'error',
-        reason: precheckReason,
-        // The bundler rejected this operation during validation, before it
-        // returned a UserOperation hash. It is safe to create a fresh quote;
-        // do not mislabel this as an unknown accepted operation, otherwise a
-        // stale bridge approval can permanently block the route.
-        safeToRetry: true,
-        userOpAccepted: 'no',
-        error: message,
-      }
-    }
+    // Return Circle/viem's original error so the official bundler response is
+    // visible to the caller and can be debugged without local classification.
     throw error
   }
   const explorerBase = String(options.explorerBaseUrl || chain.explorerUrl + '/tx/').replace(/\/?$/, '/')
