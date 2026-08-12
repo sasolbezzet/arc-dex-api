@@ -11,6 +11,48 @@ test('classifies Circle Modular 401 as a client-key configuration error', async 
   assert.equal(classifyCircleModularError(new Error('temporary receipt unavailable')), null)
 })
 
+test('legacy inactivity revoke without revokeReason is not a manual revoke', async () => {
+  const { isManuallyRevoked } = await import('../src/services/sessionKeyService.mjs?auth-test-legacy-revoke-' + Date.now())
+  // Old sweeper versions wrote revokedAt without revokeReason. Treating that as
+  // a manual revoke permanently locks those users out of reconciliation.
+  assert.equal(isManuallyRevoked({ revokedAt: 123, revokeReason: undefined }), false)
+  assert.equal(isManuallyRevoked({ revokedAt: 123 }), false)
+  assert.equal(isManuallyRevoked({ revokedAt: 123, revokeReason: 'inactivity_24h' }), false)
+  assert.equal(isManuallyRevoked({ revokedAt: 123, revokeReason: 'manual' }), true)
+  assert.equal(isManuallyRevoked({}), false)
+  assert.equal(isManuallyRevoked(null), false)
+})
+
+test('reserveSessionKey reactivates a legacy-inactivity record instead of manual reauthorization', async () => {
+  const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-legacy-revoke-'))
+  const path = join(dir, 'session-keys.json')
+  const owner = walletAddress.toLowerCase()
+  // Same shape as the production user 0xd6116ac3: revoked by an old sweeper
+  // (no revokeReason), still has a valid on-chain authorization hash, and was
+  // activated before. The next passkey flow must reactivate, not rotate.
+  await writeFile(path, JSON.stringify({
+    users: { [owner]: { walletAddress, delegateAddress, chain: 'arc-testnet', active: false, pendingAuthorization: false, authorizationUserOpHash: userOpHash, activatedAt: 1000, revokedAt: 2000 } },
+    aliases: {},
+  }))
+  const previousPath = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  try {
+    const { reserveSessionKey } = await import('../src/services/sessionKeyService.mjs?auth-test-legacy-reserve-' + Date.now())
+    const result = reserveSessionKey(owner, { walletAddress })
+    assert.equal(result.reactivation, true)
+    assert.equal(result.reauthorization, undefined)
+    assert.equal(result.address, delegateAddress)
+    assert.equal(result.pending, false)
+  } finally {
+    if (previousPath === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = previousPath
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('records one submitted authorization hash without activating the reservation', async () => {
   const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
   const { join } = await import('node:path')

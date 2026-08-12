@@ -107,6 +107,20 @@ function activityTimestampMs(value) {
   return null
 }
 
+/** True only for an explicit manual revoke.
+ *
+ * Records revoked by the inactivity sweeper carry `revokeReason: 'inactivity_24h'`
+ * and manual revokes always write `'manual'`. Older sweeper versions left only
+ * `revokedAt` with no reason at all — treating that as a manual revoke locks
+ * those users out forever, because reconciliation refuses to resurrect
+ * anything that does not look like inactivity. A missing reason therefore
+ * means a legacy inactivity revoke: the on-chain owner was never removed, so
+ * the session may be re-activated after a fresh passkey flow.
+ */
+export function isManuallyRevoked(entry) {
+  return Boolean(entry?.revokedAt && entry.revokeReason !== undefined && entry.revokeReason !== 'inactivity_24h')
+}
+
 /** Convert Circle transport authentication failures into an actionable error.
  * Without this normalization, a 401 from the Modular Wallet endpoint is
  * swallowed by receipt polling and the UI incorrectly reports a generic
@@ -316,7 +330,7 @@ export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet'
   // A manual revoke must never be silently resurrected by a passkey retry.
   // Inactivity is different: the on-chain owner is still valid, so the user
   // may explicitly re-activate that exact delegate after a fresh passkey flow.
-  if (existing?.revokedAt && existing.revokeReason !== 'inactivity_24h') {
+  if (isManuallyRevoked(existing)) {
     existing.pendingAuthorization = true
     existing.revokeReason = undefined
     existing.revokedAt = undefined
@@ -500,7 +514,7 @@ export async function verifySessionAuthorization(userId, { walletAddress, delega
   const store = loadStore()
   const entry = store.users[wallet.toLowerCase()]
   if (!entry || (!entry.pendingAuthorization && !entry.active && !entry.authorizationUserOpHash)) throw new Error('No active automation signer reservation')
-  if (entry.revokedAt && entry.revokeReason !== 'inactivity_24h') throw new Error('Session key was manually revoked; create a new Agent Wallet or explicitly authorize a new delegate.')
+  if (isManuallyRevoked(entry)) throw new Error('Session key was manually revoked; create a new Agent Wallet or explicitly authorize a new delegate.')
   if (getAddress(entry.delegateAddress) !== delegate) throw new Error('Automation signer mismatch')
   const chain = CHAINS[chainKey]
   if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
@@ -577,7 +591,7 @@ export async function reconcileSessionKeyActivation(userId) {
   const entry = walletKey ? store.users[walletKey] : null
   if (!entry) return { active: false, reason: 'no_session' }
   if (entry.active === true) return { active: true, walletAddress: entry.walletAddress, delegateAddress: entry.delegateAddress, reconciled: false }
-  if (entry.revokedAt && entry.revokeReason !== 'inactivity_24h') return { active: false, reason: 'revoked' }
+  if (isManuallyRevoked(entry)) return { active: false, reason: 'revoked' }
 
   const chainKey = entry.chain || 'arc-testnet'
   const hash = resolveAuthorizationUserOpHash(entry, chainKey)
@@ -593,7 +607,43 @@ export async function reconcileSessionKeyActivation(userId) {
     if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
     return null
   })
-  if (!receipt) return { active: false, reason: 'authorization_pending', userOpHash: hash }
+  if (!receipt) {
+    // Circle's bundler index does not retain old hashes indefinitely. A record
+    // that previously activated with this exact delegate has already proven the
+    // addOwners UserOperation succeeded on-chain, and an inactivity revoke
+    // never removes the on-chain owner. Restore the session only when the MSCA
+    // is still deployed; an undeployed account cannot execute anyway.
+    if (entry.activatedAt && entry.delegateAddress) {
+      let deployed = false
+      try {
+        const code = await client.getCode({ address: entry.walletAddress })
+        deployed = Boolean(code && code !== '0x')
+      } catch { deployed = false }
+      if (deployed) {
+        return withSessionStoreLock(() => {
+          const latest = loadStore()
+          const current = latest.users[walletKey]
+          if (!current || current.active === true) return { active: current?.active === true, reconciled: false }
+          const currentHash = resolveAuthorizationUserOpHash(current, chainKey)
+          if (String(currentHash).toLowerCase() !== String(hash).toLowerCase()) return { active: false, reason: 'authorization_changed' }
+          if (isManuallyRevoked(current)) return { active: false, reason: 'revoked' }
+          current.active = true
+          current.pendingAuthorization = false
+          current.activatedAt = current.activatedAt || Date.now()
+          current.lastUsedAt = Date.now()
+          delete current.revokedAt
+          delete current.revokeReason
+          current.reconciledAt = Date.now()
+          saveStore(latest)
+          return { active: true, walletAddress: current.walletAddress, delegateAddress: current.delegateAddress, reconciled: true, userOpHash: hash, restoredOnChain: true }
+        })
+      }
+    }
+    // A never-activated attempt whose hash the bundler no longer indexes cannot
+    // be proven. Report proof_missing so the browser can submit a fresh
+    // addOwners UserOperation instead of polling forever.
+    return { active: false, reason: 'authorization_proof_missing', userOpHash: hash }
+  }
   const operation = await client.request({ method: 'eth_getUserOperationByHash', params: [hash] }).catch(error => {
     if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
     return null
@@ -613,7 +663,7 @@ export async function reconcileSessionKeyActivation(userId) {
     if (!current || current.active === true) return { active: current?.active === true, reconciled: false }
     const currentHash = resolveAuthorizationUserOpHash(current, chainKey)
     if (String(currentHash).toLowerCase() !== String(hash).toLowerCase()) return { active: false, reason: 'authorization_changed' }
-    if (current.revokedAt && current.revokeReason !== 'inactivity_24h') return { active: false, reason: 'revoked' }
+    if (isManuallyRevoked(current)) return { active: false, reason: 'revoked' }
     current.active = true
     current.pendingAuthorization = false
     current.activatedAt = current.activatedAt || Date.now()
@@ -631,7 +681,7 @@ export function activateReservedSessionKey(userId, { walletAddress, delegateAddr
   const wallet = getAddress(walletAddress)
   const entry = store.users[wallet.toLowerCase()]
   if (!entry || (!entry.pendingAuthorization && !entry.authorizationUserOpHash)) throw new Error('No pending automation signer reservation')
-  if (entry.revokedAt && entry.revokeReason !== 'inactivity_24h') throw new Error('Session key was manually revoked; create a new Agent Wallet or explicitly authorize a new delegate.')
+  if (isManuallyRevoked(entry)) throw new Error('Session key was manually revoked; create a new Agent Wallet or explicitly authorize a new delegate.')
   if (getAddress(entry.delegateAddress) !== getAddress(delegateAddress)) throw new Error('Automation signer mismatch')
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
   entry.active = true

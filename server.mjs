@@ -329,7 +329,12 @@ app.post('/api/session/authorization-attempt', apiLimiter, requireAuth, async (r
     let previousOutcome = 'unknown'
     if (replacingDifferentHash) {
       previousOutcome = await getAuthorizationUserOperationOutcome(previousAuthorizationUserOpHash, chainKey)
-      if (previousOutcome !== 'failed') {
+      // A hash that was never finalized on a record that never activated is not
+      // duplicate-owner proof. Circle's bundler index also prunes old hashes,
+      // so 'unknown' alone must not block a fresh addOwners authorization for a
+      // never-activated record — otherwise the session is locked out forever.
+      const neverActivated = !current?.activatedAt
+      if (previousOutcome !== 'failed' && !(previousOutcome === 'unknown' && neverActivated)) {
         return res.status(409).json({ error: `A different authorization UserOperation is already recorded (${previousOutcome}); retry remains blocked until it is finalized.` })
       }
     }
