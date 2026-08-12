@@ -53,6 +53,74 @@ test('reserveSessionKey reactivates a legacy-inactivity record instead of manual
   }
 })
 
+test('manual revoke sets manualRevokePending and reconcile refuses resurrection', async () => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises')
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-manual-revoke-'))
+  const path = join(dir, 'session-keys.json')
+  const owner = walletAddress.toLowerCase()
+  await writeFile(path, JSON.stringify({
+    users: { [owner]: { walletAddress, delegateAddress, chain: 'arc-testnet', active: false, pendingAuthorization: false, authorizationUserOpHash: userOpHash, activatedAt: 1000, revokedAt: 2000, revokeReason: 'manual' } },
+    aliases: {},
+  }))
+  const previousPath = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  try {
+    const { reserveSessionKey, reconcileSessionKeyActivation } = await import('../src/services/sessionKeyService.mjs?auth-test-manual-revoke-' + Date.now())
+    const reserved = reserveSessionKey(owner, { walletAddress })
+    assert.equal(reserved.reauthorization, true)
+    const saved = JSON.parse(readFileSync(path, 'utf8'))
+    assert.equal(saved.users[owner].manualRevokePending, true)
+    // Reconcile must not resurrect the manually-revoked delegate via history;
+    // it reports the proof as missing so the browser submits a fresh addOwners.
+    const reconciled = await reconcileSessionKeyActivation(owner)
+    assert.equal(reconciled.active, false)
+    assert.equal(reconciled.reason, 'authorization_proof_missing')
+  } finally {
+    if (previousPath === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = previousPath
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('recordSessionAuthorizationAttempt replaces only failed or absent previous hashes', async () => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises')
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-replace-hash-'))
+  const path = join(dir, 'session-keys.json')
+  const owner = walletAddress.toLowerCase()
+  const firstHash = `0x${'11'.repeat(32)}`
+  const secondHash = `0x${'22'.repeat(32)}`
+  await writeFile(path, JSON.stringify({
+    users: { [owner]: { walletAddress, delegateAddress, chain: 'arc-testnet', active: false, pendingAuthorization: true, authorizationUserOpHash: firstHash } },
+    aliases: {},
+  }))
+  const previousPath = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  try {
+    const { recordSessionAuthorizationAttempt } = await import('../src/services/sessionKeyService.mjs?auth-test-replace-' + Date.now())
+    // A 'pending' or 'success' previous operation is still live and must block
+    // replacement to avoid duplicate owners.
+    assert.throws(() => recordSessionAuthorizationAttempt(owner, { walletAddress, delegateAddress, authorizationUserOpHash: secondHash, previousAuthorizationUserOpHash: firstHash, previousOutcome: 'pending' }), /different authorization/)
+    assert.throws(() => recordSessionAuthorizationAttempt(owner, { walletAddress, delegateAddress, authorizationUserOpHash: secondHash, previousAuthorizationUserOpHash: firstHash, previousOutcome: 'success' }), /different authorization/)
+    assert.throws(() => recordSessionAuthorizationAttempt(owner, { walletAddress, delegateAddress, authorizationUserOpHash: secondHash, previousAuthorizationUserOpHash: firstHash, previousOutcome: 'unknown' }), /different authorization/)
+    // 'absent' (no receipt and no indexed operation) is provably gone and may
+    // be replaced with a fresh addOwners.
+    const result = recordSessionAuthorizationAttempt(owner, { walletAddress, delegateAddress, authorizationUserOpHash: secondHash, previousAuthorizationUserOpHash: firstHash, previousOutcome: 'absent' })
+    assert.equal(result.authorizationUserOpHash, secondHash)
+    const saved = JSON.parse(readFileSync(path, 'utf8'))
+    assert.equal(saved.users[owner].authorizationUserOpHash, secondHash)
+  } finally {
+    if (previousPath === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = previousPath
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('records one submitted authorization hash without activating the reservation', async () => {
   const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
   const { join } = await import('node:path')

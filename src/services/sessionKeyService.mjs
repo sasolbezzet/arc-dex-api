@@ -330,10 +330,15 @@ export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet'
   // A manual revoke must never be silently resurrected by a passkey retry.
   // Inactivity is different: the on-chain owner is still valid, so the user
   // may explicitly re-activate that exact delegate after a fresh passkey flow.
+  // A manual revoke clears the in-store marker only after a fresh passkey
+  // authorization succeeds; the on-chain owner is never removed by revoke, so
+  // an explicit passkey flow may re-activate the exact same delegate. Until
+  // then the record stays protected from any status-read resurrection.
   if (isManuallyRevoked(existing)) {
     existing.pendingAuthorization = true
     existing.revokeReason = undefined
     existing.revokedAt = undefined
+    existing.manualRevokePending = true
     saveStore(store)
     return { address: existing.delegateAddress, walletAddress: wallet, pending: true, reauthorization: true }
   }
@@ -444,7 +449,12 @@ export function recordSessionAuthorizationAttempt(userId, { walletAddress, deleg
   }
     const existingHash = resolveAuthorizationUserOpHash(entry, chainKey)
     if (existingHash && existingHash.toLowerCase() !== authorizationUserOpHash.toLowerCase()) {
-      if (!previousAuthorizationUserOpHash || existingHash.toLowerCase() !== String(previousAuthorizationUserOpHash).toLowerCase() || previousOutcome !== 'failed') {
+      // A different hash may replace the previous one only when the old
+      // operation is provably gone ('failed' reverted, or 'absent' — no
+      // receipt and no indexed operation). Replacing a live 'success' or
+      // 'pending' hash could create a duplicate owner.
+      const replaceable = previousOutcome === 'failed' || previousOutcome === 'absent'
+      if (!previousAuthorizationUserOpHash || existingHash.toLowerCase() !== String(previousAuthorizationUserOpHash).toLowerCase() || !replaceable) {
         throw new Error('A different authorization UserOperation is already recorded')
       }
     }
@@ -496,11 +506,19 @@ export async function getAuthorizationUserOperationOutcome(userOpHash, chainKey 
   const client = createPublicClient({ chain: buildViemChain(chainKey), transport })
   try {
     const receipt = await client.request({ method: 'eth_getUserOperationReceipt', params: [userOpHash] })
-    if (!receipt) return 'unknown'
-    const status = receipt.receipt?.status
-    if (receipt.success === true && ['success', '0x1', 1, true].includes(status)) return 'success'
-    if (receipt.success === false && ['reverted', 'failed', '0x0', 0, false].includes(status)) return 'failed'
-    return 'unknown'
+    if (receipt) {
+      const status = receipt.receipt?.status
+      if (receipt.success === true && ['success', '0x1', 1, true].includes(status)) return 'success'
+      if (receipt.success === false && ['reverted', 'failed', '0x0', 0, false].includes(status)) return 'failed'
+      return 'unknown'
+    }
+    // No receipt: distinguish a UserOperation that is still being processed by
+    // the bundler (byHash returns it) from one that is genuinely gone from the
+    // index. Only 'absent' may be safely replaced with a fresh addOwners;
+    // replacing a still-pending operation could create a duplicate owner.
+    const operation = await client.request({ method: 'eth_getUserOperationByHash', params: [userOpHash] }).catch(() => null)
+    if (operation) return 'pending'
+    return 'absent'
   } catch (error) {
     if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
     return 'unknown'
@@ -592,6 +610,11 @@ export async function reconcileSessionKeyActivation(userId) {
   if (!entry) return { active: false, reason: 'no_session' }
   if (entry.active === true) return { active: true, walletAddress: entry.walletAddress, delegateAddress: entry.delegateAddress, reconciled: false }
   if (isManuallyRevoked(entry)) return { active: false, reason: 'revoked' }
+  // A manual revoke is never resurrected by the on-chain fallback below. The
+  // passkey owner must explicitly authorize the delegate again; report the
+  // proof as missing so the browser submits a fresh addOwners instead of
+  // silently reactivating the old delegate on the strength of its history.
+  if (entry.manualRevokePending) return { active: false, reason: 'authorization_proof_missing' }
 
   const chainKey = entry.chain || 'arc-testnet'
   const hash = resolveAuthorizationUserOpHash(entry, chainKey)
@@ -696,6 +719,7 @@ export function activateReservedSessionKey(userId, { walletAddress, delegateAddr
   entry.lastUsedAt = entry.activatedAt
   delete entry.revokedAt
   delete entry.revokeReason
+  delete entry.manualRevokePending
   saveStore(store)
   return entry
 }
