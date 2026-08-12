@@ -398,8 +398,35 @@ export function siweMessageHandler(req, res) {
 
 // ── SIWE verify + issue auth code ──
 import { createPublicClient, decodeEventLog, defineChain, encodeFunctionData, fallback, formatUnits, getAddress, http, parseUnits, verifyMessage } from 'viem'
+
+// Bind the verified SIWE identity to an already-active passkey session only
+// when the browser proves control of that exact MSCA with its vault token.
+// This keeps MCP MSCA-only while allowing Claude/ChatGPT's EOA identity to
+// resolve the Agent Wallet after the user explicitly approves OAuth.
+export async function bindMcpIdentityToActiveSession({ userId, mscaWalletAddress, mscaSessionToken } = {}) {
+  if (!mscaWalletAddress && !mscaSessionToken) return { ok: true, skipped: true }
+  if (!userId || !mscaWalletAddress || !mscaSessionToken) {
+    return { ok: false, error: 'Both active MSCA address and passkey session token are required for identity binding' }
+  }
+  try {
+    const { validateSession, getSessionKeyInfo } = await import('./vaultStore.mjs')
+    const authenticatedMsca = validateSession(mscaSessionToken)
+    if (!authenticatedMsca || getAddress(authenticatedMsca) !== getAddress(mscaWalletAddress)) {
+      return { ok: false, error: 'Passkey session token does not authenticate the selected MSCA' }
+    }
+    const session = await getSessionKeyInfo(mscaWalletAddress)
+    if (!session?.active || getAddress(session.walletAddress || '') !== getAddress(mscaWalletAddress)) {
+      return { ok: false, error: 'Selected MSCA does not have an active session key' }
+    }
+    const { bindSessionAlias } = await import('./sessionKeyService.mjs')
+    return { ok: true, bound: bindSessionAlias(userId, userId, mscaWalletAddress) }
+  } catch (error) {
+    return { ok: false, error: error?.message || 'MCP identity binding failed' }
+  }
+}
+
 export async function siweVerifyHandler(req, res) {
-  const { address, message, signature, clientId, redirectUri, state, codeChallenge, requestId, resource } = req.body || {}
+  const { address, message, signature, clientId, redirectUri, state, codeChallenge, requestId, resource, mscaWalletAddress, mscaSessionToken } = req.body || {}
   if (!address || !message || !clientId || !requestId) return res.status(400).json({ error: 'missing_fields' })
   if (!redirectUri || !codeChallenge) return res.status(400).json({ error: 'missing_pkce_or_redirect_uri' })
   if (!validResourceIndicator(resource)) return res.status(400).json({ error: 'invalid_target', error_description: 'resource must identify the ARCOX MCP endpoint' })
@@ -428,6 +455,13 @@ export async function siweVerifyHandler(req, res) {
   } catch {
     return res.status(401).json({ error: 'signature_verification_failed' })
   }
+
+  const binding = await bindMcpIdentityToActiveSession({
+    userId: String(address).toLowerCase(),
+    mscaWalletAddress,
+    mscaSessionToken,
+  })
+  if (!binding.ok) return res.status(403).json({ error: 'session_identity_binding_failed', error_description: binding.error })
 
   let grant
   try {

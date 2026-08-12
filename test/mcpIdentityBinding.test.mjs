@@ -119,6 +119,29 @@ test('MCP wallet balances are bound to the active MSCA and expose four chains', 
   }
 })
 
+test('OAuth identity binding requires the active MSCA passkey session and creates the explicit alias', async () => {
+  await withSessionStore({
+    [MSCA.toLowerCase()]: {
+      walletAddress: MSCA,
+      delegateAddress: OTHER,
+      active: true,
+      authorizationUserOpHash: '0x' + 'a'.repeat(64),
+    },
+  }, {}, async ({ resolveActiveMsca }) => {
+    // Use the same vaultStore module instance that mcpServer's dynamic import
+    // uses; query-string imports would create a separate in-memory token map.
+    const { createSession } = await import('../src/services/vaultStore.mjs')
+    const { bindMcpIdentityToActiveSession } = await import('../src/services/mcpServer.mjs?binding-' + Date.now() + '-' + Math.random())
+    const passkeyToken = createSession(MSCA.toLowerCase())
+    const bound = await bindMcpIdentityToActiveSession({ userId: EOA, mscaWalletAddress: MSCA, mscaSessionToken: passkeyToken })
+    assert.equal(bound.ok, true)
+    assert.equal((await resolveActiveMsca(EOA))?.walletAddress, MSCA)
+
+    const rejected = await bindMcpIdentityToActiveSession({ userId: OTHER, mscaWalletAddress: MSCA, mscaSessionToken: 'arx_vs_invalid' })
+    assert.equal(rejected.ok, false)
+  })
+})
+
 test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
   const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE
   delete process.env.ENABLE_MSCA_CCTP_BRIDGE
