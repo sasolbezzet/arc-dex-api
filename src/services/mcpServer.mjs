@@ -2925,13 +2925,15 @@ export function createMcpServer(userId, context = {}) {
   // ── SESSION KEY STATUS ──
   server.tool('arcox_session_status', 'Check if Agent Session Key (MSCA) is active for the user. Returns wallet address, delegate address, and whether session signing is available.', {}, async () => {
     const { getSessionKeyInfo } = await import('./vaultStore.mjs')
-    const info = await getSessionKeyInfo(userId)
+    const sessionOwner = boundMscaWalletAddress || userId
+    const info = await getSessionKeyInfo(sessionOwner)
     // Recording connection time here lets auto-detect choose the MSCA this user
-    // most recently connected via Claude/agent — no hardcoded wallet.
+    // most recently connected via Claude/agent — no hardcoded wallet. When OAuth
+    // carries a passkey-proven MSCA, touch that exact wallet rather than the EOA.
     if (info && info.active) {
       try {
         const { touchSessionKey } = await import('./sessionKeyService.mjs')
-        touchSessionKey(userId)
+        touchSessionKey(sessionOwner)
       } catch { /* non-fatal */ }
     }
     if (!info || !info.active) {

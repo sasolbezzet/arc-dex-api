@@ -178,6 +178,24 @@ test('server-issued OAuth MSCA binding resolves without relying on the EOA alias
   })
 })
 
+test('session status uses the OAuth-bound MSCA instead of the SIWE EOA', async () => {
+  await withSessionStore({
+    [MSCA.toLowerCase()]: {
+      walletAddress: MSCA,
+      delegateAddress: OTHER,
+      active: true,
+      authorizationUserOpHash: '0x' + 'd'.repeat(64),
+    },
+  }, {}, async ({ createMcpServer }) => {
+    const server = createMcpServer(EOA, { boundMscaWalletAddress: MSCA })
+    const response = await server._registeredTools.arcox_session_status.handler({})
+    const result = JSON.parse(response.content[0].text)
+    assert.equal(result.active, true)
+    assert.equal(result.walletAddress, MSCA)
+    assert.equal(result.delegateAddress, OTHER)
+  })
+})
+
 test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
   const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE
   delete process.env.ENABLE_MSCA_CCTP_BRIDGE
