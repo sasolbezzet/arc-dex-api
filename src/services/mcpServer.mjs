@@ -419,7 +419,11 @@ export async function bindMcpIdentityToActiveSession({ userId, mscaWalletAddress
       return { ok: false, error: 'Selected MSCA does not have an active session key' }
     }
     const { bindSessionAlias } = await import('./sessionKeyService.mjs')
-    return { ok: true, bound: bindSessionAlias(userId, userId, mscaWalletAddress) }
+    // The passkey-backed session token above proves control of this exact
+    // active MSCA. Permit this OAuth flow to replace a stale EOA alias so a
+    // newly selected Agent Wallet can connect without a manual cleanup step.
+    // The ordinary session setup path keeps the strict no-rebind default.
+    return { ok: true, bound: bindSessionAlias(userId, userId, mscaWalletAddress, { allowRebind: true }) }
   } catch (error) {
     return { ok: false, error: error?.message || 'MCP identity binding failed' }
   }

@@ -387,22 +387,28 @@ export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet'
   return { address: getAddress(generated.address), walletAddress: wallet, pending: true }
 }
 
-/** Bind an independently authenticated EOA identity to its selected MSCA. */
-export function bindSessionAlias(userId, ownerAddress, walletAddress) {
+/**
+ * Bind an independently authenticated EOA identity to its selected MSCA.
+ * `allowRebind` is reserved for callers that have separately proved control
+ * of the new MSCA (currently the passkey-backed MCP OAuth flow). Ordinary
+ * owner/session setup remains fail-closed and must explicitly revoke first.
+ */
+export function bindSessionAlias(userId, ownerAddress, walletAddress, { allowRebind = false } = {}) {
   const store = loadStore()
   const wallet = getAddress(walletAddress)
   const owner = getAddress(ownerAddress).toLowerCase()
   const requester = String(userId || '').toLowerCase()
   const existingOwner = String(store.aliases?.[owner] || '').toLowerCase()
   const existingRequester = String(store.aliases?.[requester] || '').toLowerCase()
-  if ((existingOwner && existingOwner !== wallet.toLowerCase()) || (existingRequester && existingRequester !== wallet.toLowerCase())) {
+  const conflicts = (existingOwner && existingOwner !== wallet.toLowerCase()) || (existingRequester && existingRequester !== wallet.toLowerCase())
+  if (conflicts && !allowRebind) {
     throw new Error('Identity is already bound to another MSCA; revoke the old session before rebinding.')
   }
   if (!store.aliases) store.aliases = {}
   store.aliases[requester] = wallet
   store.aliases[owner] = wallet
   saveStore(store)
-  return { ownerAddress: owner, walletAddress: wallet }
+  return { ownerAddress: owner, walletAddress: wallet, rebound: Boolean(conflicts) }
 }
 
 /**

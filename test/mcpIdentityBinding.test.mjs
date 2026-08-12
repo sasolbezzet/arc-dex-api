@@ -142,6 +142,25 @@ test('OAuth identity binding requires the active MSCA passkey session and create
   })
 })
 
+test('OAuth passkey proof can replace a stale EOA alias with the selected active MSCA', async () => {
+  await withSessionStore({
+    [MSCA.toLowerCase()]: {
+      walletAddress: MSCA,
+      delegateAddress: OTHER,
+      active: true,
+      authorizationUserOpHash: '0x' + 'e'.repeat(64),
+    },
+  }, { [EOA.toLowerCase()]: OTHER }, async ({ resolveActiveMsca }) => {
+    const { createSession } = await import('../src/services/vaultStore.mjs')
+    const { bindMcpIdentityToActiveSession } = await import('../src/services/mcpServer.mjs?binding-rebind-' + Date.now() + '-' + Math.random())
+    const passkeyToken = createSession(MSCA.toLowerCase())
+    const bound = await bindMcpIdentityToActiveSession({ userId: EOA, mscaWalletAddress: MSCA, mscaSessionToken: passkeyToken })
+    assert.equal(bound.ok, true)
+    assert.equal(bound.bound.rebound, true)
+    assert.equal((await resolveActiveMsca(EOA))?.walletAddress, MSCA)
+  })
+})
+
 test('explicit EOA-to-MSCA alias wins over an active legacy EOA session', async () => {
   await withSessionStore({
     [EOA.toLowerCase()]: {
