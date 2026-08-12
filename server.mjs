@@ -167,21 +167,37 @@ function normalizeIncomingWebAuthnCredential(input) {
   return credential
 }
 
-function circleModularHttpTransport(url, clientKey) {
+function circleModularHttpTransport(url, clientKey, cookie = '') {
   return http(String(url || '').replace(/\/+$/, ''), {
     timeout: 12_000,
     retryCount: 1,
     fetchOptions: {
-      headers: circleModularProxyHeaders(clientKey),
+      headers: {
+        ...circleModularProxyHeaders(clientKey),
+        ...(cookie ? { Cookie: cookie } : {}),
+      },
     },
   })
 }
 
-async function verifiedPasskeyWalletAddress({ credential, mode = 'Login' } = {}) {
+const passkeyFlows = new Map()
+const PASSKEY_FLOW_TTL_MS = 5 * 60 * 1000
+function cleanupPasskeyFlows() {
+  const now = Date.now()
+  for (const [flowId, flow] of passkeyFlows) if (flow.expiresAt <= now) passkeyFlows.delete(flowId)
+}
+
+async function verifiedPasskeyWalletAddress({ credential, mode = 'Login', flowId = '' } = {}) {
   const normalizedCredential = normalizeIncomingWebAuthnCredential(credential)
   const clientUrl = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc/w3s/buidl').replace(/\/+$/, '')
   const clientKey = process.env.CIRCLE_CLIENT_KEY || ''
   if (!clientKey) throw new Error('Circle Modular credential verification is not configured')
+  cleanupPasskeyFlows()
+  const flow = flowId ? passkeyFlows.get(String(flowId)) : null
+  if (flowId && (!flow || flow.expiresAt <= Date.now() || flow.mode !== mode)) throw new Error('Passkey challenge session expired or invalid')
+  // Consume the flow before verification: Circle challenges are single-use and
+  // a browser retry must start a new options flow instead of replaying it.
+  if (flowId) passkeyFlows.delete(String(flowId))
   const method = mode === 'Register' ? 'rp_getRegistrationVerification' : 'rp_getLoginVerification'
   // Circle exposes WebAuthn rp_get* methods through the passkey provider.
   // The modular provider is reserved for chain/UserOperation RPC methods;
@@ -190,7 +206,7 @@ async function verifiedPasskeyWalletAddress({ credential, mode = 'Login' } = {})
   // The Circle SDK passkey transport is browser-oriented and can reference
   // window through its bundled viem@2.45.3 path. Backend verification is plain
   // JSON-RPC, so use native viem HTTP with the Circle Client Key instead.
-  const transport = circleModularHttpTransport(clientUrl, clientKey)
+  const transport = circleModularHttpTransport(clientUrl, clientKey, flow?.cookie || '')
   const verificationClient = createPublicClient({ chain: arcTestnet, transport })
   const verification = await verificationClient.request({ method, params: [normalizedCredential] })
   const base64PublicKey = verification?.publicKey
@@ -207,21 +223,55 @@ async function verifiedPasskeyWalletAddress({ credential, mode = 'Login' } = {})
   return { walletAddress: getAddress(smartAccount.address), credential: { id: String(normalizedCredential.id), publicKey } }
 }
 
+app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
+  try {
+    const { mode = 'Login', username = '' } = req.body || {}
+    if (mode !== 'Login' && mode !== 'Register') return res.status(400).json({ error: 'Invalid passkey mode' })
+    const clientUrl = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc/w3s/buidl').replace(/\/+$/, '')
+    const clientKey = process.env.CIRCLE_CLIENT_KEY || ''
+    if (!clientKey) return res.status(503).json({ error: 'Circle Modular credential verification is not configured' })
+    const method = mode === 'Register' ? 'rp_getRegistrationOptions' : 'rp_getLoginOptions'
+    const upstream = await fetch(clientUrl, {
+      method: 'POST',
+      headers: circleModularProxyHeaders(clientKey),
+      body: JSON.stringify({ jsonrpc: '2.0', id: randomUUID(), method, params: [String(username || '')] }),
+      signal: AbortSignal.timeout(12_000),
+    })
+    const body = await upstream.json().catch(() => ({}))
+    if (!upstream.ok || body?.error || !body?.result?.challenge) {
+      throw new Error(body?.error?.message || `Circle passkey options failed (HTTP ${upstream.status})`)
+    }
+    const cookies = typeof upstream.headers.getSetCookie === 'function'
+      ? upstream.headers.getSetCookie().map(value => value.split(';', 1)[0]).filter(Boolean).join('; ')
+      : ''
+    cleanupPasskeyFlows()
+    if (passkeyFlows.size >= 1000) return res.status(429).json({ error: 'Too many pending passkey flows. Try again shortly.' })
+    const flowId = randomUUID()
+    passkeyFlows.set(flowId, { mode, cookie: cookies, expiresAt: Date.now() + PASSKEY_FLOW_TTL_MS })
+    res.json({ success: true, flowId, options: body.result })
+  } catch (error) {
+    res.status(502).json({ error: error.message })
+  }
+})
+
 app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
   try {
-    const { walletAddress, credential, mode = 'Login' } = req.body || {}
-    if (!walletAddress || !isAddress(walletAddress)) {
-      return res.status(400).json({ error: 'Valid walletAddress required' })
+    const { walletAddress, credential, mode = 'Login', flowId = '' } = req.body || {}
+    if (walletAddress && !isAddress(walletAddress)) {
+      return res.status(400).json({ error: 'walletAddress must be a valid address when supplied' })
     }
     if (mode !== 'Login' && mode !== 'Register') return res.status(400).json({ error: 'Invalid passkey mode' })
-    const verified = await verifiedPasskeyWalletAddress({ credential, mode })
-    const requested = getAddress(walletAddress)
-    if (verified.walletAddress.toLowerCase() !== requested.toLowerCase()) {
+    // The browser performs only navigator.credentials.get/create. Circle RP
+    // verification happens exactly once here; the SDK high-level helper is
+    // deliberately not called on the browser because it would consume the
+    // same single-use login session before this endpoint receives it.
+    const verified = await verifiedPasskeyWalletAddress({ credential, mode, flowId })
+    if (walletAddress && verified.walletAddress.toLowerCase() !== getAddress(walletAddress).toLowerCase()) {
       return res.status(403).json({ error: 'Passkey wallet address mismatch' })
     }
     const { createSession } = await import('./src/services/vaultStore.mjs')
     const token = createSession(verified.walletAddress.toLowerCase())
-    res.json({ success: true, token, address: verified.walletAddress, credential: verified.credential })
+    res.json({ success: true, token, address: verified.walletAddress, walletAddress: verified.walletAddress, credential: verified.credential })
   } catch (e) { res.status(401).json({ error: e.message }) }
 })
 
