@@ -335,12 +335,25 @@ export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet'
   // an explicit passkey flow may re-activate the exact same delegate. Until
   // then the record stays protected from any status-read resurrection.
   if (isManuallyRevoked(existing)) {
+    // Manual revoke is a local policy event; the old delegate may still be an
+    // on-chain owner. Never submit addOwners for that same address again.
+    // Rotate the server-held delegate only after the fresh passkey flow reaches
+    // this reservation step, preserving the old address in the audit record.
+    const generated = generateSessionKey()
+    existing.previousDelegateAddress = existing.delegateAddress
+    existing.delegateAddress = getAddress(generated.address)
+    existing.delegatePrivateKey = encrypt(generated.privateKey)
     existing.pendingAuthorization = true
+    existing.active = false
+    existing.authorizationUserOpHash = ''
+    existing.authorizationUserOpHashes = {}
     existing.revokeReason = undefined
     existing.revokedAt = undefined
-    existing.manualRevokePending = true
+    existing.manualRevokePending = false
+    existing.createdAt = Date.now()
+    existing.lastUsedAt = existing.createdAt
     saveStore(store)
-    return { address: existing.delegateAddress, walletAddress: wallet, pending: true, reauthorization: true }
+    return { address: existing.delegateAddress, walletAddress: wallet, pending: true, reauthorization: true, rotatedAfterManualRevoke: true }
   }
   // Reuse an inactive delegate with a known authorization proof. Rotating here
   // would create a second owner attempt and could leave the UI/status split
@@ -463,6 +476,9 @@ export function recordSessionAuthorizationAttempt(userId, { walletAddress, deleg
     // Destination-chain proofs must remain in the per-chain map and must never
     // become eligible through the legacy lookup path.
     if (chainKey === 'arc-testnet') entry.authorizationUserOpHash = authorizationUserOpHash
+    delete entry.lastAuthorizationOutcome
+    delete entry.lastAuthorizationErrorAt
+    delete entry.lastAuthorizationTransactionHash
     entry.authorizationAttemptAt = entry.authorizationAttemptAt || Date.now()
     saveStore(store)
     return { walletAddress: wallet, delegateAddress: delegate, chainKey, authorizationUserOpHash }
@@ -509,7 +525,7 @@ export async function getAuthorizationUserOperationOutcome(userOpHash, chainKey 
     if (receipt) {
       const status = receipt.receipt?.status
       if (receipt.success === true && ['success', '0x1', 1, true].includes(status)) return 'success'
-      if (receipt.success === false && ['reverted', 'failed', '0x0', 0, false].includes(status)) return 'failed'
+      if (receipt.success === false || ['reverted', 'failed', '0x0', 0, false].includes(status)) return 'failed'
       return 'unknown'
     }
     // No receipt: distinguish a UserOperation that is still being processed by
@@ -523,6 +539,42 @@ export async function getAuthorizationUserOperationOutcome(userOpHash, chainKey 
     if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
     return 'unknown'
   }
+}
+
+/**
+ * Check Circle's owner-to-wallet mapping before retrying an authorization.
+ * UserOperation history is bounded in Circle's indexer, but the address mapping
+ * is the durable signal needed to avoid submitting duplicate addOwners calls.
+ */
+export async function getDelegateOwnerMapping(walletAddress, delegateAddress, chainKey = 'arc-testnet') {
+  const wallet = getAddress(walletAddress)
+  const delegate = getAddress(delegateAddress)
+  const chain = CHAINS[chainKey]
+  if (!chain || !MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) return { known: false, reason: 'unsupported_chain' }
+  if (!CLIENT_URL || !CLIENT_KEY) return { known: false, reason: 'circle_not_configured' }
+  const transport = circleModularHttpTransport(chainKey)
+  const client = createPublicClient({ chain: buildViemChain(chainKey), transport })
+  try {
+    const result = await client.request({
+      method: 'circle_getAddressMapping',
+      params: [{ owner: { type: 'EOAOWNER', identifier: { address: delegate } } }],
+    })
+    const mappings = Array.isArray(result) ? result : (Array.isArray(result?.mappings) ? result.mappings : [])
+    const mapped = mappings.some(item => String(item?.walletAddress || '').toLowerCase() === wallet.toLowerCase())
+    return { known: true, mapped, walletAddress: wallet, delegateAddress: delegate }
+  } catch (error) {
+    if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
+    return { known: false, reason: 'owner_mapping_unavailable', walletAddress: wallet, delegateAddress: delegate }
+  }
+}
+
+function authorizationUserOperationError(receipt, message = 'MSCA authorization UserOperation reverted') {
+  const error = new Error(message)
+  error.code = 'authorization_userop_failed'
+  error.retryAllowed = true
+  error.transactionHash = receipt?.receipt?.transactionHash || null
+  error.receiptStatus = receipt?.receipt?.status ?? null
+  return error
 }
 
 export async function verifySessionAuthorization(userId, { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = 'arc-testnet' } = {}) {
@@ -559,7 +611,7 @@ export async function verifySessionAuthorization(userId, { walletAddress, delega
     const successfulStatus = status === 'success' || status === '0x1' || status === 1 || status === true
     const failedStatus = status === 'reverted' || status === 'failed' || status === '0x0' || status === 0 || status === false
     if (receipt?.success === false || failedStatus) {
-      throw new Error('MSCA authorization UserOperation reverted')
+      throw authorizationUserOperationError(receipt)
     }
     if (receipt?.success === true && successfulStatus) {
       receiptFinalized = true
@@ -630,42 +682,63 @@ export async function reconcileSessionKeyActivation(userId) {
     if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
     return null
   })
-  if (!receipt) {
-    // Circle's bundler index does not retain old hashes indefinitely. A record
-    // that previously activated with this exact delegate has already proven the
-    // addOwners UserOperation succeeded on-chain, and an inactivity revoke
-    // never removes the on-chain owner. Restore the session only when the MSCA
-    // is still deployed; an undeployed account cannot execute anyway.
-    if (entry.activatedAt && entry.delegateAddress) {
-      let deployed = false
-      try {
-        const code = await client.getCode({ address: entry.walletAddress })
-        deployed = Boolean(code && code !== '0x')
-      } catch { deployed = false }
-      if (deployed) {
-        return withSessionStoreLock(() => {
-          const latest = loadStore()
-          const current = latest.users[walletKey]
-          if (!current || current.active === true) return { active: current?.active === true, reconciled: false }
-          const currentHash = resolveAuthorizationUserOpHash(current, chainKey)
-          if (String(currentHash).toLowerCase() !== String(hash).toLowerCase()) return { active: false, reason: 'authorization_changed' }
-          if (isManuallyRevoked(current)) return { active: false, reason: 'revoked' }
-          current.active = true
-          current.pendingAuthorization = false
-          current.activatedAt = current.activatedAt || Date.now()
-          current.lastUsedAt = Date.now()
-          delete current.revokedAt
-          delete current.revokeReason
-          current.reconciledAt = Date.now()
-          saveStore(latest)
-          return { active: true, walletAddress: current.walletAddress, delegateAddress: current.delegateAddress, reconciled: true, userOpHash: hash, restoredOnChain: true }
-        })
+  const receiptStatus = receipt?.receipt?.status
+  const failedReceipt = receipt?.success === false
+    || ['reverted', 'failed', '0x0', 0, false].includes(receiptStatus)
+  if (failedReceipt) {
+    const transactionHash = receipt?.receipt?.transactionHash || null
+    return withSessionStoreLock(() => {
+      const latest = loadStore()
+      const current = latest.users[walletKey]
+      if (!current || current.active === true) return { active: current?.active === true, reconciled: false }
+      if (isManuallyRevoked(current)) return { active: false, reason: 'revoked' }
+      const currentHash = resolveAuthorizationUserOpHash(current, chainKey)
+      if (String(currentHash).toLowerCase() !== String(hash).toLowerCase()) return { active: false, reason: 'authorization_changed' }
+      current.lastAuthorizationOutcome = 'failed'
+      current.lastAuthorizationErrorAt = Date.now()
+      current.lastAuthorizationTransactionHash = transactionHash
+      saveStore(latest)
+      return {
+        active: false,
+        reason: 'authorization_failed',
+        retryAllowed: true,
+        userOpHash: hash,
+        transactionHash,
       }
+    })
+  }
+  if (!receipt) {
+    // The UserOperation index is bounded. Check the durable Circle owner mapping
+    // before treating a missing receipt as proof-missing and retrying addOwners.
+    const mapping = await getDelegateOwnerMapping(entry.walletAddress, entry.delegateAddress, chainKey)
+    if (mapping.known && mapping.mapped) {
+      return withSessionStoreLock(() => {
+        const latest = loadStore()
+        const current = latest.users[walletKey]
+        if (!current || current.active === true) return { active: current?.active === true, reconciled: false }
+        if (isManuallyRevoked(current)) return { active: false, reason: 'revoked' }
+        const currentHash = resolveAuthorizationUserOpHash(current, chainKey)
+        if (String(currentHash).toLowerCase() !== String(hash).toLowerCase()) return { active: false, reason: 'authorization_changed' }
+        current.active = true
+        current.pendingAuthorization = false
+        current.activatedAt = current.activatedAt || Date.now()
+        current.lastUsedAt = Date.now()
+        current.reconciledAt = Date.now()
+        current.reconciledOnChain = true
+        delete current.revokedAt
+        delete current.revokeReason
+        saveStore(latest)
+        return { active: true, walletAddress: current.walletAddress, delegateAddress: current.delegateAddress, reconciled: true, userOpHash: hash, restoredOnChain: true }
+      })
     }
-    // A never-activated attempt whose hash the bundler no longer indexes cannot
-    // be proven. Report proof_missing so the browser can submit a fresh
-    // addOwners UserOperation instead of polling forever.
-    return { active: false, reason: 'authorization_proof_missing', userOpHash: hash }
+    if (mapping.known && !mapping.mapped) {
+      // A negative address-mapping result is not proof that an old addOwners
+      // execution did not land: the mapping API and plugin owner index may
+      // have different retention/visibility. Require explicit reconciliation
+      // rather than risking a duplicate owner mutation.
+      return { active: false, reason: 'authorization_proof_missing', retryAllowed: false, userOpHash: hash }
+    }
+    return { active: false, reason: 'authorization_unknown', retryAllowed: false, userOpHash: hash }
   }
   const operation = await client.request({ method: 'eth_getUserOperationByHash', params: [hash] }).catch(error => {
     if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)

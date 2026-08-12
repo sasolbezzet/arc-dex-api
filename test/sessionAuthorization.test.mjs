@@ -71,10 +71,12 @@ test('manual revoke sets manualRevokePending and reconcile refuses resurrection'
     const { reserveSessionKey, reconcileSessionKeyActivation } = await import('../src/services/sessionKeyService.mjs?auth-test-manual-revoke-' + Date.now())
     const reserved = reserveSessionKey(owner, { walletAddress })
     assert.equal(reserved.reauthorization, true)
+    assert.equal(reserved.rotatedAfterManualRevoke, true)
     const saved = JSON.parse(readFileSync(path, 'utf8'))
-    assert.equal(saved.users[owner].manualRevokePending, true)
-    // Reconcile must not resurrect the manually-revoked delegate via history;
-    // it reports the proof as missing so the browser submits a fresh addOwners.
+    assert.notEqual(saved.users[owner].delegateAddress.toLowerCase(), delegateAddress.toLowerCase())
+    assert.equal(saved.users[owner].authorizationUserOpHash, '')
+    // Manual revoke never reuses the old owner proof. The fresh passkey flow
+    // receives a rotated delegate with no historical authorization hash.
     const reconciled = await reconcileSessionKeyActivation(owner)
     assert.equal(reconciled.active, false)
     assert.equal(reconciled.reason, 'authorization_proof_missing')
@@ -188,6 +190,31 @@ test('session aliases cannot be rebound to a different MSCA', async () => {
     if (previousEncryptionKey === undefined) delete process.env.SESSION_KEY_ENCRYPTION_KEY
     else process.env.SESSION_KEY_ENCRYPTION_KEY = previousEncryptionKey
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('Circle owner mapping identifies an existing delegate without UserOperation history', async () => {
+  const previousUrl = process.env.CIRCLE_CLIENT_URL
+  const previousKey = process.env.CIRCLE_CLIENT_KEY
+  const previousFetch = globalThis.fetch
+  process.env.CIRCLE_CLIENT_URL = 'https://circle.test/v1/rpc/w3s/buidl'
+  process.env.CIRCLE_CLIENT_KEY = 'test-client-key'
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    result: [{ walletAddress }],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  try {
+    const { getDelegateOwnerMapping } = await import('../src/services/sessionKeyService.mjs?owner-mapping-' + Date.now())
+    const found = await getDelegateOwnerMapping(walletAddress, delegateAddress)
+    assert.equal(found.known, true)
+    assert.equal(found.mapped, true)
+  } finally {
+    globalThis.fetch = previousFetch
+    if (previousUrl === undefined) delete process.env.CIRCLE_CLIENT_URL
+    else process.env.CIRCLE_CLIENT_URL = previousUrl
+    if (previousKey === undefined) delete process.env.CIRCLE_CLIENT_KEY
+    else process.env.CIRCLE_CLIENT_KEY = previousKey
   }
 })
 

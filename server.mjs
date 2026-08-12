@@ -424,7 +424,16 @@ app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
     // client-provided ownerAddress must not select another metadata owner.
     setSessionKeyInfo(req.owner, { walletAddress, delegateAddress, active: true, createdAt: entry.createdAt, authorizationUserOpHash: verified.userOpHash })
     res.json({ success: true, walletAddress, delegateAddress, active: true })
-  } catch (e) { res.status(500).json({ error: e.message }) }
+  } catch (e) {
+    const retryable = e?.code === 'authorization_userop_failed' || e?.retryAllowed === true
+    res.status(retryable ? 409 : 500).json({
+      error: e.message,
+      code: e.code || 'session_setup_failed',
+      retryAllowed: retryable,
+      ...(e.transactionHash ? { transactionHash: e.transactionHash } : {}),
+      ...(e.receiptStatus !== undefined ? { receiptStatus: e.receiptStatus } : {}),
+    })
+  }
 })
 
 app.get('/api/session/status', apiLimiter, requireAuth, async (req, res) => {
@@ -509,7 +518,16 @@ app.post('/api/session/authorize-chain', apiLimiter, requireAuth, async (req, re
     })
     recordSessionChainAuthorization(req.owner, { walletAddress, chainKey, authorizationUserOpHash: verified.userOpHash })
     res.json({ success: true, walletAddress, delegateAddress, chainKey, authorizationUserOpHash: verified.userOpHash })
-  } catch (e) { res.status(500).json({ error: e.message }) }
+  } catch (e) {
+    const retryable = e?.code === 'authorization_userop_failed' || e?.retryAllowed === true
+    res.status(retryable ? 409 : 500).json({
+      error: e.message,
+      code: e.code || 'chain_authorization_failed',
+      retryAllowed: retryable,
+      ...(e.transactionHash ? { transactionHash: e.transactionHash } : {}),
+      ...(e.receiptStatus !== undefined ? { receiptStatus: e.receiptStatus } : {}),
+    })
+  }
 })
 
 // ── Pending transactions (passkey-signed from browser) ──

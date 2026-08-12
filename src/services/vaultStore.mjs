@@ -456,11 +456,15 @@ export async function getSessionKeyInfo(owner) {
           ? 'inactivity_24h'
           : entry.revokeReason === 'manual'
             ? 'manual_revoke'
-            : entry.pendingAuthorization
-              ? 'authorization_pending'
-              : entry.authorizationUserOpHash
-                ? 'reauthorization_required'
-                : 'setup_required',
+      : entry.lastAuthorizationOutcome === 'failed'
+        ? 'authorization_failed'
+        : entry.lastAuthorizationOutcome === 'unknown'
+          ? 'authorization_unknown'
+          : entry.pendingAuthorization
+            ? 'authorization_pending'
+            : entry.authorizationUserOpHash
+              ? 'reauthorization_required'
+              : 'setup_required',
     }
   } catch { /* fall through to legacy public record for display only */ }
   const v = loadVault()
