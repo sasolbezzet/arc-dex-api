@@ -11,7 +11,7 @@ export const CHAINS = {
     id: 5042002,
     name: 'Arc Testnet',
     shortName: 'ARC',
-    rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network',
+    rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.io',
     explorerUrl: 'https://testnet.arcscan.app',
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
     transportSlug: 'arcTestnet',

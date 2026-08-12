@@ -241,9 +241,18 @@ app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
     if (!upstream.ok || body?.error || !body?.result?.challenge) {
       throw new Error(body?.error?.message || `Circle passkey options failed (HTTP ${upstream.status})`)
     }
-    const cookies = typeof upstream.headers.getSetCookie === 'function'
-      ? upstream.headers.getSetCookie().map(value => value.split(';', 1)[0]).filter(Boolean).join('; ')
-      : ''
+    // Node >= 18.14 exposes getSetCookie(); older runtimes only expose the
+    // joined "set-cookie" header, which may contain comma-separated Expires
+    // dates. Extract leading name=value pairs without splitting inside dates.
+    const getSetCookie = typeof upstream.headers.getSetCookie === 'function'
+      ? upstream.headers.getSetCookie()
+      : []
+    const rawCookies = getSetCookie.length
+      ? getSetCookie
+      : String(upstream.headers.get('set-cookie') || '')
+          .split(/,(?=\s*[^=;,\s]+=)/)
+          .filter(Boolean)
+    const cookies = rawCookies.map(value => String(value).split(';', 1)[0]).filter(Boolean).join('; ')
     cleanupPasskeyFlows()
     if (passkeyFlows.size >= 1000) return res.status(429).json({ error: 'Too many pending passkey flows. Try again shortly.' })
     const flowId = randomUUID()

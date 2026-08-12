@@ -38,6 +38,27 @@ test('vault session metadata becomes inactive after session-key inactivity expir
   }
 })
 
+test('session status does not persist inactivity revocation on a read', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-session-status-read-'))
+  const sessionPath = join(dir, 'session-keys.json')
+  const wallet = '0x' + '12'.repeat(20)
+  const stale = Date.now() - (24 * 60 * 60 * 1000)
+  await writeFile(sessionPath, JSON.stringify({ users: { [wallet]: { walletAddress: wallet, delegateAddress: wallet, chain: 'arc-testnet', active: true, lastUsedAt: stale, authorizationUserOpHash: '0x' + 'aa'.repeat(32) } }, aliases: {} }))
+  const oldSessionPath = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = sessionPath
+  try {
+    const { getSessionKey } = await import('../src/services/sessionKeyService.mjs?status-read-' + Date.now())
+    const info = getSessionKey(wallet, { sweep: false })
+    assert.equal(info?.active, false)
+    const saved = JSON.parse(await (await import('node:fs/promises')).readFile(sessionPath, 'utf8'))
+    assert.equal(saved.users[wallet].active, true)
+  } finally {
+    if (oldSessionPath === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = oldSessionPath
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('MCP connection is marked inactive after 24 hours without an agent request', async () => {
   const { registerMcpSession, listMcpSessions } = await import('../src/services/vaultStore.mjs?mcp-connection-inactivity-' + Date.now())
   const userId = '0x' + 'ab'.repeat(20)

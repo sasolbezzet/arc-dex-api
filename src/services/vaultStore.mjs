@@ -435,7 +435,11 @@ export async function getSessionKeyInfo(owner) {
   // can outlive a revoke or a failed setup and must never re-enable execution.
   try {
     const { getSessionKey } = await import('./sessionKeyService.mjs')
-    const entry = getSessionKey(key)
+    // Status reads are intentionally side-effect free. An inactive session must
+    // stay inactive after the 24-hour inactivity cutoff; reactivation requires
+    // an explicit passkey flow through /api/session/setup, which independently
+    // verifies the stored authorization UserOperation before activation.
+    const entry = getSessionKey(key, { sweep: false })
     if (entry) return {
       walletAddress: entry.walletAddress,
       delegateAddress: entry.delegateAddress,
@@ -443,7 +447,20 @@ export async function getSessionKeyInfo(owner) {
       pendingAuthorization: entry.pendingAuthorization === true,
       authorizationUserOpHash: entry.authorizationUserOpHash || '',
       createdAt: entry.createdAt,
+      activatedAt: entry.activatedAt,
+      lastUsedAt: entry.lastUsedAt,
       chain: entry.chain,
+      statusReason: entry.active === true
+        ? 'active'
+        : entry.revokeReason === 'inactivity_24h'
+          ? 'inactivity_24h'
+          : entry.revokeReason === 'manual'
+            ? 'manual_revoke'
+            : entry.pendingAuthorization
+              ? 'authorization_pending'
+              : entry.authorizationUserOpHash
+                ? 'reauthorization_required'
+                : 'setup_required',
     }
   } catch { /* fall through to legacy public record for display only */ }
   const v = loadVault()

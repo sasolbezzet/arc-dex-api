@@ -20,7 +20,8 @@ import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createPublicClient, createWalletClient, http, encodeFunctionData, getAddress, defineChain, parseUnits } from 'viem'
-import { toModularTransport, toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
+import { toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
+import { circleModularProxyHeaders } from './circleModularProxy.mjs'
 import { sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
 import { encrypt, decrypt } from './crypto.mjs'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
@@ -64,6 +65,26 @@ function buildViemChain(chainKey) {
     name: c.name,
     nativeCurrency: c.nativeCurrency,
     rpcUrls: { default: { http: [c.rpcUrl] } },
+  })
+}
+
+// Circle's chain/bundler RPC requires the X-AppInfo header (platform + app
+// origin) alongside the Bearer Client Key. The SDK's toModularTransport omits
+// it, and Circle rejects those calls with 401 "Invalid credentials." — which
+// broke authorization verification, reconciliation, and every session-key
+// execution. Mirror server.mjs's circleModularHttpTransport: native viem http
+// also avoids the SDK's browser-oriented transport under Node.js.
+function circleModularHttpTransport(chainKey) {
+  const chain = CHAINS[chainKey]
+  if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
+  if (!CLIENT_URL || !CLIENT_KEY) throw new Error('CIRCLE_CLIENT_URL and CIRCLE_CLIENT_KEY must be set')
+  const url = `${String(CLIENT_URL).replace(/\/+$/, '')}/${chain.transportSlug}`
+  return http(url, {
+    timeout: 12_000,
+    retryCount: 1,
+    fetchOptions: {
+      headers: circleModularProxyHeaders(CLIENT_KEY),
+    },
   })
 }
 
@@ -457,7 +478,7 @@ export async function getAuthorizationUserOperationOutcome(userOpHash, chainKey 
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(userOpHash || ''))) return 'unknown'
   const chain = CHAINS[chainKey]
   if (!chain || !CLIENT_URL || !CLIENT_KEY) return 'unknown'
-  const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+  const transport = circleModularHttpTransport(chainKey)
   const client = createPublicClient({ chain: buildViemChain(chainKey), transport })
   try {
     const receipt = await client.request({ method: 'eth_getUserOperationReceipt', params: [userOpHash] })
@@ -489,7 +510,7 @@ export async function verifySessionAuthorization(userId, { walletAddress, delega
   // Do not trust a client-supplied hash merely because it has the right shape.
   // Query Circle's bundler and fail closed unless the operation is finalized,
   // successful, and was submitted by this exact MSCA.
-  const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+  const transport = circleModularHttpTransport(chainKey)
   const client = createPublicClient({ chain: buildViemChain(chainKey), transport })
   let receipt = null
   let receiptFinalized = false
@@ -566,7 +587,7 @@ export async function reconcileSessionKeyActivation(userId) {
     return { active: false, reason: 'authorization_verification_unavailable' }
   }
 
-  const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+  const transport = circleModularHttpTransport(chainKey)
   const client = createPublicClient({ chain: buildViemChain(chainKey), transport })
   const receipt = await client.request({ method: 'eth_getUserOperationReceipt', params: [hash] }).catch(error => {
     if (classifyCircleModularError(error)) throw circleModularConfigurationError(error)
@@ -870,7 +891,7 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
   if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
   if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) throw new Error(`MSCA unsupported on ${chain.name}; use a supported Circle wallet product instead`)
 
-  const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+  const transport = circleModularHttpTransport(chainKey)
   const viemChain = buildViemChain(chainKey)
   const baseClient = createPublicClient({ chain: viemChain, transport })
   const modularClient = toCircleModularWalletClient({ client: baseClient })
@@ -1103,7 +1124,8 @@ export async function getUserOpStatus(userId, userOpHash, requestedChainKey) {
   const chain = CHAINS[chainKey]
   if (!chain) return { status: 'error', reason: 'unknown_chain' }
   if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) return { status: 'error', reason: 'msca_unsupported_chain', chain: chainKey }
-  const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+  if (!CLIENT_URL || !CLIENT_KEY) return { status: 'error', reason: 'circle_not_configured' }
+  const transport = circleModularHttpTransport(chainKey)
   const baseClient = createPublicClient({ chain: buildViemChain(chainKey), transport })
   const modularClient = toCircleModularWalletClient({ client: baseClient })
 
