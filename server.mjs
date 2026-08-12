@@ -9,6 +9,9 @@ import * as BridgeKitChains from '@circle-fin/bridge-kit'
 import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
 import { createPublicClient, createWalletClient, http, fallback, erc20Abi, formatUnits, defineChain, getAddress, isAddress, verifyMessage } from 'viem'
+import { toModularTransport, toPasskeyTransport, toCircleSmartAccount } from '@circle-fin/modular-wallets-core'
+import { toWebAuthnAccount } from 'viem/account-abstraction'
+import { base64UrlToBytes, bytesToCryptoKey, cryptoKeyToBytes, parsePublicKey, serializePublicKey } from 'webauthn-p256'
 import { privateKeyToAccount } from 'viem/accounts'
 import { SiweMessage } from 'siwe'
 import { PublicKey } from '@solana/web3.js'
@@ -146,20 +149,67 @@ app.use('/api/circle-modular', apiLimiter, express.json({ limit: '128kb' }), asy
   }
 })
 
+function normalizeIncomingWebAuthnCredential(input) {
+  const candidates = []
+  let current = input
+  const seen = new Set()
+  for (let depth = 0; current && depth < 4 && !seen.has(current); depth++) {
+    candidates.push(current)
+    seen.add(current)
+    if (current.raw && typeof current.raw === 'object') current = current.raw
+    else if (current.credential && typeof current.credential === 'object') current = current.credential
+    else break
+  }
+  const credential = candidates.find(value => value && typeof value === 'object' && value.id && value.response)
+  if (!credential) {
+    throw new Error('WebAuthn credential required: expected credential.id and credential.response')
+  }
+  return credential
+}
+
+async function verifiedPasskeyWalletAddress({ credential, mode = 'Login' } = {}) {
+  const normalizedCredential = normalizeIncomingWebAuthnCredential(credential)
+  const clientUrl = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc/w3s/buidl').replace(/\/+$/, '')
+  const clientKey = process.env.CIRCLE_CLIENT_KEY || ''
+  if (!clientKey) throw new Error('Circle Modular credential verification is not configured')
+  const method = mode === 'Register' ? 'rp_getRegistrationVerification' : 'rp_getLoginVerification'
+  // Circle exposes WebAuthn rp_get* methods through the passkey provider.
+  // The modular provider is reserved for chain/UserOperation RPC methods;
+  // using it here makes valid passkey login/registration fail with an opaque
+  // RPC error even when the Client Key and origin are correct.
+  const transport = toPasskeyTransport(clientUrl, clientKey)
+  const verificationClient = createPublicClient({ chain: arcTestnet, transport })
+  const verification = await verificationClient.request({ method, params: [normalizedCredential] })
+  const base64PublicKey = verification?.publicKey
+  if (!base64PublicKey) throw new Error('Circle WebAuthn verification failed')
+  const keyBytes = base64UrlToBytes(base64PublicKey)
+  const cryptoKey = await bytesToCryptoKey(keyBytes)
+  const publicKeyBytes = await cryptoKeyToBytes(cryptoKey)
+  const publicKey = serializePublicKey(parsePublicKey(publicKeyBytes), { compressed: true })
+  const owner = toWebAuthnAccount({ credential: { id: String(normalizedCredential.id), publicKey } })
+  const smartAccount = await toCircleSmartAccount({
+    client: verificationClient,
+    owner,
+  })
+  return { walletAddress: getAddress(smartAccount.address), credential: { id: String(normalizedCredential.id), publicKey } }
+}
+
 app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
   try {
-    const { walletAddress } = req.body
+    const { walletAddress, credential, mode = 'Login' } = req.body || {}
     if (!walletAddress || !isAddress(walletAddress)) {
       return res.status(400).json({ error: 'Valid walletAddress required' })
     }
-    // Trust: passkey authentication happens client-side via WebAuthn.
-    // The MSCA address is deterministic from the passkey credential.
-    // If the browser succeeded toWebAuthnCredential(Login), the user owns the passkey.
-    const addr = getAddress(walletAddress).toLowerCase()
+    if (mode !== 'Login' && mode !== 'Register') return res.status(400).json({ error: 'Invalid passkey mode' })
+    const verified = await verifiedPasskeyWalletAddress({ credential, mode })
+    const requested = getAddress(walletAddress)
+    if (verified.walletAddress.toLowerCase() !== requested.toLowerCase()) {
+      return res.status(403).json({ error: 'Passkey wallet address mismatch' })
+    }
     const { createSession } = await import('./src/services/vaultStore.mjs')
-    const token = createSession(addr) // vault session token (arx_vs_*) — recognized by /api/vault/*
-    res.json({ success: true, token, address: getAddress(walletAddress) })
-  } catch (e) { res.status(500).json({ error: e.message }) }
+    const token = createSession(verified.walletAddress.toLowerCase())
+    res.json({ success: true, token, address: verified.walletAddress, credential: verified.credential })
+  } catch (e) { res.status(401).json({ error: e.message }) }
 })
 
 // ── Session Key (Circle Modular Wallet / MSCA) ──
@@ -168,12 +218,24 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
 // UserOperations on behalf of the agent.
 app.post('/api/session/generate-key', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { walletAddress, ownerAddress } = req.body || {}
+    const { walletAddress, ownerAddress, ownerSessionToken } = req.body || {}
     if (!walletAddress || !isAddress(walletAddress) || getAddress(walletAddress).toLowerCase() !== req.owner) {
       return res.status(403).json({ error: 'walletAddress must match the authenticated MSCA' })
     }
-    const { reserveSessionKey } = await import('./src/services/sessionKeyService.mjs')
-    const key = reserveSessionKey(req.owner, { walletAddress, ownerAddress })
+    let verifiedOwnerAddress = ''
+    if (ownerAddress) {
+      if (!isAddress(ownerAddress) || !ownerSessionToken) {
+        return res.status(403).json({ error: 'Verified EOA session is required to bind ownerAddress' })
+      }
+      const vault = await import('./src/services/vaultStore.mjs')
+      verifiedOwnerAddress = vault.validateSession(ownerSessionToken) || ''
+      if (verifiedOwnerAddress !== getAddress(ownerAddress).toLowerCase()) {
+        return res.status(403).json({ error: 'ownerAddress is not authenticated by the supplied EOA session' })
+      }
+    }
+    const { reserveSessionKey, bindSessionAlias } = await import('./src/services/sessionKeyService.mjs')
+    const key = reserveSessionKey(req.owner, { walletAddress })
+    if (verifiedOwnerAddress) bindSessionAlias(req.owner, verifiedOwnerAddress, walletAddress)
     res.json({ success: true, delegateAddress: key.address, walletAddress: key.walletAddress, pendingAuthorization: key.pending })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
@@ -231,8 +293,10 @@ app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
       delegateAddress,
       authorizationUserOpHash: verified.userOpHash,
     })
-    const infoOwner = ownerAddress ? String(ownerAddress).toLowerCase() : req.owner
-    setSessionKeyInfo(infoOwner, { walletAddress, delegateAddress, active: true, createdAt: entry.createdAt, authorizationUserOpHash })
+    // Keep active session metadata under the authenticated MSCA only. The
+    // reservation already stores any EOA-to-MSCA alias for MCP resolution;
+    // client-provided ownerAddress must not select another metadata owner.
+    setSessionKeyInfo(req.owner, { walletAddress, delegateAddress, active: true, createdAt: entry.createdAt, authorizationUserOpHash: verified.userOpHash })
     res.json({ success: true, walletAddress, delegateAddress, active: true })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
@@ -242,6 +306,17 @@ app.get('/api/session/status', apiLimiter, requireAuth, async (req, res) => {
     const { getSessionKeyInfo } = await import('./src/services/vaultStore.mjs')
     const info = await getSessionKeyInfo(req.owner)
     res.json({ success: true, session: info })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// Explicit recovery only. A normal status read is side-effect free; this route
+// may reactivate an inactivity-expired session only after the backend verifies
+// the stored successful addOwners UserOperation against Circle's bundler.
+app.post('/api/session/reconcile', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { reconcileSessionKeyActivation } = await import('./src/services/sessionKeyService.mjs')
+    const result = await reconcileSessionKeyActivation(req.owner)
+    res.json({ success: true, session: result })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
@@ -342,11 +417,8 @@ app.post('/api/pending-txs/:txId/submit', apiLimiter, requireAuth, async (req, r
       return res.status(400).json({ error: 'user_operation_sender_mismatch' })
     }
 
-    // Relay signed UserOp to chain via Circle RPC
-    const { validateSignedUserOperationFees } = await import('./src/services/sessionKeyService.mjs')
-    const feeValidation = validateSignedUserOperationFees({ chainKey: tx.chainKey || 'arc-testnet', signedUserOp })
-    if (!feeValidation.ok) return res.status(400).json({ error: feeValidation.reason, ...feeValidation })
-
+    // Relay the browser-signed UserOperation using Circle's official bundler
+    // validation. Do not apply a locally invented fee floor before submission.
     const { toModularTransport } = await import('@circle-fin/modular-wallets-core')
     const { createPublicClient, defineChain } = await import('viem')
     const CLIENT_URL = process.env.CIRCLE_CLIENT_URL
