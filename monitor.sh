@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -o pipefail
 
-URL="https://arcoxdex.vercel.app/health"
+# Monitor the backend origin, not the Vercel frontend. The frontend's /health
+# path returns index.html (HTTP 200), which would otherwise trigger a false
+# restart loop after three checks. Override with ARCOX_HEALTH_URL if the API
+# origin changes.
+DEFAULT_HEALTH_URL="https://43.134.14.43.nip.io/health"
 LOG_DIR="/home/ubuntu/arc-dex-api/logs"
 LOG_FILE="$LOG_DIR/monitor.log"
 STATE_DIR="$LOG_DIR"
@@ -21,6 +25,7 @@ if [ -f /home/ubuntu/arc-dex-api/.monitor.env ]; then
   source /home/ubuntu/arc-dex-api/.monitor.env
 fi
 
+URL="${ARCOX_HEALTH_URL:-$DEFAULT_HEALTH_URL}"
 CURL_OUTPUT=$(curl -sS --max-time 10 -w "\n%{http_code}" "$URL" 2>&1)
 CURL_EXIT=$?
 
