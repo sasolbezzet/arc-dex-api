@@ -2928,28 +2928,40 @@ export function createMcpServer(userId, context = {}) {
 
   // ── SESSION KEY STATUS ──
   server.tool('arcox_session_status', 'Check if Agent Session Key (MSCA) is active for the user. Returns wallet address, delegate address, and whether session signing is available.', {}, async () => {
-    const { getSessionKeyInfo } = await import('./vaultStore.mjs')
-    const sessionOwner = boundMscaWalletAddress || userId
-    const info = await getSessionKeyInfo(sessionOwner)
-    // Recording connection time here lets auto-detect choose the MSCA this user
-    // most recently connected via Claude/agent — no hardcoded wallet. When OAuth
-    // carries a passkey-proven MSCA, touch that exact wallet rather than the EOA.
-    if (info && info.active) {
-      try {
-        const { touchSessionKey } = await import('./sessionKeyService.mjs')
-        touchSessionKey(sessionOwner)
-      } catch { /* non-fatal */ }
+    try {
+      const { getSessionKeyInfo } = await import('./vaultStore.mjs')
+      const sessionOwner = boundMscaWalletAddress || userId
+      const info = await getSessionKeyInfo(sessionOwner)
+      // Recording connection time here lets auto-detect choose the MSCA this user
+      // most recently connected via Claude/agent — no hardcoded wallet. When OAuth
+      // carries a passkey-proven MSCA, touch that exact wallet rather than the EOA.
+      if (info && info.active) {
+        try {
+          const { touchSessionKey } = await import('./sessionKeyService.mjs')
+          touchSessionKey(sessionOwner)
+        } catch { /* non-fatal */ }
+      }
+      if (!info || !info.active) {
+        return { content: [{ type: 'text', text: jsonText({ active: false, message: 'Session key belum diaktifkan. User harus setup di Plugin page (passkey required).' }) }] }
+      }
+      return { content: [{ type: 'text', text: jsonText({
+        active: true,
+        walletAddress: info.walletAddress,
+        delegateAddress: info.delegateAddress,
+        createdAt: info.createdAt,
+        message: 'Session key aktif. Agent bisa execute tx langsung dengan source=session.',
+      }) }] }
+    } catch {
+      // Never let a malformed/temporarily unavailable store become Claude's
+      // opaque "Error occurred during tool execution". The tool contract stays
+      // machine-readable and fail-closed; execution tools still require a
+      // separately resolved active MSCA/session.
+      return { content: [{ type: 'text', text: jsonText({
+        active: false,
+        statusReason: 'status_unavailable',
+        message: 'Status session key sedang tidak tersedia. Hubungkan ulang Agent Wallet lalu coba lagi.',
+      }) }] }
     }
-    if (!info || !info.active) {
-      return { content: [{ type: 'text', text: jsonText({ active: false, message: 'Session key belum diaktifkan. User harus setup di Plugin page (passkey required).' }) }] }
-    }
-    return { content: [{ type: 'text', text: jsonText({
-      active: true,
-      walletAddress: info.walletAddress,
-      delegateAddress: info.delegateAddress,
-      createdAt: info.createdAt,
-      message: 'Session key aktif. Agent bisa execute tx langsung dengan source=session.',
-    }) }] }
   })
 
   // ── GET REQUEST (poll approval/tx status) ──
@@ -3312,12 +3324,23 @@ export async function mcpHttpHandler(req, res) {
   // Handle MCP initialize and tool calls via Streamable HTTP
   const sessionId = req.headers['mcp-session-id'] || randomUUID()
   
+  const boundMscaWalletAddress = auth.mscaWalletAddress || ''
   let session = sessions.get(sessionId)
+  // Claude may reuse an MCP session id after OAuth reconnect/rebinding. Never
+  // reuse a server created for a different verified MSCA context; otherwise the
+  // request's fresh OAuth token is silently ignored by the old tool closure.
+  if (session && (session.userId !== auth.userId
+    || session.clientId !== auth.clientId
+    || (session.boundMscaWalletAddress || '') !== boundMscaWalletAddress)) {
+    sessions.delete(sessionId)
+    try { await session.server?.close?.() } catch { /* already closed */ }
+    session = null
+  }
   if (!session) {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId })
-    const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress: auth.mscaWalletAddress || '' })
+    const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress })
     await server.connect(transport)
-    session = { transport, server }
+    session = { transport, server, userId: auth.userId, clientId: auth.clientId, boundMscaWalletAddress }
     sessions.set(sessionId, session)
     
     // Cleanup after 30 min idle
