@@ -26,9 +26,9 @@ async function sha256(data) {
 /**
  * Generate a P-256 keypair + a synthetic WebAuthn registration credential.
  * Returns { privateKey (CryptoKey), publicKey (ox PublicKey), credentialId,
- * credential (JSON-RPC body for rp_*), rpIdHash }.
+ * credential (JSON-RPC body for rp_*), rpIdHash, userHandle }.
  */
-export async function createPasskey({ rpId, challenge }) {
+export async function createPasskey({ rpId, challenge, userHandle }) {
   const { privateKey, publicKey } = await WebCryptoP256.createKeyPair({ extractable: true })
   const credentialId = webcrypto.getRandomValues(new Uint8Array(32))
 
@@ -66,14 +66,20 @@ export async function createPasskey({ rpId, challenge }) {
   }
 
   const rpIdHash = await sha256(encoder.encode(rpId))
-  return { privateKey, publicKey, credentialId, credential, rpIdHash }
+  return { privateKey, publicKey, credentialId, credential, rpIdHash, userHandle }
 }
 
 /**
  * Build the getFn that viem's toWebAuthnAccount calls to produce assertions.
  * Signs (authenticatorData || sha256(clientDataJSON)) with the P-256 key.
+ *
+ * The default signature format is ASN.1 DER because ox/viem parse assertions
+ * as DER. Circle's rp_getLoginVerification (and a real browser's
+ * navigator.credentials.get) expects the IEEE P1363 raw r||s encoding, so
+ * pass { rawSignature: true } when the assertion is sent to Circle for login
+ * verification rather than to ox for UserOperation signing.
  */
-export function makePasskeyGetFn({ privateKey, credentialId, rpId }) {
+export function makePasskeyGetFn({ privateKey, credentialId, rpId, rawSignature = false, userHandle }) {
   return async (requestOptions) => {
     const challenge = new Uint8Array(requestOptions.publicKey.challenge)
     const clientDataJSON = JSON.stringify({
@@ -87,16 +93,25 @@ export function makePasskeyGetFn({ privateKey, credentialId, rpId }) {
     // Assertion flags: UP(0x01) | UV(0x04) = 0x05 (no attested credential data)
     const authenticatorData = Buffer.concat([Buffer.from(rpIdHash), Buffer.from([0x05, 0x00, 0x00, 0x00, 0x00])])
     const signedData = Buffer.concat([authenticatorData, Buffer.from(await sha256(clientDataJSONBytes))])
-    // WebCrypto subtle.sign returns IEEE P1363 (r||s, 64 bytes), but viem/ox
-    // parse the assertion as ASN.1 DER, so convert r,s into DER before
-    // returning (same as a real browser authenticator would produce).
+    // WebCrypto subtle.sign returns IEEE P1363 (r||s, 64 bytes). viem/ox parse
+    // the assertion as ASN.1 DER, so convert r,s into DER by default; Circle's
+    // rp_getLoginVerification expects the raw r||s encoding like a real
+    // browser authenticator produces.
     const rawSig = new Uint8Array(
       await webcrypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, signedData),
     )
-    const signature = P256.noble.Signature.fromCompact(rawSig).toDERRawBytes()
+    const signature = rawSignature
+      ? rawSig
+      : P256.noble.Signature.fromCompact(rawSig).toDERRawBytes()
     return {
       id: bytesToB64Url(credentialId),
       response: {
+        // Circle's rp_getLoginVerification rejects a client-side discoverable
+        // assertion that carries a blank userHandle ("Client-side Discoverable
+        // Assertion was attempted with a blank User Handle"). A real browser
+        // places userHandle inside response (PublicKeyCredential.toJSON());
+        // tests must mirror that exact shape.
+        ...(userHandle ? { userHandle } : {}),
         clientDataJSON: clientDataJSONBytes,
         authenticatorData: new Uint8Array(authenticatorData),
         signature,

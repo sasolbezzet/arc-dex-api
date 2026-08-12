@@ -94,15 +94,18 @@ if (!keyPair) {
   const options = await rpCall('rp_getRegistrationOptions', [`e2e-passkey-${Date.now()}`])
   const challenge = options.result?.challenge
   const rpId = options.result?.rp?.id || options.result?.rpId
+  const userHandle = options.result?.user?.id || ''
   if (!challenge || !rpId) throw new Error(`registration options missing challenge/rp: ${JSON.stringify(options.result)}`)
+  if (!userHandle) throw new Error(`registration options missing user.id (required for login userHandle): ${JSON.stringify(options.result)}`)
   console.log('   rpId:', rpId, '| challenge:', String(challenge).slice(0, 16) + '…')
-  const passkey = await createPasskey({ rpId, challenge })
+  const passkey = await createPasskey({ rpId, challenge, userHandle })
   const jwk = await webcrypto.subtle.exportKey('jwk', passkey.privateKey)
   state.pkcs8 = bytesToBase64Url(new Uint8Array(await webcrypto.subtle.exportKey('pkcs8', passkey.privateKey)))
   state.pubX = jwk.x
   state.pubY = jwk.y
   state.credentialId = passkey.credential.id
   state.rpId = rpId
+  state.userHandle = userHandle
   persist()
 
   const verification = await rpCall('rp_getRegistrationVerification', [passkey.credential], options.setCookie)
