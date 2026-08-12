@@ -9,7 +9,7 @@ import * as BridgeKitChains from '@circle-fin/bridge-kit'
 import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
 import { createPublicClient, createWalletClient, http, fallback, erc20Abi, formatUnits, defineChain, getAddress, isAddress, verifyMessage } from 'viem'
-import { toModularTransport, toPasskeyTransport, toCircleSmartAccount } from '@circle-fin/modular-wallets-core'
+import { toCircleSmartAccount } from '@circle-fin/modular-wallets-core'
 import { toWebAuthnAccount } from 'viem/account-abstraction'
 import { base64UrlToBytes, bytesToCryptoKey, cryptoKeyToBytes, parsePublicKey, serializePublicKey } from 'webauthn-p256'
 import { privateKeyToAccount } from 'viem/accounts'
@@ -167,6 +167,16 @@ function normalizeIncomingWebAuthnCredential(input) {
   return credential
 }
 
+function circleModularHttpTransport(url, clientKey) {
+  return http(String(url || '').replace(/\/+$/, ''), {
+    timeout: 12_000,
+    retryCount: 1,
+    fetchOptions: {
+      headers: circleModularProxyHeaders(clientKey),
+    },
+  })
+}
+
 async function verifiedPasskeyWalletAddress({ credential, mode = 'Login' } = {}) {
   const normalizedCredential = normalizeIncomingWebAuthnCredential(credential)
   const clientUrl = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc/w3s/buidl').replace(/\/+$/, '')
@@ -177,7 +187,10 @@ async function verifiedPasskeyWalletAddress({ credential, mode = 'Login' } = {})
   // The modular provider is reserved for chain/UserOperation RPC methods;
   // using it here makes valid passkey login/registration fail with an opaque
   // RPC error even when the Client Key and origin are correct.
-  const transport = toPasskeyTransport(clientUrl, clientKey)
+  // The Circle SDK passkey transport is browser-oriented and can reference
+  // window through its bundled viem@2.45.3 path. Backend verification is plain
+  // JSON-RPC, so use native viem HTTP with the Circle Client Key instead.
+  const transport = circleModularHttpTransport(clientUrl, clientKey)
   const verificationClient = createPublicClient({ chain: arcTestnet, transport })
   const verification = await verificationClient.request({ method, params: [normalizedCredential] })
   const base64PublicKey = verification?.publicKey
@@ -428,7 +441,10 @@ app.post('/api/pending-txs/:txId/submit', apiLimiter, requireAuth, async (req, r
     const chain = CHAINS[chainKey]
     if (!chain) return res.status(400).json({ error: 'unknown_chain', chain: chainKey })
     if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) return res.status(400).json({ error: 'msca_unsupported_chain', chain: chainKey })
-    const transport = toModularTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
+    // Use native HTTP for server-side Circle bundler RPC. The modular SDK
+    // transport contains browser chain-switch logic and can throw
+    // `window is not defined` under Node.js.
+    const transport = circleModularHttpTransport(`${CLIENT_URL}/${chain.transportSlug}`, CLIENT_KEY)
     const viemChain = defineChain({ id: chain.id, name: chain.name, nativeCurrency: chain.nativeCurrency, rpcUrls: { default: { http: [chain.rpcUrl] } } })
     const client = createPublicClient({ chain: viemChain, transport })
 
