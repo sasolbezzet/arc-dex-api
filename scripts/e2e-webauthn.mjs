@@ -73,11 +73,10 @@ export async function createPasskey({ rpId, challenge, userHandle }) {
  * Build the getFn that viem's toWebAuthnAccount calls to produce assertions.
  * Signs (authenticatorData || sha256(clientDataJSON)) with the P-256 key.
  *
- * The default signature format is ASN.1 DER because ox/viem parse assertions
- * as DER. Circle's rp_getLoginVerification (and a real browser's
- * navigator.credentials.get) expects the IEEE P1363 raw r||s encoding, so
- * pass { rawSignature: true } when the assertion is sent to Circle for login
- * verification rather than to ox for UserOperation signing.
+ * The signature format is ASN.1 DER because both ox/viem UserOperation
+ * signing (parseAsn1Signature) and Circle's rp_getLoginVerification require
+ * DER. The { rawSignature: true } option is kept only for protocol probing;
+ * production E2E flows must stay on DER.
  */
 export function makePasskeyGetFn({ privateKey, credentialId, rpId, rawSignature = false, userHandle }) {
   return async (requestOptions) => {

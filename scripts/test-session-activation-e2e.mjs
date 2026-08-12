@@ -121,6 +121,12 @@ if (!keyPair) {
   keyPair = { privateKey: passkey.privateKey }
   console.log('   passkey registered ✓')
 } else {
+  // A state file written before userHandle capture would produce login
+  // assertions Circle rejects ("blank User Handle"). Fail loudly instead of
+  // silently re-hitting that error on the old-user E2E path.
+  if (!state.userHandle) {
+    throw new Error('Persisted E2E state is missing userHandle (created by an older harness version); delete the state file to re-register.')
+  }
   console.log('① passkey (reused from persisted state) ✓')
 }
 
