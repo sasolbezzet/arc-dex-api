@@ -9,6 +9,7 @@ import * as BridgeKitChains from '@circle-fin/bridge-kit'
 import { createCircleWalletsAdapter } from '@circle-fin/adapter-circle-wallets'
 import { createViemAdapterFromPrivateKey } from '@circle-fin/adapter-viem-v2'
 import { createPublicClient, createWalletClient, http, fallback, erc20Abi, formatUnits, defineChain, getAddress, isAddress, verifyMessage } from 'viem'
+import { Cbor } from 'ox'
 import { toCircleSmartAccount } from '@circle-fin/modular-wallets-core'
 import { toWebAuthnAccount } from 'viem/account-abstraction'
 import { base64UrlToBytes, bytesToCryptoKey, cryptoKeyToBytes, parsePublicKey, serializePublicKey } from 'webauthn-p256'
@@ -149,6 +150,45 @@ app.use('/api/circle-modular', apiLimiter, express.json({ limit: '128kb' }), asy
   }
 })
 
+// rp_getRegistrationVerification confirms registration with `true` and does NOT
+// return the passkey public key. The Circle SDK derives the key in the browser
+// from credential.response.getPublicKey(); on the backend we parse the same
+// COSE EC2 key out of the attestationObject (CBOR { fmt, attStmt, authData })
+// and convert it to a raw SEC1 uncompressed point for webauthn-p256. The
+// challenge/assertion was already verified by Circle (verification === true),
+// and a swapped key self-defeats: the derived MSCA address would not exist in
+// Circle's registry and the frontend cross-checks the derived address.
+function passkeyPublicKeyFromAttestation(credential) {
+  try {
+    const attestationObject = String(credential?.response?.attestationObject || '')
+    if (!attestationObject) return null
+    const decoded = Cbor.decode(base64UrlToBytes(attestationObject))
+    const authData = decoded?.authData
+    if (!authData || authData.length < 37) return null
+    let offset = 37 // rpIdHash(32) + flags(1) + signCount(4)
+    if (authData[32] & 0x40) { // attested credential data present
+      offset += 16 // AAGUID
+      const credentialIdLength = (authData[offset] << 8) | authData[offset + 1]
+      offset += 2 + credentialIdLength
+    }
+    const coseKey = authData.slice(offset)
+    // RFC 9053 COSE EC2 key: 1=kty(2=EC2), 3=alg(-7=ES256), -1=crv(1=P-256),
+    // -2=x, -3=y. ox's Cbor.decode returns map keys as strings; ox's own
+    // CoseKey.toPublicKey reads decoded['-2'] and decoded['-3'] the same way.
+    const map = Cbor.decode(coseKey)
+    const x = map?.['-2']
+    const y = map?.['-3']
+    if (!x || !y || x.length !== 32 || y.length !== 32) return null
+    const raw = new Uint8Array(65)
+    raw[0] = 0x04
+    raw.set(x, 1)
+    raw.set(y, 33)
+    return serializePublicKey(parsePublicKey(raw), { compressed: true })
+  } catch {
+    return null
+  }
+}
+
 function normalizeIncomingWebAuthnCredential(input) {
   const candidates = []
   let current = input
@@ -210,11 +250,20 @@ async function verifiedPasskeyWalletAddress({ credential, mode = 'Login', flowId
   const verificationClient = createPublicClient({ chain: arcTestnet, transport })
   const verification = await verificationClient.request({ method, params: [normalizedCredential] })
   const base64PublicKey = verification?.publicKey
-  if (!base64PublicKey) throw new Error('Circle WebAuthn verification failed')
-  const keyBytes = base64UrlToBytes(base64PublicKey)
-  const cryptoKey = await bytesToCryptoKey(keyBytes)
-  const publicKeyBytes = await cryptoKeyToBytes(cryptoKey)
-  const publicKey = serializePublicKey(parsePublicKey(publicKeyBytes), { compressed: true })
+  let publicKey
+  if (base64PublicKey) {
+    const keyBytes = base64UrlToBytes(base64PublicKey)
+    const cryptoKey = await bytesToCryptoKey(keyBytes)
+    const publicKeyBytes = await cryptoKeyToBytes(cryptoKey)
+    publicKey = serializePublicKey(parsePublicKey(publicKeyBytes), { compressed: true })
+  } else if (verification === true && mode === 'Register') {
+    // Circle's registration verification resolves to `true`; derive the key
+    // from the attestationObject instead of trusting a client-supplied key.
+    publicKey = passkeyPublicKeyFromAttestation(normalizedCredential)
+    if (!publicKey) throw new Error('Circle WebAuthn verification failed: passkey public key could not be derived')
+  } else {
+    throw new Error('Circle WebAuthn verification failed')
+  }
   const owner = toWebAuthnAccount({ credential: { id: String(normalizedCredential.id), publicKey } })
   const smartAccount = await toCircleSmartAccount({
     client: verificationClient,
