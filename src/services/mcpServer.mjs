@@ -159,9 +159,9 @@ export function registerOAuthClient({ clientName, redirectUris = [] }) {
   })
 }
 
-function createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce, resource } = {}) {
+function createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce, resource, mscaWalletAddress } = {}) {
   const code = randomUUID()
-  authCodes.set(code, { clientId, userId, redirectUri, codeChallenge, state: state || '', requestId: requestId || null, challengeNonce: challengeNonce || null, resource: resource || MCP_RESOURCE_URL, expires: Date.now() + 600000 }) // 10 min
+  authCodes.set(code, { clientId, userId, redirectUri, codeChallenge, state: state || '', requestId: requestId || null, challengeNonce: challengeNonce || null, resource: resource || MCP_RESOURCE_URL, mscaWalletAddress: mscaWalletAddress || '', expires: Date.now() + 600000 }) // 10 min
   return code
 }
 
@@ -178,14 +178,14 @@ export function createAuthCode(clientId, userId, options = {}) {
 // instead of issuing competing codes and leaving the MCP client waiting on a
 // stale callback. The signature itself is verified by the caller before this
 // helper is used.
-export function findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state, resource } = {}) {
+export function findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state, resource, mscaWalletAddress } = {}) {
   const now = Date.now()
   for (const [code, auth] of authCodes) {
     if (now > auth.expires) {
       authCodes.delete(code)
       continue
     }
-    if (auth.clientId === clientId && auth.userId === userId && auth.redirectUri === redirectUri && auth.codeChallenge === codeChallenge && (auth.state || '') === (state || '') && (auth.resource || MCP_RESOURCE_URL) === (resource || MCP_RESOURCE_URL)) {
+    if (auth.clientId === clientId && auth.userId === userId && auth.redirectUri === redirectUri && auth.codeChallenge === codeChallenge && (auth.state || '') === (state || '') && (auth.resource || MCP_RESOURCE_URL) === (resource || MCP_RESOURCE_URL) && (auth.mscaWalletAddress || '') === (mscaWalletAddress || '')) {
       return code
     }
   }
@@ -224,7 +224,7 @@ export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, 
     // token issued concurrently by another worker.
     refreshAccessTokens()
     const token = 'arx_at_' + randomUUID().replace(/-/g, '')
-    accessTokens.set(token, { userId: auth.userId, clientId, resource: auth.resource || MCP_RESOURCE_URL, expires: Date.now() + TOKEN_TTL * 1000 })
+    accessTokens.set(token, { userId: auth.userId, clientId, resource: auth.resource || MCP_RESOURCE_URL, mscaWalletAddress: auth.mscaWalletAddress || '', expires: Date.now() + TOKEN_TTL * 1000 })
     saveTokens()
     return {
       access_token: token,
@@ -472,8 +472,9 @@ export async function siweVerifyHandler(req, res) {
       const challenge = siweChallenges.get(initial.nonce)
       if (!client || !request || !challenge || request.clientId !== clientId || request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri) || Date.now() > request.expires || Date.now() > challenge.expires || challenge.consumed || challenge.requestId !== requestId || challenge.clientId !== clientId || challenge.address !== String(address).toLowerCase() || challenge.message !== message) return { error: 'invalid_or_expired_siwe_challenge' }
       const userId = address.toLowerCase()
-      const existingCode = findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state, resource: request.resource || resource || MCP_RESOURCE_URL })
-      const code = existingCode || createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce: initial.nonce, resource: request.resource || resource || MCP_RESOURCE_URL })
+      const boundMscaWalletAddress = mscaWalletAddress || ''
+      const existingCode = findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state, resource: request.resource || resource || MCP_RESOURCE_URL, mscaWalletAddress: boundMscaWalletAddress })
+      const code = existingCode || createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce: initial.nonce, resource: request.resource || resource || MCP_RESOURCE_URL, mscaWalletAddress: boundMscaWalletAddress })
       challenge.completedCode = code
       challenge.signature = String(signature).toLowerCase()
       saveOAuthState()
@@ -552,12 +553,20 @@ import { CHAINS } from './chains.mjs'
 // The MCP userId is the SIWE-verified EOA used only as the tenant/auth identity.
 // On-chain reads, quotes, and execution must use the explicitly mapped Agent
 // Wallet MSCA returned by the active session key. Never use userId as payer.
-export async function resolveActiveMsca(userId) {
+export async function resolveActiveMsca(userId, boundMscaWalletAddress = '') {
   try {
     const { getSessionKeyInfo } = await import('./vaultStore.mjs')
     const { hasExplicitSessionAlias } = await import('./sessionKeyService.mjs')
-    const info = await getSessionKeyInfo(userId)
+    // A passkey-proven MSCA binding is carried by the server-issued OAuth
+    // token. Resolve that exact wallet directly so the first MCP request does
+    // not depend on a separately persisted EOA alias being visible yet.
+    const info = await getSessionKeyInfo(boundMscaWalletAddress || userId)
     if (!info?.active || !info.walletAddress) return null
+    if (boundMscaWalletAddress) {
+      if (String(info.walletAddress).toLowerCase() !== String(boundMscaWalletAddress).toLowerCase()) return null
+      if (String(info.walletAddress).toLowerCase() === String(userId).toLowerCase()) return null
+      return info
+    }
     // MCP is MSCA-only. An authenticated identity must resolve through an
     // explicit owner -> MSCA alias; never treat an EOA or an unbound wallet
     // record as the agent wallet. However, a self-alias (owner == MSCA) is
@@ -1985,6 +1994,7 @@ async function executeX402Pay(userId, invoiceId) {
 // ── MCP Server factory ──
 export function createMcpServer(userId, context = {}) {
   const requestAgent = context.agent || resolveAgentForUser(userId)
+  const boundMscaWalletAddress = context.boundMscaWalletAddress || ''
   const server = new McpServer({
     name: 'arcox-mcp',
     version: '1.0.0',
@@ -1993,7 +2003,7 @@ export function createMcpServer(userId, context = {}) {
   // ── READ-ONLY TOOLS ──
 
   server.tool('arcox_wallet_balances', 'Show Agent Wallet (MSCA) balances on Arc, Ethereum Sepolia, Base Sepolia, and Arbitrum Sepolia', {}, async () => {
-    const msca = await resolveActiveMsca(userId)
+    const msca = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     try {
       const chains = await fetchAllChainBalances(msca.walletAddress)
@@ -2022,7 +2032,7 @@ export function createMcpServer(userId, context = {}) {
   })
 
   server.tool('arcox_transaction_history', 'Check transaction history and auto-mint worker status', {}, async () => {
-    const msca = await resolveActiveMsca(userId)
+    const msca = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const data = await apiGet(`/api/tx-history?address=${encodeURIComponent(msca.walletAddress)}`, msca.walletAddress)
     return { content: [{ type: 'text', text: jsonText({ ...data, walletAddress: msca.walletAddress, walletType: 'MSCA' }) }] }
@@ -2046,7 +2056,7 @@ export function createMcpServer(userId, context = {}) {
     const knownAction = ['swap', 'send', 'bridge'].includes(action)
     const route = action === 'bridge' ? bridgeConfig(params.fromChain, params.toChain) : null
     const bridgeIsSupported = action === 'bridge' && ENABLE_MSCA_CCTP_BRIDGE && String(params.token || 'USDC').toUpperCase() === 'USDC' && Boolean(route?.source?.router && route?.destination?.messageTransmitter)
-    const session = await resolveActiveMsca(userId)
+    const session = await resolveActiveMsca(userId, boundMscaWalletAddress)
     const disabledReason = action === 'bridge' ? bridgeConfigDisabledReason(route) : null
     let routerValidation = null
     if (bridgeIsSupported && !disabledReason) {
@@ -2105,7 +2115,7 @@ export function createMcpServer(userId, context = {}) {
     if (src !== 'session') {
       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', reason: 'msca_only', source: src, chain: 'arc-testnet', walletType: null, message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote swap hanya untuk source=session.' }) }] }
     }
-    const session = await resolveActiveMsca(userId)
+    const session = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!session) {
       return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     }
@@ -2151,7 +2161,7 @@ export function createMcpServer(userId, context = {}) {
     if (source !== 'session') {
       return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
     }
-    const activeSession = await resolveActiveMsca(userId)
+    const activeSession = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!activeSession) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
     const quoteCheck = consumeExecutionQuote(userId, 'swap', params.previewId, {
       tokenIn: params.tokenIn,
@@ -2212,7 +2222,7 @@ export function createMcpServer(userId, context = {}) {
     if (src !== 'session') {
       return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote bridge hanya untuk source=session.' }) }] }
     }
-    const info = await resolveActiveMsca(userId)
+    const info = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
     if (!route || !route.source?.router || !route.destination?.messageTransmitter || token.toUpperCase() !== 'USDC') {
@@ -2306,7 +2316,7 @@ export function createMcpServer(userId, context = {}) {
     if (source !== 'session') {
       return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Circle proxy dan EOA tidak diizinkan untuk agent remote.' }) }] }
     }
-    const info = await resolveActiveMsca(userId)
+    const info = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!info) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
     if (!route || !route.source?.router || !route.destination?.messageTransmitter || String(params.token || 'USDC').toUpperCase() !== 'USDC') {
@@ -2633,7 +2643,7 @@ export function createMcpServer(userId, context = {}) {
     if (!ENABLE_MSCA_CCTP_BRIDGE) {
       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'disabled', verified: false, reason: 'msca_bridge_disabled_until_router_validation', message: 'Bridge MSCA status belum diaktifkan karena ArcoxRouter dan destination mint relayer belum tervalidasi. Tidak ada transaksi yang dikirim.' }) }] }
     }
-    const info = await resolveActiveMsca(userId)
+    const info = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const route = bridgeConfig(params.fromChain, params.toChain || 'ethereum-sepolia')
     if (!route || !route.source?.router || !route.destination?.messageTransmitter) {
@@ -2711,7 +2721,7 @@ export function createMcpServer(userId, context = {}) {
     if (!params.confirmed || !validConfirmationText(params.confirmationText)) {
       return { content: [{ type: 'text', text: jsonText({ status: 'preview_required', executed: false, message: 'Retry mint memerlukan confirmed=true dan confirmationText exactly yes atau ya.' }) }] }
     }
-    const info = await resolveActiveMsca(userId)
+    const info = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const route = bridgeConfig(params.fromChain, params.toChain)
     const disabledReason = bridgeConfigDisabledReason(route)
@@ -2784,7 +2794,7 @@ export function createMcpServer(userId, context = {}) {
     if (!chain.tokens[token] && token !== chain.nativeCurrency.symbol) {
       return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'token_not_supported', fromChain, token, message: `Token ${token} tidak tersedia di ${fromChain}.` }) }] }
     }
-    const info = await resolveActiveMsca(userId)
+    const info = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     // MSCA send quote is bound to the active wallet and exact source chain. A
     // later MSCA or chain change makes the preview unusable instead of silently
@@ -2830,7 +2840,7 @@ export function createMcpServer(userId, context = {}) {
     if (!CHAINS[fromChain]) {
       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'rejected', executed: false, action: 'send', chain: fromChain, walletType: 'MSCA', reason: 'unsupported_chain', fromChain: params.fromChain, supportedChains: Object.keys(CHAINS), message: 'fromChain wajib berupa chain yang didukung; tidak ada fallback ke Arc.' }) }] }
     }
-    const activeSession = await resolveActiveMsca(userId)
+    const activeSession = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!activeSession) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
     const gate = await canAutoExecute(userId, source, params.amount, fromChain)
     if (!gate.ok) {
@@ -3299,7 +3309,7 @@ export async function mcpHttpHandler(req, res) {
   let session = sessions.get(sessionId)
   if (!session) {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId })
-    const server = createMcpServer(auth.userId, { agent: agentName })
+    const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress: auth.mscaWalletAddress || '' })
     await server.connect(transport)
     session = { transport, server }
     sessions.set(sessionId, session)

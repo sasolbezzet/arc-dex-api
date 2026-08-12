@@ -163,6 +163,21 @@ test('explicit EOA-to-MSCA alias wins over an active legacy EOA session', async 
   })
 })
 
+test('server-issued OAuth MSCA binding resolves without relying on the EOA alias', async () => {
+  await withSessionStore({
+    [MSCA.toLowerCase()]: {
+      walletAddress: MSCA,
+      delegateAddress: OTHER,
+      active: true,
+      authorizationUserOpHash: '0x' + 'c'.repeat(64),
+    },
+  }, {}, async ({ resolveActiveMsca }) => {
+    const resolved = await resolveActiveMsca(EOA, MSCA)
+    assert.equal(resolved?.walletAddress, MSCA)
+    assert.equal(resolved?.active, true)
+  })
+})
+
 test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
   const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE
   delete process.env.ENABLE_MSCA_CCTP_BRIDGE
