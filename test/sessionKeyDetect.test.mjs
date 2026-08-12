@@ -67,7 +67,7 @@ test('inactive legacy OAuth owner does not shadow an active explicit MSCA alias'
   }
 })
 
-test('active exact identity with stale authorization does not inherit an aliased signer', async () => {
+test('explicit alias takes precedence over an active exact identity with stale authorization', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
   const path = join(dir, 'session-keys.json')
   const MSCA = '0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5'
@@ -84,9 +84,8 @@ test('active exact identity with stale authorization does not inherit an aliased
   try {
     const mod = await import('../src/services/sessionKeyService.mjs?stale-exact-' + Date.now())
     const entry = mod.getSessionKey(EOA)
-    assert.equal(entry?.active, false)
-    assert.equal(entry?.staleAuthorization, true)
-    assert.equal(entry?.walletAddress.toLowerCase(), EOA)
+    assert.equal(entry?.active, true)
+    assert.equal(entry?.walletAddress.toLowerCase(), MSCA)
   } finally {
     if (prev === undefined) delete process.env.SESSION_KEYS_PATH
     else process.env.SESSION_KEYS_PATH = prev
@@ -116,6 +115,32 @@ test('touchSessionKey updates the active aliased MSCA, not inactive legacy OAuth
     const after = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8'))
     assert.equal(after.users[EOA].lastUsedAt, before.users[EOA].lastUsedAt)
     assert.ok(after.users[MSCA].lastUsedAt > before.users[MSCA].lastUsedAt)
+  } finally {
+    if (prev === undefined) delete process.env.SESSION_KEYS_PATH
+    else process.env.SESSION_KEYS_PATH = prev
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('inactive aliased MSCA blocks touching an active legacy EOA record', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
+  const path = join(dir, 'session-keys.json')
+  const initialActivity = Date.now()
+  await writeFile(path, JSON.stringify({
+    users: {
+      [EOA]: { walletAddress: EOA, delegateAddress: EOA, chain: 'arc-testnet', createdAt: initialActivity, active: true, lastUsedAt: initialActivity },
+      ['0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5']: { walletAddress: '0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5', delegateAddress: EOA, chain: 'arc-testnet', createdAt: initialActivity, active: false, lastUsedAt: initialActivity },
+    },
+    aliases: { [EOA]: '0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5' },
+  }))
+  const prev = process.env.SESSION_KEYS_PATH
+  process.env.SESSION_KEYS_PATH = path
+  process.env.SESSION_KEY_ENCRYPTION_KEY = 'test'
+  try {
+    const mod = await import('../src/services/sessionKeyService.mjs?touch-inactive-alias-' + Date.now())
+    assert.equal(mod.touchSessionKey(EOA), null)
+    const after = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8'))
+    assert.equal(after.users[EOA].lastUsedAt, initialActivity)
   } finally {
     if (prev === undefined) delete process.env.SESSION_KEYS_PATH
     else process.env.SESSION_KEYS_PATH = prev

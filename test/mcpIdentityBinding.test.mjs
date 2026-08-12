@@ -142,6 +142,27 @@ test('OAuth identity binding requires the active MSCA passkey session and create
   })
 })
 
+test('explicit EOA-to-MSCA alias wins over an active legacy EOA session', async () => {
+  await withSessionStore({
+    [EOA.toLowerCase()]: {
+      walletAddress: EOA,
+      delegateAddress: OTHER,
+      active: true,
+      authorizationUserOpHash: '0x' + 'b'.repeat(64),
+    },
+    [MSCA.toLowerCase()]: {
+      walletAddress: MSCA,
+      delegateAddress: OTHER,
+      active: true,
+      authorizationUserOpHash: '0x' + 'a'.repeat(64),
+    },
+  }, { [EOA.toLowerCase()]: MSCA }, async ({ resolveActiveMsca }) => {
+    const resolved = await resolveActiveMsca(EOA)
+    assert.equal(resolved?.walletAddress, MSCA)
+    assert.equal(resolved?.active, true)
+  })
+})
+
 test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
   const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE
   delete process.env.ENABLE_MSCA_CCTP_BRIDGE
