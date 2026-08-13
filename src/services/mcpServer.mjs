@@ -1420,10 +1420,10 @@ export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain,
 }
 
 /**
- * An approval-only intent can become stale when the user reconnects/recreates
- * the Agent Wallet session while Circle still retains the old approval
+ * An approval-only intent can become stale when Circle retains the approval
  * UserOperation in its pending index. It has not called the router and cannot
- * create a CCTP burn, so it is safe to supersede before starting a new quote.
+ * create a CCTP burn, so it is safe to supersede before starting a new quote,
+ * even if the current session/delegate is unchanged.
  *
  * Never classify a record with a source burn hash (or a burn tx hash) this way:
  * an accepted/ambiguous burn remains blocked regardless of previewId.
@@ -1439,6 +1439,13 @@ export function isStaleApprovalOnlySourceIntent(candidate, { sessionDelegateAddr
   if (!['source_approval_unknown', 'source_approval_submitted', 'source_approval_confirmed'].includes(phase)) return false
   if (details.sourceUserOpHash || details.burnTxHash || approval.txHash) return false
 
+  // Approval only moves no USDC to the router. Even when its UserOperation is
+  // still pending under the current session, it is safe to supersede the local
+  // bridge intent and create a fresh quote: the source burn is the only
+  // irreversible step, and this record has no burn hash. A still-pending
+  // approval may later confirm, but it can only grant allowance; it cannot mint
+  // or burn by itself.
+  if (!details.sourceUserOpHash && !details.burnTxHash && !approval.txHash) return true
   const currentDelegate = String(sessionDelegateAddress || '').toLowerCase()
   const storedDelegate = String(details.sessionDelegateAddress || '').toLowerCase()
   const currentCreated = Number(sessionCreatedAt)

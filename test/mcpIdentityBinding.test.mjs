@@ -399,7 +399,7 @@ test('MCP quote handler blocks a new quote when a source intent is unresolved', 
   }
 })
 
-test('unresolved source intent blocks burns but permits only stale approval recovery', async () => {
+test('unresolved source intent blocks burns but permits approval-only recovery', async () => {
   const { hasUnresolvedSourceBridgeIntent, isStaleApprovalOnlySourceIntent } = await import('../src/services/mcpServer.mjs?unresolved-source-' + Date.now())
   const pending = {
     id: 'approval-source-unknown',
@@ -458,10 +458,12 @@ test('unresolved source intent blocks burns but permits only stale approval reco
     sessionDelegateAddress: MSCA,
     sessionCreatedAt: 200,
   }), true)
+  // A pending approval is safe to supersede even when the delegate/session is
+  // unchanged: approval alone cannot move USDC or create a CCTP burn.
   assert.equal(isStaleApprovalOnlySourceIntent(staleApproval, {
     sessionDelegateAddress: OTHER,
     sessionCreatedAt: 100,
-  }), false)
+  }), true)
   assert.equal(isStaleApprovalOnlySourceIntent({
     ...staleApproval,
     details: JSON.stringify({ ...JSON.parse(staleApproval.details), sourceUserOpHash: '0x' + 'f'.repeat(64) }),
