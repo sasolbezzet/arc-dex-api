@@ -6,7 +6,6 @@ Backend retail proxy untuk ARCOX DEX.
 
 - Web production: https://arcoxdex.vercel.app
 - MCP production: https://arcoxdex.vercel.app/mcp
-- Backend health: https://43.134.14.43.nip.io/health
 - GitHub: https://github.com/sasolbezzet/arc-dex-api
 
 MCP selalu menggunakan URL web production di atas; alamat VPS hanya dipakai sebagai backend upstream internal dan health check.
