@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-test('vault session metadata becomes inactive after session-key inactivity expiry', async () => {
+test('vault session metadata stays active after a long idle period', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-session-meta-'))
   const sessionPath = join(dir, 'session-keys.json')
   const vaultPath = join(dir, 'vault.json')
@@ -28,7 +28,7 @@ test('vault session metadata becomes inactive after session-key inactivity expir
   try {
     const { getSessionKeyInfo } = await import('../src/services/vaultStore.mjs?session-meta-' + Date.now())
     const info = await getSessionKeyInfo(msca)
-    assert.equal(info?.active, false)
+    assert.equal(info?.active, true)
   } finally {
     if (oldSessionPath === undefined) delete process.env.SESSION_KEYS_PATH
     else process.env.SESSION_KEYS_PATH = oldSessionPath
@@ -38,7 +38,7 @@ test('vault session metadata becomes inactive after session-key inactivity expir
   }
 })
 
-test('session status does not persist inactivity revocation on a read', async () => {
+test('session status stays active on a read after a long idle period', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-session-status-read-'))
   const sessionPath = join(dir, 'session-keys.json')
   const wallet = '0x' + '12'.repeat(20)
@@ -49,7 +49,7 @@ test('session status does not persist inactivity revocation on a read', async ()
   try {
     const { getSessionKey } = await import('../src/services/sessionKeyService.mjs?status-read-' + Date.now())
     const info = getSessionKey(wallet, { sweep: false })
-    assert.equal(info?.active, false)
+    assert.equal(info?.active, true)
     const saved = JSON.parse(await (await import('node:fs/promises')).readFile(sessionPath, 'utf8'))
     assert.equal(saved.users[wallet].active, true)
   } finally {
@@ -59,7 +59,7 @@ test('session status does not persist inactivity revocation on a read', async ()
   }
 })
 
-test('MCP connection is marked inactive after 24 hours without an agent request', async () => {
+test('MCP connection stays active after 24 hours without an agent request', async () => {
   const { registerMcpSession, listMcpSessions } = await import('../src/services/vaultStore.mjs?mcp-connection-inactivity-' + Date.now())
   const userId = '0x' + 'ab'.repeat(20)
   const clientId = 'test-client-' + Date.now()
@@ -67,5 +67,5 @@ test('MCP connection is marked inactive after 24 hours without an agent request'
   const sessions = listMcpSessions(userId)
   assert.equal(sessions[0].active, true)
   sessions[0].lastActivity = Date.now() - (24 * 60 * 60 * 1000)
-  assert.equal(listMcpSessions(userId)[0].active, false)
+  assert.equal(listMcpSessions(userId)[0].active, true)
 })

@@ -66,7 +66,8 @@ export function consumeChallenge(nonce) {
 }
 
 // ── MCP session tracking ──
-const MCP_SESSION_INACTIVITY_MS = 24 * 60 * 60 * 1000
+// `lastActivity` is retained for observability, but an MCP connection is not
+// marked inactive merely because the agent has been idle for a day.
 const mcpSessions = new Map() // userId -> [{ clientId, agent, connectedAt, lastActivity }]
 export function registerMcpSession(userId, clientId, agent, active = true) {
   if (!mcpSessions.has(userId)) mcpSessions.set(userId, [])
@@ -81,14 +82,7 @@ export function registerMcpSession(userId, clientId, agent, active = true) {
   }
 }
 export function listMcpSessions(userId) {
-  const sessions = mcpSessions.get(userId) || []
-  const now = Date.now()
-  for (const session of sessions) {
-    if (session.active !== false && now - Number(session.lastActivity || session.connectedAt || 0) >= MCP_SESSION_INACTIVITY_MS) {
-      session.active = false
-    }
-  }
-  return sessions
+  return mcpSessions.get(userId) || []
 }
 
 // ── Helpers ──

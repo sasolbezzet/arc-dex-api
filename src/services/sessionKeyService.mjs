@@ -44,7 +44,6 @@ const ADD_OWNERS_ABI = [{
 
 const CLIENT_URL = process.env.CIRCLE_CLIENT_URL || ''
 const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
-const SESSION_INACTIVITY_MS = 24 * 60 * 60 * 1000
 const BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 const DESTINATION_VERIFICATION_GAS_LIMITS = {
   'arc-testnet': 270_000n,
@@ -133,16 +132,6 @@ function saveStore(data) {
   atomicWriteJsonFile(sessionKeysPath(), data)
 }
 
-function activityTimestampMs(value) {
-  const numeric = Number(value)
-  if (!Number.isFinite(numeric) || numeric <= 0) return null
-  // Accept legacy Unix-second timestamps and normalize them in memory. Tiny
-  // synthetic fixtures (1, 2, 1000) are treated as missing rather than stale.
-  if (numeric >= 1_000_000_000 && numeric < 100_000_000_000) return numeric * 1000
-  if (numeric >= 100_000_000_000) return numeric
-  return null
-}
-
 /** True only for an explicit manual revoke.
  *
  * Records revoked by the inactivity sweeper carry `revokeReason: 'inactivity_24h'`
@@ -186,44 +175,12 @@ function circleModularConfigurationError(error) {
 }
 
 /**
- * Revoke sessions that have not been used by an agent for 24 hours.
- * The store is persistent, so this check also protects deployments after a
- * restart; the interval below is only a prompt cleanup mechanism.
- *
- * Legacy active records without an activity timestamp are migrated to "now"
- * rather than guessed as stale. New records always write lastUsedAt.
+ * Kept as a compatibility no-op for maintenance callers from older releases.
+ * Session keys are no longer revoked merely because an agent was idle; only an
+ * explicit/manual revoke or failed authorization can make one inactive.
  */
-export function sweepInactiveSessions(now = Date.now()) {
-  const store = loadStore()
-  let changed = false
-  let revoked = 0
-  for (const entry of Object.values(store.users || {})) {
-    if (!entry || entry.active !== true) continue
-    // Old records did not persist activity. Do not infer 24h of inactivity
-    // from an unrelated creation timestamp; establish a safe migration
-    // baseline and let the next 24h of real activity be measured.
-    const rawLastActivity = entry.lastUsedAt ?? entry.activatedAt
-    const lastActivity = activityTimestampMs(rawLastActivity)
-    if (lastActivity === null) {
-      entry.lastUsedAt = now
-      changed = true
-      continue
-    }
-    if (lastActivity !== Number(rawLastActivity)) {
-      entry.lastUsedAt = lastActivity
-      changed = true
-    }
-    if (now - lastActivity >= SESSION_INACTIVITY_MS) {
-      entry.active = false
-      entry.revokedAt = now
-      entry.revokeReason = 'inactivity_24h'
-      entry.pendingAuthorization = false
-      changed = true
-      revoked++
-    }
-  }
-  if (changed) saveStore(store)
-  return { revoked, changed }
+export function sweepInactiveSessions() {
+  return { revoked: 0, changed: false }
 }
 
 /**
@@ -247,10 +204,9 @@ function storeAliasWallet(owner) {
 }
 
 export function getSessionKey(userId, { sweep = true } = {}) {
-  // Enforce inactivity expiry on every authorization/execution path, not only
-  // on the background timer. Status metadata can opt out of persistence and
-  // report the same expiry without mutating the store during a GET request.
-  if (sweep) sweepInactiveSessions()
+  // `sweep` remains accepted for API compatibility, but inactivity is not an
+  // authorization rule. `lastUsedAt` is audit metadata only.
+  void sweep
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
   let entry = null
@@ -269,15 +225,6 @@ export function getSessionKey(userId, { sweep = true } = {}) {
   // when no explicit alias exists.
   if (!entry && exact) entry = exact
   if (!entry) return null
-  // Status reads may opt out of persistence. Still present an inactivity-expired
-  // record as inactive to callers, while leaving the durable revoke marker to
-  // the explicit sweep/execute path.
-  if (!sweep && entry.active === true) {
-    const lastActivity = activityTimestampMs(entry.lastUsedAt ?? entry.activatedAt)
-    if (lastActivity !== null && Date.now() - lastActivity >= SESSION_INACTIVITY_MS) {
-      return { ...entry, active: false, revokeReason: 'inactivity_24h', stale: true }
-    }
-  }
   // Do not promote an inactive record through walletAddress alone. Only the
   // explicit alias above may cross an OAuth/EOA → MSCA identity boundary.
   // Likewise, reject a stale exact record before considering any related data;
@@ -878,7 +825,6 @@ export function listRelatedAddresses(userId) {
  * identity must have an explicit alias to an MSCA before it can execute.
  */
 export function touchSessionKey(userId) {
-  sweepInactiveSessions()
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
   let entry = null
@@ -977,12 +923,11 @@ export function completePendingTx(txId, { signedUserOp, txHash, explorerUrl, err
   return tx
 }
 
-// Sweep expired pending txs and inactive sessions. The persistent check in
-// getSessionKey/touchSessionKey is authoritative if this timer is delayed.
+// Sweep expired pending transactions. Session activity is audit metadata and
+// never disables an otherwise authorized session key.
 const _pendingSweep = setInterval(() => {
   const now = Date.now()
   for (const [txId, tx] of pendingTxs) if (now - tx.createdAt > PENDING_TX_TTL) pendingTxs.delete(txId)
-  try { sweepInactiveSessions(now) } catch { /* retry on the next interval */ }
 }, 60_000)
 if (_pendingSweep.unref) _pendingSweep.unref()
 

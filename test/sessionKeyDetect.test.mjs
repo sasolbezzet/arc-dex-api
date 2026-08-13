@@ -285,7 +285,7 @@ test('UserOperation status can explicitly target a destination chain instead of 
   })
 })
 
-test('session is automatically revoked after 24 hours without agent activity', async () => {
+test('session remains active after 24 hours without agent activity', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
   const path = join(dir, 'session-keys.json')
   const MSCA = '0xd6116ac3e3669618a28f713d662d9ad17ebd5bc5'
@@ -301,6 +301,7 @@ test('session is automatically revoked after 24 hours without agent activity', a
         lastUsedAt: now - (24 * 60 * 60 * 1000),
         active: true,
         authorizationUserOpHash: '0x' + '88'.repeat(32),
+        authorizationUserOpHashes: { 'arbitrum-sepolia': '0x' + '88'.repeat(32) },
       },
     },
     aliases: {},
@@ -311,11 +312,11 @@ test('session is automatically revoked after 24 hours without agent activity', a
   try {
     const mod = await import('../src/services/sessionKeyService.mjs?expiry-' + Date.now())
     const entry = mod.getSessionKey(MSCA)
-    assert.equal(entry?.active, false)
+    assert.equal(entry?.active, true)
     const after = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8'))
-    assert.equal(after.users[MSCA].revokeReason, 'inactivity_24h')
-    assert.ok(after.users[MSCA].revokedAt >= now)
-    assert.equal(mod.canExecuteViaSession(MSCA, '1', 'arbitrum-sepolia').reason, 'no_session')
+    assert.equal(after.users[MSCA].revokeReason, undefined)
+    assert.equal(after.users[MSCA].revokedAt, undefined)
+    assert.equal(mod.canExecuteViaSession(MSCA, '1', 'arbitrum-sepolia').ok, true)
   } finally {
     if (prev === undefined) delete process.env.SESSION_KEYS_PATH
     else process.env.SESSION_KEYS_PATH = prev
