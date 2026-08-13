@@ -1396,6 +1396,15 @@ export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain,
   const expectedFrom = String(fromChain || '').toLowerCase()
   const expectedTo = String(toChain || '').toLowerCase()
   const expectedWallet = String(walletAddress || '').toLowerCase()
+  const completedBurnHashes = new Set()
+  for (const approval of Array.isArray(approvals) ? approvals : []) {
+    if (approval?.action !== 'bridge') continue
+    let details
+    try { details = JSON.parse(approval.details || '{}') } catch { continue }
+    if (details?.burnTxHash && (details?.mintTxHash || details?.destinationMintStatus === 'minted' || details?.settlementStatus === 'success' || approval?.status === 'success')) {
+      completedBurnHashes.add(String(details.burnTxHash).toLowerCase())
+    }
+  }
   for (const approval of Array.isArray(approvals) ? approvals : []) {
     if (approval?.action !== 'bridge') continue
     let details
@@ -1405,6 +1414,7 @@ export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain,
     // Missing wallet binding is not evidence that the intent belongs to a
     // different wallet. Fail closed and block the same user's route.
     if (expectedWallet && storedWallet && storedWallet !== expectedWallet) continue
+    if (details?.burnTxHash && completedBurnHashes.has(String(details.burnTxHash).toLowerCase())) continue
     // A legacy Circle/frontend bridge record can contain a burn hash even after
     // destination mint already completed. It remains recoverable by the
     // explicit burn-hash retry tool, but it is not an unresolved source intent

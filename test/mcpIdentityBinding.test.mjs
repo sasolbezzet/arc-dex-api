@@ -531,6 +531,24 @@ test('unresolved source intent blocks burns but permits approval-only recovery',
     toChain: 'Base_Sepolia',
     walletAddress: MSCA,
   }), null)
+  assert.equal(hasUnresolvedSourceBridgeIntent([
+    {
+      id: 'completed-legacy-bridge',
+      action: 'bridge',
+      status: 'approved',
+      details: JSON.stringify({ fromChain: 'Arc_Testnet', toChain: 'Base_Sepolia', burnTxHash: '0x' + 'a'.repeat(64), mintTxHash: '0x' + 'c'.repeat(64) }),
+    },
+    {
+      id: 'duplicate-error-record',
+      action: 'bridge',
+      status: 'error',
+      details: JSON.stringify({ fromChain: 'Arc_Testnet', toChain: 'Base_Sepolia', burnTxHash: '0x' + 'a'.repeat(64), settlementPhase: 'destination_submission_failed' }),
+    },
+  ], {
+    fromChain: 'Arc_Testnet',
+    toChain: 'Base_Sepolia',
+    walletAddress: MSCA,
+  }), null)
 })
 
 test('multi-chain balance preserves a structured error for an unavailable chain', async () => {
