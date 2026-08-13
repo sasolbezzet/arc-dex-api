@@ -394,8 +394,8 @@ test('MCP quote handler blocks a new quote when a source intent is unresolved', 
   }
 })
 
-test('unresolved source intent helper cannot be bypassed with a new bridge quote', async () => {
-  const { hasUnresolvedSourceBridgeIntent } = await import('../src/services/mcpServer.mjs?unresolved-source-' + Date.now())
+test('unresolved source intent blocks burns but permits only stale approval recovery', async () => {
+  const { hasUnresolvedSourceBridgeIntent, isStaleApprovalOnlySourceIntent } = await import('../src/services/mcpServer.mjs?unresolved-source-' + Date.now())
   const pending = {
     id: 'approval-source-unknown',
     action: 'bridge',
@@ -434,6 +434,36 @@ test('unresolved source intent helper cannot be bypassed with a new bridge quote
     toChain: 'Base_Sepolia',
     walletAddress: MSCA,
   })?.approval.id, pending.id)
+
+  // A stale approval-only operation may be superseded after a new session is
+  // created. It never called the router, so allowing a new quote cannot create
+  // a second CCTP burn.
+  const staleApproval = {
+    ...pending,
+    createdAt: 100,
+    details: JSON.stringify({
+      ...JSON.parse(pending.details),
+      settlementPhase: 'source_approval_submitted',
+      sourceApprovalUserOpHash: '0x' + 'e'.repeat(64),
+      sessionDelegateAddress: OTHER,
+      sessionCreatedAt: 100,
+    }),
+  }
+  assert.equal(isStaleApprovalOnlySourceIntent(staleApproval, {
+    sessionDelegateAddress: MSCA,
+    sessionCreatedAt: 200,
+  }), true)
+  assert.equal(isStaleApprovalOnlySourceIntent(staleApproval, {
+    sessionDelegateAddress: OTHER,
+    sessionCreatedAt: 100,
+  }), false)
+  assert.equal(isStaleApprovalOnlySourceIntent({
+    ...staleApproval,
+    details: JSON.stringify({ ...JSON.parse(staleApproval.details), sourceUserOpHash: '0x' + 'f'.repeat(64) }),
+  }, {
+    sessionDelegateAddress: MSCA,
+    sessionCreatedAt: 200,
+  }), false)
 
   // A known bundler precheck is terminal before a UserOperation hash exists,
   // so the route may safely receive a fresh quote.

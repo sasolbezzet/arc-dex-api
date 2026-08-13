@@ -1411,6 +1411,61 @@ export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain,
   return null
 }
 
+/**
+ * An approval-only intent can become stale when the user reconnects/recreates
+ * the Agent Wallet session while Circle still retains the old approval
+ * UserOperation in its pending index. It has not called the router and cannot
+ * create a CCTP burn, so it is safe to supersede before starting a new quote.
+ *
+ * Never classify a record with a source burn hash (or a burn tx hash) this way:
+ * an accepted/ambiguous burn remains blocked regardless of previewId.
+ */
+export function isStaleApprovalOnlySourceIntent(candidate, { sessionDelegateAddress, sessionCreatedAt } = {}) {
+  const approval = candidate?.approval || candidate
+  const rawDetails = candidate?.details ?? approval?.details
+  const details = typeof rawDetails === 'string'
+    ? (() => { try { return JSON.parse(rawDetails || '{}') } catch { return {} } })()
+    : (rawDetails || {})
+  if (!approval || approval.action !== 'bridge') return false
+  const phase = String(details.settlementPhase || '')
+  if (!['source_approval_unknown', 'source_approval_submitted', 'source_approval_confirmed'].includes(phase)) return false
+  if (details.sourceUserOpHash || details.burnTxHash || approval.txHash) return false
+
+  const currentDelegate = String(sessionDelegateAddress || '').toLowerCase()
+  const storedDelegate = String(details.sessionDelegateAddress || '').toLowerCase()
+  const currentCreated = Number(sessionCreatedAt)
+  const storedCreated = Number(details.sessionCreatedAt)
+  const approvalCreated = Number(approval.createdAt)
+  const delegateChanged = Boolean(currentDelegate && storedDelegate && currentDelegate !== storedDelegate)
+  const sessionChanged = Number.isFinite(currentCreated) && currentCreated > 0 && (
+    (Number.isFinite(storedCreated) && storedCreated > 0 && storedCreated < currentCreated)
+      || (!storedCreated && Number.isFinite(approvalCreated) && approvalCreated > 0 && approvalCreated < currentCreated)
+  )
+  return delegateChanged || sessionChanged
+}
+
+async function supersedeStaleSourceApproval(userId, candidate, session) {
+  if (!candidate?.approval?.id) return
+  try {
+    const vault = await import('./vaultStore.mjs')
+    const details = candidate.details || {}
+    vault.updateApprovalStatus(userId, candidate.approval.id, 'error', {
+      error: 'source_approval_superseded_after_session_change',
+      details: jsonText({
+        ...details,
+        settlementPhase: 'source_approval_superseded',
+        settlementStatus: 'error',
+        supersededAt: new Date().toISOString(),
+        supersededBySessionDelegate: session?.delegateAddress || null,
+        safeToRetry: true,
+      }),
+    })
+  } catch {
+    // The old record has no burn. A persistence failure must not prevent a
+    // fresh quote, but it also must not alter the burn safety guard below.
+  }
+}
+
 async function findPendingSourceIntent(userId, { fromChain, toChain, previewId, walletAddress } = {}) {
   try {
     const vault = await import('./vaultStore.mjs')
@@ -1452,7 +1507,8 @@ async function findPendingBridgeIntent(userId, burnTxHash, toKey) {
 
 async function recordBridgePending(userId, {
   agent, amount, fromChain, toChain, previewId, burnTxHash, sourceApprovalUserOpHash, sourceUserOpHash,
-  sourceChainKey, sourceExplorerUrl, walletAddress, destinationUserOpHash, destinationChainKey, settlementPhase, error,
+  sourceChainKey, sourceExplorerUrl, walletAddress, sessionDelegateAddress, sessionCreatedAt,
+  destinationUserOpHash, destinationChainKey, settlementPhase, error,
 } = {}) {
   const vault = await import('./vaultStore.mjs')
   const approval = vault.createApproval(userId, {
@@ -1463,6 +1519,8 @@ async function recordBridgePending(userId, {
       sourceUserOpHash: sourceUserOpHash || null,
       sourceChainKey: sourceChainKey || null,
       walletAddress: walletAddress || null,
+      sessionDelegateAddress: sessionDelegateAddress || null,
+      sessionCreatedAt: sessionCreatedAt || null,
       destinationUserOpHash: destinationUserOpHash || null,
       destinationChainKey: destinationChainKey || null,
       settlementStatus: 'pending_confirmation',
@@ -2296,7 +2354,12 @@ export function createMcpServer(userId, context = {}) {
       toChain: route.toKey,
       walletAddress: info.walletAddress,
     })
-    if (unresolvedSource) {
+    if (unresolvedSource && isStaleApprovalOnlySourceIntent(unresolvedSource, {
+      sessionDelegateAddress: info.delegateAddress,
+      sessionCreatedAt: info.createdAt,
+    })) {
+      await supersedeStaleSourceApproval(userId, unresolvedSource, info)
+    } else if (unresolvedSource) {
       return { content: [{ type: 'text', text: jsonText({
         schemaVersion: 1,
         preview: false,
@@ -2461,6 +2524,8 @@ export function createMcpServer(userId, context = {}) {
           sourceChainKey: executionChainKey(route.fromKey),
           sourceExplorerUrl: route.source.explorer,
           walletAddress: info.walletAddress,
+          sessionDelegateAddress: info.delegateAddress,
+          sessionCreatedAt: info.createdAt,
           settlementPhase: 'source_intent_created',
         })
       } catch (intentError) {
