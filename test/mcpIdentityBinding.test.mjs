@@ -799,3 +799,29 @@ test('MSCA bridge calldata approves and calls the verified ArcoxRouter', async (
   assert.equal(approve.functionName, 'approve')
   assert.deepEqual(approve.args, [route.source.router, 1_000_000n])
 })
+
+test('MCP tool failures return structured errors instead of opaque SDK execution errors', async () => {
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async () => { throw new Error('upstream transaction history unavailable') }
+  try {
+    await withSessionStore({
+      [MSCA.toLowerCase()]: {
+        walletAddress: MSCA,
+        delegateAddress: OTHER,
+        active: true,
+        authorizationUserOpHash: '0x' + 'a'.repeat(64),
+      },
+    }, { [EOA.toLowerCase()]: MSCA }, async ({ createMcpServer }) => {
+      const server = createMcpServer(EOA)
+      const response = await server._registeredTools.arcox_transaction_history.handler({})
+      const result = JSON.parse(response.content[0].text)
+      assert.equal(response.isError, true)
+      assert.equal(result.status, 'error')
+      assert.equal(result.tool, 'arcox_transaction_history')
+      assert.match(result.error, /transaction history unavailable/)
+      assert.equal(result.retryable, true)
+    })
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})

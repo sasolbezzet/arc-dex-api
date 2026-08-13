@@ -99,12 +99,19 @@ function rateLimit({ windowMs, max, keyPrefix }) {
 
 const authLimiter = rateLimit({ windowMs: 5 * 60 * 1000, max: 20, keyPrefix: 'auth' })
 const apiLimiter = rateLimit({ windowMs: 60 * 1000, max: 120, keyPrefix: 'api' })
+// PluginPanel intentionally refreshes credentials, approvals, activity, limits,
+// and sessions while passkey setup is running. Sharing the generic API bucket
+// made a valid reconnect hit HTTP 429 before the MCP approval completed.
+// Vault routes still require their own bearer/session checks, so give this
+// authenticated UI surface a separate burst budget without weakening the
+// stricter limits for public/provider APIs.
+const vaultLimiter = rateLimit({ windowMs: 60 * 1000, max: 300, keyPrefix: 'vault' })
 const attestationLimiter = rateLimit({ windowMs: 60 * 1000, max: 45, keyPrefix: 'attestation' })
 app.use('/api/intel', apiLimiter, arkhamRoutes)
 app.use('/api/treasury', apiLimiter, treasuryRoutes)
 app.use('/api/x402', apiLimiter, x402Routes)
 app.use('/api/ai-router', apiLimiter, aiRouterRoutes)
-app.use('/api/vault', apiLimiter, vaultRoutes)
+app.use('/api/vault', vaultLimiter, vaultRoutes)
 
 // ── Circle Modular Wallet proxy ──
 // Browser → /api/circle-modular/* → the same tenant-specific Circle RPC base

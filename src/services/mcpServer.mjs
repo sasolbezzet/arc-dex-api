@@ -2146,9 +2146,26 @@ export function createMcpServer(userId, context = {}) {
     version: '1.0.0',
   })
 
+  // Every MCP tool must return a machine-readable response, even when an
+  // upstream RPC/API or runtime dependency fails. Without this boundary the
+  // SDK turns a thrown handler error into the opaque "Error occurred during
+  // tool execution" shown by Claude/ChatGPT.
+  const registerTool = (name, description, schema, handler) => server['tool'](name, description, schema, async (params) => {
+    try {
+      return await handler(params)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || 'Unknown tool error')
+      console.error(`[mcp:${name}]`, message)
+      return {
+        isError: true,
+        content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'error', tool: name, error: message, retryable: true }) }],
+      }
+    }
+  })
+
   // ── READ-ONLY TOOLS ──
 
-  server.tool('arcox_wallet_balances', 'Show Agent Wallet (MSCA) balances on Arc, Ethereum Sepolia, Base Sepolia, and Arbitrum Sepolia', {}, async () => {
+  registerTool('arcox_wallet_balances', 'Show Agent Wallet (MSCA) balances on Arc, Ethereum Sepolia, Base Sepolia, and Arbitrum Sepolia', {}, async () => {
     const msca = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     try {
@@ -2181,14 +2198,14 @@ export function createMcpServer(userId, context = {}) {
     }
   })
 
-  server.tool('arcox_transaction_history', 'Check transaction history and auto-mint worker status', {}, async () => {
+  registerTool('arcox_transaction_history', 'Check transaction history and auto-mint worker status', {}, async () => {
     const msca = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     const data = await apiGet(`/api/tx-history?address=${encodeURIComponent(msca.walletAddress)}`, msca.walletAddress)
     return { content: [{ type: 'text', text: jsonText({ ...data, walletAddress: msca.walletAddress, walletType: 'MSCA' }) }] }
   })
 
-  server.tool('arcox_route_status', 'Check if a swap/bridge/send route is supported', {
+  registerTool('arcox_route_status', 'Check if a swap/bridge/send route is supported', {
     action: z.string().describe('swap, bridge, or send'),
     fromChain: z.string().optional().describe('Source chain'),
     toChain: z.string().optional().describe('Destination chain'),
@@ -2255,7 +2272,7 @@ export function createMcpServer(userId, context = {}) {
 
   // ── SWAP TOOLS (quote → confirm → execute) ──
 
-  server.tool('arcox_quote_swap', 'Get a swap quote preview. Show preview to user, wait for confirmation, then call arcox_execute_swap', {
+  registerTool('arcox_quote_swap', 'Get a swap quote preview. Show preview to user, wait for confirmation, then call arcox_execute_swap', {
     tokenIn: z.string().describe('Input token symbol (USDC, EURC, cirBTC)'),
     tokenOut: z.string().describe('Output token symbol'),
     amountIn: z.string().describe('Amount in human readable (e.g. "1")'),
@@ -2297,7 +2314,7 @@ export function createMcpServer(userId, context = {}) {
     }) }] }
   })
 
-  server.tool('arcox_execute_swap', 'Execute a confirmed swap via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_swap and user confirmation.', {
+  registerTool('arcox_execute_swap', 'Execute a confirmed swap via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_swap and user confirmation.', {
     tokenIn: z.string().describe('Input token symbol'),
     tokenOut: z.string().describe('Output token symbol'),
     amountIn: z.string().describe('Exact amount from quote'),
@@ -2358,7 +2375,7 @@ export function createMcpServer(userId, context = {}) {
 
   // ── BRIDGE TOOLS (route → quote → confirm → execute) ──
 
-  server.tool('arcox_quote_bridge', 'Get a bridge quote preview. Show preview to user, wait for confirmation, then call arcox_execute_bridge', {
+  registerTool('arcox_quote_bridge', 'Get a bridge quote preview. Show preview to user, wait for confirmation, then call arcox_execute_bridge', {
     fromChain: z.string().describe('Source chain (arc-testnet, base-sepolia, arbitrum-sepolia)'),
     toChain: z.string().describe('Destination chain'),
     amount: z.string().describe('Amount in human readable'),
@@ -2456,7 +2473,7 @@ export function createMcpServer(userId, context = {}) {
     }
   })
 
-  server.tool('arcox_execute_bridge', 'Execute a confirmed bridge via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_bridge and user confirmation.', {
+  registerTool('arcox_execute_bridge', 'Execute a confirmed bridge via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_bridge and user confirmation.', {
     fromChain: z.string().describe('Source chain'),
     toChain: z.string().describe('Destination chain'),
     amount: z.string().describe('Exact amount from quote'),
@@ -2811,7 +2828,7 @@ export function createMcpServer(userId, context = {}) {
     }
   })
 
-  server.tool('arcox_bridge_status', 'Check attestation and destination mint status for an MSCA bridge burn transaction.', {
+  registerTool('arcox_bridge_status', 'Check attestation and destination mint status for an MSCA bridge burn transaction.', {
     burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Source-chain burn transaction hash'),     fromChain: z.string().describe('Original source chain (arc-testnet or base-sepolia)'),
     toChain: z.string().describe('Destination chain used by the original quote'),
   }, async (params) => {
@@ -2887,7 +2904,7 @@ export function createMcpServer(userId, context = {}) {
     }) }] }
   })
 
-  server.tool('arcox_retry_bridge_mint', 'Retry destination receiveMessage for a confirmed MSCA bridge burn. This never burns again; it only polls attestation and mints the already-bound MSCA recipient.', {
+  registerTool('arcox_retry_bridge_mint', 'Retry destination receiveMessage for a confirmed MSCA bridge burn. This never burns again; it only polls attestation and mints the already-bound MSCA recipient.', {
     burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Previously confirmed Arc router bridge transaction hash'),     fromChain: z.string().describe('Original source chain (arc-testnet or base-sepolia)'),
     toChain: z.string().describe('Original destination chain'),
     confirmed: z.boolean().describe('Must be true to retry destination mint'),
@@ -2965,7 +2982,7 @@ export function createMcpServer(userId, context = {}) {
 
   // ── SEND TOOLS (quote → confirm → execute) ──
 
-  server.tool('arcox_quote_send', 'Get a send quote preview. Show preview to user, wait for confirmation, then call arcox_execute_send', {
+  registerTool('arcox_quote_send', 'Get a send quote preview. Show preview to user, wait for confirmation, then call arcox_execute_send', {
     to: z.string().describe('Recipient address'),
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol. Default USDC'),
@@ -3011,7 +3028,7 @@ export function createMcpServer(userId, context = {}) {
     }) }] }
   })
 
-  server.tool('arcox_execute_send', 'Execute a confirmed send via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_send and user confirmation.', {
+  registerTool('arcox_execute_send', 'Execute a confirmed send via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_send and user confirmation.', {
     to: z.string().describe('Recipient address'),
     amount: z.string().describe('Exact amount from quote'),
     token: z.string().optional().describe('Token symbol'),
@@ -3058,13 +3075,13 @@ export function createMcpServer(userId, context = {}) {
 
   // ── VAULT TOOLS ──
 
-  server.tool('arcox_vault_list_credentials', 'List vault credentials for the authenticated user', {}, async () => {
+  registerTool('arcox_vault_list_credentials', 'List vault credentials for the authenticated user', {}, async () => {
     const { listCredentials } = await import('./vaultStore.mjs')
     const creds = listCredentials(userId)
     return { content: [{ type: 'text', text: jsonText({ credentials: creds }) }] }
   })
 
-  server.tool('arcox_vault_request_approval', 'Request user approval for a transaction. Agent calls this before executing value-moving actions', {
+  registerTool('arcox_vault_request_approval', 'Request user approval for a transaction. Agent calls this before executing value-moving actions', {
     action: z.string().describe('swap, bridge, send'),
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol (USDC, EURC, etc)'),
@@ -3076,7 +3093,7 @@ export function createMcpServer(userId, context = {}) {
     return { content: [{ type: 'text', text: jsonText({ approval }) }] }
   })
 
-  server.tool('arcox_vault_get_limits', 'Get spending limits for the authenticated user', {}, async () => {
+  registerTool('arcox_vault_get_limits', 'Get spending limits for the authenticated user', {}, async () => {
     const { getLimits } = await import('./vaultStore.mjs')
     const limits = getLimits(userId)
     return { content: [{ type: 'text', text: jsonText({ limits }) }] }
@@ -3084,7 +3101,7 @@ export function createMcpServer(userId, context = {}) {
 
   // ── INFO TOOL ──
 
-  server.tool('arcox_mcp_info', 'Get ARCOX MCP server info, available services, and execution guide', {}, async () => {
+  registerTool('arcox_mcp_info', 'Get ARCOX MCP server info, available services, and execution guide', {}, async () => {
     return {
       content: [{
         type: 'text',
@@ -3114,7 +3131,7 @@ export function createMcpServer(userId, context = {}) {
   })
 
   // ── SESSION KEY STATUS ──
-  server.tool('arcox_session_status', 'Check if Agent Session Key (MSCA) is active for the user. Returns wallet address, delegate address, and whether session signing is available.', {}, async () => {
+  registerTool('arcox_session_status', 'Check if Agent Session Key (MSCA) is active for the user. Returns wallet address, delegate address, and whether session signing is available.', {}, async () => {
     try {
       const { getSessionKeyInfo } = await import('./vaultStore.mjs')
       const sessionOwner = boundMscaWalletAddress || userId
@@ -3152,7 +3169,7 @@ export function createMcpServer(userId, context = {}) {
   })
 
   // ── GET REQUEST (poll approval/tx status) ──
-  server.tool('arcox_get_request', 'Poll the status of a previously submitted transaction request. Use after execute returns pending_* status. Returns current lifecycle status + txHash if available.', {
+  registerTool('arcox_get_request', 'Poll the status of a previously submitted transaction request. Use after execute returns pending_* status. Returns current lifecycle status + txHash if available.', {
     approvalId: z.string().describe('Approval ID or request ID returned by execute tool'),
   }, async (params) => {
     const { listApprovals } = await import('./vaultStore.mjs')
@@ -3335,7 +3352,7 @@ export function createMcpServer(userId, context = {}) {
   }
   const isProviderNotFound = (status, data) => status === 404
     || /\b(?:not[ -]?found|unknown token|token unavailable)\b/i.test(String(data?.error || data?.message || ''))
-  const intelTool = (name, desc, pathFromId, schema) => server.tool(name, desc, schema, async (params) => {
+  const intelTool = (name, desc, pathFromId, schema) => registerTool(name, desc, schema, async (params) => {
     const normalizedParams = name === 'arcox_intel_get_token'
       ? { ...params, id: normalizeIntelTokenId(params.id) }
       : params
@@ -3410,7 +3427,7 @@ export function createMcpServer(userId, context = {}) {
 
   // ── x402 PAYMENT TOOLS (MSCA session-key only) ──
 
-  server.tool('arcox_x402_pay_invoice', 'Pay an ARCOX x402 invoice from the Agent Wallet (MSCA via session key). Call WITHOUT confirmed to get a preview; show it to user; then call with confirmed=true + previewId + confirmationText.', {
+  registerTool('arcox_x402_pay_invoice', 'Pay an ARCOX x402 invoice from the Agent Wallet (MSCA via session key). Call WITHOUT confirmed to get a preview; show it to user; then call with confirmed=true + previewId + confirmationText.', {
     invoiceId: z.string().describe('ARCOX x402 invoiceId from an Intel tool'),
     confirmed: z.boolean().optional().describe('Must be true to execute payment'),
     confirmationText: z.string().optional().describe('User confirmation text (yes/ya)'),
@@ -3437,7 +3454,7 @@ export function createMcpServer(userId, context = {}) {
     }
   })
 
-  server.tool('arcox_x402_invoice_status', 'Check status of an ARCO x402 invoice (pending → paid).', {
+  registerTool('arcox_x402_invoice_status', 'Check status of an ARCO x402 invoice (pending → paid).', {
     invoiceId: z.string().describe('ARCO x402 invoice ID or paymentId'),
   }, async (params) => {
     try {
