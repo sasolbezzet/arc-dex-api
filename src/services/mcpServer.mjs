@@ -1246,6 +1246,17 @@ export function destinationNonceDecision({ checked, processed } = {}) {
   return 'not_minted'
 }
 
+// A hashless destination submission is ambiguous while the bundler may still
+// be indexing it. Only the explicit retry tool may recover such an intent, and
+// only after a short cooldown; normal status polling remains fail-closed.
+export const HASHLESS_DESTINATION_RECOVERY_DELAY_MS = 60_000
+export function hashlessDestinationRetryAllowed(approval, now = Date.now()) {
+  const recordedAt = Number(approval?.updatedAt || approval?.createdAt || 0)
+  return Number.isFinite(recordedAt)
+    && recordedAt > 0
+    && now - recordedAt >= HASHLESS_DESTINATION_RECOVERY_DELAY_MS
+}
+
 export async function destinationMintAlreadyProcessed({ status, route, client: injectedClient } = {}) {
   const nonce = extractCctpMessageNonce(status?.message)
   const rpcUrl = route?.destination?.rpcUrl
@@ -1529,7 +1540,7 @@ async function resumePendingBridgeApproval(userId, approval, details, info) {
   }
 }
 
-async function mintDestinationViaMsca({ status, route, walletAddress, userId, approvalId: existingApprovalId = null }) {
+async function mintDestinationViaMsca({ status, route, walletAddress, userId, approvalId: existingApprovalId = null, allowHashlessRecovery = false }) {
   if (!status?.verified || !status.message || !status.attestation) return { success: false, error: 'Attestation belum ready' }
   const destinationKey = {
     Arc_Testnet: 'arc-testnet',
@@ -1560,48 +1571,62 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
   const existingLock = destinationMintLocks.get(lockKey)
   if (existingLock) {
     if (!existingLock.userOpHash) {
-      return { success: false, error: 'destination_mint_in_flight', approvalId: existingLock.approvalId || existingApprovalId || null, safeToRetry: false }
-    }
-    const { getUserOpStatus } = await import('./sessionKeyService.mjs')
-    const live = await getUserOpStatus(existingLock.userId || userId, existingLock.userOpHash, existingLock.chainKey)
-    if (live.status === 'success') {
+      if (!allowHashlessRecovery) {
+        return { success: false, error: 'destination_mint_in_flight', approvalId: existingLock.approvalId || existingApprovalId || null, safeToRetry: false }
+      }
+      // The explicit recovery path will re-check the destination nonce and the
+      // persisted approval cooldown below before submitting a new UserOperation.
       destinationMintLocks.delete(lockKey)
-      return { success: true, txHash: live.txHash, userOpHash: existingLock.userOpHash, explorerUrl: live.explorerUrl }
+    } else {
+      const { getUserOpStatus } = await import('./sessionKeyService.mjs')
+      const live = await getUserOpStatus(existingLock.userId || userId, existingLock.userOpHash, existingLock.chainKey)
+      if (live.status === 'success') {
+        destinationMintLocks.delete(lockKey)
+        return { success: true, txHash: live.txHash, userOpHash: existingLock.userOpHash, explorerUrl: live.explorerUrl }
+      }
+      if (live.status === 'pending_confirmation') {
+        return { success: false, error: 'destination_mint_in_flight', userOpHash: existingLock.userOpHash, safeToRetry: false }
+      }
+      if (live.status !== 'error' || !live.receipt || !['reverted', '0x0', 0, false].includes(live.receipt?.receipt?.status)) {
+        return { success: false, error: live.reason || 'destination_mint_status_unavailable', userOpHash: existingLock.userOpHash, safeToRetry: false }
+      }
+      // Only an explicitly reverted transaction releases the lock for a retry.
+      destinationMintLocks.delete(lockKey)
     }
-    if (live.status === 'pending_confirmation') {
-      return { success: false, error: 'destination_mint_in_flight', userOpHash: existingLock.userOpHash, safeToRetry: false }
-    }
-    if (live.status !== 'error' || !live.receipt || !['reverted', '0x0', 0, false].includes(live.receipt?.receipt?.status)) {
-      return { success: false, error: live.reason || 'destination_mint_status_unavailable', userOpHash: existingLock.userOpHash, safeToRetry: false }
-    }
-    // Only an explicitly reverted transaction releases the lock for a retry.
-    destinationMintLocks.delete(lockKey)
   }
   const persisted = await findPendingBridgeMint(userId, status.burnTxHash, route.toKey)
   if (persisted) {
     if (!persisted.userOpHash) {
-      destinationMintLocks.set(lockKey, { userId, userOpHash: null, chainKey: persisted.chainKey, approvalId: persisted.approval?.id || existingApprovalId || null })
-      return { success: false, error: 'destination_submission_unknown', approvalId: persisted.approval?.id || existingApprovalId || null, safeToRetry: false }
+      const approvalId = persisted.approval?.id || existingApprovalId || null
+      if (!allowHashlessRecovery || !hashlessDestinationRetryAllowed(persisted.approval)) {
+        destinationMintLocks.set(lockKey, { userId, userOpHash: null, chainKey: persisted.chainKey, approvalId })
+        return { success: false, error: 'destination_submission_unknown', approvalId, safeToRetry: false }
+      }
+      // This is an explicit, delayed recovery of a previously hashless
+      // destination submission. The nonce was already checked above and the
+      // source burn is fixed; never create a new source intent or burn.
+      destinationMintLocks.delete(lockKey)
+    } else {
+      const { getUserOpStatus } = await import('./sessionKeyService.mjs')
+      const live = await getUserOpStatus(userId, persisted.userOpHash, persisted.chainKey)
+      if (live.status === 'success') {
+        await markBridgePendingResolved(userId, persisted, 'success', { txHash: live.txHash, explorerUrl: live.explorerUrl, userOpHash: persisted.userOpHash })
+        return { success: true, txHash: live.txHash, userOpHash: persisted.userOpHash, explorerUrl: live.explorerUrl, idempotent: true }
+      }
+      if (live.status === 'pending_confirmation') {
+        destinationMintLocks.set(lockKey, { userId, userOpHash: persisted.userOpHash, chainKey: persisted.chainKey })
+        return { success: false, error: 'destination_mint_in_flight', userOpHash: persisted.userOpHash, safeToRetry: false }
+      }
+      if (live.status !== 'error' || !live.receipt || !['reverted', '0x0', 0, false].includes(live.receipt?.receipt?.status)) {
+        destinationMintLocks.set(lockKey, { userId, userOpHash: persisted.userOpHash, chainKey: persisted.chainKey })
+        return { success: false, error: live.reason || 'destination_mint_status_unavailable', userOpHash: persisted.userOpHash, safeToRetry: false }
+      }
+      await markBridgePendingResolved(userId, persisted, 'error', { userOpHash: persisted.userOpHash, error: live.reason || 'destination UserOperation failed' })
     }
-    const { getUserOpStatus } = await import('./sessionKeyService.mjs')
-    const live = await getUserOpStatus(userId, persisted.userOpHash, persisted.chainKey)
-    if (live.status === 'success') {
-      await markBridgePendingResolved(userId, persisted, 'success', { txHash: live.txHash, explorerUrl: live.explorerUrl, userOpHash: persisted.userOpHash })
-      return { success: true, txHash: live.txHash, userOpHash: persisted.userOpHash, explorerUrl: live.explorerUrl, idempotent: true }
-    }
-    if (live.status === 'pending_confirmation') {
-      destinationMintLocks.set(lockKey, { userId, userOpHash: persisted.userOpHash, chainKey: persisted.chainKey })
-      return { success: false, error: 'destination_mint_in_flight', userOpHash: persisted.userOpHash, safeToRetry: false }
-    }
-    if (live.status !== 'error' || !live.receipt || !['reverted', '0x0', 0, false].includes(live.receipt?.receipt?.status)) {
-      destinationMintLocks.set(lockKey, { userId, userOpHash: persisted.userOpHash, chainKey: persisted.chainKey })
-      return { success: false, error: live.reason || 'destination_mint_status_unavailable', userOpHash: persisted.userOpHash, safeToRetry: false }
-    }
-    await markBridgePendingResolved(userId, persisted, 'error', { userOpHash: persisted.userOpHash, error: live.reason || 'destination UserOperation failed' })
   }
   const pendingIntent = await findPendingBridgeIntent(userId, status.burnTxHash, route.toKey)
   let approvalId = existingApprovalId || pendingIntent?.approval?.id || null
-  if (pendingIntent?.phase === 'destination_submitted' || pendingIntent?.phase === 'submission_unknown') {
+  if (!allowHashlessRecovery && (pendingIntent?.phase === 'destination_submitted' || pendingIntent?.phase === 'submission_unknown')) {
     destinationMintLocks.set(lockKey, { userId, userOpHash: null, chainKey: destinationKey, approvalId })
     return { success: false, error: 'destination_mint_in_flight', approvalId, safeToRetry: false }
   }
@@ -1694,22 +1719,35 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
     destinationMintLocks.delete(lockKey)
     return { success: true, approvalId, txHash: result.txHash, userOpHash: result.userOpHash, explorerUrl: `${route.destination.explorer}${result.txHash}` }
   } catch (error) {
-    // The transport may fail after the bundler accepted the UserOperation. Do
-    // not release this lock on an ambiguous outcome; retrying receiveMessage
-    // could duplicate a valid mint. The lock stays fail-closed until nonce or
-    // UserOperation status proves the original operation final.
+    // The transport may fail after the bundler accepted the UserOperation. Keep
+    // its hash and original error so the next retry polls the exact operation
+    // instead of submitting a duplicate receiveMessage call blindly.
     const message = String(error?.message || error)
+    const submittedUserOpHash = error?.userOpHash || null
+    const submittedExplorerUrl = error?.explorerUrl || null
     const currentLock = destinationMintLocks.get(lockKey)
-    if (currentLock?.approvalId) {
-      await updateBridgePending(userId, currentLock.approvalId, {
-        settlementPhase: 'submission_unknown',
-        settlementStatus: 'pending_confirmation',
+    const lockApprovalId = currentLock?.approvalId || approvalId || null
+    if (lockApprovalId) {
+      await updateBridgePending(userId, lockApprovalId, {
+        fromChain: route.fromKey,
+        toChain: route.toKey,
+        burnTxHash: status.burnTxHash,
         destinationChainKey: destinationKey,
-        destinationUserOpHash: null,
-      }, 'pending_confirmation', { error: message })
+        settlementPhase: submittedUserOpHash ? 'destination_submitted' : 'submission_unknown',
+        settlementStatus: 'pending_confirmation',
+        destinationUserOpHash: submittedUserOpHash,
+      }, 'pending_confirmation', { error: message, userOpHash: submittedUserOpHash, explorerUrl: submittedExplorerUrl })
     }
-    destinationMintLocks.set(lockKey, { userId, userOpHash: null, chainKey: destinationKey, approvalId: currentLock?.approvalId || null, error: message })
-    return { success: false, error: 'destination_mint_status_unavailable', approvalId: currentLock?.approvalId || approvalId || null, safeToRetry: false }
+    destinationMintLocks.set(lockKey, { userId, userOpHash: submittedUserOpHash, chainKey: destinationKey, approvalId: lockApprovalId, error: message })
+    return {
+      success: false,
+      error: submittedUserOpHash ? 'destination_mint_receipt_unavailable' : 'destination_mint_status_unavailable',
+      detail: message.slice(0, 500),
+      approvalId: lockApprovalId,
+      userOpHash: submittedUserOpHash,
+      explorerUrl: submittedExplorerUrl,
+      safeToRetry: false,
+    }
 
   }
 }
@@ -2551,7 +2589,7 @@ export function createMcpServer(userId, context = {}) {
       }
       let auditPending = false
       const mint = bridgeStatus.verified
-        ? await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress, userId, approvalId }).catch(error => ({ success: false, error: error?.message || 'Destination MSCA mint request failed', approvalId, safeToRetry: false }))
+        ? await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress, userId, approvalId }).catch(error => ({ success: false, error: error?.message || 'Destination MSCA mint request failed', detail: String(error?.message || error).slice(0, 500), userOpHash: error?.userOpHash || null, explorerUrl: error?.explorerUrl || null, approvalId, safeToRetry: false }))
         : { success: false, error: 'Attestation belum ready', approvalId, safeToRetry: false }
       approvalId = mint.approvalId || approvalId
       if (!mint.success && mint.userOpHash && mint.safeToRetry === false) {
@@ -2768,7 +2806,7 @@ export function createMcpServer(userId, context = {}) {
           error: null, message: 'Destination mint sudah selesai sebelumnya. Tidak mengirim UserOperation ulang.',
         }) }] }
       }
-      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress, userId })
+      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress, userId, allowHashlessRecovery: true })
       return { content: [{ type: 'text', text: jsonText({        status: mint.success ? 'minted' : (mint.error === 'destination_mint_in_flight' || mint.error === 'destination_nonce_check_unavailable' ? 'settlement_pending' : 'mint_failed'), executed: mint.success && !mint.idempotent, idempotent: Boolean(mint.idempotent), burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, destinationMintStatus: mint.success ? 'minted' : 'pending', safeToRetry: mint.success ? false : (mint.safeToRetry ?? false), error: mint.success ? null : mint.error, message: mint.success ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya.' : 'Destination receiveMessage berhasil via MSCA UserOperation.') : (mint.error === 'destination_mint_in_flight' ? 'Destination mint UserOperation masih pending. Jangan retry sampai status UserOperation final.' : 'Destination mint belum aman untuk diulang; pastikan status UserOperation dan nonce destination sudah final.') }) }] }
 
     } catch (e) {

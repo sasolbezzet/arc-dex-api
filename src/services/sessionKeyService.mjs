@@ -1063,6 +1063,17 @@ export function buildUserOperationParams({ account, calls } = {}) {
   return { account, calls }
 }
 
+// A receipt lookup can fail after Circle has already accepted the UserOperation.
+// Keep the hash attached to the original error so bridge recovery can poll the
+// exact operation instead of creating a hashless, unrecoverable lock.
+export function annotateUserOperationError(error, userOpHash, explorerUrl) {
+  const target = error instanceof Error ? error : new Error(String(error || 'UserOperation receipt unavailable'))
+  if (userOpHash) target.userOpHash = userOpHash
+  if (explorerUrl) target.explorerUrl = explorerUrl
+  target.code = target.code || 'user_operation_receipt_unavailable'
+  return target
+}
+
 /**
  * Keep the fee envelope authoritative when a paymaster response is merged into
  * the UserOperation. Some Circle/Arbitrum paymaster responses echo a zero tip;
@@ -1134,24 +1145,32 @@ export async function executeViaSession(userId, calls, options = {}) {
     receipt = await waitForUserOperationReceipt(modularClient, { hash: userOpHash })
   } catch (error) {
     const message = String(error?.message || '')
+    const explorerUrl = `${explorerBase}${userOpHash}`
+    const contextualError = annotateUserOperationError(error, userOpHash, explorerUrl)
     if (/timed out|timeout|timed-out/i.test(message)) {
       return {
         status: 'pending_confirmation',
         reason: 'user_operation_pending',
         userOpHash,
-        explorerUrl: `${explorerBase}${userOpHash}`,
+        explorerUrl,
         error: message,
       }
     }
-    throw error
+    // Do not discard the hash on non-timeout receipt/indexer errors. The
+    // caller must be able to query the exact operation before retrying.
+    throw contextualError
   }
 
   const receiptTxHash = receipt?.receipt?.transactionHash || null
   const transactionStatus = receipt?.receipt?.status
   const transactionSucceeded = transactionStatus === 'success' || transactionStatus === '0x1' || transactionStatus === 1 || transactionStatus === true
+  const transactionFailed = transactionStatus === 'reverted' || transactionStatus === 'failed' || transactionStatus === '0x0' || transactionStatus === 0 || transactionStatus === false
   const success = receipt?.success === true && (options.requireSuccessfulTransactionReceipt !== true || transactionSucceeded)
+  if (receipt?.success === true && options.requireSuccessfulTransactionReceipt === true && transactionFailed) {
+    return { status: 'error', reason: 'transaction_reverted', txHash: receiptTxHash || null, explorerUrl: receiptTxHash ? `${explorerBase}${receiptTxHash}` : null, userOpHash, receipt }
+  }
   if (receipt?.success === true && options.requireSuccessfulTransactionReceipt === true && !transactionSucceeded) {
-    return { status: 'pending_confirmation', reason: 'transaction_receipt_status_unavailable_or_failed', userOpHash, receipt }
+    return { status: 'pending_confirmation', reason: 'transaction_receipt_status_unavailable', userOpHash, receipt }
   }
   if (success && (options.requireTransactionHash === true || options.requireSuccessfulTransactionReceipt === true) && !receiptTxHash) {
     return {
@@ -1169,6 +1188,7 @@ export async function executeViaSession(userId, calls, options = {}) {
 
   return {
     status: success ? 'success' : 'error',
+    reason: success ? undefined : (receipt?.success === false ? 'user_operation_failed' : 'transaction_failed'),
     txHash,
     explorerUrl,
     userOpHash,
@@ -1287,6 +1307,14 @@ export async function getUserOpStatus(userId, userOpHash, requestedChainKey) {
       || transactionStatus === '0x1'
       || transactionStatus === 1
       || transactionStatus === true
+    const transactionFailed = transactionStatus === 'reverted'
+      || transactionStatus === 'failed'
+      || transactionStatus === '0x0'
+      || transactionStatus === 0
+      || transactionStatus === false
+    if (receipt.success === false || transactionFailed) {
+      return { status: 'error', reason: transactionFailed ? 'transaction_reverted' : 'user_operation_failed', userOpHash, txHash, explorerUrl: txHash ? `${String(chain.explorerUrl || '').replace(/\/?$/, '')}/tx/${txHash}` : null, receipt }
+    }
     // A UserOperation hash is not an EVM transaction hash. Without the latter
     // we cannot prove a source burn exists or safely continue a bridge.
     if (receipt.success === true && (!txHash || !transactionSucceeded)) {

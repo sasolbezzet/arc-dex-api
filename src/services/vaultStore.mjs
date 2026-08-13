@@ -343,6 +343,7 @@ export function updateApprovalStatus(owner, id, status, extra = {}) {
   const a = v.approvals.find(x => x.owner === owner && x.id === id)
   if (!a) return null
   a.status = status
+  a.updatedAt = Date.now()
   if (extra.txHash) a.txHash = extra.txHash
   if (extra.explorerUrl) a.explorerUrl = extra.explorerUrl
   if (extra.userOpHash) a.userOpHash = extra.userOpHash

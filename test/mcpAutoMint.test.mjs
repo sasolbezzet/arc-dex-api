@@ -33,3 +33,22 @@ test('waitForCctpBridgeStatus queues auto-mint once after the configured delay a
     globalThis.fetch = previousFetch
   }
 })
+
+test('hashless destination recovery requires a cooldown and updated approval timestamp', async () => {
+  const { HASHLESS_DESTINATION_RECOVERY_DELAY_MS, hashlessDestinationRetryAllowed } = await import('../src/services/mcpServer.mjs?hashless-recovery-' + Date.now() + '-' + Math.random())
+  const now = 1_000_000
+  assert.equal(hashlessDestinationRetryAllowed({ updatedAt: now - HASHLESS_DESTINATION_RECOVERY_DELAY_MS + 1 }, now), false)
+  assert.equal(hashlessDestinationRetryAllowed({ updatedAt: now - HASHLESS_DESTINATION_RECOVERY_DELAY_MS }, now), true)
+  assert.equal(hashlessDestinationRetryAllowed({ createdAt: now - HASHLESS_DESTINATION_RECOVERY_DELAY_MS }, now), true)
+  assert.equal(hashlessDestinationRetryAllowed({ updatedAt: 0, createdAt: 0 }, now), false)
+})
+
+test('receipt errors retain the accepted UserOperation hash for destination recovery', async () => {
+  const { annotateUserOperationError } = await import('../src/services/sessionKeyService.mjs?receipt-hash-' + Date.now() + '-' + Math.random())
+  const original = new Error('Circle receipt indexer unavailable')
+  const annotated = annotateUserOperationError(original, '0x' + 'a'.repeat(64), 'https://example.invalid/tx/0x' + 'a'.repeat(64))
+  assert.equal(annotated, original)
+  assert.equal(annotated.userOpHash, '0x' + 'a'.repeat(64))
+  assert.match(annotated.explorerUrl, /0x[a]+$/)
+  assert.equal(annotated.code, 'user_operation_receipt_unavailable')
+})
