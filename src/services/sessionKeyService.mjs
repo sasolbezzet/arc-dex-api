@@ -22,7 +22,7 @@ import { dirname } from 'node:path'
 import { createPublicClient, createWalletClient, http, encodeFunctionData, getAddress, defineChain, parseUnits } from 'viem'
 import { toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
 import { circleModularProxyHeaders } from './circleModularProxy.mjs'
-import { sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
+import { getPaymasterData, getPaymasterStubData, sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
 import { encrypt, decrypt } from './crypto.mjs'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { getLimits } from './vaultStore.mjs'
@@ -45,6 +45,37 @@ const ADD_OWNERS_ABI = [{
 const CLIENT_URL = process.env.CIRCLE_CLIENT_URL || ''
 const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
 const SESSION_INACTIVITY_MS = 24 * 60 * 60 * 1000
+const BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
+const DESTINATION_VERIFICATION_GAS_LIMIT = 350_000n
+
+function parseFeeQuantity(value) {
+  try {
+    if (typeof value === 'string' && /^0x[0-9a-f]+$/i.test(value.trim())) return BigInt(value)
+    if (typeof value === 'string' && /^\d+$/.test(value.trim())) return BigInt(value)
+    if (typeof value === 'bigint') return value
+    if (typeof value === 'number' && Number.isSafeInteger(value)) return BigInt(value)
+  } catch { /* invalid fee is handled by the caller */ }
+  return null
+}
+
+export function normalizeUserOperationFees({ maxFeePerGas = 0n, maxPriorityFeePerGas = 0n, minPriorityFeePerGas = BUNDLER_MIN_PRIORITY_FEE_WEI } = {}) {
+  let observedMax = parseFeeQuantity(maxFeePerGas) ?? 0n
+  let observedPriority = parseFeeQuantity(maxPriorityFeePerGas) ?? 0n
+  if (observedMax < 0n) observedMax = 0n
+  if (observedPriority < 0n) observedPriority = 0n
+  const minimum = parseFeeQuantity(minPriorityFeePerGas) ?? BUNDLER_MIN_PRIORITY_FEE_WEI
+  const priority = observedPriority >= minimum ? observedPriority : minimum
+  const max = observedMax >= priority ? observedMax + priority : priority * 2n
+  return { maxFeePerGas: max, maxPriorityFeePerGas: priority }
+}
+
+export function classifyUserOperationPrecheckError(error) {
+  const message = String(error?.message || error || '')
+  if (/max operations .*reached for account|account.*unstaked/i.test(message)) return 'bundler_account_reputation_limit'
+  if (/paymaster.*stake|signature aggregator.*stake|unstaked/i.test(message)) return 'bundler_stake_requirement'
+  if (/precheck failed|maxPriorityFeePerGas|missing or invalid parameters|verification gas limit efficiency/i.test(message)) return 'user_operation_precheck_failed'
+  return null
+}
 
 // Resolve on each store operation so tests and controlled runtime configuration
 // can switch the backing file without retaining a stale path from module load.
@@ -1057,10 +1088,48 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
 }
 
 /** Build the exact UserOperation parameters used by sendUserOperation. */
-export function buildUserOperationParams({ account, calls } = {}) {
-  // Circle's bundler and Gas Station own fee estimation. Do not replace the
-  // official envelope with an application-defined fee floor.
-  return { account, calls }
+export function buildUserOperationParams({ account, calls, chainKey, baseClient, feeProfile } = {}) {
+  const params = { account, calls }
+  const destinationBridge = ['arc-bridge', 'base-destination', 'arbitrum-destination'].includes(String(feeProfile || ''))
+  if (chainKey !== 'arbitrum-sepolia' && !destinationBridge) return params
+  return (async () => {
+    const gasPrice = baseClient?.getGasPrice ? await baseClient.getGasPrice().catch(() => 0n) : 0n
+    const suggestedPriority = baseClient?.request ? await baseClient.request({ method: 'eth_maxPriorityFeePerGas' }).catch(() => 0n) : 0n
+    const fees = normalizeUserOperationFees({ maxFeePerGas: gasPrice, maxPriorityFeePerGas: suggestedPriority })
+    params.maxFeePerGas = fees.maxFeePerGas
+    params.maxPriorityFeePerGas = fees.maxPriorityFeePerGas
+    // Circle's bundler requires a reasonable verification-gas efficiency. The
+    // default 1.5M estimate is far above the actual MSCA signature cost and is
+    // rejected for destination receiveMessage operations.
+    if (destinationBridge) params.verificationGasLimit = DESTINATION_VERIFICATION_GAS_LIMIT
+    return params
+  })()
+}
+
+export function stripPaymasterFeeOverrides(response = {}) {
+  const { maxFeePerGas: _maxFeePerGas, maxPriorityFeePerGas: _maxPriorityFeePerGas, ...paymasterFields } = response || {}
+  return paymasterFields
+}
+
+export function preserveUserOperationFeeEnvelope(response = {}, fees = {}) {
+  const maxFeePerGas = parseFeeQuantity(fees.maxFeePerGas)
+  const maxPriorityFeePerGas = parseFeeQuantity(fees.maxPriorityFeePerGas)
+  if (maxFeePerGas === null || maxPriorityFeePerGas === null || maxPriorityFeePerGas <= 0n || maxFeePerGas < maxPriorityFeePerGas) {
+    throw new Error('Complete non-zero UserOperation fee envelope required')
+  }
+  return { ...stripPaymasterFeeOverrides(response), maxFeePerGas, maxPriorityFeePerGas }
+}
+
+export function paymasterWithFeeOverrides(client, fees) {
+  const requestFees = {
+    maxFeePerGas: parseFeeQuantity(fees?.maxFeePerGas),
+    maxPriorityFeePerGas: parseFeeQuantity(fees?.maxPriorityFeePerGas),
+  }
+  if (requestFees.maxFeePerGas === null || requestFees.maxPriorityFeePerGas === null) throw new Error('Complete UserOperation fee envelope required')
+  return {
+    getPaymasterStubData: async request => preserveUserOperationFeeEnvelope(await getPaymasterStubData(client, { ...request, ...requestFees }), requestFees),
+    getPaymasterData: async request => preserveUserOperationFeeEnvelope(await getPaymasterData(client, { ...request, ...requestFees }), requestFees),
+  }
 }
 
 // A receipt lookup can fail after Circle has already accepted the UserOperation.
@@ -1124,13 +1193,26 @@ export async function executeViaSession(userId, calls, options = {}) {
   // Submit UserOperation with optional paymaster sponsorship
   const userOpParams = await buildUserOperationParams({ account: smartAccount, calls: normalizedCalls, chainKey, baseClient, feeProfile: options.feeProfile })
 
-  // Circle Gas Station owns sponsorship and fee selection when requested.
-  if (options.paymaster === true) userOpParams.paymaster = true
+  // Arc bridge settlement can pay gas from the MSCA's native USDC balance;
+  // using Circle paymaster there triggers the efficiency/stake guard. Rollup
+  // destinations remain sponsored, but preserve the non-zero fee envelope
+  // because the paymaster response can otherwise overwrite it with zero.
+  const arcBridgeProfile = chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
+  const sponsoredDestination = ['base-destination', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
+  if (options.paymaster === true) {
+    if (arcBridgeProfile) userOpParams.paymaster = false
+    else if (sponsoredDestination || chainKey === 'arbitrum-sepolia') userOpParams.paymaster = paymasterWithFeeOverrides(modularClient, userOpParams)
+    else userOpParams.paymaster = true
+  }
 
   let userOpHash
   try {
     userOpHash = await sendUserOperation(modularClient, userOpParams)
   } catch (error) {
+    const precheckReason = classifyUserOperationPrecheckError(error)
+    if (precheckReason) {
+      return { status: 'error', reason: precheckReason, safeToRetry: true, userOpAccepted: 'no', error: String(error?.message || error) }
+    }
     // Return Circle/viem's original error so the official bundler response is
     // visible to the caller and can be debugged without local classification.
     throw error

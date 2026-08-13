@@ -1665,7 +1665,7 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
       to: route.destination.messageTransmitter,
       value: 0n,
       data: encodeFunctionData({ abi: RECEIVE_MESSAGE_ABI, functionName: 'receiveMessage', args: [status.message, status.attestation] }),
-    }], { paymaster: true, chainKey: destinationKey, feeProfile: destinationKey === 'arbitrum-sepolia' ? 'arbitrum-destination' : destinationKey === 'arc-testnet' ? 'arc-bridge' : undefined, requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+    }], { paymaster: true, chainKey: destinationKey, feeProfile: destinationKey === 'arbitrum-sepolia' ? 'arbitrum-destination' : destinationKey === 'arc-testnet' ? 'arc-bridge' : 'base-destination', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
     if (result.status === 'pending_confirmation') {
       const details = {
         fromChain: route.fromKey,
@@ -1685,6 +1685,22 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
       return { success: false, error: result.reason || 'destination_mint_pending', approvalId, userOpHash: result.userOpHash, safeToRetry: false }
     }
     if (result.status !== 'success') {
+      if (result.safeToRetry === true && result.userOpAccepted === 'no') {
+        await updateBridgePending(userId, approvalId, {
+          fromChain: route.fromKey,
+          toChain: route.toKey,
+          burnTxHash: status.burnTxHash,
+          destinationChainKey: destinationKey,
+          settlementPhase: 'destination_submission_failed',
+          settlementStatus: 'error',
+          destinationUserOpHash: null,
+          reason: result.reason || 'user_operation_precheck_failed',
+          userOpAccepted: 'no',
+          safeToRetry: true,
+        }, 'error', { txHash: status.burnTxHash, error: result.error || result.reason })
+        destinationMintLocks.delete(lockKey)
+        return { success: false, error: result.reason || 'destination_user_operation_precheck_failed', detail: result.error || null, approvalId, safeToRetry: true }
+      }
       if (!(result.status === 'error' && result.receipt && ['reverted', '0x0', 0, false].includes(result.receipt?.receipt?.status))) {
         const details = {
           fromChain: route.fromKey,
