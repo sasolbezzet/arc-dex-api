@@ -2921,6 +2921,7 @@ export function createMcpServer(userId, context = {}) {
         message: 'CCTP message tidak terikat ke route/MSCA yang aktif. Retry mint diblokir dan tidak ada transaksi destination yang dikirim.',
       }) }] }
       if (!status.verified) return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, burnTxHash: params.burnTxHash, messageStatus: status.messageStatus || 'pending', message: 'Attestation belum tersedia. Tidak ada transaksi destination yang dikirim.' }) }] }
+      const pendingBridgeIntent = await findPendingBridgeMint(userId, params.burnTxHash, route.toKey)
       const destinationMint = await destinationMintAlreadyProcessed({ status, route })
       const nonceDecision = destinationNonceDecision(destinationMint)
       if (nonceDecision === 'unavailable') {
@@ -2932,6 +2933,12 @@ export function createMcpServer(userId, context = {}) {
         }) }] }
       }
       if (nonceDecision === 'minted') {
+        if (pendingBridgeIntent) {
+          await markBridgePendingResolved(userId, pendingBridgeIntent, 'success', {
+            ...(pendingBridgeIntent.approval?.txHash ? { txHash: pendingBridgeIntent.approval.txHash } : {}),
+            ...(pendingBridgeIntent.approval?.explorerUrl ? { explorerUrl: pendingBridgeIntent.approval.explorerUrl } : {}),
+          })
+        }
         return { content: [{ type: 'text', text: jsonText({
           status: 'minted', executed: false, idempotent: true, burnTxHash: params.burnTxHash,
           walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: null,
@@ -2939,7 +2946,14 @@ export function createMcpServer(userId, context = {}) {
           error: null, message: 'Destination mint sudah selesai sebelumnya. Tidak mengirim UserOperation ulang.',
         }) }] }
       }
-      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress, userId, allowHashlessRecovery: true })
+      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress, userId, approvalId: pendingBridgeIntent?.approval?.id || null, allowHashlessRecovery: true })
+      if (mint.success && pendingBridgeIntent) {
+        await markBridgePendingResolved(userId, pendingBridgeIntent, 'success', {
+          ...(mint.txHash ? { txHash: mint.txHash } : {}),
+          ...(mint.explorerUrl ? { explorerUrl: mint.explorerUrl } : {}),
+          ...(mint.userOpHash ? { userOpHash: mint.userOpHash } : {}),
+        })
+      }
       return { content: [{ type: 'text', text: jsonText({        status: mint.success ? 'minted' : (mint.error === 'destination_mint_in_flight' || mint.error === 'destination_nonce_check_unavailable' ? 'settlement_pending' : 'mint_failed'), executed: mint.success && !mint.idempotent, idempotent: Boolean(mint.idempotent), burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, destinationMintStatus: mint.success ? 'minted' : 'pending', safeToRetry: mint.success ? false : (mint.safeToRetry ?? false), error: mint.success ? null : mint.error, message: mint.success ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya.' : 'Destination receiveMessage berhasil via MSCA UserOperation.') : (mint.error === 'destination_mint_in_flight' ? 'Destination mint UserOperation masih pending. Jangan retry sampai status UserOperation final.' : 'Destination mint belum aman untuk diulang; pastikan status UserOperation dan nonce destination sudah final.') }) }] }
 
     } catch (e) {
