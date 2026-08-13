@@ -2937,6 +2937,7 @@ export function createMcpServer(userId, context = {}) {
           await markBridgePendingResolved(userId, pendingBridgeIntent, 'success', {
             ...(pendingBridgeIntent.approval?.txHash ? { txHash: pendingBridgeIntent.approval.txHash } : {}),
             ...(pendingBridgeIntent.approval?.explorerUrl ? { explorerUrl: pendingBridgeIntent.approval.explorerUrl } : {}),
+            details: jsonText({ ...pendingBridgeIntent.details, settlementStatus: 'success', settlementPhase: 'destination_minted', destinationMintStatus: 'minted' }),
           })
         }
         return { content: [{ type: 'text', text: jsonText({
@@ -2952,6 +2953,7 @@ export function createMcpServer(userId, context = {}) {
           ...(mint.txHash ? { txHash: mint.txHash } : {}),
           ...(mint.explorerUrl ? { explorerUrl: mint.explorerUrl } : {}),
           ...(mint.userOpHash ? { userOpHash: mint.userOpHash } : {}),
+          details: jsonText({ ...pendingBridgeIntent.details, settlementStatus: 'success', settlementPhase: 'destination_minted', destinationMintStatus: 'minted', mintTxHash: mint.txHash || pendingBridgeIntent.details?.mintTxHash || null, destinationUserOpHash: mint.userOpHash || pendingBridgeIntent.details?.destinationUserOpHash || null }),
         })
       }
       return { content: [{ type: 'text', text: jsonText({        status: mint.success ? 'minted' : (mint.error === 'destination_mint_in_flight' || mint.error === 'destination_nonce_check_unavailable' ? 'settlement_pending' : 'mint_failed'), executed: mint.success && !mint.idempotent, idempotent: Boolean(mint.idempotent), burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, destinationMintStatus: mint.success ? 'minted' : 'pending', safeToRetry: mint.success ? false : (mint.safeToRetry ?? false), error: mint.success ? null : mint.error, message: mint.success ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya.' : 'Destination receiveMessage berhasil via MSCA UserOperation.') : (mint.error === 'destination_mint_in_flight' ? 'Destination mint UserOperation masih pending. Jangan retry sampai status UserOperation final.' : 'Destination mint belum aman untuk diulang; pastikan status UserOperation dan nonce destination sudah final.') }) }] }
