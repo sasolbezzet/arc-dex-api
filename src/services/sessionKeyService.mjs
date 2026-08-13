@@ -49,7 +49,7 @@ const BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 const DESTINATION_VERIFICATION_GAS_LIMITS = {
   'arc-testnet': 270_000n,
   'base-sepolia': 270_000n,
-  'arbitrum-sepolia': 140_000n,
+  'arbitrum-sepolia': 125_000n,
 }
 
 function parseFeeQuantity(value) {
