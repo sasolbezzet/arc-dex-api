@@ -47,9 +47,9 @@ const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
 const SESSION_INACTIVITY_MS = 24 * 60 * 60 * 1000
 const BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 const DESTINATION_VERIFICATION_GAS_LIMITS = {
-  'arc-testnet': 290_000n,
-  'base-sepolia': 290_000n,
-  'arbitrum-sepolia': 180_000n,
+  'arc-testnet': 270_000n,
+  'base-sepolia': 270_000n,
+  'arbitrum-sepolia': 140_000n,
 }
 
 function parseFeeQuantity(value) {
