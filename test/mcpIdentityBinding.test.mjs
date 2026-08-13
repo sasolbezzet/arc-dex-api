@@ -50,7 +50,7 @@ test('MCP wallet balances are bound to the active MSCA and expose four chains', 
   delete process.env.ENABLE_MSCA_CCTP_BRIDGE
   const { CHAINS } = await import('../src/services/chains.mjs?balance-test-' + Date.now())
   const values = {
-    'arc-testnet': { native: '0xde0b6b3a7640000', USDC: '0xf4240' },
+    'arc-testnet': { native: '0xde0b6b3a7640000', USDC: '0xf4240', EURC: '0x1e8480', USYC: '0x2dc6c0' },
     'ethereum-sepolia': { native: '0x16345785d8a0000', USDC: '0x0f4240', EURC: '0x1e8480' },
     'base-sepolia': { native: '0x6f05b59d3b20000', USDC: '0x2dc6c0', EURC: '0x1e8480' },
     'arbitrum-sepolia': { native: '0x2386f26fc10000', USDC: '0x4c4b40' },
@@ -102,11 +102,16 @@ test('MCP wallet balances are bound to the active MSCA and expose four chains', 
         assert.ok('nativeBalance' in chain)
         assert.ok('nativeSymbol' in chain)
         assert.ok('tokens' in chain)
+        assert.ok('tokenContracts' in chain)
+        assert.ok('contracts' in chain)
+        assert.deepEqual(chain.contracts.tokens, chain.tokenContracts)
         assert.ok(['ok', 'partial', 'error'].includes(chain.status))
       }
       assert.ok('USDC' in result, 'legacy flat Arc token field remains available')
       assert.equal(result.chains['arc-testnet'].nativeBalance, '1')
       assert.equal(result.chains['arc-testnet'].tokens.USDC, '1')
+      assert.equal(result.chains['arc-testnet'].tokens.EURC, '2')
+      assert.equal(result.chains['arc-testnet'].tokens.USYC, '3')
       assert.equal(result.chains['ethereum-sepolia'].nativeBalance, '0.1')
       assert.equal(result.chains['ethereum-sepolia'].tokens.USDC, '1')
       assert.equal(result.chains['base-sepolia'].tokens.USDC, '3')
@@ -530,6 +535,9 @@ test('multi-chain balance config has canonical USDC addresses and no fake Arbitr
   assert.equal(CHAINS['base-sepolia'].tokens.USDC.toLowerCase(), '0x036cbd53842c5426634e7929541ec2318f3dcf7e')
   assert.equal(CHAINS['arbitrum-sepolia'].tokens.USDC.toLowerCase(), '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d')
   assert.equal(CHAINS['arbitrum-sepolia'].tokens.EURC, null)
+  assert.equal(CHAINS['arc-testnet'].tokens.USDC.toLowerCase(), '0x3600000000000000000000000000000000000000')
+  assert.equal(CHAINS['arc-testnet'].tokens.EURC.toLowerCase(), '0x89b50855aa3be2f677cd6303cec089b5f319d72a')
+  assert.equal(CHAINS['arc-testnet'].tokens.USYC.toLowerCase(), '0xe9185f0c5f296ed1797aae4238d26ccabeadb86c')
 })
 
 test('CCTP V2 decoder distinguishes TokenMessenger header recipient from MSCA mint recipient', async () => {

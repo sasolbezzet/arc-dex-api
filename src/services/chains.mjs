@@ -11,14 +11,15 @@ export const CHAINS = {
     id: 5042002,
     name: 'Arc Testnet',
     shortName: 'ARC',
-    rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.io',
+    rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network',
     explorerUrl: 'https://testnet.arcscan.app',
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
     transportSlug: 'arcTestnet',
     tokens: {
       USDC:  '0x3600000000000000000000000000000000000000',
       ETH:   null, // native on Arc is USDC
-      EURC:  null,
+      EURC:  '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
+      USYC:  '0xe9185F0c5F296Ed1797AaE4238D26CCaBEadb86C',
       cirBTC: null,
     },
   },

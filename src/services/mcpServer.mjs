@@ -1356,14 +1356,43 @@ async function findPendingBridgeMint(userId, burnTxHash, toKey) {
   return null
 }
 
+// Classify the source phase using burn evidence only. An approval UserOperation
+// is not a burn: it may have a hash even when the later router call was rejected
+// before submission. This distinction is what lets a failed burn be treated as
+// "never happened" without ever bypassing an accepted/ambiguous burn.
+export function classifySourceBridgeBurn(details = {}, approval = {}) {
+  const phase = String(details?.settlementPhase || '')
+  const burnTxHash = details?.burnTxHash || null
+  const burnUserOpHash = details?.sourceUserOpHash || null
+  if (burnTxHash) return 'burn_confirmed'
+  if (burnUserOpHash) {
+    const reason = String(details?.reason || approval?.error || '').toLowerCase()
+    const terminal = details?.safeToRetry === true && [
+      'bundler_account_reputation_limit',
+      'bundler_stake_requirement',
+      'user_operation_precheck_failed',
+      'transaction_reverted',
+      'transaction_failed',
+      'user_operation_failed',
+    ].includes(reason)
+    return terminal ? 'burn_failed' : 'burn_unresolved'
+  }
+  if (['source_submission_failed', 'source_approval_failed'].includes(phase)
+    && details?.safeToRetry === true
+    && ['bundler_account_reputation_limit', 'bundler_stake_requirement', 'user_operation_precheck_failed', 'transaction_reverted', 'transaction_failed', 'user_operation_failed'].includes(String(details?.reason || '').toLowerCase())) {
+    return 'burn_failed'
+  }
+  if (['source_intent_created', 'source_approval_unknown', 'source_approval_submitted', 'source_approval_confirmed', 'source_submission_unknown', 'source_submitted', 'source_confirmed', 'source_submission_failed', 'source_approval_failed'].includes(phase)) return 'burn_unresolved'
+  return 'none'
+}
+
 // A new quote must not bypass an unresolved source UserOperation by using a
-// different previewId. Explicitly terminal precheck failures are different:
-// the bundler rejected them before returning a UserOperation hash, so a fresh
-// quote is safe. Any accepted hash, timeout, or hashless record without a
-// proven terminal precheck remains fail-closed.
+// different previewId. Explicitly terminal burn failures are different: the
+// bundler/receipt proved the router burn did not succeed, so no source funds
+// moved and a fresh quote is safe. Any accepted hash, timeout, or hashless
+// record without a proven terminal failure remains fail-closed.
 export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain, walletAddress } = {}) {
   const pendingPhases = new Set(['source_intent_created', 'source_approval_unknown', 'source_approval_submitted', 'source_approval_confirmed', 'source_submission_unknown', 'source_submitted', 'source_confirmed'])
-  const terminalPrecheckReasons = new Set(['bundler_account_reputation_limit', 'bundler_stake_requirement', 'user_operation_precheck_failed'])
   const expectedFrom = String(fromChain || '').toLowerCase()
   const expectedTo = String(toChain || '').toLowerCase()
   const expectedWallet = String(walletAddress || '').toLowerCase()
@@ -1377,33 +1406,12 @@ export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain,
     // different wallet. Fail closed and block the same user's route.
     if (expectedWallet && storedWallet && storedWallet !== expectedWallet) continue
 
-    const sourceHash = details?.sourceUserOpHash || details?.sourceApprovalUserOpHash || approval?.userOpHash
-    const burnHash = details?.burnTxHash || approval?.txHash
-    const errorText = String(details?.reason || approval?.error || '').toLowerCase()
-    const terminalPrecheck = ['source_submission_failed', 'source_approval_failed'].includes(details?.settlementPhase)
-      && !sourceHash && !burnHash
-      // Error text is diagnostic only. A record is retryable only when the
-      // execution path explicitly recorded that the bundler rejected it before
-      // acceptance; this prevents a transport error containing “paymaster”
-      // from being mistaken for proof that no burn was accepted.
-      && details?.userOpAccepted === 'no'
-      && details?.safeToRetry === true
-      && terminalPrecheckReasons.has(String(details?.reason || '').toLowerCase())
-      && [...terminalPrecheckReasons].some(reason => errorText.includes(reason))
-    const unresolvedSourceFailure = ['source_submission_failed', 'source_approval_failed'].includes(details?.settlementPhase)
-      && !terminalPrecheck
-    if (unresolvedSourceFailure) return { approval, details }
-    if (terminalPrecheck) continue
+    const burnState = classifySourceBridgeBurn(details, approval)
+    if (burnState === 'burn_failed' || burnState === 'none') continue
+    if (burnState === 'burn_confirmed') return { approval, details }
 
-    // Legacy source failures did not persist acceptance metadata. If they are
-    // hashless and not explicitly marked as a terminal precheck, the branch
-    // above already returned them as ambiguous; this fallback covers pending
-    // phases and the legacy unknown marker.
     const unknownSubmission = details?.settlementPhase === 'source_submission_unknown'
-      || (details?.settlementPhase === 'source_submission_failed'
-        && details?.userOpAccepted !== 'no'
-        && details?.safeToRetry !== true
-        && !sourceHash && !burnHash)
+      || (details?.settlementPhase === 'source_submission_failed' && burnState === 'burn_unresolved')
     if (!['pending_confirmation', 'pending_signature'].includes(approval?.status) && !unknownSubmission) continue
     if (!pendingPhases.has(details?.settlementPhase) && !unknownSubmission) continue
     return { approval, details }
@@ -1723,7 +1731,7 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
       to: route.destination.messageTransmitter,
       value: 0n,
       data: encodeFunctionData({ abi: RECEIVE_MESSAGE_ABI, functionName: 'receiveMessage', args: [status.message, status.attestation] }),
-    }], { paymaster: true, chainKey: destinationKey, feeProfile: destinationKey === 'arbitrum-sepolia' ? 'arbitrum-destination' : destinationKey === 'arc-testnet' ? 'arc-bridge' : 'base-destination', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+    }], { paymaster: true, chainKey: destinationKey, feeProfile: destinationKey === 'arbitrum-sepolia' ? 'arbitrum-destination' : destinationKey === 'arc-testnet' ? 'arc-destination' : 'base-destination', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
     if (result.status === 'pending_confirmation') {
       const details = {
         fromChain: route.fromKey,
@@ -2134,7 +2142,11 @@ export function createMcpServer(userId, context = {}) {
         USYC: chains['arc-testnet']?.USYC ?? null,
         cirBTC: chains['arc-testnet']?.cirBTC ?? null,
         supportedChains: ['arc-testnet', 'ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia'],
-        note: 'Semua balance dibaca dari alamat MSCA yang sama melalui read-only RPC; tidak memakai EOA atau Circle proxy wallet.',
+        balancePolicy: {
+          native: 'eth_getBalance dari MSCA; Arc native USDC memakai 18 decimals untuk gas',
+          erc20: 'balanceOf(MSCA) memakai address kontrak resmi per chain; Arc ERC-20 USDC memakai 6 decimals',
+        },
+        note: 'Semua balance dibaca dari alamat MSCA yang sama melalui read-only RPC; tidak memakai EOA atau Circle proxy wallet. Setiap chain mengembalikan tokenContracts/contracts untuk audit address.',
       }) }] }
     } catch (error) {
       return { content: [{ type: 'text', text: jsonText({
@@ -2551,12 +2563,18 @@ export function createMcpServer(userId, context = {}) {
         try {
           approvalResult = await executeViaSession(userId, [approveCall], executionOptions)
         } catch (submissionError) {
+          const submittedApprovalUserOpHash = submissionError?.userOpHash || null
+          const submittedApprovalExplorerUrl = submissionError?.explorerUrl || null
           await updateBridgePending(userId, approvalId, {
             fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId,
-            sourceChainKey: executionChainKey(route.fromKey), settlementPhase: 'source_approval_unknown',
+            sourceApprovalUserOpHash: submittedApprovalUserOpHash,
+            sourceChainKey: executionChainKey(route.fromKey),
+            settlementPhase: submittedApprovalUserOpHash ? 'source_approval_submitted' : 'source_approval_unknown',
             settlementStatus: 'pending_confirmation',
-          }, 'pending_confirmation', { error: submissionError?.message || 'Source approval UserOperation status unknown' })
-          return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, approvalSubmitted: false, approvalId, safeToRetry: false, reason: 'source_approval_unknown', message: 'Approval UserOperation sumber tidak pasti. Jangan kirim approval atau burn ulang; rekonsiliasi status terlebih dahulu.' }) }] }
+            userOpAccepted: submittedApprovalUserOpHash ? 'yes' : 'unknown',
+            safeToRetry: false,
+          }, 'pending_confirmation', { error: submissionError?.message || 'Source approval UserOperation status unknown', userOpHash: submittedApprovalUserOpHash, explorerUrl: submittedApprovalExplorerUrl })
+          return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, approvalSubmitted: Boolean(submittedApprovalUserOpHash), approvalId, sourceApprovalUserOpHash: submittedApprovalUserOpHash, userOpHash: submittedApprovalUserOpHash, userOpExplorerUrl: submittedApprovalExplorerUrl, safeToRetry: false, reason: submittedApprovalUserOpHash ? 'source_approval_pending' : 'source_approval_unknown', message: submittedApprovalUserOpHash ? 'Approval UserOperation sudah diterima bundler tetapi receipt belum tersedia. Jangan kirim approval ulang.' : 'Approval UserOperation sumber tidak pasti. Jangan kirim approval atau burn ulang; rekonsiliasi status terlebih dahulu.' }) }] }
         }
         const approvalSucceeded = approvalResult.status === 'success'
         const approvalPending = approvalResult.status === 'pending_confirmation'
@@ -2591,13 +2609,22 @@ export function createMcpServer(userId, context = {}) {
       try {
         result = await executeViaSession(userId, [burnCall], executionOptions)
       } catch (submissionError) {
+        // executeViaSession may throw after Circle accepted the operation
+        // (for example, receipt indexing failed). Preserve that hash as a
+        // burn submission; only a known precheck result is safe to replace.
+        const submittedBurnUserOpHash = submissionError?.userOpHash || null
+        const submittedBurnExplorerUrl = submissionError?.explorerUrl || null
         await updateBridgePending(userId, approvalId, {
           fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId,
           sourceApprovalUserOpHash,
-          sourceChainKey: executionChainKey(route.fromChain), settlementPhase: 'source_submission_unknown',
+          sourceUserOpHash: submittedBurnUserOpHash,
+          sourceChainKey: executionChainKey(route.fromKey),
+          settlementPhase: submittedBurnUserOpHash ? 'source_submitted' : 'source_submission_unknown',
           settlementStatus: 'pending_confirmation',
-        }, 'pending_confirmation', { error: submissionError?.message || 'Source burn UserOperation submission status unknown' })
-        return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, approvalSubmitted: true, sourceSubmitted: false, approvalId, safeToRetry: false, reason: 'source_submission_unknown', message: 'Approval sudah selesai tetapi hasil burn UserOperation tidak pasti. Jangan kirim burn ulang; rekonsiliasi status terlebih dahulu.' }) }] }
+          userOpAccepted: submittedBurnUserOpHash ? 'yes' : 'unknown',
+          safeToRetry: false,
+        }, 'pending_confirmation', { error: submissionError?.message || 'Source burn UserOperation submission status unknown', userOpHash: submittedBurnUserOpHash, explorerUrl: submittedBurnExplorerUrl })
+        return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, approvalSubmitted: true, sourceSubmitted: Boolean(submittedBurnUserOpHash), approvalId, sourceApprovalUserOpHash, sourceUserOpHash: submittedBurnUserOpHash, userOpHash: submittedBurnUserOpHash, userOpExplorerUrl: submittedBurnExplorerUrl, safeToRetry: false, reason: submittedBurnUserOpHash ? 'source_user_operation_pending' : 'source_submission_unknown', message: submittedBurnUserOpHash ? 'Burn UserOperation sudah diterima bundler tetapi receipt belum tersedia. Jangan burn ulang; rekonsiliasi hash ini.' : 'Approval sudah selesai tetapi hasil burn UserOperation tidak pasti. Jangan kirim burn ulang; rekonsiliasi status terlebih dahulu.' }) }] }
       }
       const sourceSucceeded = result.status === 'success'
       const sourcePending = result.status === 'pending_confirmation'
@@ -2612,7 +2639,10 @@ export function createMcpServer(userId, context = {}) {
         settlementStatus: sourceSucceeded ? 'source_confirmed' : sourcePending ? 'pending_confirmation' : 'error',
         reason: result.reason || null,
         userOpAccepted: result.userOpAccepted || (result.userOpHash ? 'yes' : sourceFailed ? 'unknown' : null),
-        safeToRetry: result.safeToRetry === true,
+        // A definitive burn precheck/revert means the router was never
+        // successfully called. It is safe to make a fresh quote; only a
+        // successful burnTxHash remains recoverable via destination mint.
+        safeToRetry: result.safeToRetry === true || (sourceFailed && ['transaction_reverted', 'transaction_failed', 'user_operation_failed'].includes(String(result.reason || ''))),
       }, sourceFailed ? 'error' : 'pending_confirmation', { txHash: sourceSucceeded ? result.txHash : undefined, userOpHash: result.userOpHash, explorerUrl: result.explorerUrl, error: result.error })
       executionQuotes.delete(params.previewId)
       if (result.status === 'pending_confirmation') {

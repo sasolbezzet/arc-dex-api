@@ -52,3 +52,78 @@ test('receipt errors retain the accepted UserOperation hash for destination reco
   assert.match(annotated.explorerUrl, /0x[a]+$/)
   assert.equal(annotated.code, 'user_operation_receipt_unavailable')
 })
+
+test('destination bridge fee preparation prefers Circle Gas Station fee recommendations', async () => {
+  const { buildUserOperationParams } = await import('../src/services/sessionKeyService.mjs?circle-gas-destination-' + Date.now() + '-' + Math.random())
+  const methods = []
+  const params = await buildUserOperationParams({
+    account: {},
+    calls: [],
+    chainKey: 'base-sepolia',
+    feeProfile: 'base-destination',
+    baseClient: {
+      request: async ({ method }) => {
+        methods.push(method)
+        if (method === 'circle_getUserOperationGasPrice') return { medium: { maxFeePerGas: '2000000000', maxPriorityFeePerGas: '1000000000' } }
+        return '0x1'
+      },
+      getGasPrice: async () => 1n,
+    },
+  })
+  assert.ok(methods.includes('circle_getUserOperationGasPrice'))
+  assert.equal(params.maxPriorityFeePerGas, 1_000_000_000n)
+  assert.equal(params.maxFeePerGas, 3_000_000_000n)
+  assert.equal(params.verificationGasLimit, 270_000n)
+})
+
+test('failed source burn before router execution does not block a fresh bridge quote', async () => {
+  const { classifySourceBridgeBurn, hasUnresolvedSourceBridgeIntent } = await import('../src/services/mcpServer.mjs?source-burn-retry-' + Date.now() + '-' + Math.random())
+  const approvalHash = '0x' + 'a'.repeat(64)
+  const failed = {
+    id: 'approval-only',
+    action: 'bridge',
+    status: 'error',
+    userOpHash: approvalHash,
+    details: JSON.stringify({
+      fromChain: 'Arc_Testnet',
+      toChain: 'Base_Sepolia',
+      walletAddress: '0x2222222222222222222222222222222222222222',
+      sourceApprovalUserOpHash: approvalHash,
+      settlementPhase: 'source_submission_failed',
+      reason: 'user_operation_precheck_failed',
+      userOpAccepted: 'no',
+      safeToRetry: true,
+    }),
+  }
+  assert.equal(classifySourceBridgeBurn(JSON.parse(failed.details), failed), 'burn_failed')
+  assert.equal(hasUnresolvedSourceBridgeIntent([failed], {
+    fromChain: 'Arc_Testnet',
+    toChain: 'Base_Sepolia',
+    walletAddress: '0x2222222222222222222222222222222222222222',
+  }), null)
+})
+
+test('accepted source burn remains blocked even when the preview id changes', async () => {
+  const { classifySourceBridgeBurn, hasUnresolvedSourceBridgeIntent } = await import('../src/services/mcpServer.mjs?source-burn-accepted-' + Date.now() + '-' + Math.random())
+  const burnUserOpHash = '0x' + 'b'.repeat(64)
+  const pending = {
+    id: 'burn-accepted',
+    action: 'bridge',
+    status: 'pending_confirmation',
+    details: JSON.stringify({
+      fromChain: 'Arc_Testnet',
+      toChain: 'Base_Sepolia',
+      previewId: 'old-preview',
+      walletAddress: '0x2222222222222222222222222222222222222222',
+      sourceUserOpHash: burnUserOpHash,
+      settlementPhase: 'source_submitted',
+      userOpAccepted: 'yes',
+    }),
+  }
+  assert.equal(classifySourceBridgeBurn(JSON.parse(pending.details), pending), 'burn_unresolved')
+  assert.equal(hasUnresolvedSourceBridgeIntent([pending], {
+    fromChain: 'Arc_Testnet',
+    toChain: 'Base_Sepolia',
+    walletAddress: '0x2222222222222222222222222222222222222222',
+  })?.approval.id, pending.id)
+})

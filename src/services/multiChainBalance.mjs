@@ -63,6 +63,15 @@ async function fetchChainBalances(chainKey, walletAddress) {
     }
   }
   balances.tokens = tokens
+  // Return the exact contract used for every ERC-20 read. Arc's native USDC
+  // balance is intentionally separate: Arc documents native USDC with 18
+  // decimals and the optional ERC-20 interface with 6 decimals, while both
+  // represent the same underlying balance.
+  balances.tokenContracts = Object.fromEntries(Object.entries(chain.tokens).filter(([, address]) => Boolean(address)))
+  balances.contracts = {
+    nativeBalance: null,
+    tokens: balances.tokenContracts,
+  }
   // Preserve the established flat token keys consumed by the frontend and
   // older MCP clients, while exposing nativeBalance separately.
   Object.assign(balances, tokens)
@@ -93,6 +102,11 @@ export async function fetchAllChainBalances(walletAddress) {
         nativeBalance: null,
         nativeSymbol: CHAINS[key]?.nativeCurrency?.symbol || null,
         tokens: {},
+        tokenContracts: Object.fromEntries(Object.entries(CHAINS[key]?.tokens || {}).filter(([, address]) => Boolean(address))),
+        contracts: {
+          nativeBalance: null,
+          tokens: Object.fromEntries(Object.entries(CHAINS[key]?.tokens || {}).filter(([, address]) => Boolean(address))),
+        },
         status: 'error',
         errors: [error?.message || 'RPC lookup failed'],
       }

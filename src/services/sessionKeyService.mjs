@@ -51,6 +51,7 @@ const DESTINATION_VERIFICATION_GAS_LIMITS = {
   'base-sepolia': 270_000n,
   'arbitrum-sepolia': 125_000n,
 }
+const CIRCLE_GAS_PRICE_LEVELS = ['medium', 'fast', 'slow']
 
 function parseFeeQuantity(value) {
   try {
@@ -1094,11 +1095,27 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
 /** Build the exact UserOperation parameters used by sendUserOperation. */
 export function buildUserOperationParams({ account, calls, chainKey, baseClient, feeProfile } = {}) {
   const params = { account, calls }
-  const destinationBridge = ['arc-bridge', 'base-destination', 'arbitrum-destination'].includes(String(feeProfile || ''))
+  const destinationBridge = ['arc-bridge', 'arc-destination', 'base-destination', 'arbitrum-destination'].includes(String(feeProfile || ''))
   if (chainKey !== 'arbitrum-sepolia' && !destinationBridge) return params
   return (async () => {
-    const gasPrice = baseClient?.getGasPrice ? await baseClient.getGasPrice().catch(() => 0n) : 0n
-    const suggestedPriority = baseClient?.request ? await baseClient.request({ method: 'eth_maxPriorityFeePerGas' }).catch(() => 0n) : 0n
+    // Use Circle's UserOperation gas-price recommendation first so the
+    // destination operation matches the same envelope expected by Gas Station.
+    // Public RPC values remain a fallback when the method is unavailable.
+    let circleFees = null
+    if (baseClient?.request) {
+      const price = await baseClient.request({ method: 'circle_getUserOperationGasPrice', params: [] }).catch(() => null)
+      for (const levelName of CIRCLE_GAS_PRICE_LEVELS) {
+        const level = price?.[levelName]
+        const maxFeePerGas = parseFeeQuantity(level?.maxFeePerGas)
+        const maxPriorityFeePerGas = parseFeeQuantity(level?.maxPriorityFeePerGas)
+        if (maxFeePerGas !== null && maxPriorityFeePerGas !== null && maxPriorityFeePerGas > 0n && maxFeePerGas >= maxPriorityFeePerGas) {
+          circleFees = { maxFeePerGas, maxPriorityFeePerGas }
+          break
+        }
+      }
+    }
+    const gasPrice = circleFees?.maxFeePerGas ?? (baseClient?.getGasPrice ? await baseClient.getGasPrice().catch(() => 0n) : 0n)
+    const suggestedPriority = circleFees?.maxPriorityFeePerGas ?? (baseClient?.request ? await baseClient.request({ method: 'eth_maxPriorityFeePerGas' }).catch(() => 0n) : 0n)
     const fees = normalizeUserOperationFees({ maxFeePerGas: gasPrice, maxPriorityFeePerGas: suggestedPriority })
     params.maxFeePerGas = fees.maxFeePerGas
     params.maxPriorityFeePerGas = fees.maxPriorityFeePerGas
@@ -1201,10 +1218,10 @@ export async function executeViaSession(userId, calls, options = {}) {
   // using Circle paymaster there triggers the efficiency/stake guard. Rollup
   // destinations remain sponsored, but preserve the non-zero fee envelope
   // because the paymaster response can otherwise overwrite it with zero.
-  const arcBridgeProfile = chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
-  const sponsoredDestination = ['base-destination', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
+  const arcSourceBridgeProfile = chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
+  const sponsoredDestination = ['arc-destination', 'base-destination', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
   if (options.paymaster === true) {
-    if (arcBridgeProfile) userOpParams.paymaster = false
+    if (arcSourceBridgeProfile) userOpParams.paymaster = false
     else if (sponsoredDestination || chainKey === 'arbitrum-sepolia') userOpParams.paymaster = paymasterWithFeeOverrides(modularClient, userOpParams)
     else userOpParams.paymaster = true
   }
