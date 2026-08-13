@@ -1405,6 +1405,11 @@ export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain,
     // Missing wallet binding is not evidence that the intent belongs to a
     // different wallet. Fail closed and block the same user's route.
     if (expectedWallet && storedWallet && storedWallet !== expectedWallet) continue
+    // A legacy Circle/frontend bridge record can contain a burn hash even after
+    // destination mint already completed. It remains recoverable by the
+    // explicit burn-hash retry tool, but it is not an unresolved source intent
+    // and must not block a new quote forever.
+    if (details?.mintTxHash || details?.destinationMintStatus === 'minted' || details?.settlementStatus === 'success' || approval?.status === 'success') continue
 
     const burnState = classifySourceBridgeBurn(details, approval)
     if (burnState === 'burn_failed' || burnState === 'none') continue

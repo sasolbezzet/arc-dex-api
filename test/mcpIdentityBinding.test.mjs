@@ -512,6 +512,25 @@ test('unresolved source intent blocks burns but permits approval-only recovery',
     toChain: 'Base_Sepolia',
     walletAddress: MSCA,
   })?.approval.id, 'approval-unknown-error')
+
+  // Completed legacy frontend/Circle bridge records remain recoverable by
+  // burn hash, but destination mint is already done and must not block quotes.
+  assert.equal(hasUnresolvedSourceBridgeIntent([{
+    id: 'completed-legacy-bridge',
+    action: 'bridge',
+    status: 'approved',
+    txHash: '0x' + 'b'.repeat(64),
+    details: JSON.stringify({
+      fromChain: 'Arc_Testnet',
+      toChain: 'Base_Sepolia',
+      burnTxHash: '0x' + 'a'.repeat(64),
+      mintTxHash: '0x' + 'c'.repeat(64),
+    }),
+  }], {
+    fromChain: 'Arc_Testnet',
+    toChain: 'Base_Sepolia',
+    walletAddress: MSCA,
+  }), null)
 })
 
 test('multi-chain balance preserves a structured error for an unavailable chain', async () => {
