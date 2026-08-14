@@ -5,6 +5,7 @@ import { verifyAgentOwnership } from '../services/agentIdentityService.mjs'
 import { verifyOwnerToken } from '../services/authToken.mjs'
 import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
+import { arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
@@ -221,9 +222,9 @@ export async function reconcileX402Invoice(id) {
       scheduleAgentMemoProof(invoice)
       return invoice
     }
-    const rpc = process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'
+    const rpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
     const drpcKey = process.env.DRPC_KEY || ''
-    const fallbackRpcs = ['https://rpc.testnet.arc.network', 'https://arc-testnet.drpc.org', 'https://rpc.testnet.arc-node.thecanteenapp.com/v1/swrm_cb280d6a2612407c4a1dfc8ae235c0ae62bdfe0740559a355dcb7c48b22b345a'].filter(u => u !== rpc)
+    const fallbackRpcs = arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' }).filter(u => u !== rpc)
     const transports = [
       http(rpc, { timeout: 8_000, retryCount: 1, ...(drpcKey ? { fetchOptions: { headers: { Authorization: `Bearer ${drpcKey}` } } } : {}) }),
       ...fallbackRpcs.map(u => http(u, { timeout: 8_000, retryCount: 1 })),

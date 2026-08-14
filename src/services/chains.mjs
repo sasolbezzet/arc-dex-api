@@ -1,5 +1,6 @@
 // chains.mjs — Multi-chain configuration for MSCA + balance fetching.
 // Supported: Arc Testnet, Ethereum Sepolia, Arbitrum Sepolia, Base Sepolia.
+import { resolveArcRpc } from '../config/arcRpc.mjs'
 
 // Circle Modular Wallet/MSCA support is narrower than Circle Gas Station support.
 // Ethereum Sepolia can use other Circle wallet products/Gas Station, but it is
@@ -11,7 +12,7 @@ export const CHAINS = {
     id: 5042002,
     name: 'Arc Testnet',
     shortName: 'ARC',
-    rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network',
+    rpcUrl: resolveArcRpc(),
     explorerUrl: 'https://testnet.arcscan.app',
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
     transportSlug: 'arcTestnet',

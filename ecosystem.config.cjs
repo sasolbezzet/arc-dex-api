@@ -8,6 +8,7 @@ module.exports = {
       node_args: '--env-file=.env',
       env: {
         NODE_ENV: 'production',
+        USE_CANTEEN_RPC: 'true',
       },
       env_file: '.env',
       instances: 1,

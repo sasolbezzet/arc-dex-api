@@ -212,7 +212,7 @@ yang sudah ter-deploy menyimpan treasury on-chain; owner juga harus memanggil
 
 Catatan teknis:
 
-- RPC `rpc.testnet.arc.network` adalah RPC publik yang sinkron dan direkomendasikan. Jangan pakai `arc-node.thecanteenapp.com` karena tertinggal ~1 blok dan menyebabkan nonce konflik.
+- RPC publik `rpc.testnet.arc.network` adalah fallback yang sinkron. Production backend dan local agent dapat memakai RPC Canteen melalui environment lokal (`arc-canteen rpc-url`); jangan commit URL bertoken ke repository.
 - `eth_getLogs` pada RPC publik dibatasi 10,000 block range per request. Backend memecah lookback menjadi chunk 8,000 block untuk menghindari error.
 - Invoice yang sudah `expired` tetap di-reconcile jika ada bukti pembayaran on-chain (memo atau Gateway). Ini mencegah dana terkunci saat TTL 300 detik berlalu sebelum reconcile sempat berjalan.
 - PM2 membutuhkan `--update-env` setelah mengubah `.env` agar env baru dimuat. Tanpa ini, process restart dengan env lama.

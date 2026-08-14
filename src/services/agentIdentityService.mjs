@@ -1,4 +1,5 @@
 import { createPublicClient, defineChain, getAddress, http, fallback, isAddress, parseAbiItem } from 'viem'
+import { arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
 
 export const IDENTITY_REGISTRY = '0x8004A818BFB912233c491871b3d84c89A494BD9e'
 const TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 indexed tokenId)')
@@ -10,14 +11,10 @@ const identityAbi = [
   { type: 'function', name: 'tokenURI', stateMutability: 'view', inputs: [{ name: 'tokenId', type: 'uint256' }], outputs: [{ name: '', type: 'string' }] },
 ]
 
-const ARC_FALLBACK_RPCS = [
-  'https://rpc.testnet.arc.network',
-  'https://arc-testnet.drpc.org',
-  'https://rpc.testnet.arc-node.thecanteenapp.com/v1/swrm_cb280d6a2612407c4a1dfc8ae235c0ae62bdfe0740559a355dcb7c48b22b345a',
-]
+const ARC_FALLBACK_RPCS = arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
 
 function client() {
-  const primaryRpc = process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'
+  const primaryRpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
   const chain = defineChain({
     id: Number(process.env.ARC_CHAIN_ID || 5042002),
     name: 'Arc Testnet',

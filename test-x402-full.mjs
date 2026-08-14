@@ -8,7 +8,7 @@ const chain = {
   id: 5042002,
   name: 'Arc Testnet',
   nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-  rpcUrls: { default: { http: ['https://rpc.testnet.arc-node.thecanteenapp.com/v1/swrm_cb280d6a2612407c4a1dfc8ae235c0ae62bdfe0740559a355dcb7c48b22b345a'] } },
+  rpcUrls: { default: { http: ['https://rpc.testnet.arc.network'] } },
 }
 
 const client = createWalletClient({ account, chain, transport: http() })

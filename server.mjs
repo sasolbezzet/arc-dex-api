@@ -30,6 +30,7 @@ import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
 import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus } from './src/services/circleWalletWebhookService.mjs'
+import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 
 process.umask(0o077)
@@ -630,12 +631,9 @@ const SIWE_ALLOWED_DOMAINS = (process.env.SIWE_ALLOWED_DOMAINS || DEFAULT_SIWE_D
 if (!process.env.AUTH_SECRET) console.warn('[security] AUTH_SECRET not set. Set a dedicated random AUTH_SECRET before production.')
 
 const DRPC_KEY = process.env.DRPC_KEY || ''
-// Primary public Arc RPC, plus fallbacks. Order matters: public Arc first, then dRPC, then canteenapp.
-const ARC_RPC_URLS = [
-  'https://rpc.testnet.arc.network',
-  'https://arc-testnet.drpc.org',
-  'https://rpc.testnet.arc-node.thecanteenapp.com/v1/swrm_cb280d6a2612407c4a1dfc8ae235c0ae62bdfe0740559a355dcb7c48b22b345a',
-]
+// Prefer the local Canteen RPC when explicitly enabled by production env;
+// never hardcode its token in source. Public Arc and dRPC remain fallbacks.
+const ARC_RPC_URLS = arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
 const ARC_RPC_PRIMARY = ARC_RPC_URLS[0]
 const ARC_RPC_DRPC = 'https://arc-testnet.drpc.org'
 /** Fetch wrapper — adds Bearer auth header for dRPC when DRPC_KEY is set and

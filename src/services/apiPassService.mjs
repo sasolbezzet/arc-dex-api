@@ -1,4 +1,5 @@
 import { createPublicClient, defineChain, getAddress, http, fallback } from 'viem'
+import { arcRpcUrls } from '../config/arcRpc.mjs'
 
 export const API_PASS_ABI = [
   { type: 'function', name: 'ownerOf', stateMutability: 'view', inputs: [{ name: 'tokenId', type: 'uint256' }], outputs: [{ type: 'address' }] },
@@ -7,11 +8,7 @@ export const API_PASS_ABI = [
   { type: 'function', name: 'isSessionDelegate', stateMutability: 'view', inputs: [{ name: 'tokenId', type: 'uint256' }, { name: 'delegate', type: 'address' }], outputs: [{ type: 'bool' }] },
 ]
 
-const ARC_RPC_LIST = [
-  process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org',
-  'https://rpc.testnet.arc.network',
-  'https://rpc.testnet.arc-node.thecanteenapp.com/v1/swrm_cb280d6a2612407c4a1dfc8ae235c0ae62bdfe0740559a355dcb7c48b22b345a',
-].filter(Boolean)
+const ARC_RPC_LIST = arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
 const chain = defineChain({
   id: 5042002,
   name: 'Arc Testnet',

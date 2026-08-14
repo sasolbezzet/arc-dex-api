@@ -553,6 +553,7 @@ import { mintOwnerToken } from './authToken.mjs'
 import { markX402ServiceOutcome, publicInvoice } from '../middleware/x402Middleware.mjs'
 import { fetchAllChainBalances } from './multiChainBalance.mjs'
 import { CHAINS } from './chains.mjs'
+import { arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
 
 // The MCP userId is the SIWE-verified EOA used only as the tenant/auth identity.
 // On-chain reads, quotes, and execution must use the explicitly mapped Agent
@@ -579,7 +580,7 @@ export async function resolveActiveMsca(userId, boundMscaWalletAddress = '') {
     if (isSelfAlias) {
       // Self-alias is allowed only if the address is a deployed contract (MSCA)
       const { createPublicClient, http, defineChain } = await import('viem')
-      const arcRpc = process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network'
+      const arcRpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
       const client = createPublicClient({ chain: defineChain({ id: 5042002, name: 'Arc Testnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [arcRpc] } } }), transport: http(arcRpc) })
       const code = await client.getBytecode({ address: info.walletAddress }).catch(() => undefined)
       if (!code || code === '0x') return null
@@ -663,7 +664,7 @@ const BRIDGE_CCTP = {
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
     // Frontend uses CCTP V2 fast finality for all EVM routes.
     requiredFinalityThreshold: 1000,
-    rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.testnet.arc.network',
+    rpcUrl: resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' }),
     explorer: 'https://testnet.arcscan.app/tx/',
     router: process.env.ARCOX_FEE_ROUTER_ADDRESS || '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
   },
@@ -763,7 +764,7 @@ function bridgeRpcUrls(chainConfig) {
   const key = String(chainConfig?.name || '').toLowerCase()
   const chainId = Number(chainConfig?.chainId)
   const configured = key === 'arc_testnet' || chainId === 5042002
-    ? [process.env.ARC_RPC_URL, 'https://rpc.testnet.arc.network', 'https://arc-testnet.drpc.org']
+    ? arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
     : key === 'base_sepolia' || chainId === 84532
       ? [process.env.BASE_SEPOLIA_RPC_URL, 'https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com']
       : key === 'arbitrum_sepolia' || chainId === 421614
@@ -1295,7 +1296,7 @@ async function destinationMscaPreflight({ route, walletAddress, requireAuthoriza
   const { createPublicClient } = await import('viem')
   const rpcUrls = [...new Set([
     route.destination.rpcUrl,
-    ...(route.toKey === 'Arc_Testnet' ? [process.env.ARC_RPC_URL, 'https://rpc.testnet.arc.network', 'https://arc-testnet.drpc.org'] : []),
+    ...(route.toKey === 'Arc_Testnet' ? arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' }) : []),
     ...(route.toKey === 'Base_Sepolia' ? [process.env.BASE_SEPOLIA_RPC_URL, 'https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com'] : []),
     ...(route.toKey === 'Arbitrum_Sepolia' ? [process.env.ARB_SEPOLIA_RPC_URL, 'https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com'] : []),
   ].filter(Boolean))]

@@ -1,6 +1,7 @@
 import { createPublicClient, createWalletClient, defineChain, encodeFunctionData, getAddress, http, keccak256, toHex } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { IDENTITY_REGISTRY } from './agentIdentityService.mjs'
+import { resolveArcRpc } from '../config/arcRpc.mjs'
 
 export const ARC_MEMO_CONTRACT = process.env.ARC_MEMO_CONTRACT || '0x5294E9927c3306DcBaDb03fe70b92e01cCede505'
 const memoAbi = [{
@@ -47,7 +48,7 @@ export async function submitAgentMemoProof(input = {}) {
   const chain = defineChain({
     id: Number(process.env.ARC_CHAIN_ID || 5042002), name: 'Arc Testnet',
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-    rpcUrls: { default: { http: [process.env.ARC_RPC_URL || process.env.RPC || 'https://arc-testnet.drpc.org'] } },
+    rpcUrls: { default: { http: [resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })] } },
   })
   const transport = http(chain.rpcUrls.default.http[0], { timeout: 12_000, retryCount: 1 })
   const wallet = createWalletClient({ account, chain, transport })
