@@ -5,7 +5,7 @@ import { verifyAgentOwnership } from '../services/agentIdentityService.mjs'
 import { verifyOwnerToken } from '../services/authToken.mjs'
 import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
-import { arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
+import { ARC_RPC_LOG_CHUNK_SIZE, arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
@@ -253,7 +253,7 @@ export async function reconcileX402Invoice(id) {
       return invoice
     }
     const invoiceCreatedAt = Date.parse(invoice.createdAt || '')
-    const chunkSize = 8_000n
+    const chunkSize = ARC_RPC_LOG_CHUNK_SIZE
     let match = null
     for (let chunkStart = fromBlock; chunkStart <= current && !match; chunkStart += chunkSize) {
       const chunkEnd = chunkStart + chunkSize - 1n > current ? current : chunkStart + chunkSize - 1n
@@ -394,7 +394,7 @@ async function findMemoPayment(client, invoice, fromBlock, toBlock) {
   const expectedAmount = safeNormalizeAmount(invoice.uniqueAmount)
   const expectedTo = normalizeAddress(invoice.recipient)
   if (!expectedAmount || !expectedTo) return null
-  const chunkSize = 8_000n
+  const chunkSize = ARC_RPC_LOG_CHUNK_SIZE
   let allMemoLogs = []
   for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += chunkSize) {
     const chunkEnd = chunkStart + chunkSize - 1n > toBlock ? toBlock : chunkStart + chunkSize - 1n

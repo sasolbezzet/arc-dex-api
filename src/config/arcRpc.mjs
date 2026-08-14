@@ -3,6 +3,10 @@ import { homedir } from 'os'
 
 export const PUBLIC_ARC_RPC = 'https://rpc.testnet.arc.network'
 export const DRPC_ARC_RPC = 'https://arc-testnet.drpc.org'
+// Canteen rejects the public-RPC 8k log window and can hit its response-size
+// limit sooner when a high-volume ERC-20 event is queried. Keep all Arc scans
+// below the observed safe window for both Canteen and fallback consistency.
+export const ARC_RPC_LOG_CHUNK_SIZE = 2_000n
 const CANTEEN_ENV_FILE = `${homedir()}/.arc-canteen/env`
 
 function readCanteenRpc() {

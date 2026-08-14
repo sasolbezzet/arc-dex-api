@@ -1,5 +1,5 @@
 import { createPublicClient, defineChain, getAddress, http, fallback, isAddress, parseAbiItem } from 'viem'
-import { arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
+import { ARC_RPC_LOG_CHUNK_SIZE, arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
 
 export const IDENTITY_REGISTRY = '0x8004A818BFB912233c491871b3d84c89A494BD9e'
 const TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 indexed tokenId)')
@@ -103,7 +103,7 @@ async function idsFromRecentLogs(rpc, owner, expected) {
   const floor = latest > lookback ? latest - lookback : 0n
   const ids = new Set()
   for (let toBlock = latest; toBlock >= floor && ids.size < expected;) {
-    const fromBlock = toBlock > 9_999n ? toBlock - 9_999n : 0n
+    const fromBlock = toBlock > ARC_RPC_LOG_CHUNK_SIZE - 1n ? toBlock - (ARC_RPC_LOG_CHUNK_SIZE - 1n) : 0n
     const logs = await rpc.getLogs({ address: IDENTITY_REGISTRY, event: TRANSFER_EVENT, args: { to: owner }, fromBlock: fromBlock < floor ? floor : fromBlock, toBlock })
     for (const log of logs) if (log.args.tokenId !== undefined) ids.add(log.args.tokenId.toString())
     if (fromBlock <= floor) break

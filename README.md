@@ -18,7 +18,7 @@ MCP selalu menggunakan URL web production di atas; alamat VPS hanya dipakai seba
 - Circle Gateway webhook foundation dan dev simulator.
 - Eco route preview untuk future cross-chain stablecoin invoice.
 - x402 middleware untuk premium API endpoint memakai real Arc Testnet USDC invoice.
-- Arc Transaction Memo reconciliation untuk x402 payment dengan chunked `eth_getLogs` (8k block range per request) untuk menghormati batas 10k RPC.
+- Arc Transaction Memo reconciliation untuk x402 payment dengan chunked `eth_getLogs` (2k block range per request) agar kompatibel dengan RPC Canteen dan fallback publik.
 - Reconcile invoice yang sudah `expired` tetap diproses jika ada bukti pembayaran on-chain (memo transfer atau Gateway record).
 - `wallets-db.json` sebagai mapping owner ke Circle wallet proxy.
 - `tx-history-db.json` sebagai history transaksi web UI dan agent.
@@ -213,7 +213,7 @@ yang sudah ter-deploy menyimpan treasury on-chain; owner juga harus memanggil
 Catatan teknis:
 
 - RPC publik `rpc.testnet.arc.network` adalah fallback yang sinkron. Production backend dan local agent dapat memakai RPC Canteen melalui environment lokal (`arc-canteen rpc-url`); jangan commit URL bertoken ke repository.
-- `eth_getLogs` pada RPC publik dibatasi 10,000 block range per request. Backend memecah lookback menjadi chunk 8,000 block untuk menghindari error.
+- `eth_getLogs` pada RPC Canteen memiliki batas parameter/ukuran respons yang lebih ketat daripada RPC publik. Semua scan Arc memakai chunk konservatif 2,000 block agar tidak gagal `-32602` atau response-size limit.
 - Invoice yang sudah `expired` tetap di-reconcile jika ada bukti pembayaran on-chain (memo atau Gateway). Ini mencegah dana terkunci saat TTL 300 detik berlalu sebelum reconcile sempat berjalan.
 - PM2 membutuhkan `--update-env` setelah mengubah `.env` agar env baru dimuat. Tanpa ini, process restart dengan env lama.
 - Hati-hati zombie process: pastikan tidak ada process lama yang masih mendengarkan di port 3001 sebelum start backend baru.
