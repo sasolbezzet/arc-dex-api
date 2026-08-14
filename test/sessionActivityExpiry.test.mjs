@@ -59,6 +59,14 @@ test('session status stays active on a read after a long idle period', async () 
   }
 })
 
+test('MCP HTTP transport does not expire during a normal 1-2 hour Claude idle period', async () => {
+  const { MCP_SESSION_IDLE_TTL_MS, shouldExpireMcpSession } = await import('../src/services/mcpServer.mjs?mcp-transport-idle-' + Date.now())
+  const now = Date.now()
+  assert.equal(MCP_SESSION_IDLE_TTL_MS, 24 * 60 * 60 * 1000)
+  assert.equal(shouldExpireMcpSession({ lastActivity: now - (2 * 60 * 60 * 1000) }, now), false)
+  assert.equal(shouldExpireMcpSession({ lastActivity: now - (25 * 60 * 60 * 1000) }, now), true)
+})
+
 test('MCP connection stays active after 24 hours without an agent request', async () => {
   const { registerMcpSession, listMcpSessions } = await import('../src/services/vaultStore.mjs?mcp-connection-inactivity-' + Date.now())
   const userId = '0x' + 'ab'.repeat(20)

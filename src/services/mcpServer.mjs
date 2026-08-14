@@ -30,6 +30,16 @@ function jsonText(value) {
 const SERVER_URL = process.env.SERVER_URL || 'https://arcoxdex.vercel.app'
 const MCP_RESOURCE_URL = `${SERVER_URL}/mcp`
 const TOKEN_TTL = 3600 * 24 // 24 hours
+// Keep the Streamable HTTP transport alive for the same practical lifetime as
+// the OAuth token. The previous fixed 30-minute timer deleted an otherwise
+// valid MCP session while Claude was idle; its next tools/call then reached a
+// missing transport and surfaced as the opaque SDK execution error.
+export const MCP_SESSION_IDLE_TTL_MS = Number(process.env.MCP_SESSION_IDLE_TTL_MS || 24 * 60 * 60 * 1000)
+
+export function shouldExpireMcpSession(session, now = Date.now()) {
+  const lastActivity = Number(session?.lastActivity || 0)
+  return lastActivity > 0 && now - lastActivity >= MCP_SESSION_IDLE_TTL_MS
+}
 
 function validResourceIndicator(resource) {
   return !resource || String(resource) === MCP_RESOURCE_URL
@@ -3525,15 +3535,29 @@ export async function mcpHttpHandler(req, res) {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId })
     const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress })
     await server.connect(transport)
-    session = { transport, server, userId: auth.userId, clientId: auth.clientId, boundMscaWalletAddress }
+    session = { transport, server, userId: auth.userId, clientId: auth.clientId, boundMscaWalletAddress, lastActivity: Date.now() }
     sessions.set(sessionId, session)
-    
-    // Cleanup after 30 min idle
-    setTimeout(() => {
-      sessions.delete(sessionId)
-      try { server.close() } catch {}
-    }, 1800000)
+    scheduleMcpSessionCleanup(sessionId, session)
+  } else {
+    // A valid OAuth request keeps the same MCP transport alive. This is not
+    // session-key authorization and does not revoke/reactivate anything.
+    session.lastActivity = Date.now()
   }
 
   await session.transport.handleRequest(req, res, req.body)
+}
+
+function scheduleMcpSessionCleanup(sessionId, session) {
+  const elapsed = Date.now() - Number(session.lastActivity || Date.now())
+  const delay = Math.max(1000, MCP_SESSION_IDLE_TTL_MS - elapsed)
+  const timer = setTimeout(() => {
+    if (sessions.get(sessionId) !== session) return
+    if (shouldExpireMcpSession(session)) {
+      sessions.delete(sessionId)
+      try { session.server.close() } catch {}
+      return
+    }
+    scheduleMcpSessionCleanup(sessionId, session)
+  }, delay)
+  if (timer.unref) timer.unref()
 }
