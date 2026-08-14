@@ -34,7 +34,9 @@ export function resolveArcRpc({
   const configured = validRpc(configuredRpc)
   const canteen = validRpc(canteenRpc)
   const envRpc = validRpc(applicationRpc)
-  return (preferCanteen ? configured || canteen || envRpc : configured || envRpc || canteen) || PUBLIC_ARC_RPC
+  const legacyDprc = envRpc === DRPC_ARC_RPC
+  const useCanteen = preferCanteen || legacyDprc
+  return (useCanteen ? configured || canteen || envRpc : configured || envRpc || canteen) || PUBLIC_ARC_RPC
 }
 
 export function arcRpcUrls(options = {}) {
