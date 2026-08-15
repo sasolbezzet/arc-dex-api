@@ -3742,7 +3742,7 @@ export function createMcpServer(userId, context = {}) {
         abi: [{ type: 'function', name: 'transfer', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }],
         functionName: 'transfer',
         args: [getAddress(invoice.merchantAddress), parseUnits(String(invoice.amount), 6)],
-      }], { paymaster: true, chainKey: 'arc-testnet', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+      }], { paymaster: true, chainKey: 'arc-testnet', feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
       if (result.status !== 'success') {
         return { content: [{ type: 'text', text: jsonText({ status: 'error', executed: false, reason: result.reason || 'payment failed', error: result.error, txHash: result.txHash }) }] }
       }

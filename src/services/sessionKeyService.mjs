@@ -1040,7 +1040,7 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
 /** Build the exact UserOperation parameters used by sendUserOperation. */
 export function buildUserOperationParams({ account, calls, chainKey, baseClient, feeProfile } = {}) {
   const params = { account, calls }
-  const destinationBridge = ['arc-bridge', 'arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source'].includes(String(feeProfile || ''))
+  const destinationBridge = ['arc-bridge', 'arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source', 'arc-pay'].includes(String(feeProfile || ''))
   if (chainKey !== 'arbitrum-sepolia' && !destinationBridge) return params
   return (async () => {
     // Use Circle's UserOperation gas-price recommendation first so the
@@ -1103,7 +1103,7 @@ export function resolveSessionPaymasterMode({ chainKey, feeProfile, requested = 
   const profile = String(feeProfile || '')
   const arcSourceBridge = chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(profile)
   if (arcSourceBridge) return 'native'
-  const circleGasStation = ['arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source'].includes(profile) || chainKey === 'arbitrum-sepolia'
+  const circleGasStation = ['arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source', 'arc-pay'].includes(profile) || chainKey === 'arbitrum-sepolia'
   return circleGasStation ? 'circle-gas-station' : 'default'
 }
 

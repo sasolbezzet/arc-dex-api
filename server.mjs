@@ -26,6 +26,7 @@ import aiRouterRoutes, { openAiChatCompletions, openAiModels } from './src/route
 import vaultRoutes from './src/routes/vaultRoutes.mjs'
 import { oauthMetadataHandler, protectedResourceHandler, oauthAuthorizeHandler, siweMessageHandler, siweVerifyHandler, oauthTokenHandler, oauthRegisterHandler, mcpHttpHandler } from './src/services/mcpServer.mjs'
 import { estimateUnifiedBalanceX402, getX402Invoice, markUnifiedBalanceSpendSubmitted, processCircleX402Webhook, publicInvoice, reconcileX402Invoice, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
+import { paymentLogMatches } from './src/services/invoiceVerify.mjs'
 import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
@@ -1555,20 +1556,7 @@ async function verifyInvoicePaymentTx(invoice, input = {}) {
   let merchant
   try { merchant = getAddress(invoice.merchantAddress).toLowerCase() } catch { throw new Error('Invoice merchantAddress is invalid') }
   const payer = payerAddress ? payerAddress.toLowerCase() : ''
-  const matched = receipt.logs.some((log) => {
-    if (String(log.address).toLowerCase() !== TOKENS.USDC.toLowerCase()) return false
-    try {
-      const decoded = decodeEventLog({ abi: erc20Abi, data: log.data, topics: log.topics })
-      if (String(Reflect.get(decoded, 'eventName') || '') !== 'Transfer') return false
-      const args = Reflect.get(decoded, 'args') || {}
-      const from = String(Reflect.get(args, 'from') || '').toLowerCase()
-      const to = String(Reflect.get(args, 'to') || '').toLowerCase()
-      const value = BigInt(String(Reflect.get(args, 'value') || '0'))
-      return to === merchant && value === expectedAmount && (!payer || from === payer)
-    } catch {
-      return false
-    }
-  })
+  const matched = receipt.logs.some((log) => paymentLogMatches({ log, expectedAmount, merchantAddress: merchant, payerAddress: payer }))
   if (!matched) throw new Error('Payment transaction does not match invoice amount/token/recipient')
   return true
 }
