@@ -323,6 +323,7 @@ export async function reconcileX402Invoice(id) {
 // are deliberately represented as an explicit reviewable outcome here; this
 // service must not invent a treasury private key or send an unapproved refund.
 export function markX402ServiceOutcome(invoiceOrId, { status = 'provider_error', reason = '', refundEligible = true } = {}) {
+  loadPersistentInvoices()
   const invoice = typeof invoiceOrId === 'string'
     ? invoices.get(invoiceOrId)
     : invoiceOrId

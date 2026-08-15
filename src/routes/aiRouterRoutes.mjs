@@ -30,6 +30,7 @@ import { delegateConfig, estimateDelegatedAiSpend, spendDelegatedAiPayment } fro
 import { listAgentIdentities, verifyAgentOwnership } from '../services/agentIdentityService.mjs'
 import { submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { getGatewayDelegateStatus } from '../services/gatewayDelegateService.mjs'
+import { fetchUnifiedBalanceSummary } from '../services/gatewayBalanceService.mjs'
 
 const router = Router()
 const aiResponseCache = new Map()
@@ -42,9 +43,25 @@ router.get('/status', requireOwnerQueryAuth, async (req, res) => {
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
   try {
     const identity = await resolveActiveIdentity(ownerAddress)
+    const status = getAiRouterStatus(ownerAddress)
+    // Replace the placeholder Unified Balance readout with the real Gateway
+    // balance when reachable. Fail-open: on Gateway errors keep the fallback
+    // text so the status endpoint never 5xx over a balance lookup.
+    try {
+      const summary = await fetchUnifiedBalanceSummary({ address: ownerAddress })
+      if (summary) {
+        status.unifiedBalance = {
+          ...status.unifiedBalance,
+          available: summary.totalConfirmedBalance,
+          totalConfirmedBalance: summary.totalConfirmedBalance,
+          chains: summary.chains,
+          fetchedAt: summary.fetchedAt,
+        }
+      }
+    } catch { /* keep placeholder */ }
     res.json({
       ok: true,
-      ...getAiRouterStatus(ownerAddress),
+      ...status,
       solanaDelegateAddress: delegateConfig().solanaDelegateAddress || '',
       agentIdentity: identity.active,
       agentIdentities: identity.items,
