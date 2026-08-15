@@ -2131,7 +2131,7 @@ async function executeX402Pay(userId, invoiceId) {
     abi: X402_TRANSFER_ABI,
     functionName: 'transfer',
     args: [getAddress(invoice.recipient), amountUnits],
-  }], { paymaster: true, chainKey: 'arc-testnet' })
+  }], { paymaster: true, chainKey: 'arc-testnet', feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
 
   if (result.status !== 'success') {
     return { status: result.status, executed: false, error: result.reason || 'x402 payment via MSCA gagal', userOpHash: result.userOpHash }
