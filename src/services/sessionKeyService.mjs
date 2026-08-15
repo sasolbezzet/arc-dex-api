@@ -1040,7 +1040,7 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
 /** Build the exact UserOperation parameters used by sendUserOperation. */
 export function buildUserOperationParams({ account, calls, chainKey, baseClient, feeProfile } = {}) {
   const params = { account, calls }
-  const destinationBridge = ['arc-bridge', 'arc-destination', 'base-destination', 'arbitrum-destination'].includes(String(feeProfile || ''))
+  const destinationBridge = ['arc-bridge', 'arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source'].includes(String(feeProfile || ''))
   if (chainKey !== 'arbitrum-sepolia' && !destinationBridge) return params
   return (async () => {
     // Use Circle's UserOperation gas-price recommendation first so the
@@ -1096,6 +1096,15 @@ export function paymasterWithFeeOverrides(client, fees) {
     getPaymasterStubData: async request => preserveUserOperationFeeEnvelope(await getPaymasterStubData(client, { ...request, ...requestFees }), requestFees),
     getPaymasterData: async request => preserveUserOperationFeeEnvelope(await getPaymasterData(client, { ...request, ...requestFees }), requestFees),
   }
+}
+
+export function resolveSessionPaymasterMode({ chainKey, feeProfile, requested = false } = {}) {
+  if (requested !== true) return 'disabled'
+  const profile = String(feeProfile || '')
+  const arcSourceBridge = chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(profile)
+  if (arcSourceBridge) return 'native'
+  const circleGasStation = ['arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source'].includes(profile) || chainKey === 'arbitrum-sepolia'
+  return circleGasStation ? 'circle-gas-station' : 'default'
 }
 
 // A receipt lookup can fail after Circle has already accepted the UserOperation.
@@ -1163,13 +1172,10 @@ export async function executeViaSession(userId, calls, options = {}) {
   // using Circle paymaster there triggers the efficiency/stake guard. Rollup
   // destinations remain sponsored, but preserve the non-zero fee envelope
   // because the paymaster response can otherwise overwrite it with zero.
-  const arcSourceBridgeProfile = chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
-  const sponsoredDestination = ['arc-destination', 'base-destination', 'arbitrum-destination'].includes(String(options.feeProfile || ''))
-  if (options.paymaster === true) {
-    if (arcSourceBridgeProfile) userOpParams.paymaster = false
-    else if (sponsoredDestination || chainKey === 'arbitrum-sepolia') userOpParams.paymaster = paymasterWithFeeOverrides(modularClient, userOpParams)
-    else userOpParams.paymaster = true
-  }
+  const paymasterMode = resolveSessionPaymasterMode({ chainKey, feeProfile: options.feeProfile, requested: options.paymaster === true })
+  if (paymasterMode === 'native') userOpParams.paymaster = false
+  else if (paymasterMode === 'circle-gas-station') userOpParams.paymaster = paymasterWithFeeOverrides(modularClient, userOpParams)
+  else if (paymasterMode === 'default') userOpParams.paymaster = true
 
   let userOpHash
   try {

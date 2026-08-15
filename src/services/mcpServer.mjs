@@ -770,6 +770,18 @@ function bridgeConfig(fromChain, toChain) {
   return { fromKey: chainKey(fromChain), toKey: chainKey(toChain), source, destination }
 }
 
+// Circle Gas Station sponsorship is explicit for inbound bridges. The source
+// approval and burn UserOperations on Base/Arbitrum must both use the same
+// paymaster-aware fee profile; otherwise Base falls through to the generic
+// UserOperation path and may charge the MSCA's native balance instead.
+export function resolveMscaBridgeFeeProfile(route) {
+  if (route?.toKey === 'Arc_Testnet' && route?.fromKey === 'Base_Sepolia') return 'base-to-arc-source'
+  if (route?.toKey === 'Arc_Testnet' && route?.fromKey === 'Arbitrum_Sepolia') return 'arbitrum-to-arc-source'
+  if (route?.fromKey === 'Arc_Testnet' && route?.toKey === 'Arbitrum_Sepolia') return 'arbitrum-destination'
+  if (route?.fromKey === 'Arc_Testnet') return 'arc-bridge'
+  return undefined
+}
+
 function bridgeRpcUrls(chainConfig) {
   const key = String(chainConfig?.name || '').toLowerCase()
   const chainId = Number(chainConfig?.chainId)
@@ -2597,7 +2609,7 @@ export function createMcpServer(userId, context = {}) {
       const executionOptions = {
         paymaster: true,
         chainKey: executionChainKey(route.fromKey),
-        feeProfile: route.fromKey === 'Arc_Testnet' && route.toKey === 'Arbitrum_Sepolia' ? 'arbitrum-destination' : route.fromKey === 'Arc_Testnet' ? 'arc-bridge' : undefined,
+        feeProfile: resolveMscaBridgeFeeProfile(route),
         explorerBaseUrl: route.source.explorer,
         requireTransactionHash: true,
         requireSuccessfulTransactionReceipt: true,
@@ -3475,10 +3487,489 @@ export function createMcpServer(userId, context = {}) {
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ status: 'error', error: e?.message || 'status error' }) }] }
     }
+  })  // ── DOCS / CATALOG / GUIDE (read-only, self-contained) ──
+  // Ported from the arcox-mcp runtime so plugin agents get the same service
+  // catalog, docs search, UI map, action planning, and execution guide.
+
+  const arcoxPages = [
+    { id: 'swap', title: 'Swap', purpose: 'Swap retail tokens on Arc Testnet from Agent Wallet (MSCA).', userInputs: ['tokenIn', 'tokenOut', 'amountIn'], actions: ['arcox_quote_swap', 'arcox_execute_swap'] },
+    { id: 'bridge', title: 'Bridge', purpose: 'Bridge USDC across Arc/Base/Arbitrum Sepolia via verified ArcoxRouter + CCTP.', userInputs: ['fromChain', 'toChain', 'token', 'amount'], actions: ['arcox_quote_bridge', 'arcox_execute_bridge', 'arcox_bridge_status', 'arcox_retry_bridge_mint'] },
+    { id: 'send', title: 'Send', purpose: 'Send supported tokens to another address from the Agent Wallet.', userInputs: ['recipient', 'token', 'amount'], actions: ['arcox_quote_send', 'arcox_execute_send'] },
+    { id: 'pay', title: 'ARCOX Pay', purpose: 'Create and pay USDC invoice/payment requests on Arc Testnet.', userInputs: ['amount', 'merchantAddress'], actions: ['arcox_create_payment_request', 'arcox_quote_payment_request', 'arcox_pay_payment_request', 'arcox_check_payment_status'] },
+    { id: 'intel', title: 'Intel', purpose: 'Address/entity/token/tx intelligence through ARCOX API (x402 paid).', userInputs: ['address/entity/token/hash'], actions: ['arcox_intel_get_address', 'arcox_intel_get_tx', 'arcox_x402_pay_invoice'] },
+    { id: 'ai_router', title: 'AI Router', purpose: 'Manage API keys, list models, call models, and inspect usage.', userInputs: ['prompt'], actions: ['get_ai_router_status', 'create_ai_api_key', 'list_ai_models', 'call_ai_model', 'get_usage_logs'] },
+  ]
+  const arcoxActions = [
+    { id: 'swap', page: 'swap', intentExamples: ['swap 1 eurc to usdc', 'berapa dapat usdc dari 5 eurc'], requiredSlots: ['tokenIn', 'tokenOut', 'amountIn'], safeExecution: 'quote_then_confirm' },
+    { id: 'bridge', page: 'bridge', intentExamples: ['bridge 1 usdc dari arc ke base', 'bridge dari arbitrum ke arc'], requiredSlots: ['fromChain', 'toChain', 'token', 'amount'], safeExecution: 'quote_then_confirm' },
+    { id: 'send', page: 'send', intentExamples: ['send 5 usdc ke 0x...', 'kirim usdc dari agent wallet'], requiredSlots: ['recipient', 'token', 'amount'], safeExecution: 'quote_then_confirm' },
+    { id: 'pay_invoice', page: 'pay', intentExamples: ['create payment request 10 usdc ke 0x...', 'bayar invoice arcox'], requiredSlots: ['amount', 'merchantAddress'], safeExecution: 'quote_then_confirm' },
+    { id: 'intel', page: 'intel', intentExamples: ['analyze address 0x...', 'check token btc'], requiredSlots: ['address/entity/token/hash'], safeExecution: 'x402_paid_read' },
+  ]
+  const arcoxChainSupport = {
+    Arc_Testnet: { bridge: true, router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7', circleWallet: true, aliases: ['arc', 'arc testnet'] },
+    Ethereum_Sepolia: { bridge: true, router: '0x53aB114FeE64b177B8D6066056DfD03Ea38D0ef1', circleWallet: false, aliases: ['ethereum', 'eth sepolia'] },
+    Base_Sepolia: { bridge: true, router: '0x9425cC5b3C8B9e0FCb35beBdE737B4365A614Acc', circleWallet: false, aliases: ['base', 'base sepolia'] },
+    Arbitrum_Sepolia: { bridge: true, router: '0x5dCAA895dDc7350cF0f9eb69E69536a4548b0cA7', circleWallet: false, aliases: ['arbitrum', 'arb sepolia'] },
+  }
+  const arcoxRetailRules = [
+    'Always quote before swap, bridge, send, or invoice payment.',
+    'Never execute a value-moving action without explicit user confirmation (yes/ya).',
+    'Bridge pending is normal after burn; poll arcox_bridge_status and retry mint with the burn tx.',
+    'Agent may prepare plans, but user-owned funds require explicit confirmation.',
+  ]
+  const arcoxDocsCatalog = [
+    { id: 'overview', title: 'ARCOX Overview', tags: ['dex', 'arc', 'wallet'], body: 'ARCOX DEX is a retail Arc Testnet app for swap, bridge, send, ARCOX Pay invoices, and agent workflows. Value-moving actions must quote before execution.' },
+    { id: 'pay', title: 'ARCOX Pay', tags: ['pay', 'invoice', 'usdc'], body: 'ARCOX Pay creates public USDC invoice/payment links on Arc Testnet. Invoice payment requires preview and confirmation.' },
+    { id: 'bridge-retry', title: 'Bridge Retry', tags: ['bridge', 'retry', 'cctp'], body: 'CCTP bridge has approve, burn, attestation, and mint stages. If burn succeeded but mint is pending, retry mint instead of repeating the burn.' },
+    { id: 'mcp-safety', title: 'MCP Safety Rules', tags: ['mcp', 'agent', 'safety'], body: 'Agents must call quote tools first, show preview, receive explicit confirmation, then execute with previewId and confirmationText.' },
+    { id: 'intel-x402', title: 'Intel x402', tags: ['intel', 'x402', 'arkham'], body: 'ARCOX Intel is x402 paid: unpaid requests return an invoice; pay via arcox_x402_pay_invoice then retry with paymentId.' },
+  ]
+
+  registerTool('arcox_search_docs', 'Search ARCOX product and MCP documentation. Use this before guessing an unfamiliar ARCOX flow.', {
+    query: z.string().describe('Search query'),
+  }, async (params) => {
+    const words = String(params.query || '').toLowerCase().split(/\W+/).filter(Boolean)
+    const results = arcoxDocsCatalog.map(doc => {
+      const haystack = [doc.id, doc.title, ...(doc.tags || []), doc.body].join(' ').toLowerCase()
+      const score = words.reduce((sum, w) => sum + (haystack.includes(w) ? 1 : 0), 0)
+      return { id: doc.id, title: doc.title, tags: doc.tags, score, snippet: doc.body.slice(0, 220) }
+    }).filter(item => item.score > 0 || !words.length).sort((a, b) => b.score - a.score)
+    return { content: [{ type: 'text', text: jsonText({ query: params.query, results, safeNextStep: results.length ? 'Call arcox_read_doc with the selected id before acting on unfamiliar flows.' : 'No doc match found. Ask the user to clarify the desired ARCOX flow.' }) }] }
+  })
+
+  registerTool('arcox_read_doc', 'Read a structured ARCOX documentation page by id returned from arcox_search_docs.', {
+    id: z.string().describe('Document id from arcox_search_docs'),
+  }, async (params) => {
+    const doc = arcoxDocsCatalog.find(item => item.id === String(params.id || '').toLowerCase())
+    if (!doc) return { content: [{ type: 'text', text: jsonText({ error: `Unknown ARCOX doc id: ${params.id}` }) }] }
+    return { content: [{ type: 'text', text: jsonText({ ...doc }) }] }
+  })
+
+  registerTool('arcox_service_catalog', 'Return a concise catalog of ARCOX MCP services, capabilities, safety rules, and example prompts.', {}, async () => {
+    return { content: [{ type: 'text', text: jsonText({
+      project: 'ARCOX DEX + ARCOX MCP',
+      safety: 'All value-moving tools must quote/preview first and require user confirmation.',
+      services: [
+        { name: 'wallet_balances', description: 'Read Agent Wallet MSCA balances across chains.' },
+        { name: 'swap', description: 'Quote and execute supported Arc swaps with preview-before-execute.' },
+        { name: 'bridge', description: 'Quote and execute supported USDC CCTP bridge routes; attestation-ready destinations mint automatically or via arcox_retry_bridge_mint.' },
+        { name: 'send', description: 'Quote and send supported Arc tokens from the Agent Wallet.' },
+        { name: 'arcox_pay', description: 'Create/quote/pay/check ARCOX Pay invoice workflows.' },
+        { name: 'intel_x402', description: 'ARCOX Intel via backend Arkham API with Arc Testnet USDC x402 payment.' },
+        { name: 'ai_router', description: 'Check AI Router status, create/revoke API keys, list models, call models, and inspect usage.' },
+        { name: 'agentic_jobs', description: 'List/create/complete Agentic Economy jobs through the AI Router API.' },
+      ],
+      examplePrompts: [
+        'show all wallet balances', 'quote bridge 1 usdc from arc to base', 'check auto mint worker status for 0xBURN_TX',
+        'send 1 eurc from agent wallet to 0x...', 'retry bridge 0xBURN_TX from arbitrum sepolia to arc', 'quote swap 1 eurc to usdc',
+        'create payment request 10 usdc to 0x...', 'check x402 invoice arcox_x402_...', 'list ai router models', 'call ai router model with prompt ...',
+      ],
+    }) }] }
+  })
+
+  registerTool('arcox_catalog', 'Backward-compatible alias for arcox_service_catalog.', {}, async () => ({
+    content: [{ type: 'text', text: jsonText({
+      project: 'ARCOX DEX + ARCOX MCP',
+      safety: 'All value-moving tools must quote/preview first and require user confirmation.',
+      services: [
+        { name: 'wallet_balances', description: 'Read Agent Wallet MSCA balances across chains.' },
+        { name: 'swap', description: 'Quote and execute supported Arc swaps with preview-before-execute.' },
+        { name: 'bridge', description: 'Quote and execute supported USDC CCTP bridge routes; attestation-ready destinations mint automatically or via arcox_retry_bridge_mint.' },
+        { name: 'send', description: 'Quote and send supported Arc tokens from the Agent Wallet.' },
+        { name: 'arcox_pay', description: 'Create/quote/pay/check ARCOX Pay invoice workflows.' },
+        { name: 'intel_x402', description: 'ARCOX Intel via backend Arkham API with Arc Testnet USDC x402 payment.' },
+        { name: 'ai_router', description: 'Check AI Router status, create/revoke API keys, list models, call models, and inspect usage.' },
+        { name: 'agentic_jobs', description: 'List/create Agentic Economy jobs through the AI Router API.' },
+      ],
+      examplePrompts: [
+        'show all wallet balances', 'quote bridge 1 usdc from arc to base', 'check auto mint worker status for 0xBURN_TX',
+        'send 1 eurc from agent wallet to 0x...', 'retry bridge 0xBURN_TX from arbitrum sepolia to arc', 'quote swap 1 eurc to usdc',
+        'create payment request 10 usdc to 0x...', 'check x402 invoice arcox_x402_...', 'list ai router models', 'call ai router model with prompt ...',
+      ],
+    }) }],
+  }))
+
+  registerTool('arcox_execution_guide', 'Return exact step-by-step tool routes for every ARCOX MCP flow so agents do not guess tool order.', {
+    intent: z.string().optional().describe('Optional filter: swap, bridge, send, pay, intel, retry'),
+  }, async (params) => {
+    const guide = {
+      rule: 'Never guess tool order. For every value-moving request: quote first, show preview, wait for user yes/ya, then execute with previewId and confirmationText.',
+      flows: [
+        { intent: 'swap', steps: ['arcox_quote_swap', 'show preview', 'user yes', 'arcox_execute_swap with confirmed=true, previewId, confirmationText'] },
+        { intent: 'bridge', steps: ['arcox_quote_bridge', 'show preview', 'user yes', 'arcox_execute_bridge', 'if pending: arcox_bridge_status / arcox_retry_bridge_mint'] },
+        { intent: 'send', steps: ['arcox_quote_send', 'show preview', 'user yes', 'arcox_execute_send'] },
+        { intent: 'pay', steps: ['arcox_create_payment_request or arcox_get_payment_request', 'arcox_quote_payment_request', 'show preview', 'user yes', 'arcox_pay_payment_request'] },
+        { intent: 'intel', steps: ['arcox_intel_get_* to get invoice', 'arcox_x402_pay_invoice without confirmed for preview', 'user yes', 'pay with confirmed=true, previewId', 'retry intel with paymentId'] },
+        { intent: 'retry', steps: ['arcox_bridge_status with burnTxHash', 'if attestation ready: arcox_retry_bridge_mint'] },
+      ],
+      recovery: ['If a tool returns preview_required, call the same tool without confirmed to get previewId.', 'If invoice status is payment_required/settlement_pending, poll status; do not ask for txHash.', 'If a call times out, check status/history before repeating value-moving execution.'],
+    }
+    const intent = String(params.intent || '').toLowerCase()
+    const flows = intent ? guide.flows.filter(f => f.intent.includes(intent) || intent.includes(f.intent)) : guide.flows
+    return { content: [{ type: 'text', text: jsonText({ ...guide, flows }) }] }
+  })
+
+  registerTool('arcox_ui_map', 'Return the full ARCOX DEX page/action map so an agent can understand the Web UI.', {}, async () => ({
+    content: [{ type: 'text', text: jsonText({ pages: arcoxPages, actions: arcoxActions, chains: arcoxChainSupport, retailRules: arcoxRetailRules }) }],
+  }))
+
+  registerTool('arcox_action_plan', 'Convert a user intent into a cautious ARCOX action plan with missing slots and signing rules.', {
+    intent: z.string().describe('User intent, e.g. bridge 1 usdc arc ke base'),
+    pageHint: z.string().optional(),
+  }, async (params) => {
+    const text = `${params.intent} ${params.pageHint || ''}`.toLowerCase()
+    const action = arcoxActions.map(a => ({ action: a, score: [a.id, a.page, ...a.intentExamples].join(' ').toLowerCase().split(/\W+/).reduce((sum, w) => sum + (w && text.includes(w) ? 1 : 0), 0) })).sort((a, b) => b.score - a.score)[0]
+    if (!action?.score) return { content: [{ type: 'text', text: jsonText({ status: 'needs_clarification', reason: 'No matching ARCOX action found.', safeNextStep: 'Call arcox_execution_guide, then ask whether user wants swap, bridge, send, pay, or intel.' }) }] }
+    const page = arcoxPages.find(p => p.id === action.action.page)
+    return { content: [{ type: 'text', text: jsonText({ status: 'planned', matchedAction: action.action, page, missingSlots: action.action.requiredSlots, safetyRules: arcoxRetailRules, safeNextStep: action.action.safeExecution === 'quote_then_confirm' ? 'Quote/preview first, request explicit user confirmation, then execute with previewId and confirmationText.' : 'Fetch quote/status only.' }) }] }
+  })
+
+  registerTool('arcox_agent_status', 'Return the bound Agent Wallet MSCA status, delegate, and balances without exposing signing secrets.', {}, async () => {
+    const info = await resolveActiveMsca(userId, boundMscaWalletAddress)
+    if (!info) return { content: [{ type: 'text', text: jsonText({ ...mscaRequiredResult(), status: 'no_session' }) }] }
+    const balances = await apiGet(`/api/multi-balance/${encodeURIComponent(info.walletAddress)}`, info.walletAddress).catch(() => null)
+    return { content: [{ type: 'text', text: jsonText({
+      status: 'active', walletAddress: info.walletAddress, delegateAddress: info.delegateAddress, active: true,
+      balances: balances?.balances || null,
+      safeNextStep: 'Read-only status. For balances use arcox_wallet_balances.',
+    }) }] }
+  })
+
+  // ── ARCOX PAY (invoice / payment request) tools — backed by /api/invoices ──
+  // Ported from the arcox-mcp runtime but executed with the Agent Wallet MSCA
+  // session key instead of a local EOA signer.
+
+  const invoiceSummary = invoice => ({
+    invoiceId: invoice?.invoiceId, orderId: invoice?.orderId, amount: invoice?.amount, token: invoice?.token,
+    network: invoice?.network, merchantAddress: invoice?.merchantAddress, memo: invoice?.memo, status: invoice?.status,
+    paymentUrl: invoice?.paymentUrl, txHash: invoice?.txHash, paidAt: invoice?.paidAt, expiresAt: invoice?.expiresAt, timeline: invoice?.timeline || [],
+  })
+  const assertPayableInvoice = invoice => {
+    if (!invoice?.invoiceId) throw new Error('Invoice not found.')
+    if (invoice.status === 'paid') throw new Error('Invoice already paid.')
+    if (invoice.status === 'expired' || invoice.status === 'cancelled' || invoice.status === 'failed') throw new Error(`Invoice status is ${invoice.status}.`)
+    if (Date.now() > new Date(invoice.expiresAt).getTime()) throw new Error('Invoice expired.')
+    if (invoice.token !== 'USDC' || invoice.network !== 'arc-testnet') throw new Error('Only USDC invoices on arc-testnet are supported.')
+  }
+
+  registerTool('arcox_create_payment_request', 'Create an ARCOX Pay USDC invoice/payment request on Arc Testnet.', {
+    amount: z.string().describe('Amount in human readable USDC'),
+    merchantAddress: z.string().describe('Merchant wallet address that receives the payment'),
+    token: z.string().optional().describe('Token symbol. Default USDC'),
+    orderId: z.string().optional(),
+    memo: z.string().optional(),
+    expiresInMinutes: z.number().optional().describe('Default 15'),
+  }, async (params) => {
+    try {
+      const invoice = await apiPost('/api/invoices', {
+        orderId: params.orderId, amount: String(params.amount || ''), token: params.token || 'USDC', network: 'arc-testnet',
+        merchantAddress: params.merchantAddress, memo: params.memo, expiresInMinutes: params.expiresInMinutes || 15,
+      }, userId)
+      if (invoice?.error) return { content: [{ type: 'text', text: jsonText({ error: invoice.error }) }] }
+      return { content: [{ type: 'text', text: jsonText({ ...invoiceSummary(invoice), safeNextStep: 'Invoice dibuat. Call arcox_quote_payment_request dengan invoiceId sebelum pembayaran.' }) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'create payment request failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_get_payment_request', 'Read a full ARCOX Pay invoice/payment request.', {
+    invoiceId: z.string().describe('Invoice id'),
+  }, async (params) => {
+    try {
+      const invoice = await apiGet(`/api/invoices/${encodeURIComponent(params.invoiceId)}`, userId)
+      if (invoice?.error) return { content: [{ type: 'text', text: jsonText({ error: invoice.error }) }] }
+      return { content: [{ type: 'text', text: jsonText(invoiceSummary(invoice)) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'get payment request failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_quote_payment_request', 'Quote an ARCOX Pay invoice before payment execution. Required before arcox_pay_payment_request.', {
+    invoiceId: z.string().describe('Invoice id'),
+  }, async (params) => {
+    try {
+      const info = await resolveActiveMsca(userId, boundMscaWalletAddress)
+      if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+      const invoice = await apiGet(`/api/invoices/${encodeURIComponent(params.invoiceId)}`, userId)
+      if (invoice?.error) return { content: [{ type: 'text', text: jsonText({ error: invoice.error }) }] }
+      assertPayableInvoice(invoice)
+      const { readContract } = await import('viem/actions')
+      const arcRpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
+      const client = createPublicClient({ chain: defineChain({ id: 5042002, name: 'Arc Testnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 6 }, rpcUrls: { default: { http: arcRpc } } }), transport: http(arcRpc) })
+      const amountUnits = parseUnits(String(invoice.amount), 6)
+      const balance = await client.readContract({ address: '0x3600000000000000000000000000000000000000', abi: [{ type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: '', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] }], functionName: 'balanceOf', args: [info.walletAddress] }).catch(() => 0n)
+      return { content: [{ type: 'text', text: jsonText({
+        ...invoiceSummary(invoice), payerAddress: info.walletAddress, payerUsdcBalance: formatUnits(balance, 6),
+        supported: balance >= amountUnits, requiresUserConfirmation: true,
+        userMustCheck: ['Invoice id is correct.', 'Merchant address is correct.', 'Amount and token are correct.', 'This action moves funds and cannot be reversed after execution.'],
+        safeNextStep: 'Tampilkan preview ini ke user. Setelah user bilang yes/ya, panggil arcox_pay_payment_request dengan invoiceId, previewId dan confirmationText.',
+      }) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'quote payment request failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_pay_payment_request', 'Pay a quoted ARCOX Pay invoice with the Agent Wallet MSCA. Requires previewId from arcox_quote_payment_request and user confirmation.', {
+    invoiceId: z.string().describe('Invoice id'),
+    amount: z.string().optional(),
+    token: z.string().optional(),
+    merchantAddress: z.string().optional(),
+    previewId: z.string().optional(),
+    confirmed: z.boolean().optional(),
+    confirmationText: z.string().optional(),
+  }, async (params) => {
+    if (!params.confirmed) {
+      const quote = await server._registeredTools.arcox_quote_payment_request.handler({ invoiceId: params.invoiceId })
+      const q = JSON.parse(quote.content[0].text)
+      return { content: [{ type: 'text', text: jsonText({ status: 'preview', requiresUserConfirmation: true, ...q, safeNextStep: 'Tampilkan preview ini ke user. Setelah user bilang yes/ya, panggil arcox_pay_payment_request dengan confirmed=true dan confirmationText.' }) }] }
+    }
+    if (!['yes', 'ya'].includes(String(params.confirmationText || '').trim().toLowerCase())) {
+      return { content: [{ type: 'text', text: jsonText({ status: 'confirmation_required', reason: 'Konfirmasi eksplisit (ya/yes) wajib sebelum bayar invoice.' }) }] }
+    }
+    try {
+      const info = await resolveActiveMsca(userId, boundMscaWalletAddress)
+      if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+      const invoice = await apiGet(`/api/invoices/${encodeURIComponent(params.invoiceId)}`, userId)
+      if (invoice?.error) return { content: [{ type: 'text', text: jsonText({ error: invoice.error }) }] }
+      assertPayableInvoice(invoice)
+      if (params.amount && String(params.amount) !== String(invoice.amount)) throw new Error('Invoice amount changed after quote.')
+      if (params.token && String(params.token).toUpperCase() !== String(invoice.token).toUpperCase()) throw new Error('Invoice token changed after quote.')
+      if (params.merchantAddress && String(params.merchantAddress).toLowerCase() !== String(invoice.merchantAddress).toLowerCase()) throw new Error('Invoice merchantAddress changed after quote.')
+      const { executeViaSession } = await import('./sessionKeyService.mjs')
+      const result = await executeViaSession(info.walletAddress, [{
+        to: '0x3600000000000000000000000000000000000000', value: 0n,
+        abi: [{ type: 'function', name: 'transfer', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }],
+        functionName: 'transfer',
+        args: [getAddress(invoice.merchantAddress), parseUnits(String(invoice.amount), 6)],
+      }], { paymaster: true, chainKey: 'arc-testnet', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+      if (result.status !== 'success') {
+        return { content: [{ type: 'text', text: jsonText({ status: 'error', executed: false, reason: result.reason || 'payment failed', error: result.error, txHash: result.txHash }) }] }
+      }
+      const paid = await apiPost(`/api/invoices/${encodeURIComponent(params.invoiceId)}/mark-paid`, { txHash: result.txHash, payerAddress: info.walletAddress }, userId)
+      return { content: [{ type: 'text', text: jsonText({ status: 'paid', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, invoice: invoiceSummary(paid?.invoice || paid || invoice) }) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ status: 'error', executed: false, error: e?.message || 'pay payment request failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_check_payment_status', 'Check ARCOX Pay invoice status, tx hash, paidAt, and timeline.', {
+    invoiceId: z.string().describe('Invoice id'),
+  }, async (params) => {
+    try {
+      const data = await apiGet(`/api/invoices/${encodeURIComponent(params.invoiceId)}/status`, userId)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'check payment status failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_pay_get_payment_status', 'Legacy payment status compatibility. For x402 Intel invoices use arcox_x402_invoice_status.', {
+    payment_id: z.string().describe('Legacy payment id'),
+  }, async () => ({
+    content: [{ type: 'text', text: jsonText({ status: 'disabled', reason: 'Legacy provider payment status is disabled. x402 now uses internal ARCOX invoices and Arc memo/on-chain reconciliation.', safeNextStep: 'Use arcox_x402_invoice_status with invoiceId or paymentId.' }) }],
+  }))
+
+  registerTool('arcox_pay_list_recent_payments', 'Legacy payment history compatibility. For x402 Intel invoices use arcox_x402_invoice_status.', {
+    limit: z.number().optional().describe('Default 10'),
+  }, async () => ({
+    content: [{ type: 'text', text: jsonText({ status: 'disabled', reason: 'Legacy provider payment history is disabled. x402 now uses internal ARCOX invoices and Arc memo/on-chain reconciliation.', safeNextStep: 'Use arcox_x402_invoice_status for paid Intel invoices, or arcox_get_payment_request for ARCOX Pay invoices.' }) }],
+  }))
+
+  // ── ARCOX INTEL full wallet report (x402-paid) ──
+  registerTool('arcox_intel_quote_wallet_report', 'Quote an ARCOX Intel full wallet report. Shows x402 price and confirmation requirement before paid analysis.', {
+    address: z.string().describe('Wallet address (0x...)'),
+  }, async (params) => {
+    try {
+      const sessionInfo = await (await import('./vaultStore.mjs')).getSessionKeyInfo(userId)
+      const r = await fetch(`${BACKEND_URL}/api/intel/report/address/${encodeURIComponent(params.address)}`, { headers: { ...(sessionInfo?.active && sessionInfo.walletAddress ? { Authorization: `Bearer ${mintOwnerToken(userId)}`, 'X-Arcox-Owner': sessionInfo.walletAddress } : {}) } })
+      const data = await r.json()
+      return { content: [{ type: 'text', text: jsonText({ ...data, safeNextStep: data?.paymentRequired || data?.invoice ? 'Invoice x402 dibuat. Pay via arcox_x402_pay_invoice (tanpa confirmed) untuk preview, lalu retry dengan paymentId.' : 'Report tersedia. Call arcox_intel_execute_wallet_report dengan paymentId jika belum ter-unlock.' }) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'quote wallet report failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_intel_execute_wallet_report', 'Execute an ARCOX Intel full wallet report after x402 payment. If no paymentId is supplied, returns a payment preview/invoice only.', {
+    address: z.string().describe('Wallet address (0x...)'),
+    paymentId: z.string().optional().describe('x402 paymentId if already paid'),
+  }, async (params) => {
+    try {
+      const sessionInfo = await (await import('./vaultStore.mjs')).getSessionKeyInfo(userId)
+      const r = await fetch(`${BACKEND_URL}/api/intel/report/address/${encodeURIComponent(params.address)}`, { headers: { ...(sessionInfo?.active && sessionInfo.walletAddress ? { Authorization: `Bearer ${mintOwnerToken(userId)}`, 'X-Arcox-Owner': sessionInfo.walletAddress } : {}), 'X-Payment-Id': params.paymentId || '' } })
+      const data = await r.json()
+      if (r.status === 402 || data?.paymentRequired) return { content: [{ type: 'text', text: jsonText({ paymentRequired: true, ...data, safeNextStep: 'Pay via arcox_x402_pay_invoice (tanpa confirmed) untuk preview, lalu retry tool ini dengan paymentId.' }) }] }
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'execute wallet report failed' }) }] }
+    }
+  })
+
+  // ── AI ROUTER tools (owner-scoped, backed by /api/ai-router) ──
+  const routerOwner = async () => {
+    const info = await resolveActiveMsca(userId, boundMscaWalletAddress)
+    return info?.walletAddress || ''
+  }
+
+  registerTool('get_ai_router_status', 'Get ARCOX AI Router status for the bound Agent Wallet owner.', {
+    ownerAddress: z.string().optional().describe('Optional explicit owner address (must match the active MSCA)'),
+  }, async (params) => {
+    try {
+      const owner = params.ownerAddress || await routerOwner()
+      if (!owner) return { content: [{ type: 'text', text: jsonText({ ...mscaRequiredResult(), status: 'no_session' }) }] }
+      const data = await apiGet(`/api/ai-router/status?ownerAddress=${encodeURIComponent(owner)}`, owner)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'ai router status failed' }) }] }
+    }
+  })
+
+  registerTool('list_agent_identities', 'List Arc Agent Identities owned by the bound Agent Wallet.', {
+    ownerAddress: z.string().optional(), refresh: z.boolean().optional(),
+  }, async (params) => {
+    try {
+      const owner = params.ownerAddress || await routerOwner()
+      if (!owner) return { content: [{ type: 'text', text: jsonText({ ...mscaRequiredResult(), status: 'no_session' }) }] }
+      const data = await apiGet(`/api/ai-router/agent-identities?ownerAddress=${encodeURIComponent(owner)}${params.refresh ? '&refresh=true' : ''}`, owner)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'list agent identities failed' }) }] }
+    }
+  })
+
+  registerTool('select_agent_identity', 'Select an owned Arc Agent Identity as the active identity for new API keys and Agent Jobs.', {
+    agentId: z.string().describe('Agent id'), ownerAddress: z.string().optional(),
+  }, async (params) => {
+    try {
+      const owner = params.ownerAddress || await routerOwner()
+      if (!owner) return { content: [{ type: 'text', text: jsonText({ ...mscaRequiredResult(), status: 'no_session' }) }] }
+      const data = await apiPost('/api/ai-router/agent-identities/select', { ownerAddress: owner, agentId: params.agentId }, owner)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'select agent identity failed' }) }] }
+    }
+  })
+
+  registerTool('get_ai_router_api_keys', 'List AI Router API keys for the bound Agent Wallet owner.', {
+    ownerAddress: z.string().optional(),
+  }, async (params) => {
+    try {
+      const owner = params.ownerAddress || await routerOwner()
+      if (!owner) return { content: [{ type: 'text', text: jsonText({ ...mscaRequiredResult(), status: 'no_session' }) }] }
+      const data = await apiGet(`/api/ai-router/api-keys?ownerAddress=${encodeURIComponent(owner)}`, owner)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'list api keys failed' }) }] }
+    }
+  })
+
+  registerTool('create_ai_api_key', 'Create a standard ARCOX AI Router API key. Returns the key once; backend stores only its hash.', {
+    ownerAddress: z.string().optional(), label: z.string().optional(),
+  }, async (params) => {
+    try {
+      const owner = params.ownerAddress || await routerOwner()
+      if (!owner) return { content: [{ type: 'text', text: jsonText({ ...mscaRequiredResult(), status: 'no_session' }) }] }
+      const data = await apiPost('/api/ai-router/api-keys', { ownerAddress: owner, label: params.label || 'ARCOX MCP AI Router' }, owner)
+      return { content: [{ type: 'text', text: jsonText({ ...data, safeNextStep: 'Copy the apiKey now. ARCOX stores only the hash and cannot show it again.' }) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'create api key failed' }) }] }
+    }
+  })
+
+  registerTool('revoke_ai_api_key', 'Revoke an ARCOX AI Router API key owned by the bound Agent Wallet.', {
+    keyId: z.string().describe('Key id'), ownerAddress: z.string().optional(),
+  }, async (params) => {
+    try {
+      const owner = params.ownerAddress || await routerOwner()
+      if (!owner) return { content: [{ type: 'text', text: jsonText({ ...mscaRequiredResult(), status: 'no_session' }) }] }
+      const data = await apiPost(`/api/ai-router/api-keys/${encodeURIComponent(params.keyId)}/revoke`, { ownerAddress: owner }, owner)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'revoke api key failed' }) }] }
+    }
+  })
+
+  registerTool('list_ai_models', 'List OpenAI-compatible ARCOX AI Router models.', {}, async () => {
+    try {
+      const data = await apiGet('/api/ai-router/models', userId)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'list models failed' }) }] }
+    }
+  })
+
+  registerTool('get_usage_logs', 'Get ARCOX AI Router usage logs for the bound Agent Wallet owner.', {
+    ownerAddress: z.string().optional(), limit: z.number().optional().describe('Default 10'),
+  }, async (params) => {
+    try {
+      const owner = params.ownerAddress || await routerOwner()
+      if (!owner) return { content: [{ type: 'text', text: jsonText({ ...mscaRequiredResult(), status: 'no_session' }) }] }
+      const data = await apiGet(`/api/ai-router/usage?ownerAddress=${encodeURIComponent(owner)}&limit=${params.limit || 10}`, owner)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'usage logs failed' }) }] }
+    }
+  })
+
+  registerTool('call_ai_model', 'Call ARCOX AI Router directly with a standard arx_sk API key (billing via Unified Balance Auto Pay).', {
+    prompt: z.string().describe('User prompt'),
+    model: z.string().optional().describe('Default arcox/auto'),
+    apiKey: z.string().optional().describe('arx_sk_... API key. Required unless set in backend env.'),
+  }, async (params) => {
+    try {
+      const apiKey = String(params.apiKey || process.env.ARCOX_AI_ROUTER_API_KEY || '').trim()
+      if (!apiKey.startsWith('arx_sk_')) return { content: [{ type: 'text', text: jsonText({ error: 'ARCOX AI Router API key is required (arx_sk_...). Create one with create_ai_api_key.' }) }] }
+      const r = await fetch(`${BACKEND_URL}/v1/chat/completions`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model: params.model || 'arcox/auto', messages: [{ role: 'user', content: params.prompt }], temperature: 0.7 }),
+        signal: AbortSignal.timeout(90_000),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (r.status === 402) return { content: [{ type: 'text', text: jsonText({ status: 'payment_required', ...data, safeNextStep: 'Deposit USDC to Unified Balance in ARCOX Web UI, enable Auto Pay, then retry.' }) }] }
+      if (!r.ok || data?.error) return { content: [{ type: 'text', text: jsonText({ error: data?.error?.message || data?.error || `HTTP ${r.status}` }) }] }
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'call ai model failed' }) }] }
+    }
+  })
+
+  // ── AGENT JOBS (via AI Router API key, agent:jobs scope) ──
+  registerTool('list_agent_jobs', 'List identity-bound Agent Job summaries for the ARCOX API key.', {
+    apiKey: z.string().describe('arx_sk_... API key with agent:jobs scope'), limit: z.number().optional().describe('Default 50'),
+  }, async (params) => {
+    try {
+      const key = String(params.apiKey || '').trim()
+      if (!key.startsWith('arx_sk_')) return { content: [{ type: 'text', text: jsonText({ error: 'ARCOX API key required (arx_sk_... with agent:jobs scope).' }) }] }
+      const r = await fetch(`${BACKEND_URL}/api/ai-router/agent-jobs?limit=${params.limit || 50}`, { headers: { Authorization: `Bearer ${key}` } })
+      const data = await r.json()
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'list agent jobs failed' }) }] }
+    }
+  })
+
+  registerTool('create_agent_job', 'Record an identity-bound Agent Job through the AI Router API key.', {
+    apiKey: z.string().describe('arx_sk_... API key with agent:jobs scope'),
+    agentId: z.string().optional(), jobId: z.string().optional(), txHash: z.string().optional(), memoId: z.string().optional(),
+    status: z.string().optional().describe('Default created'),
+  }, async (params) => {
+    try {
+      const key = String(params.apiKey || '').trim()
+      if (!key.startsWith('arx_sk_')) return { content: [{ type: 'text', text: jsonText({ error: 'ARCOX API key required (arx_sk_... with agent:jobs scope).' }) }] }
+      const r = await fetch(`${BACKEND_URL}/api/ai-router/agent-jobs`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+        body: JSON.stringify({ agentId: params.agentId, jobId: params.jobId, txHash: params.txHash, memoId: params.memoId, status: params.status || 'created' }),
+      })
+      const data = await r.json()
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'create agent job failed' }) }] }
+    }
   })
 
   return server
 }
+
 
 // ── Streamable HTTP MCP handler ──
 export async function mcpHttpHandler(req, res) {
