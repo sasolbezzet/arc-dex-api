@@ -4,7 +4,50 @@ import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { createAuthCode, exchangeCodeForToken, findExistingAuthCode, oauthRegisterHandler, registerOAuthClient } from '../src/services/mcpServer.mjs'
+import { createAuthCode, exchangeCodeForToken, findExistingAuthCode, isValidRedirectUri, oauthRegisterHandler, refreshAccessTokenGrant, registerOAuthClient, validateAccessToken } from '../src/services/mcpServer.mjs'
+
+test('refresh token grant issues a new access token and rotates the refresh token', () => {
+  const redirectUri = 'https://client.example/callback'
+  const challenge = createHash('sha256').update('refresh-verifier-1234567890').digest('base64url')
+  const client = registerOAuthClient({ clientName: 'mcp-oauth-refresh-test', redirectUris: [redirectUri] })
+  const code = createAuthCode(client.clientId, '0x2222222222222222222222222222222222222222', { redirectUri, codeChallenge: challenge, state: 's' })
+  const issued = exchangeCodeForToken(code, client.clientId, client.clientSecret, redirectUri, 'refresh-verifier-1234567890', undefined)
+  assert.ok(issued.access_token?.startsWith('arx_at_'))
+  assert.ok(issued.refresh_token?.startsWith('arx_rt_'))
+  assert.ok(validateAccessToken(issued.access_token))
+
+  // Refresh with the exact client secret → new pair, old refresh single-use.
+  const refreshed = refreshAccessTokenGrant(issued.refresh_token, client.clientId, client.clientSecret, undefined)
+  assert.ok(refreshed.access_token?.startsWith('arx_at_'), JSON.stringify(refreshed))
+  assert.ok(refreshed.refresh_token && refreshed.refresh_token !== issued.refresh_token)
+  assert.ok(validateAccessToken(refreshed.access_token))
+  assert.equal(refreshAccessTokenGrant(issued.refresh_token, client.clientId, client.clientSecret, undefined).error, 'invalid_grant')
+  assert.equal(refreshAccessTokenGrant(refreshed.refresh_token, client.clientId, client.clientSecret, undefined).access_token.startsWith('arx_at_'), true)
+})
+
+test('refresh token grant rejects wrong client or unknown token', () => {
+  const redirectUri = 'https://client.example/callback'
+  const challenge = createHash('sha256').update('refresh-verifier-abcdef1234').digest('base64url')
+  const client = registerOAuthClient({ clientName: 'mcp-oauth-refresh-bad-test', redirectUris: [redirectUri] })
+  const other = registerOAuthClient({ clientName: 'mcp-oauth-refresh-bad-other', redirectUris: [redirectUri] })
+  const code = createAuthCode(client.clientId, '0x2222222222222222222222222222222222222222', { redirectUri, codeChallenge: challenge, state: 's' })
+  const issued = exchangeCodeForToken(code, client.clientId, client.clientSecret, redirectUri, 'refresh-verifier-abcdef1234', undefined)
+  assert.equal(refreshAccessTokenGrant(issued.refresh_token, other.clientId, other.clientSecret, undefined).error, 'invalid_grant')
+  assert.equal(refreshAccessTokenGrant('arx_rt_unknown', client.clientId, client.clientSecret, undefined).error, 'invalid_grant')
+})
+
+test('dynamic client registration rejects non-https / non-localhost redirect URIs', () => {
+  assert.equal(isValidRedirectUri('https://chatgpt.com/auth/callback/arcox'), true)
+  assert.equal(isValidRedirectUri('https://claude.ai/callback'), true)
+  assert.equal(isValidRedirectUri('http://127.0.0.1:47562/callback'), true)
+  assert.equal(isValidRedirectUri('http://localhost:3000/callback'), true)
+  assert.equal(isValidRedirectUri('http://evil.example/callback'), false)
+  assert.equal(isValidRedirectUri('javascript:alert(1)'), false)
+  assert.equal(isValidRedirectUri('not-a-url'), false)
+  assert.throws(() => registerOAuthClient({ clientName: 'bad', redirectUris: ['http://evil.example/cb'] }), /redirect_uris must be https/i)
+  const ok = registerOAuthClient({ clientName: 'good', redirectUris: ['http://127.0.0.1:47562/callback'] })
+  assert.ok(ok.clientId.startsWith('arcox_'))
+})
 
 test('repeated SIWE verification reuses the same pending authorization code', () => {
   const redirectUri = 'https://client.example/callback'

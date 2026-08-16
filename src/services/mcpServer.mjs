@@ -14,6 +14,7 @@ const authCodes = new Map() // code -> { clientId, userId, redirectUri, codeChal
 const oauthRequests = new Map() // requestId -> original authorization request
 const siweChallenges = new Map() // nonce -> exact SIWE challenge binding
 const accessTokens = new Map() // token -> { userId, clientId, expires }
+const refreshTokens = new Map() // refresh token -> { userId, clientId, resource, mscaWalletAddress, expires }
 // destination chain + CCTP nonce -> { userId, userOpHash, chainKey }
 // A pending destination UserOperation must remain discoverable until its
 // receipt is known; a plain Set would lose the hash on timeout/restart.
@@ -30,6 +31,7 @@ function jsonText(value) {
 const SERVER_URL = process.env.SERVER_URL || 'https://arcoxdex.vercel.app'
 const MCP_RESOURCE_URL = `${SERVER_URL}/mcp`
 const TOKEN_TTL = 3600 * 24 // 24 hours
+const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 // Keep the Streamable HTTP transport alive for the same practical lifetime as
 // the OAuth token. The previous fixed 30-minute timer deleted an otherwise
 // valid MCP session while Claude was idle; its next tools/call then reached a
@@ -143,22 +145,45 @@ const oauthClients = loadClients()
 refreshOAuthState()
 
 function loadTokens() {
-  const d = readJsonFile(OAUTH_TOKENS_PATH, { tokens: {} })
-  return new Map(Object.entries(d.tokens || {}))
+  const d = readJsonFile(OAUTH_TOKENS_PATH, { tokens: {}, refresh: {} })
+  return { access: new Map(Object.entries(d.tokens || {})), refresh: new Map(Object.entries(d.refresh || {})) }
 }
 function saveTokens() {
-  atomicWriteJsonFile(OAUTH_TOKENS_PATH, { tokens: Object.fromEntries(accessTokens) })
+  atomicWriteJsonFile(OAUTH_TOKENS_PATH, { tokens: Object.fromEntries(accessTokens), refresh: Object.fromEntries(refreshTokens) })
 }
 function refreshAccessTokens() {
+  const { access, refresh } = loadTokens()
   accessTokens.clear()
-  for (const [token, auth] of loadTokens()) {
+  for (const [token, auth] of access) {
     if (auth?.expires > Date.now()) accessTokens.set(token, auth)
+  }
+  refreshTokens.clear()
+  for (const [token, auth] of refresh) {
+    if (auth?.expires > Date.now()) refreshTokens.set(token, auth)
   }
 }
 refreshAccessTokens()
 
 // ── OAuth helpers ──
+// Dynamic client registration is open to any OAuth client (Claude, ChatGPT,
+// Claude Code), so redirect URIs must be constrained: https everywhere, or
+// http only on localhost/127.0.0.1 (Claude Code callbacks). This prevents an
+// attacker from registering a client whose redirect harvests an auth code.
+export function isValidRedirectUri(uri) {
+  try {
+    const url = new URL(uri)
+    if (url.protocol === 'https:') return true
+    if (url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1')) return true
+    return false
+  } catch {
+    return false
+  }
+}
+
 export function registerOAuthClient({ clientName, redirectUris = [] }) {
+  if (!Array.isArray(redirectUris) || redirectUris.length === 0 || !redirectUris.every(isValidRedirectUri)) {
+    throw new Error('redirect_uris must be https URLs (or http://localhost / http://127.0.0.1)')
+  }
   return withOAuthStateLock(() => {
     refreshOAuthClients()
     const clientId = 'arcox_' + randomUUID().slice(0, 12)
@@ -234,12 +259,52 @@ export function exchangeCodeForToken(code, clientId, clientSecret, redirectUri, 
     // token issued concurrently by another worker.
     refreshAccessTokens()
     const token = 'arx_at_' + randomUUID().replace(/-/g, '')
+    const refreshToken = 'arx_rt_' + randomUUID().replace(/-/g, '')
     accessTokens.set(token, { userId: auth.userId, clientId, resource: auth.resource || MCP_RESOURCE_URL, mscaWalletAddress: auth.mscaWalletAddress || '', expires: Date.now() + TOKEN_TTL * 1000 })
+    refreshTokens.set(refreshToken, { userId: auth.userId, clientId, resource: auth.resource || MCP_RESOURCE_URL, mscaWalletAddress: auth.mscaWalletAddress || '', expires: Date.now() + REFRESH_TOKEN_TTL_MS })
     saveTokens()
     return {
       access_token: token,
       token_type: 'Bearer',
       expires_in: TOKEN_TTL,
+      refresh_token: refreshToken,
+      scope: 'mcp:tools',
+    }
+  })
+}
+
+export function refreshAccessTokenGrant(refreshToken, clientId, clientSecret, resource) {
+  if (!refreshToken) return { error: 'invalid_grant', error_description: 'refresh_token required' }
+  return withOAuthStateLock(() => {
+    refreshOAuthClients()
+    refreshAccessTokens()
+    const auth = refreshTokens.get(refreshToken)
+    if (!auth) return { error: 'invalid_grant', error_description: 'Invalid refresh token' }
+    if (Date.now() > auth.expires) {
+      refreshTokens.delete(refreshToken)
+      saveTokens()
+      return { error: 'invalid_grant', error_description: 'Refresh token expired; authorize again' }
+    }
+    if (auth.clientId !== clientId) return { error: 'invalid_grant', error_description: 'client_id mismatch' }
+    if (resource && !validResourceIndicator(resource)) return { error: 'invalid_target', error_description: 'resource must identify the ARCOX MCP endpoint' }
+    if (resource && resource !== (auth.resource || MCP_RESOURCE_URL)) return { error: 'invalid_target', error_description: 'resource does not match the refresh token' }
+    const client = oauthClients.get(clientId)
+    if (!client) return { error: 'invalid_client', error_description: 'Unknown client_id' }
+    if (clientSecret !== undefined && clientSecret !== '') {
+      if (client.clientSecret !== clientSecret) return { error: 'invalid_client', error_description: 'Invalid client_secret' }
+    }
+    // Rotate: the old refresh token is single-use.
+    refreshTokens.delete(refreshToken)
+    const token = 'arx_at_' + randomUUID().replace(/-/g, '')
+    const nextRefresh = 'arx_rt_' + randomUUID().replace(/-/g, '')
+    accessTokens.set(token, { userId: auth.userId, clientId, resource: auth.resource || MCP_RESOURCE_URL, mscaWalletAddress: auth.mscaWalletAddress || '', expires: Date.now() + TOKEN_TTL * 1000 })
+    refreshTokens.set(nextRefresh, { userId: auth.userId, clientId, resource: auth.resource || MCP_RESOURCE_URL, mscaWalletAddress: auth.mscaWalletAddress || '', expires: Date.now() + REFRESH_TOKEN_TTL_MS })
+    saveTokens()
+    return {
+      access_token: token,
+      token_type: 'Bearer',
+      expires_in: TOKEN_TTL,
+      refresh_token: nextRefresh,
       scope: 'mcp:tools',
     }
   })
@@ -273,6 +338,9 @@ const _authSweep = setInterval(() => {
       let changed = false
       for (const [token, auth] of accessTokens) {
         if (now > auth.expires) { accessTokens.delete(token); changed = true }
+      }
+      for (const [token, auth] of refreshTokens) {
+        if (now > auth.expires) { refreshTokens.delete(token); changed = true }
       }
       if (changed) saveTokens()
     })
@@ -522,7 +590,16 @@ export function oauthTokenHandler(req, res) {
     if (result.error) return res.status(400).json(result)
     return res.json(result)
   }
-  // refresh_token not implemented yet
+  if (grant_type === 'refresh_token') {
+    let result
+    try {
+      result = refreshAccessTokenGrant(code, client_id, client_secret, resource)
+    } catch (error) {
+      return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+    }
+    if (result.error) return res.status(400).json(result)
+    return res.json(result)
+  }
   res.status(400).json({ error: 'unsupported_grant_type' })
 }
 
@@ -531,6 +608,9 @@ export function oauthRegisterHandler(req, res) {
   const { client_name, redirect_uris = [], grant_types = ['authorization_code'], response_types = ['code'], token_endpoint_auth_method = 'none' } = req.body || {}
   if (!Array.isArray(redirect_uris) || redirect_uris.length === 0 || redirect_uris.some(uri => typeof uri !== 'string' || !uri)) {
     return res.status(400).json({ error: 'invalid_client_metadata', error_description: 'redirect_uris must be a non-empty array of URI strings' })
+  }
+  if (!redirect_uris.every(isValidRedirectUri)) {
+    return res.status(400).json({ error: 'invalid_client_metadata', error_description: 'redirect_uris must be https URLs (or http://localhost / http://127.0.0.1)' })
   }
   let client
   try {
