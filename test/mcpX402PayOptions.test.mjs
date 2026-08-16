@@ -2,7 +2,13 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
-const source = readFileSync(new URL('../src/services/mcpServer.mjs', import.meta.url), 'utf8')
+// x402 pay + intel tools moved to src/services/mcp/intelTools.mjs during the
+// repo split; keep both locations in scope so the guards survive future moves.
+const sourceFiles = [
+  '../src/services/mcp/intelTools.mjs',
+  '../src/services/mcpServer.mjs',
+].map(rel => readFileSync(new URL(rel, import.meta.url), 'utf8'))
+const source = sourceFiles.join('\n')
 
 test('x402 session payment uses arc-pay fee profile (bundler floor guard)', () => {
   // executeX402Pay must route through the same circle-gas-station envelope as
