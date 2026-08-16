@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { createAuthCode, exchangeCodeForToken, findExistingAuthCode, isValidRedirectUri, oauthRegisterHandler, refreshAccessTokenGrant, registerOAuthClient, validateAccessToken } from '../src/services/mcpServer.mjs'
+import { createAuthCode, exchangeCodeForToken, findExistingAuthCode, isValidRedirectUri, oauthRegisterHandler, oauthTokenHandler, refreshAccessTokenGrant, registerOAuthClient, validateAccessToken } from '../src/services/mcpServer.mjs'
 
 test('refresh token grant issues a new access token and rotates the refresh token', () => {
   const redirectUri = 'https://client.example/callback'
@@ -47,6 +47,26 @@ test('dynamic client registration rejects non-https / non-localhost redirect URI
   assert.throws(() => registerOAuthClient({ clientName: 'bad', redirectUris: ['http://evil.example/cb'] }), /redirect_uris must be https/i)
   const ok = registerOAuthClient({ clientName: 'good', redirectUris: ['http://127.0.0.1:47562/callback'] })
   assert.ok(ok.clientId.startsWith('arcox_'))
+})
+
+test('token endpoint accepts refresh_token from the request body', async () => {
+  const redirectUri = 'https://client.example/callback'
+  const challenge = createHash('sha256').update('handler-verifier-1234567890').digest('base64url')
+  const client = registerOAuthClient({ clientName: 'mcp-oauth-handler-test', redirectUris: [redirectUri] })
+  const code = createAuthCode(client.clientId, '0x2222222222222222222222222222222222222222', { redirectUri, codeChallenge: challenge, state: 's' })
+  const issued = exchangeCodeForToken(code, client.clientId, client.clientSecret, redirectUri, 'handler-verifier-1234567890', undefined)
+  let statusCode = 0
+  let body = null
+  const res = {
+    status(n) { statusCode = n; return this },
+    json(b) { body = b; return this },
+  }
+  await oauthTokenHandler({ body: { grant_type: 'refresh_token', refresh_token: issued.refresh_token, client_id: client.clientId } }, res)
+  // Success path calls res.json() directly (Express defaults to 200); a 400
+  // here would mean the handler rejected the grant.
+  assert.notEqual(statusCode, 400)
+  assert.ok(body.access_token?.startsWith('arx_at_'))
+  assert.ok(body.refresh_token && body.refresh_token !== issued.refresh_token)
 })
 
 test('repeated SIWE verification reuses the same pending authorization code', () => {

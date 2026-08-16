@@ -578,7 +578,7 @@ export async function siweVerifyHandler(req, res) {
 
 // ── Token endpoint ──
 export function oauthTokenHandler(req, res) {
-  const { grant_type, code, client_id, client_secret, redirect_uri, code_verifier, resource } = req.body || {}
+  const { grant_type, code, refresh_token, client_id, client_secret, redirect_uri, code_verifier, resource } = req.body || {}
   if (grant_type === 'authorization_code') {
 
     let result
@@ -593,7 +593,7 @@ export function oauthTokenHandler(req, res) {
   if (grant_type === 'refresh_token') {
     let result
     try {
-      result = refreshAccessTokenGrant(code, client_id, client_secret, resource)
+      result = refreshAccessTokenGrant(refresh_token, client_id, client_secret, resource)
     } catch (error) {
       return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
     }
