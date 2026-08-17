@@ -2047,6 +2047,23 @@ function consumeExecutionQuote(userId, action, previewId, params) {
 const X402_ARC_USDC = process.env.X402_USDC_ADDRESS || '0x3600000000000000000000000000000000000000'
 const X402_TRANSFER_ABI = [{ type: 'function', name: 'transfer', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
 const X402_APPROVE_ABI = [{ type: 'function', name: 'approve', stateMutability: 'nonpayable', inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
+
+// Arc Testnet swap token registry + on-chain AMM router (USDC↔cirBTC).
+// The AMM router is EOA-and-smart-account compatible (transferFrom(msg.sender))
+// and is the only on-chain route that does not depend on Circle's flaky
+// Stablecoin Service routing for USDC↔EURC on Arc Testnet.
+const SWAP_TOKEN_ADDRESS = {
+  USDC: '0x3600000000000000000000000000000000000000',
+  EURC: '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
+  cirBTC: '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF',
+}
+const SWAP_TOKEN_DECIMALS = { USDC: 6, EURC: 6, cirBTC: 8 }
+const ARCOX_AMM_ROUTER = process.env.ARCOX_AMM_ROUTER || '0x9f2443691bddd8343590c68e2a2cdec5fd0b6124'
+const AMM_SWAP_ABI = [{ type: 'function', name: 'swapWithFee', stateMutability: 'nonpayable', inputs: [
+  { name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' },
+  { name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' },
+], outputs: [{ name: 'amountOut', type: 'uint256' }] }]
+
 const ADAPTER_EXECUTE_ABI = [{
   type: 'function', name: 'execute', stateMutability: 'payable',
   inputs: [
@@ -2081,16 +2098,72 @@ function normalizePreparedExecution(params) {
   }
 }
 
+function computeMinAmountOut(amountOutDecimal, decimals) {
+  if (!amountOutDecimal || Number(amountOutDecimal) <= 0) return 0n
+  const units = parseUnits(String(amountOutDecimal), decimals)
+  // 1% slippage tolerance (mirrors the frontend computeMinAmountOut)
+  return (units * 99n) / 100n
+}
+
 function buildPreparedSwapCalls(prepared, expected = {}) {
   const allowedAdapter = String(process.env.ARCOX_SWAP_ADAPTER || '').toLowerCase()
-  // Never execute opaque adapter calldata without an explicit production
-  // allowlist. This keeps MCP swaps fail-closed until the deployment config
-  // names the exact audited adapter contract.
+  const allowedAmmRouter = String(process.env.ARCOX_AMM_ROUTER || '').toLowerCase()
+  if (expected.tokenIn && String(prepared?.tokenIn || '').toUpperCase() !== String(expected.tokenIn).toUpperCase()) return { calls: null, reason: 'quote_token_in_mismatch' }
+  if (expected.tokenOut && String(prepared?.tokenOut || '').toUpperCase() !== String(expected.tokenOut).toUpperCase()) return { calls: null, reason: 'quote_token_out_mismatch' }
+
+  // ── AMM router single-leg (USDC↔cirBTC) — on-chain, no Circle routing ──
+  if (prepared?.source === 'arcox-amm-router') {
+    if (!allowedAmmRouter) return { calls: null, reason: 'amm_router_not_allowlisted' }
+    if (String(prepared.ammRouter || '').toLowerCase() !== allowedAmmRouter) return { calls: null, reason: 'amm_router_mismatch' }
+    const tokenInAddr = prepared.tokenInAddress || SWAP_TOKEN_ADDRESS[prepared.tokenIn]
+    const tokenOutAddr = prepared.tokenOutAddress || SWAP_TOKEN_ADDRESS[prepared.tokenOut]
+    if (!tokenInAddr || !tokenOutAddr || !prepared.amountIn || !prepared.amountOut) return { calls: null, reason: 'amm_route_incomplete' }
+    const amountIn = parseUnits(String(prepared.amountIn), SWAP_TOKEN_DECIMALS[prepared.tokenIn] ?? 6)
+    const minAmountOut = computeMinAmountOut(prepared.amountOut, SWAP_TOKEN_DECIMALS[prepared.tokenOut] ?? 8)
+    return {
+      calls: [
+        { to: getAddress(tokenInAddr), value: 0n, data: encodeFunctionData({ abi: X402_APPROVE_ABI, functionName: 'approve', args: [getAddress(prepared.ammRouter), amountIn] }) },
+        { to: getAddress(prepared.ammRouter), value: 0n, data: encodeFunctionData({ abi: AMM_SWAP_ABI, functionName: 'swapWithFee', args: [getAddress(tokenInAddr), getAddress(tokenOutAddr), amountIn, minAmountOut] }) },
+      ],
+      reason: null,
+    }
+  }
+
+  // ── AMM router 2-leg (EURC↔cirBTC): adapter leg (EURC↔USDC) + AMM leg (USDC↔cirBTC) ──
+  if (prepared?.source === 'arcox-amm-router-2leg') {
+    if (!allowedAdapter) return { calls: null, reason: 'adapter_not_allowlisted' }
+    if (!allowedAmmRouter) return { calls: null, reason: 'amm_router_not_allowlisted' }
+    if (String(prepared.adapterContract || '').toLowerCase() !== allowedAdapter) return { calls: null, reason: 'adapter_mismatch' }
+    if (String(prepared.ammRouter || '').toLowerCase() !== allowedAmmRouter) return { calls: null, reason: 'amm_router_mismatch' }
+    if (!Array.isArray(prepared.legs) || prepared.legs.length === 0) return { calls: null, reason: 'prepared_route_incomplete' }
+    const calls = []
+    for (const leg of prepared.legs) {
+      if (leg?.provider === 'arcox-amm') {
+        // AMM leg: approve + swapWithFee on the AMM router
+        const tokenInAddr = leg.tokenInAddress || SWAP_TOKEN_ADDRESS[leg.tokenIn]
+        const tokenOutAddr = leg.tokenOutAddress || SWAP_TOKEN_ADDRESS[leg.tokenOut]
+        if (!tokenInAddr || !tokenOutAddr || !leg.amountIn || !leg.estimatedAmount) return { calls: null, reason: 'amm_leg_incomplete' }
+        const amountIn = parseUnits(String(leg.amountIn), SWAP_TOKEN_DECIMALS[leg.tokenIn] ?? 6)
+        const minAmountOut = computeMinAmountOut(leg.estimatedAmount, SWAP_TOKEN_DECIMALS[leg.tokenOut] ?? 8)
+        calls.push({ to: getAddress(tokenInAddr), value: 0n, data: encodeFunctionData({ abi: X402_APPROVE_ABI, functionName: 'approve', args: [getAddress(prepared.ammRouter), amountIn] }) })
+        calls.push({ to: getAddress(prepared.ammRouter), value: 0n, data: encodeFunctionData({ abi: AMM_SWAP_ABI, functionName: 'swapWithFee', args: [getAddress(tokenInAddr), getAddress(tokenOutAddr), amountIn, minAmountOut] }) })
+      } else {
+        // Stablecoin adapter leg: approve + execute
+        if (!leg?.executionParams || !leg.signature || !leg.tokenInAddress || !leg.amountBaseUnits) return { calls: null, reason: 'prepared_leg_incomplete' }
+        const executionParams = normalizePreparedExecution(leg.executionParams)
+        if (!executionParams) return { calls: null, reason: 'prepared_execution_params_invalid' }
+        const amount = BigInt(leg.amountBaseUnits)
+        calls.push({ to: getAddress(leg.tokenInAddress), value: 0n, data: encodeFunctionData({ abi: X402_APPROVE_ABI, functionName: 'approve', args: [getAddress(prepared.adapterContract), amount] }) })
+        calls.push({ to: getAddress(prepared.adapterContract), value: 0n, data: encodeFunctionData({ abi: ADAPTER_EXECUTE_ABI, functionName: 'execute', args: [executionParams, [{ permitType: 0, token: getAddress(leg.tokenInAddress), amount, permitCalldata: '0x' }], leg.signature] }) })
+      }
+    }
+    return { calls, reason: null }
+  }
+
+  // ── Stablecoin Service adapter (EURC↔USDC via Circle, single leg) ──
   if (!allowedAdapter) return { calls: null, reason: 'adapter_not_allowlisted' }
   if (!prepared?.adapterContract || !Array.isArray(prepared.legs) || prepared.legs.length === 0) return { calls: null, reason: 'prepared_route_incomplete' }
   if (String(prepared.adapterContract).toLowerCase() !== allowedAdapter) return { calls: null, reason: 'adapter_mismatch' }
-  if (expected.tokenIn && String(prepared.tokenIn || '').toUpperCase() !== String(expected.tokenIn).toUpperCase()) return { calls: null, reason: 'quote_token_in_mismatch' }
-  if (expected.tokenOut && String(prepared.tokenOut || '').toUpperCase() !== String(expected.tokenOut).toUpperCase()) return { calls: null, reason: 'quote_token_out_mismatch' }
   const calls = []
   for (const leg of prepared.legs) {
     if (!leg?.executionParams || !leg.signature || !leg.tokenInAddress || !leg.amountBaseUnits) return { calls: null, reason: 'prepared_leg_incomplete' }
@@ -2327,7 +2400,9 @@ export function createMcpServer(userId, context = {}) {
     const tokens = [params.token, params.tokenIn, params.tokenOut]
       .filter(Boolean)
       .map(token => String(token).toUpperCase())
-    const hasUnsupportedSwapToken = action === 'swap' && tokens.some(token => token === 'CIRBTC' || token === 'USYC')
+    // cirBTC swaps run on the on-chain AMM router (USDC↔cirBTC) and are fully
+    // supported for MSCA execution; only USYC has no production route.
+    const hasUnsupportedSwapToken = action === 'swap' && tokens.some(token => token === 'USYC')
     const knownAction = ['swap', 'send', 'bridge'].includes(action)
     const route = action === 'bridge' ? bridgeConfig(params.fromChain, params.toChain) : null
     const bridgeIsSupported = action === 'bridge' && ENABLE_MSCA_CCTP_BRIDGE && String(params.token || 'USDC').toUpperCase() === 'USDC' && Boolean(route?.source?.router && route?.destination?.messageTransmitter)
@@ -2451,18 +2526,23 @@ export function createMcpServer(userId, context = {}) {
     }
     try {
       const preparedPayload = quoteCheck.quote.params.prepared
-      if (!preparedPayload || preparedPayload.source !== 'stablecoin-service' || !preparedPayload.adapterContract) {
+      const allowedSwapSources = ['stablecoin-service', 'arcox-amm-router', 'arcox-amm-router-2leg']
+      if (!preparedPayload || !allowedSwapSources.includes(preparedPayload.source)) {
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'swap_route_not_supported_for_msca', message: 'Route ini belum aman untuk eksekusi MSCA.' }) }] }
       }
         const preparedResult = buildPreparedSwapCalls(preparedPayload, { tokenIn: params.tokenIn, tokenOut: params.tokenOut })
       if (!preparedResult.calls) {
         const message = preparedResult.reason === 'adapter_not_allowlisted'
           ? 'Server belum mengonfigurasi ARCOX_SWAP_ADAPTER untuk eksekusi MSCA.'
-          : preparedResult.reason === 'prepared_leg_incomplete'
-            ? 'Circle tidak mengembalikan executionParams/signature lengkap untuk route ini. Coba pasangan stablecoin yang didukung.'
-            : preparedResult.reason === 'adapter_mismatch'
-              ? 'Adapter swap dari quote tidak cocok dengan adapter yang diizinkan server.'
-              : 'Quote swap ini belum menghasilkan calldata MSCA yang aman untuk dieksekusi.'
+          : preparedResult.reason === 'amm_router_not_allowlisted'
+            ? 'Server belum mengonfigurasi ARCOX_AMM_ROUTER untuk eksekusi MSCA.'
+            : preparedResult.reason === 'prepared_leg_incomplete'
+              ? 'Circle tidak mengembalikan executionParams/signature lengkap untuk route ini. Coba pasangan stablecoin yang didukung.'
+              : preparedResult.reason === 'adapter_mismatch'
+                ? 'Adapter swap dari quote tidak cocok dengan adapter yang diizinkan server.'
+                : preparedResult.reason === 'amm_router_mismatch'
+                  ? 'AMM router dari quote tidak cocok dengan router yang diizinkan server.'
+                  : 'Quote swap ini belum menghasilkan calldata MSCA yang aman untuk dieksekusi.'
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: preparedResult.reason || 'swap_calldata_unavailable', message }) }] }
       }
       const { swapViaSession } = await import('./sessionKeyService.mjs')
