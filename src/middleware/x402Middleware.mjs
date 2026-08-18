@@ -6,6 +6,7 @@ import { verifyOwnerToken } from '../services/authToken.mjs'
 import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
 import { ARC_RPC_LOG_CHUNK_SIZE, arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
+import { scheduleWebhookEventUpsert, scheduleX402InvoiceUpsert } from '../services/supabasePersistence.mjs'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
@@ -63,6 +64,7 @@ function persistInvoices() {
       }
     }
     atomicWriteJsonFile(X402_INVOICE_DB, retained)
+    for (const invoice of retained) scheduleX402InvoiceUpsert(invoice)
   } catch (error) {
     console.error('[x402] failed to persist invoice db', error?.message || error)
   }
@@ -551,11 +553,13 @@ export function processCircleX402Webhook(payload = {}) {
     createdAt: new Date().toISOString(),
   }
   webhookEvents.set(eventId, event)
+  scheduleWebhookEventUpsert(event)
   while (webhookEvents.size > 1000) webhookEvents.delete(webhookEvents.keys().next().value)
 
   if (eventType !== 'transactions.inbound') {
     event.processed = true
     event.processedAt = new Date().toISOString()
+    scheduleWebhookEventUpsert(event)
     return { duplicate: false, event, ignored: true, reason: 'unsupported_event_type' }
   }
 
@@ -574,6 +578,7 @@ export function processCircleX402Webhook(payload = {}) {
   if (!isFinalCircleStatus(extracted.status)) {
     event.processed = true
     event.processedAt = new Date().toISOString()
+    scheduleWebhookEventUpsert(event)
     return { duplicate: false, event, ignored: true, reason: 'non_final_status' }
   }
 
@@ -607,6 +612,7 @@ export function processCircleX402Webhook(payload = {}) {
     invoices.set(latest.invoiceId, latest)
     invoices.set(latest.paymentId, latest)
     persistInvoices()
+    scheduleWebhookEventUpsert(event)
     scheduleAgentMemoProof(latest)
     return { duplicate: false, event, invoice: latest }
   }
@@ -615,6 +621,7 @@ export function processCircleX402Webhook(payload = {}) {
   event.processedAt = new Date().toISOString()
   unmatchedInboundEvents.push(event)
   if (unmatchedInboundEvents.length > 1000) unmatchedInboundEvents.splice(0, unmatchedInboundEvents.length - 1000)
+  scheduleWebhookEventUpsert(event)
   return { duplicate: false, event, unmatched: true }
 }
 

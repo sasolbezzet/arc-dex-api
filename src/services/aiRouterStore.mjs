@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from 'crypto'
 import { privateKeyToAccount } from 'viem/accounts'
 import { atomicWriteJsonFile, readJsonFile } from './jsonFileStore.mjs'
 import { treasuryAddress as configuredTreasuryAddress } from '../config/treasury.mjs'
+import { scheduleAiUsageUpsert } from './supabasePersistence.mjs'
 
 const DB_FILE = process.env.AI_ROUTER_DB || './ai-router-db.json'
 const state = globalThis.__arcoxAiRouterStore || load()
@@ -427,6 +428,7 @@ export function addUsageLog(entry) {
   state.usageLogs.unshift(log)
   state.usageLogs = state.usageLogs.slice(0, 1000)
   saveAiRouterStore()
+  scheduleAiUsageUpsert(log)
   return log
 }
 

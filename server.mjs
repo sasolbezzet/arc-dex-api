@@ -34,6 +34,7 @@ import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCirc
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
+import { scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
 
 process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -1424,6 +1425,7 @@ function appendTxHistory(owner, input) {
   const withoutExisting = items.filter(item => item?.id !== rec.id)
   db[key] = [rec, ...withoutExisting].sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0)).slice(0, 100)
   saveTxHistory(db)
+  scheduleTransactionHistoryUpsert(rec)
   return rec
 }
 
@@ -1509,6 +1511,7 @@ function createInvoice(input = {}) {
   const db = loadInvoices()
   db[invoiceId] = invoice
   saveInvoices(db)
+  schedulePaymentInvoiceUpsert(invoice)
   return invoice
 }
 
@@ -1536,6 +1539,7 @@ function patchInvoice(invoiceId, patch = {}) {
   }
   db[invoice.invoiceId] = invoice
   saveInvoices(db)
+  schedulePaymentInvoiceUpsert(invoice)
   return invoice
 }
 
@@ -1552,6 +1556,7 @@ function markInvoicePaid(invoiceId, input = {}) {
   invoice.timeline = [...(invoice.timeline || []), timelineEvent('manual_mark_paid', 'Invoice marked paid by payment confirmation or sandbox tool.', invoice.txHash)]
   db[invoice.invoiceId] = invoice
   saveInvoices(db)
+  schedulePaymentInvoiceUpsert(invoice)
   return invoice
 }
 
@@ -1695,6 +1700,7 @@ function saveGenericWebhookEvent(provider, notificationId, eventType, rawPayload
     }
     eventDb[id] = event
     saveWebhookEvents(eventDb)
+    scheduleWebhookEventUpsert(event)
     return { duplicate: false, event }
   })
 }
@@ -1707,6 +1713,7 @@ function updateGenericWebhookEvent(notificationId, mutate) {
     const next = mutate({ ...event }) || event
     eventDb[String(notificationId)] = next
     saveWebhookEvents(eventDb)
+    scheduleWebhookEventUpsert(next)
     return next
   })
 }
@@ -1775,6 +1782,7 @@ async function processCircleGatewayWebhook(payload = {}) {
   }
   eventDb[fields.notificationId] = event
   saveWebhookEvents(eventDb)
+  scheduleWebhookEventUpsert(event)
 
   const { invoice } = findInvoiceForWebhook(payload)
   if (!invoice) {
@@ -1783,6 +1791,7 @@ async function processCircleGatewayWebhook(payload = {}) {
     event.processedAt = nowIso()
     eventDb[fields.notificationId] = event
     saveWebhookEvents(eventDb)
+    scheduleWebhookEventUpsert(event)
     return { duplicate: false, matched: false, event }
   }
 
@@ -1805,6 +1814,7 @@ async function processCircleGatewayWebhook(payload = {}) {
     target.timeline = [...(target.timeline || []), timelineEvent(mapped.type, mapped.message, fields.txHash)]
     invoiceDb[target.invoiceId] = target
     saveInvoices(invoiceDb)
+    schedulePaymentInvoiceUpsert(target)
   }
   event.processed = true
   event.matched = true
@@ -1813,6 +1823,7 @@ async function processCircleGatewayWebhook(payload = {}) {
   event.processedAt = nowIso()
   eventDb[fields.notificationId] = event
   saveWebhookEvents(eventDb)
+  scheduleWebhookEventUpsert(event)
   return { duplicate: false, matched: true, event, invoice: target }
 }
 
@@ -3570,5 +3581,6 @@ if (!process.env.VERCEL) {
     console.log('Routes: health, wallet, balance, quote, swap, prepare-bridge,')
     console.log('        get-attestation, mint-cctp-solana, mint-cctp-from-solana, send, history')
     console.log('        invoices, circle-gateway webhook, eco route-preview')
+    console.log('[supabase] persistence:', JSON.stringify(supabasePersistenceStatus()))
   })
 }
