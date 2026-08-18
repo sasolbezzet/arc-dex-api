@@ -773,7 +773,7 @@ test('MSCA bridge calldata approves and calls the verified ArcoxRouter', async (
     },
     destination: { domain: 6, requiredFinalityThreshold: 1000 },
   }
-  const calls = buildMscaRouterBridgeCalls({ route, amount: 1_000_000n, mintRecipient: MSCA })
+  const calls = buildMscaRouterBridgeCalls({ route, amount: 1_000_000n, mintRecipient: MSCA, maxFee: 10n })
   assert.equal(calls.length, 2)
   assert.equal(calls[0].to.toLowerCase(), route.source.usdc.toLowerCase())
   assert.equal(calls[1].to.toLowerCase(), route.source.router.toLowerCase())

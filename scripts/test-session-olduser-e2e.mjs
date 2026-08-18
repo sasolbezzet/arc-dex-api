@@ -2,7 +2,7 @@
 // the session must become active again (or re-authorize the delegate).
 // Uses the persisted E2E credential (state file) for the existing MSCA so no
 // new wallet is created — exactly like an existing user logging back in.
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { webcrypto } from 'node:crypto'
 import { custom, createPublicClient, defineChain, getAddress, encodeFunctionData, http } from 'viem'
 import { toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
@@ -18,8 +18,10 @@ const chain = CHAINS[chainKey]
 const CLIENT_URL = String(process.env.CIRCLE_CLIENT_URL || '').replace(/\/+$/, '')
 const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
 
-const st = JSON.parse(readFileSync(process.env.E2E_STATE_PATH || '/tmp/arcox-e2e-state.json', 'utf8'))
-console.log('using persisted passkey credential for MSCA:', st.msca, '| delegate:', st.delegateAddress)
+const statePath = process.env.E2E_STATE_PATH || '/tmp/arcox-e2e-state.json'
+const st = JSON.parse(readFileSync(statePath, 'utf8'))
+const persistedMsca = st.msca || st.walletAddress
+console.log('using persisted passkey credential for MSCA:', persistedMsca, '| delegate:', st.delegateAddress)
 if (!st.pkcs8 || !st.rpId || !st.credentialId) throw new Error('state file missing credential fields')
 
 const privateKey = await webcrypto.subtle.importKey(
@@ -73,8 +75,12 @@ const verifyRes = await fetch(`${BASE}/api/auth/passkey-login`, { method: 'POST'
 const verifyJson = await verifyRes.json()
 if (!verifyRes.ok || !verifyJson.token) throw new Error(`passkey login failed: ${verifyRes.status} ${JSON.stringify(verifyJson)}`)
 const token = verifyJson.token
+// Persist only the short-lived vault token for follow-up E2E calls; the
+// credential/private key already belongs to this local test state file.
+st.token = token
+writeFileSync(statePath, JSON.stringify(st, null, 2))
 const walletAddress = getAddress(verifyJson.address)
-console.log('② passkey login OK → MSCA:', walletAddress, '| matches persisted:', walletAddress.toLowerCase() === st.msca.toLowerCase())
+console.log('② passkey login OK → MSCA:', walletAddress, '| matches persisted:', walletAddress.toLowerCase() === persistedMsca.toLowerCase())
 
 // --- 2. Reserve a NEW delegate (this is what a real login does) ---
 const reserveRes = await fetch(`${BASE}/api/session/generate-key`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ walletAddress }) })

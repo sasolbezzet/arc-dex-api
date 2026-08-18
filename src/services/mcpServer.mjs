@@ -796,8 +796,61 @@ const BRIDGE_CCTP = {
 // mint relayer have been configured and a small testnet transfer is approved.
 const ENABLE_MSCA_CCTP_BRIDGE = process.env.ENABLE_MSCA_CCTP_BRIDGE === 'true'
 const BRIDGE_ZERO_BYTES32 = `0x${'0'.repeat(64)}`
-const BRIDGE_MAX_FEE = BigInt(process.env.CCTP_MAX_FEE_BASE_UNITS || '10')
+// CCTP Fast Transfer fees are route- and amount-dependent. Circle explicitly
+// says not to hardcode them: query Iris immediately before the burn and add a
+// small buffer so a fee change cannot degrade the message or revert the burn.
+const CCTP_FEE_API_BASE_URL = String(process.env.CCTP_FEE_API_BASE_URL || 'https://iris-api-sandbox.circle.com').replace(/\/+$/, '')
+const CCTP_FEE_BUFFER_BPS = Number(process.env.CCTP_FEE_BUFFER_BPS || '2000')
+// The pure calldata builder defaults to zero; production quote/execute always
+// supplies the fresh Circle-derived value explicitly. There is no production
+// hardcoded fee fallback that could silently degrade a Fast Transfer.
+const BRIDGE_BUILDER_DEFAULT_MAX_FEE = 0n
 const configuredBridgeFinalityThreshold = Number(process.env.CCTP_MIN_FINALITY_THRESHOLD || '1000')
+
+function parseFeeRateHundredthsBps(value) {
+  const raw = String(value ?? '').trim()
+  if (!/^\d+(?:\.\d+)?$/.test(raw)) throw new Error('Circle fee API returned an invalid minimumFee')
+  const [whole, fraction = ''] = raw.split('.')
+  let hundredths = BigInt(whole) * 100n + BigInt((fraction + '00').slice(0, 2))
+  if (fraction.length > 2 && Number(fraction[2]) >= 5) hundredths += 1n
+  return hundredths
+}
+
+export function calculateCctpMaxFee({ amount, minimumFee, bufferBps = CCTP_FEE_BUFFER_BPS } = {}) {
+  const transferAmount = BigInt(amount)
+  const buffer = Number(bufferBps)
+  if (transferAmount <= 0n) throw new Error('CCTP fee amount must be positive')
+  if (!Number.isInteger(buffer) || buffer < 0 || buffer > 10000) throw new Error('CCTP fee buffer must be between 0 and 10000 bps')
+  // minimumFee is expressed in basis points. Keeping two decimal places as an
+  // integer avoids floating point errors (1.3 bps = 130 / 1,000,000).
+  const feeRateHundredthsBps = parseFeeRateHundredthsBps(minimumFee)
+  const protocolFee = (transferAmount * feeRateHundredthsBps) / 1_000_000n
+  const maxFee = (protocolFee * BigInt(10_000 + buffer) + 9_999n) / 10_000n
+  return { protocolFee, maxFee, feeRateHundredthsBps, bufferBps: buffer }
+}
+
+export async function getCctpFeeQuote(route, amount, fetchImpl = fetch) {
+  const sourceDomain = Number(route?.source?.domain)
+  const destinationDomain = Number(route?.destination?.domain)
+  const finalityThreshold = bridgeFinalityThreshold(route)
+  if (!Number.isInteger(sourceDomain) || !Number.isInteger(destinationDomain)) throw new Error('CCTP route domains are not configured')
+  const url = `${CCTP_FEE_API_BASE_URL}/v2/burn/USDC/fees/${sourceDomain}/${destinationDomain}`
+  const response = await fetchImpl(url, { headers: { Accept: 'application/json' } })
+  if (!response.ok) throw new Error(`Circle CCTP fee API HTTP ${response.status}`)
+  const payload = await response.json()
+  const entries = Array.isArray(payload) ? payload : (Array.isArray(payload?.fees) ? payload.fees : [])
+  const entry = entries.find(item => Number(item?.finalityThreshold) === finalityThreshold)
+  if (!entry) throw new Error(`Circle CCTP fee unavailable for finality threshold ${finalityThreshold}`)
+  const calculated = calculateCctpMaxFee({ amount, minimumFee: entry.minimumFee })
+  return {
+    ...calculated,
+    sourceDomain,
+    destinationDomain,
+    finalityThreshold,
+    minimumFee: String(entry.minimumFee),
+    endpoint: url,
+  }
+}
 // Circle CCTP V2 defines only 1000 (Confirmed) and 2000 (Finalized). Keep an
 // invalid deployment setting from producing unsupported calldata; normalize it
 // to the conservative confirmed threshold for non-Arc destinations.
@@ -965,7 +1018,7 @@ async function getRouterFeeQuote(route, amount) {
 // Pure calldata builder shared by execution and regression tests. The router
 // pulls the gross amount from msg.sender (the MSCA), sends its platform fee to
 // treasury, and burns the remaining netAmount through standard CCTP V2.
-export function buildMscaRouterBridgeCalls({ route, amount, mintRecipient, maxFee = BRIDGE_MAX_FEE, minFinalityThreshold }) {
+export function buildMscaRouterBridgeCalls({ route, amount, mintRecipient, maxFee = BRIDGE_BUILDER_DEFAULT_MAX_FEE, minFinalityThreshold }) {
   if (!route?.source?.router || !route?.source?.usdc || route?.destination?.domain === undefined) throw new Error('Invalid ArcoxRouter bridge route')
   const grossAmount = BigInt(amount)
   const requiredFinalityThreshold = bridgeFinalityThreshold(route)
@@ -1451,13 +1504,13 @@ async function findPendingBridgeMint(userId, burnTxHash, toKey) {
       if (!['pending_confirmation', 'pending_signature'].includes(approval.status)) continue
       let details
       try { details = JSON.parse(approval.details || '{}') } catch { details = null }
-      if (details?.burnTxHash !== burnTxHash || details?.toChain !== toKey) continue
-      if (!details.destinationChainKey) continue
+      const destinationKey = details?.destinationChainKey || details?.toChain
+      if (details?.burnTxHash !== burnTxHash || executionChainKey(destinationKey) !== executionChainKey(toKey)) continue
       return {
         approval,
         phase: details.settlementPhase || (details.destinationUserOpHash ? 'destination_submitted' : 'intent_created'),
         userOpHash: details.destinationUserOpHash || null,
-        chainKey: details.destinationChainKey,
+        chainKey: details.destinationChainKey || executionChainKey(toKey),
       }
     }
   } catch { /* status/retry remains fail-closed below */ }
@@ -1635,7 +1688,8 @@ async function findPendingBridgeIntent(userId, burnTxHash, toKey) {
       if (!['pending_confirmation', 'pending_signature'].includes(approval.status)) continue
       let details
       try { details = JSON.parse(approval.details || '{}') } catch { details = null }
-      if (details?.burnTxHash === burnTxHash && details?.toChain === toKey && details?.destinationChainKey && !details.destinationUserOpHash) {
+      const destinationKey = details?.destinationChainKey || details?.toChain
+      if (details?.burnTxHash === burnTxHash && executionChainKey(destinationKey) === executionChainKey(toKey) && !details.destinationUserOpHash) {
         return { approval, details, phase: details.settlementPhase || 'intent_created' }
       }
     }
@@ -2048,10 +2102,10 @@ const X402_ARC_USDC = process.env.X402_USDC_ADDRESS || '0x3600000000000000000000
 const X402_TRANSFER_ABI = [{ type: 'function', name: 'transfer', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
 const X402_APPROVE_ABI = [{ type: 'function', name: 'approve', stateMutability: 'nonpayable', inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
 
-// Arc Testnet swap token registry + on-chain AMM router (USDC↔cirBTC).
-// The AMM router is EOA-and-smart-account compatible (transferFrom(msg.sender))
-// and is the only on-chain route that does not depend on Circle's flaky
-// Stablecoin Service routing for USDC↔EURC on Arc Testnet.
+// Arc Testnet swap token registry + on-chain AMM route (USDC↔cirBTC).
+// The deployed router's swapWithFee implementation double-pulls from the
+// caller. Execution therefore targets the router's registered pool directly;
+// the pool pulls once from the MSCA and sends output back to it.
 const SWAP_TOKEN_ADDRESS = {
   USDC: '0x3600000000000000000000000000000000000000',
   EURC: '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
@@ -2059,9 +2113,9 @@ const SWAP_TOKEN_ADDRESS = {
 }
 const SWAP_TOKEN_DECIMALS = { USDC: 6, EURC: 6, cirBTC: 8 }
 const ARCOX_AMM_ROUTER = process.env.ARCOX_AMM_ROUTER || '0x9f2443691bddd8343590c68e2a2cdec5fd0b6124'
-const AMM_SWAP_ABI = [{ type: 'function', name: 'swapWithFee', stateMutability: 'nonpayable', inputs: [
-  { name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' },
-  { name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' },
+const ARCOX_AMM_POOL = process.env.ARCOX_AMM_POOL || '0xd4aF8e12903A4c6bD60BbC353fb97ffC9Cc2Dc2D'
+const AMM_POOL_SWAP_ABI = [{ type: 'function', name: 'swap', stateMutability: 'nonpayable', inputs: [
+  { name: 'tokenIn', type: 'address' }, { name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' },
 ], outputs: [{ name: 'amountOut', type: 'uint256' }] }]
 
 const ADAPTER_EXECUTE_ABI = [{
@@ -2105,7 +2159,7 @@ function computeMinAmountOut(amountOutDecimal, decimals) {
   return (units * 99n) / 100n
 }
 
-function buildPreparedSwapCalls(prepared, expected = {}) {
+export function buildPreparedSwapCalls(prepared, expected = {}) {
   const allowedAdapter = String(process.env.ARCOX_SWAP_ADAPTER || '').toLowerCase()
   const allowedAmmRouter = String(process.env.ARCOX_AMM_ROUTER || '').toLowerCase()
   if (expected.tokenIn && String(prepared?.tokenIn || '').toUpperCase() !== String(expected.tokenIn).toUpperCase()) return { calls: null, reason: 'quote_token_in_mismatch' }
@@ -2115,18 +2169,27 @@ function buildPreparedSwapCalls(prepared, expected = {}) {
   if (prepared?.source === 'arcox-amm-router') {
     if (!allowedAmmRouter) return { calls: null, reason: 'amm_router_not_allowlisted' }
     if (String(prepared.ammRouter || '').toLowerCase() !== allowedAmmRouter) return { calls: null, reason: 'amm_router_mismatch' }
+    const allowedAmmPool = String(process.env.ARCOX_AMM_POOL || ARCOX_AMM_POOL).toLowerCase()
+    if (!allowedAmmPool) return { calls: null, reason: 'amm_pool_not_allowlisted' }
+    if (String(prepared.ammPool || '').toLowerCase() !== allowedAmmPool) return { calls: null, reason: 'amm_pool_mismatch' }
     const tokenInAddr = prepared.tokenInAddress || SWAP_TOKEN_ADDRESS[prepared.tokenIn]
     const tokenOutAddr = prepared.tokenOutAddress || SWAP_TOKEN_ADDRESS[prepared.tokenOut]
     if (!tokenInAddr || !tokenOutAddr || !prepared.amountIn || !prepared.amountOut) return { calls: null, reason: 'amm_route_incomplete' }
-    const amountIn = parseUnits(String(prepared.amountIn), SWAP_TOKEN_DECIMALS[prepared.tokenIn] ?? 6)
+    const grossAmount = parseUnits(String(prepared.amountIn), SWAP_TOKEN_DECIMALS[prepared.tokenIn] ?? 6)
+    const amountIn = parseUnits(String(prepared.platformFee?.swapAmountIn || prepared.ammSwapAmount || prepared.amountIn), SWAP_TOKEN_DECIMALS[prepared.tokenIn] ?? 6)
+    if (amountIn <= 0n || amountIn > grossAmount) return { calls: null, reason: 'amm_amount_invalid' }
     const minAmountOut = computeMinAmountOut(prepared.amountOut, SWAP_TOKEN_DECIMALS[prepared.tokenOut] ?? 8)
-    return {
-      calls: [
-        { to: getAddress(tokenInAddr), value: 0n, data: encodeFunctionData({ abi: X402_APPROVE_ABI, functionName: 'approve', args: [getAddress(prepared.ammRouter), amountIn] }) },
-        { to: getAddress(prepared.ammRouter), value: 0n, data: encodeFunctionData({ abi: AMM_SWAP_ABI, functionName: 'swapWithFee', args: [getAddress(tokenInAddr), getAddress(tokenOutAddr), amountIn, minAmountOut] }) },
-      ],
-      reason: null,
+    const calls = []
+    const feeAmount = prepared.platformFee?.amount
+      ? parseUnits(String(prepared.platformFee.amount), SWAP_TOKEN_DECIMALS[prepared.tokenIn] ?? 6)
+      : 0n
+    if (feeAmount > 0n) {
+      if (!prepared.platformFee?.treasury) return { calls: null, reason: 'amm_fee_treasury_missing' }
+      calls.push({ to: getAddress(tokenInAddr), value: 0n, data: encodeFunctionData({ abi: X402_TRANSFER_ABI, functionName: 'transfer', args: [getAddress(prepared.platformFee.treasury), feeAmount] }) })
     }
+    calls.push({ to: getAddress(tokenInAddr), value: 0n, data: encodeFunctionData({ abi: X402_APPROVE_ABI, functionName: 'approve', args: [getAddress(prepared.ammPool), amountIn] }) })
+    calls.push({ to: getAddress(prepared.ammPool), value: 0n, data: encodeFunctionData({ abi: AMM_POOL_SWAP_ABI, functionName: 'swap', args: [getAddress(tokenInAddr), amountIn, minAmountOut] }) })
+    return { calls, reason: null }
   }
 
   // ── AMM router 2-leg (EURC↔cirBTC): adapter leg (EURC↔USDC) + AMM leg (USDC↔cirBTC) ──
@@ -2135,18 +2198,28 @@ function buildPreparedSwapCalls(prepared, expected = {}) {
     if (!allowedAmmRouter) return { calls: null, reason: 'amm_router_not_allowlisted' }
     if (String(prepared.adapterContract || '').toLowerCase() !== allowedAdapter) return { calls: null, reason: 'adapter_mismatch' }
     if (String(prepared.ammRouter || '').toLowerCase() !== allowedAmmRouter) return { calls: null, reason: 'amm_router_mismatch' }
+    const allowedAmmPool = String(process.env.ARCOX_AMM_POOL || ARCOX_AMM_POOL).toLowerCase()
+    if (!allowedAmmPool) return { calls: null, reason: 'amm_pool_not_allowlisted' }
+    if (String(prepared.ammPool || '').toLowerCase() !== allowedAmmPool) return { calls: null, reason: 'amm_pool_mismatch' }
     if (!Array.isArray(prepared.legs) || prepared.legs.length === 0) return { calls: null, reason: 'prepared_route_incomplete' }
     const calls = []
+    const feeAmount = prepared.platformFee?.amount
+      ? parseUnits(String(prepared.platformFee.amount), SWAP_TOKEN_DECIMALS[prepared.tokenIn] ?? 6)
+      : 0n
+    if (feeAmount > 0n) {
+      if (!prepared.platformFee?.treasury) return { calls: null, reason: 'amm_fee_treasury_missing' }
+      calls.push({ to: getAddress(SWAP_TOKEN_ADDRESS[prepared.tokenIn]), value: 0n, data: encodeFunctionData({ abi: X402_TRANSFER_ABI, functionName: 'transfer', args: [getAddress(prepared.platformFee.treasury), feeAmount] }) })
+    }
     for (const leg of prepared.legs) {
       if (leg?.provider === 'arcox-amm') {
-        // AMM leg: approve + swapWithFee on the AMM router
+        // AMM leg: approve the registered pool, then call pool.swap directly.
         const tokenInAddr = leg.tokenInAddress || SWAP_TOKEN_ADDRESS[leg.tokenIn]
         const tokenOutAddr = leg.tokenOutAddress || SWAP_TOKEN_ADDRESS[leg.tokenOut]
         if (!tokenInAddr || !tokenOutAddr || !leg.amountIn || !leg.estimatedAmount) return { calls: null, reason: 'amm_leg_incomplete' }
         const amountIn = parseUnits(String(leg.amountIn), SWAP_TOKEN_DECIMALS[leg.tokenIn] ?? 6)
         const minAmountOut = computeMinAmountOut(leg.estimatedAmount, SWAP_TOKEN_DECIMALS[leg.tokenOut] ?? 8)
-        calls.push({ to: getAddress(tokenInAddr), value: 0n, data: encodeFunctionData({ abi: X402_APPROVE_ABI, functionName: 'approve', args: [getAddress(prepared.ammRouter), amountIn] }) })
-        calls.push({ to: getAddress(prepared.ammRouter), value: 0n, data: encodeFunctionData({ abi: AMM_SWAP_ABI, functionName: 'swapWithFee', args: [getAddress(tokenInAddr), getAddress(tokenOutAddr), amountIn, minAmountOut] }) })
+        calls.push({ to: getAddress(tokenInAddr), value: 0n, data: encodeFunctionData({ abi: X402_APPROVE_ABI, functionName: 'approve', args: [getAddress(prepared.ammPool), amountIn] }) })
+        calls.push({ to: getAddress(prepared.ammPool), value: 0n, data: encodeFunctionData({ abi: AMM_POOL_SWAP_ABI, functionName: 'swap', args: [getAddress(tokenInAddr), amountIn, minAmountOut] }) })
       } else {
         // Stablecoin adapter leg: approve + execute
         if (!leg?.executionParams || !leg.signature || !leg.tokenInAddress || !leg.amountBaseUnits) return { calls: null, reason: 'prepared_leg_incomplete' }
@@ -2530,7 +2603,7 @@ export function createMcpServer(userId, context = {}) {
       if (!preparedPayload || !allowedSwapSources.includes(preparedPayload.source)) {
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'swap_route_not_supported_for_msca', message: 'Route ini belum aman untuk eksekusi MSCA.' }) }] }
       }
-        const preparedResult = buildPreparedSwapCalls(preparedPayload, { tokenIn: params.tokenIn, tokenOut: params.tokenOut })
+      const preparedResult = buildPreparedSwapCalls(preparedPayload, { tokenIn: params.tokenIn, tokenOut: params.tokenOut })
       if (!preparedResult.calls) {
         const message = preparedResult.reason === 'adapter_not_allowlisted'
           ? 'Server belum mengonfigurasi ARCOX_SWAP_ADAPTER untuk eksekusi MSCA.'
@@ -2542,7 +2615,9 @@ export function createMcpServer(userId, context = {}) {
                 ? 'Adapter swap dari quote tidak cocok dengan adapter yang diizinkan server.'
                 : preparedResult.reason === 'amm_router_mismatch'
                   ? 'AMM router dari quote tidak cocok dengan router yang diizinkan server.'
-                  : 'Quote swap ini belum menghasilkan calldata MSCA yang aman untuk dieksekusi.'
+                  : preparedResult.reason === 'amm_pool_mismatch'
+                    ? 'AMM pool dari quote tidak cocok dengan pool yang diizinkan server.'
+                    : 'Quote swap ini belum menghasilkan calldata MSCA yang aman untuk dieksekusi.'
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: preparedResult.reason || 'swap_calldata_unavailable', message }) }] }
       }
       const { swapViaSession } = await import('./sessionKeyService.mjs')
@@ -2555,7 +2630,14 @@ export function createMcpServer(userId, context = {}) {
         })
         return { content: [{ type: 'text', text: jsonText({ status: 'executed', executed: true, txHash: result.txHash, explorerUrl: result.explorerUrl, message: `Swap ${params.amountIn} ${params.tokenIn} → ${params.tokenOut} berhasil via MSCA (session key).` }) }] }
       }
-      return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, error: result.reason || 'Session swap gagal' }) }] }
+      return { content: [{ type: 'text', text: jsonText({
+        status: 'session_failed',
+        executed: false,
+        reason: result.reason || 'session_swap_failed',
+        error: result.error || result.reason || 'Session swap gagal',
+        safeToRetry: result.safeToRetry === true,
+        userOpAccepted: result.userOpAccepted || 'unknown',
+      }) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ status: 'session_error', executed: false, error: e?.message || 'Session error' }) }] }
     }
@@ -2621,6 +2703,7 @@ export function createMcpServer(userId, context = {}) {
       const amount = parseUnits(String(params.amount).trim(), 6)
       if (amount <= 0n) throw new Error('Amount bridge tidak valid')
       const fee = await getRouterFeeQuote(route, amount)
+      const cctpFee = await getCctpFeeQuote(route, fee.netAmount)
       const quote = createExecutionQuote(userId, 'bridge', {
         fromChain: route.fromKey,
         toChain: route.toKey,
@@ -2630,7 +2713,10 @@ export function createMcpServer(userId, context = {}) {
         platformFeeBaseUnits: fee.fee.toString(),
         netBurnBaseUnits: fee.netAmount.toString(),
         router: route.source.router,
-        maxFeeBaseUnits: BRIDGE_MAX_FEE.toString(),
+        maxFeeBaseUnits: cctpFee.maxFee.toString(),
+        cctpProtocolFeeBaseUnits: cctpFee.protocolFee.toString(),
+        cctpMinimumFee: cctpFee.minimumFee,
+        cctpFeeBufferBps: cctpFee.bufferBps,
         minFinalityThreshold: bridgeFinalityThreshold(route),
       })
       return { content: [{ type: 'text', text: jsonText({
@@ -2653,6 +2739,14 @@ export function createMcpServer(userId, context = {}) {
         note: 'MSCA → MSCA melalui ArcoxRouter.bridgeUsdcWithFee → CCTP depositForBurn. Router menarik gross USDC dari MSCA; destination recipient tetap MSCA. Tidak ada fallback ke EOA/Circle proxy.',
         previewId: quote.previewId,
         expiresAt: new Date(quote.expires).toISOString(),
+        cctpFee: {
+          burnAmountBaseUnits: fee.netAmount.toString(),
+          protocolFeeBaseUnits: cctpFee.protocolFee.toString(),
+          maxFeeBaseUnits: cctpFee.maxFee.toString(),
+          minimumFee: cctpFee.minimumFee,
+          bufferBps: cctpFee.bufferBps,
+          finalityThreshold: cctpFee.finalityThreshold,
+        },
         execution: 'approve USDC → ArcoxRouter.bridgeUsdcWithFee → CCTP attestation → receiveMessage destination',
         safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_bridge dengan confirmed=true.',
       }) }] }
@@ -2697,6 +2791,7 @@ export function createMcpServer(userId, context = {}) {
       const amount = parseUnits(String(params.amount).trim(), 6)
       if (amount <= 0n) throw new Error('Amount bridge tidak valid')
       const fee = await getRouterFeeQuote(route, amount)
+      const cctpFee = await getCctpFeeQuote(route, fee.netAmount)
       const quoteCheck = inspectExecutionQuote(userId, 'bridge', params.previewId, {
         fromChain: route.fromKey,
         toChain: route.toKey,
@@ -2707,10 +2802,16 @@ export function createMcpServer(userId, context = {}) {
       if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
       const quotedFee = quoteCheck.quote.params.platformFeeBaseUnits
       const quotedNet = quoteCheck.quote.params.netBurnBaseUnits
-      if (quoteCheck.quote.params.router !== route.source.router || quoteCheck.quote.params.maxFeeBaseUnits !== BRIDGE_MAX_FEE.toString() || Number(quoteCheck.quote.params.minFinalityThreshold) !== bridgeFinalityThreshold(route) || quotedFee !== fee.fee.toString() || quotedNet !== fee.netAmount.toString()) {
+      if (quoteCheck.quote.params.router !== route.source.router
+        || quoteCheck.quote.params.maxFeeBaseUnits !== cctpFee.maxFee.toString()
+        || quoteCheck.quote.params.cctpProtocolFeeBaseUnits !== cctpFee.protocolFee.toString()
+        || quoteCheck.quote.params.cctpMinimumFee !== cctpFee.minimumFee
+        || Number(quoteCheck.quote.params.cctpFeeBufferBps) !== cctpFee.bufferBps
+        || Number(quoteCheck.quote.params.minFinalityThreshold) !== bridgeFinalityThreshold(route)
+        || quotedFee !== fee.fee.toString() || quotedNet !== fee.netAmount.toString()) {
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'quote_fee_changed', message: 'Router fee berubah setelah preview. Buat quote bridge baru.' }) }] }
       }
-      const calls = buildMscaRouterBridgeCalls({ route, amount, mintRecipient: info.walletAddress, minFinalityThreshold: bridgeFinalityThreshold(route) })
+      const calls = buildMscaRouterBridgeCalls({ route, amount, mintRecipient: info.walletAddress, maxFee: cctpFee.maxFee, minFinalityThreshold: bridgeFinalityThreshold(route) })
       const [approveCall, burnCall] = calls
       const existingSourceIntent = await findPendingSourceIntent(userId, {
         fromChain: route.fromKey,
@@ -3004,7 +3105,7 @@ export function createMcpServer(userId, context = {}) {
         mintError: mint.success ? null : mint.error,
         cctpFeeExecuted: bridgeStatus.cctpFeeExecuted || null,
         netMintAmount: bridgeStatus.netMintAmount || null,
-        fee: { platformFeeBaseUnits: fee.fee.toString(), netBurnBaseUnits: fee.netAmount.toString(), totalDebitBaseUnits: amount.toString(), cctpMaxFeeBaseUnits: BRIDGE_MAX_FEE.toString() },
+        fee: { platformFeeBaseUnits: fee.fee.toString(), netBurnBaseUnits: fee.netAmount.toString(), totalDebitBaseUnits: amount.toString(), cctpProtocolFeeBaseUnits: cctpFee.protocolFee.toString(), cctpMaxFeeBaseUnits: cctpFee.maxFee.toString(), cctpMinimumFee: cctpFee.minimumFee, cctpFeeBufferBps: cctpFee.bufferBps },
         message: mint.success
           ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya; tidak ada UserOperation ulang.' : 'Bridge MSCA berhasil sampai destination.')
           : (bridgeStatus.autoMintQueued

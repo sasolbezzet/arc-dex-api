@@ -33,6 +33,7 @@ import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/confi
 import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus } from './src/services/circleWalletWebhookService.mjs'
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
+import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
 
 process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -758,6 +759,10 @@ const STABLECOIN_SERVICE_BASE_URL = 'https://api.circle.com'
 
 // cirBTC AMM Router — on-chain fallback when Circle API doesn't support cirBTC
 const CIRBTC_AMM_ROUTER = process.env.CIRBTC_AMM_ROUTER || '0x9f2443691bddd8343590c68e2a2cdec5fd0b6124'
+// The deployed router's swapWithFee implementation double-pulls from the
+// caller. Execute against its registered pool instead; the pool pulls once
+// from the caller and sends output back to that caller.
+const CIRBTC_AMM_POOL = process.env.CIRBTC_AMM_POOL || '0xd4aF8e12903A4c6bD60BbC353fb97ffC9Cc2Dc2D'
 const CIRBTC_AMM_ROUTER_ABI = [
   { type: 'function', name: 'getAmountOut', stateMutability: 'view', inputs: [{ name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' }, { name: 'amountIn', type: 'uint256' }], outputs: [{ name: '', type: 'uint256' }] },
   { type: 'function', name: 'swapWithFee', stateMutability: 'nonpayable', inputs: [{ name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' }, { name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' }], outputs: [{ name: 'amountOut', type: 'uint256' }] },
@@ -776,12 +781,14 @@ function isEurcCirBtcSwap(tokenIn, tokenOut) {
   return (tokenIn === 'EURC' && tokenOut === 'cirBTC') || (tokenIn === 'cirBTC' && tokenOut === 'EURC')
 }
 async function quoteCirBtcAmmRoute(tokenIn, tokenOut, amount) {
-  const feeBps = PLATFORM_FEE_BPS
-  const feeAmount = ((Number(amount) * feeBps) / 10000).toFixed(TOKEN_DECIMALS[tokenIn])
+  const platformFee = splitPlatformFee(amount, tokenIn)
+  const feeBps = platformFee.feeBps
+  const feeAmount = platformFee.feeAmount
+  const swapAmount = platformFee.netAmount
   // EURC↔cirBTC: 2-leg via USDC. Leg 1 EURC→USDC via Circle API, Leg 2 USDC→cirBTC via AMM.
   if (isEurcCirBtcSwap(tokenIn, tokenOut)) {
     if (tokenIn === 'EURC' && tokenOut === 'cirBTC') {
-      const leg1Params = buildStablecoinSwapParams({ owner: platformTreasury(), tokenIn: 'EURC', tokenOut: 'USDC', amount })
+      const leg1Params = buildStablecoinSwapParams({ owner: platformTreasury(), tokenIn: 'EURC', tokenOut: 'USDC', amount: swapAmount })
       const leg1 = await stablecoinRequest('/v1/stablecoinKits/quote', { query: leg1Params })
       const usdcAmount = unitsToDecimal(BigInt(leg1?.quote?.estimatedAmount || '0'), 6)
       if (Number(usdcAmount) <= 0) throw new Error('EURC→USDC leg returned zero')
@@ -795,7 +802,8 @@ async function quoteCirBtcAmmRoute(tokenIn, tokenOut, amount) {
         available: true, source: 'arcox-amm-router',
         route: 'EURC → USDC → cirBTC', provider: 'arcox-amm-2leg',
         amountOut: finalOut, minAmountOut: finalOut, fee: '0.000000',
-        platformFee: { bps: feeBps, amount: feeAmount, token: tokenIn, treasury: platformTreasury(), swapAmountIn: amount },
+        platformFee: { bps: feeBps, amount: feeAmount, token: tokenIn, treasury: platformTreasury(), swapAmountIn: swapAmount },
+        ammPool: CIRBTC_AMM_POOL,
         rate: Number(finalOut) / Number(amount || 1), intermediateAmount: usdcAmount,
       }
     } else {
@@ -817,7 +825,7 @@ async function quoteCirBtcAmmRoute(tokenIn, tokenOut, amount) {
   // Direct USDC↔cirBTC: single-leg AMM
   const tokenInAddr = TOKENS[tokenIn]
   const tokenOutAddr = TOKENS[tokenOut]
-  const amountUnits = decimalToUnits(amount, TOKEN_DECIMALS[tokenIn])
+  const amountUnits = decimalToUnits(swapAmount, TOKEN_DECIMALS[tokenIn])
   const amountOut = await arcPublicClient.readContract({
     address: CIRBTC_AMM_ROUTER, abi: CIRBTC_AMM_ROUTER_ABI, functionName: 'getAmountOut',
     args: [tokenInAddr, tokenOutAddr, amountUnits],
@@ -833,12 +841,13 @@ async function quoteCirBtcAmmRoute(tokenIn, tokenOut, amount) {
     fee: '0.000000',
     platformFee: {
       bps: PLATFORM_FEE_BPS,
-      amount: ((Number(amount) * PLATFORM_FEE_BPS) / 10000).toFixed(TOKEN_DECIMALS[tokenIn]),
+      amount: feeAmount,
       token: tokenIn,
       treasury: platformTreasury(),
-      swapAmountIn: amount,
+      swapAmountIn: swapAmount,
     },
     rate: Number(amountOutDecimal) / Number(amount || 1),
+    ammPool: CIRBTC_AMM_POOL,
   }
 }
 
@@ -2445,12 +2454,14 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
           legs: [],
           platformFee: ammQuote.platformFee,
           ammRouter: CIRBTC_AMM_ROUTER,
-          note: 'cirBTC swap uses on-chain AMM router. Agent executes approve + swapWithFee directly.',
+          ammPool: CIRBTC_AMM_POOL,
+          ammSwapAmount: ammQuote.platformFee?.swapAmountIn || safeAmount,
+          note: 'cirBTC swap uses the registered on-chain AMM pool. Approve the pool, transfer the platform fee, then call pool.swap directly.',
         })
       }
       // Two-leg EURC → cirBTC: EURC→USDC via stablecoin adapter, USDC→cirBTC via AMM router
       if (tokenIn === 'EURC' && tokenOut === 'cirBTC') {
-        const firstParams = buildStablecoinSwapParams({ owner, tokenIn: 'EURC', tokenOut: 'USDC', amount: safeAmount, customFeeBps: 0 })
+        const firstParams = buildStablecoinSwapParams({ owner, tokenIn: 'EURC', tokenOut: 'USDC', amount: ammQuote.platformFee?.swapAmountIn || safeAmount, customFeeBps: 0 })
         const first = await prepareEoaSwapLeg(firstParams, 'EURC', 'USDC')
         const secondLegAmount = ammQuote.intermediateAmount || first.amountOut
         return res.json({
@@ -2464,6 +2475,8 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
           amountOut: ammQuote.amountOut,
           adapterContract: ARC_APPKIT_ADAPTER,
           ammRouter: CIRBTC_AMM_ROUTER,
+          ammPool: CIRBTC_AMM_POOL,
+          ammSwapAmount: ammQuote.intermediateAmount,
           legs: [
             first,
             {
@@ -2852,9 +2865,27 @@ app.post('/api/mint-cctp-from-solana', apiLimiter, requireServerSignedMintAuth, 
 // Saat attestation siap, frontend bisa mint via MetaMask menggunakan data dari worker.
 const AUTO_MINT_DB = './auto-mint-jobs.json'
 const autoMintJobs = new Map(Object.entries(readJsonObject(AUTO_MINT_DB))) // jobId -> job
+const autoMintWorkers = new Set()
+const autoMintRetryTimers = new Map()
 
 function persistAutoMintJobs() {
   atomicWriteJson(AUTO_MINT_DB, Object.fromEntries(autoMintJobs))
+}
+
+function scheduleAutoMintRetry(jobId, delayMs) {
+  const previous = autoMintRetryTimers.get(jobId)
+  if (previous) clearTimeout(previous)
+  const timer = setTimeout(() => {
+    autoMintRetryTimers.delete(jobId)
+    const current = autoMintJobs.get(jobId)
+    if (current && autoMintRetryDue(current)) {
+      try { startAutoMintWorker(jobId, current.burnTx, current.fromChain, current.toChain, current.owner) } catch (error) {
+        console.error('[auto-mint] retry schedule failed:', error?.message || error)
+      }
+    }
+  }, Math.max(0, Number(delayMs) || 0))
+  if (timer.unref) timer.unref()
+  autoMintRetryTimers.set(jobId, timer)
 }
 
 function startAutoMintWorker(jobId, burnTx, fromChain, toChain, owner) {
@@ -2863,6 +2894,7 @@ function startAutoMintWorker(jobId, burnTx, fromChain, toChain, owner) {
   const fromInfo = CCTP[fromChain]
   const toInfo = CCTP[toChain]
   if (!fromInfo || !toInfo) return
+  if (autoMintWorkers.has(jobId)) return
 
   const existing = autoMintJobs.get(jobId)
   if (existing?.owner && String(existing.owner).toLowerCase() !== normalizedOwner) throw new Error('Auto-mint job belongs to another wallet')
@@ -2873,52 +2905,64 @@ function startAutoMintWorker(jobId, burnTx, fromChain, toChain, owner) {
     toChain,
     owner: normalizedOwner,
     status: 'polling',
+    retryable: false,
     error: undefined,
+    nextRetryAt: undefined,
     createdAt: existing?.createdAt || Date.now(),
     attempts: 0,
+    totalAttempts: Number(existing?.totalAttempts || 0),
   }
   autoMintJobs.set(jobId, job)
   persistAutoMintJobs()
+  autoMintWorkers.add(jobId)
+  const retryTimer = autoMintRetryTimers.get(jobId)
+  if (retryTimer) { clearTimeout(retryTimer); autoMintRetryTimers.delete(jobId) }
 
   console.log(`[auto-mint] worker started for ${burnTx.slice(0, 16)}... ${fromChain}→${toChain}`)
 
   ;(async () => {
-    const maxAttempts = 200 // ~10 menit @ 3s
-    for (let i = 0; i < maxAttempts; i++) {
-      try {
-        const current = autoMintJobs.get(jobId)
-        if (!current || current.status === 'cancelled') return
+    try {
+      for (let i = 0; i < AUTO_MINT_MAX_ATTEMPTS; i++) {
+        try {
+          const current = autoMintJobs.get(jobId)
+          if (!current || current.status === 'cancelled') return
 
-        const att = await pollAttestation(fromInfo.domain, burnTx, 1, false)
-        if (att) {
-          autoMintJobs.set(jobId, {
-            ...current,
-            status: 'ready',
-            attestation: att.attestation,
-            message: att.message,
-            messageTransmitter: toInfo.messageTransmitter,
-            toChain,
-            fromChain,
-            burnTx,
-            readyAt: Date.now(),
-          })
-          persistAutoMintJobs()
-          console.log(`[auto-mint] attestation ready for ${burnTx.slice(0, 16)}...`)
-          return
+          const att = await pollAttestation(fromInfo.domain, burnTx, 1, false)
+          if (att) {
+            autoMintJobs.set(jobId, {
+              ...current,
+              status: 'ready',
+              retryable: false,
+              attestation: att.attestation,
+              message: att.message,
+              messageTransmitter: toInfo.messageTransmitter,
+              toChain,
+              fromChain,
+              burnTx,
+              readyAt: Date.now(),
+            })
+            persistAutoMintJobs()
+            console.log(`[auto-mint] attestation ready for ${burnTx.slice(0, 16)}...`)
+            return
+          }
+          autoMintJobs.set(jobId, { ...current, attempts: i + 1, totalAttempts: Number(current.totalAttempts || 0) + 1 })
+          if (i % 10 === 0) persistAutoMintJobs()
+          await new Promise(r => setTimeout(r, 3000))
+        } catch (e) {
+          console.error(`[auto-mint] poll error attempt ${i + 1}:`, e.message)
+          await new Promise(r => setTimeout(r, 5000))
         }
-        autoMintJobs.set(jobId, { ...current, attempts: i + 1 })
-        if (i % 10 === 0) persistAutoMintJobs()
-        await new Promise(r => setTimeout(r, 3000))
-      } catch (e) {
-        console.error(`[auto-mint] poll error attempt ${i + 1}:`, e.message)
-        await new Promise(r => setTimeout(r, 5000))
       }
-    }
-    const final = autoMintJobs.get(jobId)
-    if (final && final.status === 'polling') {
-      autoMintJobs.set(jobId, { ...final, status: 'timeout', error: 'Attestation timeout after 200 attempts' })
-      persistAutoMintJobs()
-      console.log(`[auto-mint] timeout for ${burnTx.slice(0, 16)}...`)
+      const final = autoMintJobs.get(jobId)
+      if (final && final.status === 'polling') {
+        const retryable = markAutoMintRetryable(final)
+        autoMintJobs.set(jobId, retryable)
+        persistAutoMintJobs()
+        scheduleAutoMintRetry(jobId, Number(retryable.nextRetryAt) - Date.now())
+        console.log(`[auto-mint] retryable timeout for ${burnTx.slice(0, 16)}...; source burn is unchanged`)
+      }
+    } finally {
+      autoMintWorkers.delete(jobId)
     }
   })()
 }
@@ -2936,12 +2980,14 @@ app.post('/api/auto-mint/register', apiLimiter, requireAuth, async (req, res) =>
     if (existing && (!existing.owner || String(existing.owner).toLowerCase() !== owner)) {
       return res.status(404).json({ error: 'Job not found' })
     }
-    if (existing && (existing.status === 'ready' || existing.status === 'polling')) {
-      return res.json({ jobId, status: existing.status, message: 'Job already exists' })
+    if (existing && autoMintJobIsActive(existing)) {
+      return res.json({ jobId, status: existing.status, retryable: false, message: 'Job already exists' })
     }
 
+    // A retryable/legacy timeout is the same burn hash and owner. Requeue only
+    // attestation polling; never submit another source burn.
     startAutoMintWorker(jobId, safeBurnTx, fromChain, toChain, owner)
-    res.json({ jobId, status: 'polling', message: 'Auto-mint worker started' })
+    res.json({ jobId, status: 'polling', retryable: false, burnReused: Boolean(existing), message: existing ? 'Auto-mint attestation polling requeued; source burn is unchanged' : 'Auto-mint worker started' })
   } catch (e) {
     console.error('[auto-mint/register]', e.message)
     res.status(500).json({ error: e.message })
@@ -3494,12 +3540,22 @@ app.get('/api/history/:address', async (req, res) => {
 export { app }
 
 // Resume persisted attestation workers after a VPS restart. A completed/failed
-// job is left untouched; only polling jobs are safe to resume idempotently.
+// job is left untouched; polling and retryable jobs are safe to resume because
+// they only query Iris and never submit a source burn.
 for (const [jobId, job] of autoMintJobs) {
-  if (job?.status === 'polling' && job.owner) {
-    try { startAutoMintWorker(jobId, job.burnTx, job.fromChain, job.toChain, job.owner) } catch (error) {
-      console.error('[auto-mint] resume failed:', error?.message || error)
+  if (!job?.owner) continue
+  try {
+    if (job.status === 'polling') startAutoMintWorker(jobId, job.burnTx, job.fromChain, job.toChain, job.owner)
+    else if (job.status === 'retryable' || job.status === 'timeout') {
+      // Migrate the old terminal timeout shape into the retryable lifecycle;
+      // this is read-only recovery of the same burn hash, never a new burn.
+      const retryable = job.status === 'timeout' ? markAutoMintRetryable({ ...job, status: 'polling' }) : job
+      autoMintJobs.set(jobId, retryable)
+      persistAutoMintJobs()
+      scheduleAutoMintRetry(jobId, Math.max(0, Number(retryable.nextRetryAt || 0) - Date.now()))
     }
+  } catch (error) {
+    console.error('[auto-mint] resume failed:', error?.message || error)
   }
 }
 

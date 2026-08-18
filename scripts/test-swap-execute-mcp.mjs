@@ -3,7 +3,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { privateKeyToAccount } from 'viem/accounts'
 
 const BASE = process.env.E2E_BASE_URL || 'https://arcoxdex.vercel.app'
-const STATE_PATH = '/tmp/arcox-e2e-prod-state.json'
+const STATE_PATH = process.env.PROD_STATE_PATH || '/tmp/arcox-e2e-prod-state.json'
 const EOA_KEY = process.env.TEST_EOA_KEY || `0x${'11'.repeat(32)}`
 const REDIRECT_URI = 'http://127.0.0.1:9876/callback'
 const account = privateKeyToAccount(EOA_KEY)
@@ -26,7 +26,7 @@ const verifyRes = await fetch(`${BASE}/api/auth/siwe-verify`, { method: 'POST', 
 const verifyData = await verifyRes.json()
 const tokenRes = await fetch(`${BASE}/api/auth/token`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'authorization_code', code: verifyData.code, client_id: client.client_id, redirect_uri: REDIRECT_URI, code_verifier: codeVerifier, resource: `${BASE}/mcp` }) })
 const tokenData = await tokenRes.json()
-if (!tokenData.access_token) throw new Error('token failed: ' + JSON.stringify(tokenData))
+if (!tokenData.access_token) throw new Error(`token failed: ${tokenRes.status} ${JSON.stringify(tokenData)}`)
 
 let sessionId = ''
 let rid = 1
