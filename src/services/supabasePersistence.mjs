@@ -496,6 +496,10 @@ export async function readAiUsage(ownerAddress, fallback = [], limit = 25) {
       .order('created_at', { ascending: false })
       .limit(Math.min(Math.max(Number(limit) || 25, 1), 100))
     if (error) throw error
+    if ((!Array.isArray(data) || data.length === 0) && local.length > 0) {
+      stats.aiUsageReads++
+      return { usageLogs: local, source: 'json-fallback', compared: true, mismatch: true }
+    }
     const usageLogs = (Array.isArray(data) ? data : []).map(row => ({
       ...(row?.metadata && typeof row.metadata === 'object' ? row.metadata : {}),
       requestId: String(row?.request_id || ''),
