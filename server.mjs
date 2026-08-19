@@ -34,7 +34,7 @@ import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCirc
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
-import { scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
+import { readTransactionHistory, scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
 
 process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -3225,8 +3225,9 @@ app.post('/api/bridge', apiLimiter, requireAuth, async (req, res) => {
 app.get('/api/tx-history', apiLimiter, requireAuth, async (req, res) => {
   try {
     const db = loadTxHistory()
-    const items = Array.isArray(db[req.authAddress]) ? db[req.authAddress] : []
-    res.json({ success: true, history: items.slice(0, 100) })
+    const localItems = Array.isArray(db[req.authAddress]) ? db[req.authAddress] : []
+    const read = await readTransactionHistory(req.authAddress, localItems, 100)
+    res.json({ success: true, history: read.items.slice(0, 100) })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 

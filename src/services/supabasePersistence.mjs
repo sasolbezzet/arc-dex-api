@@ -8,6 +8,7 @@ const url = String(process.env.SUPABASE_URL || '').replace(/\/$/, '')
 const serviceRoleKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '')
 const configured = mode === 'shadow' || mode === 'canary'
 const enabled = configured && /^https:\/\/[^\s]+\.supabase\.co$/.test(url) && serviceRoleKey.length > 20
+const transactionHistoryReadPrimary = enabled && String(process.env.SUPABASE_TX_HISTORY_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const client = enabled
   ? createClient(url, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -22,6 +23,10 @@ const stats = globalThis.__arcoxSupabasePersistenceStats || {
   failed: 0,
   lastError: '',
   lastSuccessAt: null,
+  shadowReads: 0,
+  shadowMismatches: 0,
+  shadowFailures: 0,
+  lastShadowError: '',
 }
 globalThis.__arcoxSupabasePersistenceStats = stats
 
@@ -90,6 +95,11 @@ export function supabasePersistenceStatus() {
     failed: stats.failed,
     lastError: stats.lastError,
     lastSuccessAt: stats.lastSuccessAt,
+    transactionHistoryReadPrimary,
+    shadowReads: stats.shadowReads,
+    shadowMismatches: stats.shadowMismatches,
+    shadowFailures: stats.shadowFailures,
+    lastShadowError: stats.lastShadowError,
   }
 }
 
@@ -103,6 +113,89 @@ export async function probeSupabasePersistence() {
   const { error } = await client.from('transaction_history').select('id').limit(1)
   if (error) throw error
   return { ok: true, ...supabasePersistenceStatus() }
+}
+
+function historyComparable(row) {
+  return {
+    id: String(row?.id || ''),
+    owner: String(row?.owner || row?.owner_address || '').toLowerCase(),
+    action: String(row?.action || ''),
+    status: String(row?.status || ''),
+    tx: String(row?.tx || row?.tx_hash || ''),
+    burnTx: String(row?.burnTx || row?.burn_tx_hash || ''),
+    mintTx: String(row?.mintTx || row?.mint_tx_hash || ''),
+    amount: String(row?.amount || ''),
+  }
+}
+
+function transactionHistoryFromSupabase(row) {
+  const metadata = row?.metadata && typeof row.metadata === 'object' ? row.metadata : {}
+  const occurredAt = Date.parse(String(row?.occurred_at || row?.created_at || ''))
+  return {
+    ...metadata,
+    // Backfill preserves legacy IDs in metadata when it has to namespace a
+    // collision by owner. Keep the public history shape compatible with JSON;
+    // the Supabase row ID remains an internal storage key.
+    id: String(metadata.legacyId || metadata.id || row?.id || ''),
+    ts: Number.isFinite(occurredAt) ? occurredAt : Number(metadata.ts || Date.now()),
+    owner: String(row?.owner_address || metadata.owner || '').toLowerCase(),
+    action: String(row?.action || metadata.action || 'send'),
+    source: String(row?.source || metadata.source || 'web-ui'),
+    walletSource: String(row?.wallet_source || metadata.walletSource || ''),
+    from: String(row?.from_chain || metadata.from || ''),
+    to: String(row?.to_chain || metadata.to || ''),
+    amount: String(row?.amount || metadata.amount || ''),
+    token: String(row?.token || metadata.token || 'USDC'),
+    status: String(row?.status || metadata.status || 'success'),
+    tx: String(row?.tx_hash || metadata.tx || metadata.txHash || ''),
+    explorer: String(row?.explorer_url || metadata.explorer || ''),
+    approveTx: String(row?.approve_tx_hash || metadata.approveTx || ''),
+    burnTx: String(row?.burn_tx_hash || metadata.burnTx || ''),
+    burnExplorerUrl: String(row?.burn_explorer_url || metadata.burnExplorerUrl || ''),
+    mintTx: String(row?.mint_tx_hash || metadata.mintTx || ''),
+    mintExplorerUrl: String(row?.mint_explorer_url || metadata.mintExplorerUrl || ''),
+    srcDomain: row?.source_domain ?? metadata.srcDomain,
+    dstDomain: row?.destination_domain ?? metadata.dstDomain,
+    note: String(row?.note || metadata.note || ''),
+    error: String(row?.error || metadata.error || ''),
+  }
+}
+
+export async function readTransactionHistory(ownerAddress, fallback = [], limit = 100) {
+  const localRows = Array.isArray(fallback) ? fallback.slice(0, limit) : []
+  if (!enabled || !isUsableOwner(ownerAddress)) return { items: localRows, source: 'json', compared: false }
+  try {
+    const { data, error } = await client
+      .from('transaction_history')
+      .select('*')
+      .eq('owner_address', String(ownerAddress).toLowerCase())
+      .order('occurred_at', { ascending: false })
+      .limit(limit)
+    if (error) throw error
+    const remoteRows = (data || []).map(transactionHistoryFromSupabase)
+    const localById = new Map(localRows.map(row => [String(row?.id || ''), row]))
+    const remoteById = new Map(remoteRows.map(row => [String(row?.id || ''), row]))
+    const mismatch = localRows.length !== remoteRows.length
+      || localRows.some(row => JSON.stringify(historyComparable(row)) !== JSON.stringify(historyComparable(remoteById.get(String(row?.id || '')))))
+      || remoteRows.some(row => !localById.has(String(row?.id || '')))
+    stats.shadowReads++
+    if (mismatch) stats.shadowMismatches++
+    return {
+      items: transactionHistoryReadPrimary ? remoteRows : localRows,
+      source: transactionHistoryReadPrimary ? 'supabase' : 'json',
+      compared: true,
+      mismatch,
+    }
+  } catch (error) {
+    stats.shadowFailures++
+    stats.lastShadowError = String(error?.message || error).slice(0, 240)
+    if (transactionHistoryReadPrimary) {
+      // Availability takes priority over the canary: preserve the old JSON
+      // response if Supabase is temporarily unavailable.
+      return { items: localRows, source: 'json-fallback', compared: false, error: stats.lastShadowError }
+    }
+    return { items: localRows, source: 'json', compared: false, error: stats.lastShadowError }
+  }
 }
 
 export function scheduleTransactionHistoryUpsert(record) {
