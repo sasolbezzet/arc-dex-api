@@ -10,6 +10,7 @@ const configured = mode === 'shadow' || mode === 'canary'
 const enabled = configured && /^https:\/\/[^\s]+\.supabase\.co$/.test(url) && serviceRoleKey.length > 20
 const transactionHistoryReadPrimary = enabled && String(process.env.SUPABASE_TX_HISTORY_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const paymentInvoiceReadPrimary = enabled && String(process.env.SUPABASE_PAYMENT_INVOICE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
+const invoiceEventsReadPrimary = enabled && String(process.env.SUPABASE_INVOICE_EVENTS_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const client = enabled
   ? createClient(url, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -32,6 +33,9 @@ const stats = globalThis.__arcoxSupabasePersistenceStats || {
   invoiceMismatches: 0,
   invoiceFailures: 0,
   lastInvoiceError: '',
+  invoiceEventReads: 0,
+  invoiceEventFailures: 0,
+  lastInvoiceEventError: '',
 }
 globalThis.__arcoxSupabasePersistenceStats = stats
 
@@ -110,6 +114,10 @@ export function supabasePersistenceStatus() {
     invoiceMismatches: stats.invoiceMismatches,
     invoiceFailures: stats.invoiceFailures,
     lastInvoiceError: stats.lastInvoiceError,
+    invoiceEventsReadPrimary,
+    invoiceEventReads: stats.invoiceEventReads,
+    invoiceEventFailures: stats.invoiceEventFailures,
+    lastInvoiceEventError: stats.lastInvoiceEventError,
   }
 }
 
@@ -289,6 +297,29 @@ export async function readPaymentInvoice(invoiceId, fallback = null) {
       return { invoice: null, source: 'supabase', compared: true, mismatch: false }
     }
     const remote = paymentInvoiceFromSupabase(data)
+    if (invoiceEventsReadPrimary) {
+      try {
+        const { data: eventRows, error: eventError } = await client
+          .from('invoice_events')
+          .select('event_type,message,tx_hash,metadata,created_at')
+          .eq('invoice_id', String(invoiceId || ''))
+          .order('created_at', { ascending: true })
+        if (eventError) throw eventError
+        stats.invoiceEventReads++
+        if (Array.isArray(eventRows) && eventRows.length > 0) {
+          remote.timeline = eventRows.map(row => ({
+            ...(row?.metadata && typeof row.metadata === 'object' ? row.metadata : {}),
+            type: String(row?.event_type || 'update'),
+            message: String(row?.message || ''),
+            ...(row?.tx_hash ? { txHash: String(row.tx_hash) } : {}),
+            createdAt: row?.created_at || undefined,
+          }))
+        }
+      } catch (eventError) {
+        stats.invoiceEventFailures++
+        stats.lastInvoiceEventError = String(eventError?.message || eventError).slice(0, 240)
+      }
+    }
     const mismatch = local ? JSON.stringify(invoiceComparable(local)) !== JSON.stringify(invoiceComparable(remote)) : false
     stats.invoiceReads++
     if (mismatch) stats.invoiceMismatches++
