@@ -12,6 +12,7 @@ const transactionHistoryReadPrimary = enabled && String(process.env.SUPABASE_TX_
 const paymentInvoiceReadPrimary = enabled && String(process.env.SUPABASE_PAYMENT_INVOICE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const invoiceEventsReadPrimary = enabled && String(process.env.SUPABASE_INVOICE_EVENTS_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const x402InvoiceReadPrimary = enabled && String(process.env.SUPABASE_X402_INVOICE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
+const aiUsageReadPrimary = enabled && String(process.env.SUPABASE_AI_USAGE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const client = enabled
   ? createClient(url, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -40,6 +41,9 @@ const stats = globalThis.__arcoxSupabasePersistenceStats || {
   x402InvoiceReads: 0,
   x402InvoiceFailures: 0,
   lastX402InvoiceError: '',
+  aiUsageReads: 0,
+  aiUsageFailures: 0,
+  lastAiUsageError: '',
 }
 globalThis.__arcoxSupabasePersistenceStats = stats
 
@@ -126,6 +130,10 @@ export function supabasePersistenceStatus() {
     x402InvoiceReads: stats.x402InvoiceReads,
     x402InvoiceFailures: stats.x402InvoiceFailures,
     lastX402InvoiceError: stats.lastX402InvoiceError,
+    aiUsageReadPrimary,
+    aiUsageReads: stats.aiUsageReads,
+    aiUsageFailures: stats.aiUsageFailures,
+    lastAiUsageError: stats.lastAiUsageError,
   }
 }
 
@@ -474,6 +482,48 @@ export async function readX402Invoice(invoiceId, fallback = null) {
     stats.x402InvoiceFailures++
     stats.lastX402InvoiceError = String(error?.message || error).slice(0, 240)
     return { invoice: local, source: local ? 'json-fallback' : 'json', compared: false, error: stats.lastX402InvoiceError }
+  }
+}
+
+export async function readAiUsage(ownerAddress, fallback = [], limit = 25) {
+  const local = Array.isArray(fallback) ? fallback : []
+  if (!enabled || !aiUsageReadPrimary || !isUsableOwner(ownerAddress)) return { usageLogs: local, source: 'json', compared: false }
+  try {
+    const { data, error } = await client
+      .from('ai_router_usage')
+      .select('*')
+      .eq('owner_address', String(ownerAddress).toLowerCase())
+      .order('created_at', { ascending: false })
+      .limit(Math.min(Math.max(Number(limit) || 25, 1), 100))
+    if (error) throw error
+    const usageLogs = (Array.isArray(data) ? data : []).map(row => ({
+      ...(row?.metadata && typeof row.metadata === 'object' ? row.metadata : {}),
+      requestId: String(row?.request_id || ''),
+      ownerAddress: String(row?.owner_address || '').toLowerCase(),
+      agentId: String(row?.agent_id || ''),
+      apiKeyIdHash: String(row?.api_key_id_hash || ''),
+      sbtTokenId: String(row?.sbt_token_id || ''),
+      paymentId: String(row?.payment_id || ''),
+      txHash: String(row?.tx_hash || ''),
+      memoId: String(row?.memo_id || ''),
+      jobId: String(row?.job_id || ''),
+      model: String(row?.model || ''),
+      providerUsed: String(row?.provider_used || ''),
+      inputTokens: Number(row?.input_tokens || 0),
+      outputTokens: Number(row?.output_tokens || 0),
+      cost: String(row?.cost_usdc || '0.000000'),
+      fallbackCount: Number(row?.fallback_count || 0),
+      status: String(row?.status || 'created'),
+      latency: Number(row?.latency_ms || 0),
+      error: String(row?.error || ''),
+      createdAt: row?.created_at || undefined,
+    }))
+    stats.aiUsageReads++
+    return { usageLogs, source: 'supabase', compared: true, mismatch: JSON.stringify(local) !== JSON.stringify(usageLogs) }
+  } catch (error) {
+    stats.aiUsageFailures++
+    stats.lastAiUsageError = String(error?.message || error).slice(0, 240)
+    return { usageLogs: local, source: 'json-fallback', compared: false, error: stats.lastAiUsageError }
   }
 }
 

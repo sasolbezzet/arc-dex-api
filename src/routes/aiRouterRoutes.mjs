@@ -31,6 +31,7 @@ import { listAgentIdentities, verifyAgentOwnership } from '../services/agentIden
 import { submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { getGatewayDelegateStatus } from '../services/gatewayDelegateService.mjs'
 import { fetchUnifiedBalanceSummary } from '../services/gatewayBalanceService.mjs'
+import { readAiUsage } from '../services/supabasePersistence.mjs'
 
 const router = Router()
 const aiResponseCache = new Map()
@@ -192,11 +193,12 @@ router.get('/models', (_req, res) => {
   res.json({ ok: true, data: pricedModels(), object: 'list' })
 })
 
-router.get('/usage', requireOwnerQueryAuth, (req, res) => {
+router.get('/usage', requireOwnerQueryAuth, async (req, res) => {
   const ownerAddress = normalizeOwner(req.query.ownerAddress)
   if (!ownerAddress) return res.status(400).json({ error: 'ownerAddress is required' })
   const limit = Number(req.query.limit || 5)
-  res.json({ ok: true, usageLogs: usageForOwner(ownerAddress, limit) })
+  const read = await readAiUsage(ownerAddress, usageForOwner(ownerAddress, limit), limit)
+  res.json({ ok: true, usageLogs: read.usageLogs })
 })
 
 router.get('/agent-jobs', async (req, res) => {
