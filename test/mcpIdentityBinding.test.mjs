@@ -269,6 +269,37 @@ test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
   }
 })
 
+test('MCP swap route status does not claim Circle support without a live quote', async () => {
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async url => {
+    assert.match(String(url), /\/api\/eoa-swap-quote$/)
+    return new Response(JSON.stringify({ available: false, code: 'NO_SWAP_ROUTE', error: 'No route available' }), { status: 200 })
+  }
+  try {
+    await withSessionStore({
+      [MSCA.toLowerCase()]: {
+        walletAddress: MSCA,
+        delegateAddress: OTHER,
+        active: true,
+        authorizationUserOpHash: '0x' + 'a'.repeat(64),
+      },
+    }, { [EOA.toLowerCase()]: MSCA }, async ({ createMcpServer }) => {
+      const server = createMcpServer(EOA)
+      const response = await server._registeredTools.arcox_route_status.handler({
+        action: 'swap', tokenIn: 'USDC', tokenOut: 'EURC', amountIn: '1', source: 'session',
+      })
+      const result = JSON.parse(response.content[0].text)
+      assert.equal(result.supported, false)
+      assert.equal(result.executionSupported, false)
+      assert.equal(result.quoteChecked, true)
+      assert.equal(result.quoteAvailable, false)
+      assert.equal(result.reason, 'NO_SWAP_ROUTE')
+    })
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
 test('MCP recognizes Arbitrum→Arc as an MSCA route before any source burn', async () => {
   const { isMscaCctpRouteConfigured } = await import('../src/services/mcpServer.mjs?arb-arc-route-' + Date.now() + '-' + Math.random())
   assert.equal(isMscaCctpRouteConfigured('arbitrum-sepolia', 'arc-testnet'), true)

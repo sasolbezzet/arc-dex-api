@@ -2530,6 +2530,7 @@ export function createMcpServer(userId, context = {}) {
     token: z.string().optional().describe('Token symbol (USDC, EURC, cirBTC)'),
     tokenIn: z.string().optional().describe('Swap input token'),
     tokenOut: z.string().optional().describe('Swap output token'),
+    amountIn: z.string().optional().describe('Exact swap amount for a Circle route availability check'),
     source: z.string().optional().describe('session (MSCA)'),
   }, async (params) => {
     const action = String(params.action || '').toLowerCase()
@@ -2537,8 +2538,9 @@ export function createMcpServer(userId, context = {}) {
     const tokens = [params.token, params.tokenIn, params.tokenOut]
       .filter(Boolean)
       .map(token => String(token).toUpperCase())
-    // cirBTC swaps run on the on-chain AMM router (USDC↔cirBTC) and are fully
-    // supported for MSCA execution; only USYC has no production route.
+    // cirBTC swaps run on the on-chain AMM router (USDC↔cirBTC). Stablecoin
+    // pairs are amount-dependent in Circle Stablecoin Service, so a generic
+    // token-list check must not claim execution support without a live quote.
     const hasUnsupportedSwapToken = action === 'swap' && tokens.some(token => token === 'USYC')
     const knownAction = ['swap', 'send', 'bridge'].includes(action)
     const route = action === 'bridge' ? bridgeConfig(params.fromChain, params.toChain) : null
@@ -2553,8 +2555,18 @@ export function createMcpServer(userId, context = {}) {
     if (bridgeIsSupported && routerValidation?.ok === true && session && !disabledReason) {
       destinationReadiness = await destinationMscaPreflight({ route, walletAddress: session.walletAddress }).catch(error => ({ ok: false, reason: 'destination_msca_preflight_failed', message: error?.message || 'Destination MSCA preflight gagal' }))
     }
+    let swapQuote = null
+    if (action === 'swap' && session && source === 'session' && !hasUnsupportedSwapToken && params.tokenIn && params.tokenOut && params.amountIn) {
+      swapQuote = await apiPost('/api/eoa-swap-quote', {
+        tokenIn: params.tokenIn,
+        tokenOut: params.tokenOut,
+        amountIn: params.amountIn,
+        metamaskAddress: session.walletAddress,
+      }, session.walletAddress).catch(error => ({ available: false, code: 'swap_quote_unavailable', error: error?.message || 'Circle swap quote unavailable' }))
+    }
     const bridgeReady = bridgeIsSupported && !disabledReason && routerValidation?.ok === true && destinationReadiness?.ok === true
-    const mscaSupported = Boolean(session) && source === 'session' && knownAction && (action === 'bridge' ? bridgeReady : !hasUnsupportedSwapToken)
+    const swapReady = action === 'swap' && !hasUnsupportedSwapToken && swapQuote?.available === true
+    const mscaSupported = Boolean(session) && source === 'session' && knownAction && (action === 'bridge' ? bridgeReady : action === 'swap' ? swapReady : true)
     const reason = !session
       ? 'no_session'
       : source !== 'session'
@@ -2569,9 +2581,13 @@ export function createMcpServer(userId, context = {}) {
                 ? (routerValidation?.reason || 'router_route_validation_failed')
                 : action === 'bridge' && !destinationReadiness?.ok
                 ? (destinationReadiness?.reason || 'destination_msca_not_ready')
-              : hasUnsupportedSwapToken
-              ? 'swap_route_not_supported_for_msca'
-              : null
+                : action === 'swap' && hasUnsupportedSwapToken
+                  ? 'swap_route_not_supported_for_msca'
+                  : action === 'swap' && !params.amountIn
+                    ? 'swap_amount_required'
+                    : action === 'swap' && swapQuote?.available !== true
+                      ? (swapQuote?.code || 'swap_route_not_supported_for_msca')
+                      : null
     return { content: [{ type: 'text', text: jsonText({
       supported: mscaSupported,
       executionSupported: mscaSupported,
@@ -2583,10 +2599,13 @@ export function createMcpServer(userId, context = {}) {
       tokens: ['USDC', 'EURC', 'cirBTC'],
       sources: ['session'],
       reason,
+      quoteChecked: action === 'swap' ? Boolean(swapQuote) : undefined,
+      quoteAvailable: action === 'swap' ? (swapQuote?.available ?? null) : undefined,
+      quoteError: action === 'swap' && swapQuote?.available !== true ? (swapQuote?.error || null) : undefined,
       routerValidated: action === 'bridge' ? Boolean(routerValidation?.ok) : undefined,
       routerValidationError: action === 'bridge' && routerValidation?.ok === false ? routerValidation.message : undefined,
       destinationReady: action === 'bridge' ? Boolean(destinationReadiness?.ok) : undefined,
-      note: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote tetap wajib sebelum eksekusi.',
+      note: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Swap stablecoin harus memiliki quote Circle yang live; quote tetap wajib sebelum eksekusi.',
     }) }] }
   })
 
