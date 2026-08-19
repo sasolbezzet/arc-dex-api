@@ -30,3 +30,9 @@ server.pid
 
 # runtime state (never commit real clients/approvals/activity)
 data/
+
+# Local agent/CLI metadata (never deploy or commit)
+.agents/
+.claude/
+skills-lock.json
+supabase/.temp/

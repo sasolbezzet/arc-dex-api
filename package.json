@@ -7,6 +7,8 @@
     "check": "node --check server.mjs && node --check src/routes/aiRouterRoutes.mjs && node --check src/routes/arkhamRoutes.mjs && node --check src/routes/treasuryRoutes.mjs && node --check src/routes/x402Routes.mjs",
     "test": "npm run check && node --test test/*.test.mjs",
     "test:solana-e2e": "node scripts/test-solana-unified-e2e.mjs",
+    "supabase:reconcile": "node --env-file=.env scripts/supabase-backfill-dry-run.mjs",
+    "supabase:backfill:apply": "node --env-file=.env scripts/supabase-backfill-apply.mjs",
     "maintenance:prune": "node scripts/prune-runtime.mjs"
   },
   "keywords": [],
