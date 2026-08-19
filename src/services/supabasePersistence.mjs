@@ -44,6 +44,10 @@ const stats = globalThis.__arcoxSupabasePersistenceStats || {
   aiUsageReads: 0,
   aiUsageFailures: 0,
   lastAiUsageError: '',
+  webhookShadowReads: 0,
+  webhookShadowMismatches: 0,
+  webhookShadowFailures: 0,
+  lastWebhookShadowError: '',
 }
 globalThis.__arcoxSupabasePersistenceStats = stats
 
@@ -134,6 +138,13 @@ export function supabasePersistenceStatus() {
     aiUsageReads: stats.aiUsageReads,
     aiUsageFailures: stats.aiUsageFailures,
     lastAiUsageError: stats.lastAiUsageError,
+    // Webhook idempotency remains JSON/file-lock primary. These counters only
+    // describe post-write Supabase shadow verification.
+    webhookReadPrimary: false,
+    webhookShadowReads: stats.webhookShadowReads,
+    webhookShadowMismatches: stats.webhookShadowMismatches,
+    webhookShadowFailures: stats.webhookShadowFailures,
+    lastWebhookShadowError: stats.lastWebhookShadowError,
   }
 }
 
@@ -385,6 +396,79 @@ export function schedulePaymentInvoiceUpsert(invoice) {
       if (eventError) throw eventError
     }
   })
+}
+
+function webhookComparable(row) {
+  return {
+    provider: String(row?.provider || ''),
+    notificationId: String(row?.notificationId || row?.notification_id || ''),
+    eventType: String(row?.eventType || row?.event_type || ''),
+    processed: Boolean(row?.processed),
+    matched: Boolean(row?.matched),
+    relatedInvoiceId: String(row?.relatedInvoiceId || row?.related_invoice_id || ''),
+    relatedTxHash: String(row?.relatedTxHash || row?.related_tx_hash || ''),
+    relatedUserOpHash: String(row?.relatedUserOpHash || row?.related_user_operation_hash || ''),
+    walletAddress: String(row?.walletAddress || row?.wallet_address || '').toLowerCase(),
+    status: String(row?.status || ''),
+    error: String(row?.error || ''),
+  }
+}
+
+function webhookFromSupabase(row) {
+  return {
+    provider: String(row?.provider || ''),
+    notificationId: String(row?.notification_id || ''),
+    eventType: String(row?.event_type || ''),
+    processed: Boolean(row?.processed),
+    matched: Boolean(row?.matched),
+    relatedInvoiceId: String(row?.related_invoice_id || ''),
+    relatedTxHash: String(row?.related_tx_hash || ''),
+    relatedUserOpHash: String(row?.related_user_operation_hash || ''),
+    walletAddress: String(row?.wallet_address || '').toLowerCase(),
+    status: String(row?.status || ''),
+    error: String(row?.error || ''),
+    rawPayload: row?.raw_payload && typeof row.raw_payload === 'object' ? row.raw_payload : {},
+    receivedAt: row?.received_at || undefined,
+    processedAt: row?.processed_at || undefined,
+    createdAt: row?.created_at || undefined,
+  }
+}
+
+// Shadow verification deliberately waits for queued writes first. It never
+// participates in webhook deduplication or processing decisions: JSON plus the
+// file lock remains the only idempotency source until transactional cutover is
+// designed and tested.
+export async function shadowReadWebhookEvent(provider, notificationId, local = null) {
+  const localEvent = local && typeof local === 'object' ? local : null
+  if (!enabled || !provider || !notificationId) {
+    return { event: localEvent, source: 'json', compared: false }
+  }
+  try {
+    await flushSupabaseWrites()
+    const { data, error } = await client
+      .from('webhook_events')
+      .select('*')
+      .eq('provider', String(provider))
+      .eq('notification_id', String(notificationId))
+      .maybeSingle()
+    if (error) throw error
+    stats.webhookShadowReads++
+    if (!data) {
+      const mismatch = Boolean(localEvent)
+      if (mismatch) stats.webhookShadowMismatches++
+      return { event: localEvent, source: 'json', compared: Boolean(localEvent), mismatch }
+    }
+    const remoteEvent = webhookFromSupabase(data)
+    const mismatch = localEvent
+      ? JSON.stringify(webhookComparable(localEvent)) !== JSON.stringify(webhookComparable(remoteEvent))
+      : false
+    if (mismatch) stats.webhookShadowMismatches++
+    return { event: localEvent, remoteEvent, source: 'json', compared: Boolean(localEvent), mismatch }
+  } catch (error) {
+    stats.webhookShadowFailures++
+    stats.lastWebhookShadowError = String(error?.message || error).slice(0, 240)
+    return { event: localEvent, source: 'json', compared: false, error: stats.lastWebhookShadowError }
+  }
 }
 
 export function scheduleWebhookEventUpsert(event) {

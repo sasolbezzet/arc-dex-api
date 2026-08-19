@@ -6,13 +6,29 @@ import { verifyOwnerToken } from '../services/authToken.mjs'
 import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
 import { ARC_RPC_LOG_CHUNK_SIZE, arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
-import { readX402Invoice, scheduleWebhookEventUpsert, scheduleX402InvoiceUpsert } from '../services/supabasePersistence.mjs'
+import { readX402Invoice, scheduleWebhookEventUpsert, scheduleX402InvoiceUpsert, shadowReadWebhookEvent } from '../services/supabasePersistence.mjs'
+import { claimWebhookEvent, completeWebhookEvent } from '../services/supabaseOperationalState.mjs'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
 
 const webhookEvents = globalThis.__arcoxX402WebhookEvents || new Map()
 globalThis.__arcoxX402WebhookEvents = webhookEvents
+
+function scheduleAndShadowX402WebhookEvent(event) {
+  scheduleWebhookEventUpsert(event)
+  // Offline fallback only. When the operational Supabase claim succeeds,
+  // completion is written through the atomic RPC instead.
+  void shadowReadWebhookEvent(event.provider, event.notificationId, event)
+}
+
+async function completeX402WebhookEvent(event, claimToken) {
+  if (claimToken) {
+    const completed = await completeWebhookEvent(event, claimToken)
+    if (completed.completed) return
+  }
+  scheduleAndShadowX402WebhookEvent(event)
+}
 
 const unmatchedInboundEvents = globalThis.__arcoxX402UnmatchedInboundEvents || []
 globalThis.__arcoxX402UnmatchedInboundEvents = unmatchedInboundEvents
@@ -543,29 +559,33 @@ export async function verifyCircleWebhookSignature(req, rawBody) {
   }
 }
 
-export function processCircleX402Webhook(payload = {}) {
+export async function processCircleX402Webhook(payload = {}) {
   loadPersistentInvoices()
   const eventId = eventIdFromCircle(payload) || `circle_${Date.now()}_${randomUUID().slice(0, 8)}`
   const eventType = eventTypeFromCircle(payload)
-  if (webhookEvents.has(eventId)) return { duplicate: true, event: webhookEvents.get(eventId) }
-
   const data = dataFromCircle(payload)
   const event = {
     id: eventId,
+    notificationId: eventId,
     provider: 'circle',
     eventType,
     processed: false,
     matched: false,
     createdAt: new Date().toISOString(),
+    rawPayload: payload,
   }
+  const claim = await claimWebhookEvent(event)
+  if (claim.enabled && claim.duplicate) return { duplicate: true, event: claim.event || event }
+  if (!claim.enabled && webhookEvents.has(eventId)) return { duplicate: true, event: webhookEvents.get(eventId) }
+  const claimToken = claim.enabled ? claim.claimToken : ''
   webhookEvents.set(eventId, event)
-  scheduleWebhookEventUpsert(event)
+  if (!claim.enabled) scheduleAndShadowX402WebhookEvent(event)
   while (webhookEvents.size > 1000) webhookEvents.delete(webhookEvents.keys().next().value)
 
   if (eventType !== 'transactions.inbound') {
     event.processed = true
     event.processedAt = new Date().toISOString()
-    scheduleWebhookEventUpsert(event)
+    await completeX402WebhookEvent(event, claimToken)
     return { duplicate: false, event, ignored: true, reason: 'unsupported_event_type' }
   }
 
@@ -584,7 +604,7 @@ export function processCircleX402Webhook(payload = {}) {
   if (!isFinalCircleStatus(extracted.status)) {
     event.processed = true
     event.processedAt = new Date().toISOString()
-    scheduleWebhookEventUpsert(event)
+    await completeX402WebhookEvent(event, claimToken)
     return { duplicate: false, event, ignored: true, reason: 'non_final_status' }
   }
 
@@ -618,7 +638,7 @@ export function processCircleX402Webhook(payload = {}) {
     invoices.set(latest.invoiceId, latest)
     invoices.set(latest.paymentId, latest)
     persistInvoices()
-    scheduleWebhookEventUpsert(event)
+    await completeX402WebhookEvent(event, claimToken)
     scheduleAgentMemoProof(latest)
     return { duplicate: false, event, invoice: latest }
   }
@@ -627,7 +647,7 @@ export function processCircleX402Webhook(payload = {}) {
   event.processedAt = new Date().toISOString()
   unmatchedInboundEvents.push(event)
   if (unmatchedInboundEvents.length > 1000) unmatchedInboundEvents.splice(0, unmatchedInboundEvents.length - 1000)
-  scheduleWebhookEventUpsert(event)
+  await completeX402WebhookEvent(event, claimToken)
   return { duplicate: false, event, unmatched: true }
 }
 

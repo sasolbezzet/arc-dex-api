@@ -34,7 +34,8 @@ import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCirc
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
-import { readPaymentInvoice, readTransactionHistory, scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
+import { readPaymentInvoice, readTransactionHistory, scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, shadowReadWebhookEvent, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
+import { claimWebhookEvent, completeWebhookEvent, listAutoMintJobs, readAutoMintJob, claimAutoMintLease, releaseAutoMintLease, supabaseOperationalStatus, upsertAutoMintJob } from './src/services/supabaseOperationalState.mjs'
 
 process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -1434,6 +1435,13 @@ function saveInvoices(db) { atomicWriteJson(INVOICE_DB, db) }
 function loadWebhookEvents() { return readJsonObject(WEBHOOK_DB) }
 function saveWebhookEvents(db) { atomicWriteJson(WEBHOOK_DB, db) }
 
+function scheduleAndShadowWebhookEvent(event) {
+  scheduleWebhookEventUpsert(event)
+  // Supabase is diagnostic-only for webhooks. Never await or use this result
+  // in the idempotency/processing path; JSON + file lock remains authoritative.
+  void shadowReadWebhookEvent(event.provider, event.notificationId, event)
+}
+
 function nowIso() { return new Date().toISOString() }
 
 function timelineEvent(type, message, txHash = '') {
@@ -1682,46 +1690,58 @@ function withWebhookDbLock(fn) {
   }
 }
 
-function saveGenericWebhookEvent(provider, notificationId, eventType, rawPayload, extra = {}) {
-  return withWebhookDbLock(() => {
+async function saveGenericWebhookEvent(provider, notificationId, eventType, rawPayload, extra = {}) {
+  const id = String(notificationId || `${provider}_${Date.now()}_${randomUUID().slice(0, 8)}`)
+  const event = {
+    id: `wh_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`,
+    provider,
+    notificationId: id,
+    eventType: String(eventType || ''),
+    rawPayload,
+    processed: false,
+    matched: false,
+    createdAt: nowIso(),
+    ...extra,
+  }
+  const claim = await claimWebhookEvent(event)
+  if (claim.enabled && claim.duplicate) return { duplicate: true, event: claim.event || event, claimToken: '' }
+  const saved = withWebhookDbLock(() => {
     const eventDb = loadWebhookEvents()
-    const id = String(notificationId || `${provider}_${Date.now()}_${randomUUID().slice(0, 8)}`)
-    if (eventDb[id]) return { duplicate: true, event: eventDb[id] }
-    const event = {
-      id: `wh_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`,
-      provider,
-      notificationId: id,
-      eventType: String(eventType || ''),
-      rawPayload,
-      processed: false,
-      matched: false,
-      createdAt: nowIso(),
-      ...extra,
-    }
+    // Supabase claim is the cross-worker idempotency authority. The local file
+    // remains a fallback/backup and is still protected for offline operation.
+    if (!claim.enabled && eventDb[id]) return { duplicate: true, event: eventDb[id], claimToken: '' }
     eventDb[id] = event
     saveWebhookEvents(eventDb)
-    scheduleWebhookEventUpsert(event)
+    if (!claim.enabled) scheduleAndShadowWebhookEvent(event)
     return { duplicate: false, event }
   })
+  return { ...saved, claimToken: claim.enabled ? claim.claimToken : '' }
 }
 
-function updateGenericWebhookEvent(notificationId, mutate) {
-  return withWebhookDbLock(() => {
+async function updateGenericWebhookEvent(notificationId, mutate, claimToken = '') {
+  const next = withWebhookDbLock(() => {
     const eventDb = loadWebhookEvents()
     const event = eventDb[String(notificationId)]
     if (!event) return null
-    const next = mutate({ ...event }) || event
-    eventDb[String(notificationId)] = next
+    const updated = mutate({ ...event }) || event
+    eventDb[String(notificationId)] = updated
     saveWebhookEvents(eventDb)
-    scheduleWebhookEventUpsert(next)
-    return next
+    return updated
   })
+  if (!next) return null
+  if (claimToken) {
+    const completed = await completeWebhookEvent(next, claimToken)
+    if (!completed.completed) scheduleAndShadowWebhookEvent(next)
+  } else {
+    scheduleAndShadowWebhookEvent(next)
+  }
+  return next
 }
 
 // Webhooks are only a wake-up hint. An exact hash match may resume the
 // attestation worker, but this path never submits receiveMessage or marks a
 // mint complete. Destination mint remains wallet-signed/on-chain verified.
-function wakeAutoMintFromWebhook(reconciliation, status) {
+async function wakeAutoMintFromWebhook(reconciliation, status) {
   if (!isSuccessfulCircleWalletStatus(status)) return []
   const queued = []
   for (const match of reconciliation?.matches || []) {
@@ -1740,7 +1760,7 @@ function wakeAutoMintFromWebhook(reconciliation, status) {
     try {
       const existing = autoMintJobs.get(burnTxHash)
       if (!existing || !['polling', 'ready'].includes(existing.status)) {
-        startAutoMintWorker(burnTxHash, burnTxHash, details.fromChain, details.toChain, match.owner)
+        await startAutoMintWorker(burnTxHash, burnTxHash, details.fromChain, details.toChain, match.owner)
       }
       queued.push({ approvalId: match.id, jobId: burnTxHash, status: existing?.status || 'polling' })
     } catch (error) {
@@ -1765,33 +1785,18 @@ async function processCircleGatewayWebhook(payload = {}) {
   if (!payload || typeof payload !== 'object') throw new Error('Invalid webhook payload')
   const fields = extractWebhookFields(payload)
   if (!fields.eventType) throw new Error('Missing webhook event type')
-  const eventDb = loadWebhookEvents()
-  if (eventDb[fields.notificationId]) {
-    return { duplicate: true, event: eventDb[fields.notificationId] }
-  }
-  const event = {
-    id: `wh_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`,
-    provider: 'circle-gateway',
-    notificationId: fields.notificationId,
-    eventType: fields.eventType,
-    rawPayload: payload,
-    processed: false,
-    matched: false,
+  const saved = await saveGenericWebhookEvent('circle-gateway', fields.notificationId, fields.eventType, payload, {
     ...(fields.txHash ? { relatedTxHash: fields.txHash } : {}),
-    createdAt: nowIso(),
-  }
-  eventDb[fields.notificationId] = event
-  saveWebhookEvents(eventDb)
-  scheduleWebhookEventUpsert(event)
+  })
+  if (saved.duplicate) return { duplicate: true, event: saved.event }
+  const event = saved.event
 
   const { invoice } = findInvoiceForWebhook(payload)
   if (!invoice) {
     event.processed = true
     event.matched = false
     event.processedAt = nowIso()
-    eventDb[fields.notificationId] = event
-    saveWebhookEvents(eventDb)
-    scheduleWebhookEventUpsert(event)
+    await updateGenericWebhookEvent(fields.notificationId, () => event, saved.claimToken)
     return { duplicate: false, matched: false, event }
   }
 
@@ -1821,9 +1826,7 @@ async function processCircleGatewayWebhook(payload = {}) {
   event.relatedInvoiceId = target.invoiceId
   event.relatedTxHash = fields.txHash || target.txHash
   event.processedAt = nowIso()
-  eventDb[fields.notificationId] = event
-  saveWebhookEvents(eventDb)
-  scheduleWebhookEventUpsert(event)
+  await updateGenericWebhookEvent(fields.notificationId, () => event, saved.claimToken)
   return { duplicate: false, matched: true, event, invoice: target }
 }
 
@@ -2875,22 +2878,37 @@ app.post('/api/mint-cctp-from-solana', apiLimiter, requireServerSignedMintAuth, 
 // Background worker yang poll attestation untuk bridge yang timeout di frontend.
 // Saat attestation siap, frontend bisa mint via MetaMask menggunakan data dari worker.
 const AUTO_MINT_DB = './auto-mint-jobs.json'
-const autoMintJobs = new Map(Object.entries(readJsonObject(AUTO_MINT_DB))) // jobId -> job
+const autoMintJobs = new Map(Object.entries(readJsonObject(AUTO_MINT_DB)).map(([jobId, job]) => [jobId, { ...(job || {}), jobId: job?.jobId || jobId }])) // fallback/cache; Supabase is primary when available
 const autoMintWorkers = new Set()
 const autoMintRetryTimers = new Map()
 
+async function hydrateAutoMintJobs() {
+  const localJobs = [...autoMintJobs.values()]
+  const remote = await listAutoMintJobs()
+  if (!remote.enabled || remote.unavailable) return { source: 'json', count: autoMintJobs.size, error: remote.error || '' }
+  const remoteIds = new Set(remote.jobs.map(job => job.jobId))
+  for (const job of remote.jobs) autoMintJobs.set(job.jobId, job)
+  // One-time/idempotent migration for legacy JSON jobs. Existing Supabase rows
+  // win on collision; missing rows are copied without touching the chain.
+  for (const job of localJobs) {
+    if (!remoteIds.has(job.jobId)) await upsertAutoMintJob(job)
+  }
+  return { source: 'supabase', count: autoMintJobs.size, backfilled: localJobs.filter(job => !remoteIds.has(job.jobId)).length }
+}
+
 function persistAutoMintJobs() {
   atomicWriteJson(AUTO_MINT_DB, Object.fromEntries(autoMintJobs))
+  for (const job of autoMintJobs.values()) void upsertAutoMintJob(job)
 }
 
 function scheduleAutoMintRetry(jobId, delayMs) {
   const previous = autoMintRetryTimers.get(jobId)
   if (previous) clearTimeout(previous)
-  const timer = setTimeout(() => {
+  const timer = setTimeout(async () => {
     autoMintRetryTimers.delete(jobId)
     const current = autoMintJobs.get(jobId)
     if (current && autoMintRetryDue(current)) {
-      try { startAutoMintWorker(jobId, current.burnTx, current.fromChain, current.toChain, current.owner) } catch (error) {
+      try { await startAutoMintWorker(jobId, current.burnTx, current.fromChain, current.toChain, current.owner) } catch (error) {
         console.error('[auto-mint] retry schedule failed:', error?.message || error)
       }
     }
@@ -2899,18 +2917,27 @@ function scheduleAutoMintRetry(jobId, delayMs) {
   autoMintRetryTimers.set(jobId, timer)
 }
 
-function startAutoMintWorker(jobId, burnTx, fromChain, toChain, owner) {
+async function startAutoMintWorker(jobId, burnTx, fromChain, toChain, owner) {
   const normalizedOwner = String(owner || '').toLowerCase()
   if (!normalizedOwner) throw new Error('Authenticated owner required')
   const fromInfo = CCTP[fromChain]
   const toInfo = CCTP[toChain]
-  if (!fromInfo || !toInfo) return
-  if (autoMintWorkers.has(jobId)) return
+  if (!fromInfo || !toInfo) return false
+  if (autoMintWorkers.has(jobId)) return false
 
   const existing = autoMintJobs.get(jobId)
   if (existing?.owner && String(existing.owner).toLowerCase() !== normalizedOwner) throw new Error('Auto-mint job belongs to another wallet')
+  const candidate = { ...(existing || {}), jobId, burnTx, fromChain, toChain, owner: normalizedOwner }
+  const lease = await claimAutoMintLease(candidate)
+  if (lease.enabled && !lease.claimed) {
+    if (lease.job) autoMintJobs.set(jobId, lease.job)
+    persistAutoMintJobs()
+    return false
+  }
+  const leaseToken = lease.leaseToken
   const job = {
     ...(existing || {}),
+    jobId,
     burnTx,
     fromChain,
     toChain,
@@ -2974,8 +3001,10 @@ function startAutoMintWorker(jobId, burnTx, fromChain, toChain, owner) {
       }
     } finally {
       autoMintWorkers.delete(jobId)
+      if (leaseToken) void releaseAutoMintLease(jobId, leaseToken)
     }
   })()
+  return true
 }
 
 app.post('/api/auto-mint/register', apiLimiter, requireAuth, async (req, res) => {
@@ -2987,7 +3016,8 @@ app.post('/api/auto-mint/register', apiLimiter, requireAuth, async (req, res) =>
 
     const jobId = safeBurnTx
     const owner = String(req.owner || '').toLowerCase()
-    const existing = autoMintJobs.get(jobId)
+    const remoteExisting = await readAutoMintJob(jobId)
+    const existing = remoteExisting.job || autoMintJobs.get(jobId)
     if (existing && (!existing.owner || String(existing.owner).toLowerCase() !== owner)) {
       return res.status(404).json({ error: 'Job not found' })
     }
@@ -2997,7 +3027,7 @@ app.post('/api/auto-mint/register', apiLimiter, requireAuth, async (req, res) =>
 
     // A retryable/legacy timeout is the same burn hash and owner. Requeue only
     // attestation polling; never submit another source burn.
-    startAutoMintWorker(jobId, safeBurnTx, fromChain, toChain, owner)
+    await startAutoMintWorker(jobId, safeBurnTx, fromChain, toChain, owner)
     res.json({ jobId, status: 'polling', retryable: false, burnReused: Boolean(existing), message: existing ? 'Auto-mint attestation polling requeued; source burn is unchanged' : 'Auto-mint worker started' })
   } catch (e) {
     console.error('[auto-mint/register]', e.message)
@@ -3008,7 +3038,9 @@ app.post('/api/auto-mint/register', apiLimiter, requireAuth, async (req, res) =>
 app.get('/api/auto-mint/status/:jobId', apiLimiter, requireAuth, async (req, res) => {
   try {
     const jobId = normalizeTxHash(req.params.jobId, 'jobId')
-    const job = autoMintJobs.get(jobId)
+    const localJob = autoMintJobs.get(jobId)
+    const remote = await readAutoMintJob(jobId)
+    const job = remote.job || localJob
     if (!job || !job.owner || String(job.owner).toLowerCase() !== String(req.owner || '').toLowerCase()) {
       return res.status(404).json({ error: 'Job not found' })
     }
@@ -3343,7 +3375,7 @@ app.post('/api/circle/webhook', apiLimiter, async (req, res) => {
   const payload = parseWebhookJson(rawBody)
   const verification = await verifyCircleWebhookSignature(req, rawBody)
   if (!verification.ok) return res.status(401).json({ ok: false, provider: 'circle', error: verification.error })
-  const result = processCircleX402Webhook(payload)
+  const result = await processCircleX402Webhook(payload)
   res.json({
     ok: true,
     received: true,
@@ -3370,7 +3402,7 @@ app.post('/api/webhooks/circle', apiLimiter, async (req, res) => {
   if (!verification.ok) return res.status(401).json({ ok: false, provider: 'circle', product: 'gateway', error: verification.error })
 
   const fields = extractCircleGatewayFields(payload)
-  const saved = saveGenericWebhookEvent('circle-gateway', fields.eventId || `circle_${Date.now()}`, fields.eventType || 'gateway.unknown', payload, {
+  const saved = await saveGenericWebhookEvent('circle-gateway', fields.eventId || `circle_${Date.now()}`, fields.eventType || 'gateway.unknown', payload, {
     relatedTxHash: fields.txHash || undefined,
   })
 
@@ -3384,8 +3416,10 @@ app.post('/api/webhooks/circle', apiLimiter, async (req, res) => {
     } else if (fields.eventType?.startsWith('gateway.')) {
       // TODO: store unhandled Circle Gateway lifecycle event for reconciliation.
     }
+    saved.event.processed = true
+    saved.event.processedAt = nowIso()
+    await updateGenericWebhookEvent(fields.eventId, () => saved.event, saved.claimToken)
   }
-  // TODO: store Circle notification ID to prevent duplicate processing.
 
   console.log('[webhook:circle-gateway] parsed event', { ...fields, rawPayload: undefined, duplicate: saved.duplicate })
   res.json({
@@ -3426,7 +3460,7 @@ app.post('/api/webhooks/circle-wallet', apiLimiter, async (req, res) => {
     }
     const notification = payload.notification && typeof payload.notification === 'object' ? payload.notification : payload.data && typeof payload.data === 'object' ? payload.data : {}
     const extracted = extractCircleWalletTransaction(payload)
-    const saved = saveGenericWebhookEvent('circle-wallets', eventId, eventType, payload, {
+    const saved = await saveGenericWebhookEvent('circle-wallets', eventId, eventType, payload, {
       relatedTxHash: extracted.txHash || undefined,
       relatedUserOpHash: extracted.userOpHash || undefined,
       walletAddress: extracted.walletAddress || undefined,
@@ -3443,12 +3477,12 @@ app.post('/api/webhooks/circle-wallet', apiLimiter, async (req, res) => {
         eventId,
         eventType,
       })
-      const autoMint = wakeAutoMintFromWebhook(reconciliation, extracted.status)
+      const autoMint = await wakeAutoMintFromWebhook(reconciliation, extracted.status)
       saved.event.processed = true
       saved.event.processedAt = nowIso()
       saved.event.reconciliation = reconciliation
       saved.event.autoMint = autoMint
-      updateGenericWebhookEvent(eventId, () => saved.event)
+      await updateGenericWebhookEvent(eventId, () => saved.event, saved.claimToken)
     }
 
     res.json({
@@ -3562,10 +3596,12 @@ export { app }
 // Resume persisted attestation workers after a VPS restart. A completed/failed
 // job is left untouched; polling and retryable jobs are safe to resume because
 // they only query Iris and never submit a source burn.
+const autoMintHydration = await hydrateAutoMintJobs()
+console.log('[auto-mint] persistence:', JSON.stringify({ ...supabaseOperationalStatus(), ...autoMintHydration }))
 for (const [jobId, job] of autoMintJobs) {
   if (!job?.owner) continue
   try {
-    if (job.status === 'polling') startAutoMintWorker(jobId, job.burnTx, job.fromChain, job.toChain, job.owner)
+    if (job.status === 'polling') await startAutoMintWorker(jobId, job.burnTx, job.fromChain, job.toChain, job.owner)
     else if (job.status === 'retryable' || job.status === 'timeout') {
       // Migrate the old terminal timeout shape into the retryable lifecycle;
       // this is read-only recovery of the same burn hash, never a new burn.
@@ -3590,6 +3626,6 @@ if (!process.env.VERCEL) {
     console.log('Routes: health, wallet, balance, quote, swap, prepare-bridge,')
     console.log('        get-attestation, mint-cctp-solana, mint-cctp-from-solana, send, history')
     console.log('        invoices, circle-gateway webhook, eco route-preview')
-    console.log('[supabase] persistence:', JSON.stringify(supabasePersistenceStatus()))
+    console.log('[supabase] persistence:', JSON.stringify({ ...supabasePersistenceStatus(), ...supabaseOperationalStatus() }))
   })
 }
