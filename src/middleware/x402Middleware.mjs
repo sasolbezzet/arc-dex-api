@@ -6,7 +6,7 @@ import { verifyOwnerToken } from '../services/authToken.mjs'
 import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
 import { ARC_RPC_LOG_CHUNK_SIZE, arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
-import { scheduleWebhookEventUpsert, scheduleX402InvoiceUpsert } from '../services/supabasePersistence.mjs'
+import { readX402Invoice, scheduleWebhookEventUpsert, scheduleX402InvoiceUpsert } from '../services/supabasePersistence.mjs'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
@@ -201,7 +201,13 @@ export function getX402Invoice(id) {
 }
 
 export async function reconcileX402Invoice(id) {
-  const invoice = getX402Invoice(id)
+  const local = getX402Invoice(id)
+  const read = await readX402Invoice(id, local)
+  const invoice = read.invoice
+  if (invoice?.invoiceId && invoice?.paymentId) {
+    invoices.set(invoice.invoiceId, invoice)
+    invoices.set(invoice.paymentId, invoice)
+  }
   if (!invoice || !invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) return invoice
   if (invoice.status === 'paid' || invoice.status === 'refunded' || invoice.status === 'cancelled') return invoice
   try {

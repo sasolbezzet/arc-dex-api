@@ -11,6 +11,7 @@ const enabled = configured && /^https:\/\/[^\s]+\.supabase\.co$/.test(url) && se
 const transactionHistoryReadPrimary = enabled && String(process.env.SUPABASE_TX_HISTORY_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const paymentInvoiceReadPrimary = enabled && String(process.env.SUPABASE_PAYMENT_INVOICE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const invoiceEventsReadPrimary = enabled && String(process.env.SUPABASE_INVOICE_EVENTS_READ_PRIMARY || 'true').toLowerCase() !== 'false'
+const x402InvoiceReadPrimary = enabled && String(process.env.SUPABASE_X402_INVOICE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const client = enabled
   ? createClient(url, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -36,6 +37,9 @@ const stats = globalThis.__arcoxSupabasePersistenceStats || {
   invoiceEventReads: 0,
   invoiceEventFailures: 0,
   lastInvoiceEventError: '',
+  x402InvoiceReads: 0,
+  x402InvoiceFailures: 0,
+  lastX402InvoiceError: '',
 }
 globalThis.__arcoxSupabasePersistenceStats = stats
 
@@ -118,6 +122,10 @@ export function supabasePersistenceStatus() {
     invoiceEventReads: stats.invoiceEventReads,
     invoiceEventFailures: stats.invoiceEventFailures,
     lastInvoiceEventError: stats.lastInvoiceEventError,
+    x402InvoiceReadPrimary,
+    x402InvoiceReads: stats.x402InvoiceReads,
+    x402InvoiceFailures: stats.x402InvoiceFailures,
+    lastX402InvoiceError: stats.lastX402InvoiceError,
   }
 }
 
@@ -426,6 +434,47 @@ export function scheduleAiUsageUpsert(entry) {
     const { error } = await client.from('ai_router_usage').upsert(payload, { onConflict: 'request_id' })
     if (error) throw error
   })
+}
+
+export async function readX402Invoice(invoiceId, fallback = null) {
+  const local = fallback && typeof fallback === 'object' ? fallback : null
+  if (!enabled || !x402InvoiceReadPrimary) return { invoice: local, source: 'json', compared: false }
+  const lookup = String(invoiceId || '')
+  if (!lookup) return { invoice: local, source: 'json', compared: false }
+  try {
+    let { data, error } = await client.from('x402_invoices').select('*').eq('invoice_id', lookup).maybeSingle()
+    if (error) throw error
+    if (!data) {
+      const result = await client.from('x402_invoices').select('*').eq('payment_id', lookup).maybeSingle()
+      data = result.data
+      error = result.error
+      if (error) throw error
+    }
+    if (!data) return { invoice: local, source: local ? 'json-fallback' : 'supabase', compared: Boolean(local), mismatch: Boolean(local) }
+    const payload = data.payload && typeof data.payload === 'object' ? data.payload : {}
+    const remote = {
+      ...payload,
+      invoiceId: String(data.invoice_id || payload.invoiceId || ''),
+      paymentId: String(data.payment_id || payload.paymentId || ''),
+      ownerWallet: String(data.owner_wallet || payload.ownerWallet || '').toLowerCase(),
+      status: String(data.status || payload.status || ''),
+      amount: String(data.amount || payload.amount || ''),
+      network: String(data.network || payload.network || ''),
+      txHash: String(data.tx_hash || payload.txHash || ''),
+      updatedAt: data.updated_at || payload.updatedAt || data.created_at || payload.createdAt || '',
+    }
+    // The async dual-write may briefly leave Supabase behind a just-mutated
+    // JSON record. Prefer the newer local state until the queued upsert lands.
+    const localUpdated = Date.parse(String(local?.updatedAt || local?.createdAt || ''))
+    const remoteUpdated = Date.parse(String(remote.updatedAt || ''))
+    const useLocal = local && Number.isFinite(localUpdated) && Number.isFinite(remoteUpdated) && localUpdated > remoteUpdated
+    stats.x402InvoiceReads++
+    return { invoice: useLocal ? local : remote, source: useLocal ? 'json-newer' : 'supabase', compared: Boolean(local), mismatch: Boolean(local && !useLocal && JSON.stringify({ status: local.status, txHash: local.txHash || '' }) !== JSON.stringify({ status: remote.status, txHash: remote.txHash || '' })) }
+  } catch (error) {
+    stats.x402InvoiceFailures++
+    stats.lastX402InvoiceError = String(error?.message || error).slice(0, 240)
+    return { invoice: local, source: local ? 'json-fallback' : 'json', compared: false, error: stats.lastX402InvoiceError }
+  }
 }
 
 export function scheduleX402InvoiceUpsert(invoice) {
