@@ -9,6 +9,7 @@ const serviceRoleKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '')
 const configured = mode === 'shadow' || mode === 'canary'
 const enabled = configured && /^https:\/\/[^\s]+\.supabase\.co$/.test(url) && serviceRoleKey.length > 20
 const transactionHistoryReadPrimary = enabled && String(process.env.SUPABASE_TX_HISTORY_READ_PRIMARY || 'true').toLowerCase() !== 'false'
+const paymentInvoiceReadPrimary = enabled && String(process.env.SUPABASE_PAYMENT_INVOICE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const client = enabled
   ? createClient(url, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -27,6 +28,10 @@ const stats = globalThis.__arcoxSupabasePersistenceStats || {
   shadowMismatches: 0,
   shadowFailures: 0,
   lastShadowError: '',
+  invoiceReads: 0,
+  invoiceMismatches: 0,
+  invoiceFailures: 0,
+  lastInvoiceError: '',
 }
 globalThis.__arcoxSupabasePersistenceStats = stats
 
@@ -96,10 +101,15 @@ export function supabasePersistenceStatus() {
     lastError: stats.lastError,
     lastSuccessAt: stats.lastSuccessAt,
     transactionHistoryReadPrimary,
+    paymentInvoiceReadPrimary,
     shadowReads: stats.shadowReads,
     shadowMismatches: stats.shadowMismatches,
     shadowFailures: stats.shadowFailures,
     lastShadowError: stats.lastShadowError,
+    invoiceReads: stats.invoiceReads,
+    invoiceMismatches: stats.invoiceMismatches,
+    invoiceFailures: stats.invoiceFailures,
+    lastInvoiceError: stats.lastInvoiceError,
   }
 }
 
@@ -231,6 +241,63 @@ export function scheduleTransactionHistoryUpsert(record) {
     const { error } = await client.from('transaction_history').upsert(payload, { onConflict: 'id' })
     if (error) throw error
   })
+}
+
+function invoiceComparable(invoice) {
+  return {
+    invoiceId: String(invoice?.invoiceId || invoice?.invoice_id || ''),
+    merchantAddress: String(invoice?.merchantAddress || invoice?.merchant_address || '').toLowerCase(),
+    amount: String(invoice?.amount || ''),
+    status: String(invoice?.status || ''),
+    txHash: String(invoice?.txHash || invoice?.tx_hash || ''),
+  }
+}
+
+function paymentInvoiceFromSupabase(row) {
+  const metadata = row?.metadata && typeof row.metadata === 'object' ? row.metadata : {}
+  return {
+    ...metadata,
+    invoiceId: String(row?.invoice_id || metadata.invoiceId || ''),
+    orderId: String(row?.order_id || metadata.orderId || ''),
+    merchantAddress: String(row?.merchant_address || metadata.merchantAddress || '').toLowerCase(),
+    amount: String(row?.amount || metadata.amount || ''),
+    token: String(row?.token || metadata.token || 'USDC'),
+    network: String(row?.network || metadata.network || 'arc-testnet'),
+    memo: String(row?.memo || metadata.memo || ''),
+    status: String(row?.status || metadata.status || 'unpaid'),
+    paymentUrl: String(row?.payment_url || metadata.paymentUrl || ''),
+    payerAddress: String(row?.payer_address || metadata.payerAddress || '').toLowerCase(),
+    txHash: String(row?.tx_hash || metadata.txHash || ''),
+    paidAt: row?.paid_at || metadata.paidAt || null,
+    expiresAt: row?.expires_at || metadata.expiresAt || null,
+    timeline: Array.isArray(row?.timeline) ? row.timeline : (Array.isArray(metadata.timeline) ? metadata.timeline : []),
+  }
+}
+
+export async function readPaymentInvoice(invoiceId, fallback = null) {
+  const local = fallback && typeof fallback === 'object' ? fallback : null
+  if (!enabled || !paymentInvoiceReadPrimary) return { invoice: local, source: 'json', compared: false }
+  try {
+    const { data, error } = await client.from('payment_invoices').select('*').eq('invoice_id', String(invoiceId || '')).maybeSingle()
+    if (error) throw error
+    if (!data) {
+      if (local) {
+        stats.invoiceReads++
+        stats.invoiceMismatches++
+        return { invoice: local, source: 'json-fallback', compared: true, mismatch: true }
+      }
+      return { invoice: null, source: 'supabase', compared: true, mismatch: false }
+    }
+    const remote = paymentInvoiceFromSupabase(data)
+    const mismatch = local ? JSON.stringify(invoiceComparable(local)) !== JSON.stringify(invoiceComparable(remote)) : false
+    stats.invoiceReads++
+    if (mismatch) stats.invoiceMismatches++
+    return { invoice: paymentInvoiceReadPrimary ? remote : local, source: paymentInvoiceReadPrimary ? 'supabase' : 'json', compared: Boolean(local), mismatch }
+  } catch (error) {
+    stats.invoiceFailures++
+    stats.lastInvoiceError = String(error?.message || error).slice(0, 240)
+    return { invoice: local, source: local ? 'json-fallback' : 'json', compared: false, error: stats.lastInvoiceError }
+  }
 }
 
 export function schedulePaymentInvoiceUpsert(invoice) {

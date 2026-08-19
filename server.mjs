@@ -34,7 +34,7 @@ import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCirc
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
-import { readTransactionHistory, scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
+import { readPaymentInvoice, readTransactionHistory, scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
 
 process.umask(0o077)
 process.on('uncaughtException', (err) => console.error('[UncaughtException]', err.message))
@@ -3253,7 +3253,11 @@ app.post('/api/invoices', apiLimiter, async (req, res) => {
 
 app.get('/api/invoices/:invoiceId', apiLimiter, async (req, res) => {
   try {
-    res.json(getInvoiceOrThrow(req.params.invoiceId))
+    const db = loadInvoices()
+    const invoiceId = String(req.params.invoiceId || '')
+    const read = await readPaymentInvoice(invoiceId, db[invoiceId] || null)
+    if (!read.invoice) throw new Error('Invoice not found')
+    res.json(read.invoice)
   } catch(e) {
     res.status(404).json({ error: e.message })
   }
@@ -3276,7 +3280,11 @@ app.patch('/api/invoices/:invoiceId', apiLimiter, requireAuth, async (req, res) 
 
 app.get('/api/invoices/:invoiceId/status', apiLimiter, async (req, res) => {
   try {
-    const invoice = getInvoiceOrThrow(req.params.invoiceId)
+    const db = loadInvoices()
+    const invoiceId = String(req.params.invoiceId || '')
+    const read = await readPaymentInvoice(invoiceId, db[invoiceId] || null)
+    const invoice = read.invoice
+    if (!invoice) throw new Error('Invoice not found')
     res.json({
       invoiceId: invoice.invoiceId,
       orderId: invoice.orderId,
