@@ -1603,6 +1603,62 @@ export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain,
   return null
 }
 
+// Reconcile a locally pending source burn before blocking a new quote. The
+// vault record can lag behind the chain when a destination UserOperation was
+// completed by the worker/webhook path but its audit update was lost. A used
+// CCTP nonce is durable proof that the destination mint already happened; in
+// that case close the local intent idempotently and allow a fresh quote.
+async function reconcileCompletedBridgeIntent(userId, candidate) {
+  const details = candidate?.details || {}
+  const burnTxHash = details.burnTxHash
+  if (!burnTxHash || !details.fromChain || !details.toChain) return false
+  const route = bridgeConfig(details.fromChain, details.toChain)
+  if (!route?.source?.router || !route?.destination?.messageTransmitter) return false
+  let amount
+  try {
+    const amountText = String(details.amount || candidate.approval?.amount || '').trim()
+    amount = amountText && amountText !== '0' ? parseUnits(amountText, 6) : undefined
+  } catch {
+    return false
+  }
+  let proof
+  try {
+    proof = await verifyBridgeBurn({
+      burnTxHash,
+      route,
+      walletAddress: details.walletAddress,
+      amount,
+    })
+  } catch {
+    return false
+  }
+  if (!proof?.ok) return false
+  const status = await getCctpBridgeStatus({
+    burnTxHash,
+    sourceDomain: route.source.domain,
+    destinationDomain: route.destination.domain,
+    walletAddress: details.walletAddress,
+    route,
+    expectedBurnAmount: BigInt(proof.args.amount) - BigInt(proof.args.fee),
+  })
+  if (!status?.verified) return false
+  const destinationMint = await destinationMintAlreadyProcessed({ status, route })
+  if (destinationNonceDecision(destinationMint) !== 'minted') return false
+
+  const reconciledDetails = {
+    ...details,
+    settlementStatus: 'success',
+    settlementPhase: 'destination_minted',
+    destinationMintStatus: 'minted',
+    mintTxHash: details.mintTxHash || null,
+    reconciledAt: new Date().toISOString(),
+  }
+  await markBridgePendingResolved(userId, candidate, 'success', {
+    details: jsonText(reconciledDetails),
+  })
+  return true
+}
+
 /**
  * An approval-only intent can become stale when Circle retains the approval
  * UserOperation in its pending index. It has not called the router and cannot
@@ -2678,11 +2734,15 @@ export function createMcpServer(userId, context = {}) {
       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'bridge', fromChain: executionChainKey(params.fromChain), toChain: executionChainKey(params.toChain), chain: executionChainKey(params.fromChain), walletType: 'MSCA', reason: disabledReason, message: disabledReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi.' : 'Bridge MSCA belum diaktifkan.' }) }] }
     }
     const { listApprovals } = await import('./vaultStore.mjs')
-    const unresolvedSource = hasUnresolvedSourceBridgeIntent(listApprovals(userId), {
+    let unresolvedSource = hasUnresolvedSourceBridgeIntent(listApprovals(userId), {
       fromChain: route.fromKey,
       toChain: route.toKey,
       walletAddress: info.walletAddress,
     })
+    if (unresolvedSource?.details?.burnTxHash) {
+      const reconciled = await reconcileCompletedBridgeIntent(userId, unresolvedSource)
+      if (reconciled) unresolvedSource = null
+    }
     if (unresolvedSource && isStaleApprovalOnlySourceIntent(unresolvedSource, {
       sessionDelegateAddress: info.delegateAddress,
       sessionCreatedAt: info.createdAt,
@@ -2700,7 +2760,11 @@ export function createMcpServer(userId, context = {}) {
         walletType: 'MSCA',
         reason: 'unresolved_source_intent',
         approvalId: unresolvedSource.approval?.id || null,
-        message: 'Bridge intent sumber sebelumnya belum memiliki hasil UserOperation yang pasti. Rekonsiliasi status intent tersebut sebelum meminta quote baru; burn tidak diulang.',
+        burnTxHash: unresolvedSource.details?.burnTxHash || null,
+        nextAction: unresolvedSource.details?.burnTxHash ? 'arcox_bridge_status atau arcox_retry_bridge_mint' : 'arcox_execute_bridge dengan previewId yang sama',
+        message: unresolvedSource.details?.burnTxHash
+          ? 'Source burn sudah terjadi tetapi status mint destination belum tersinkron. Rekonsiliasi dengan arcox_bridge_status atau retry mint memakai burnTxHash yang sama; jangan burn ulang.'
+          : 'Bridge intent sumber sebelumnya belum memiliki hasil UserOperation yang pasti. Rekonsiliasi status intent tersebut sebelum meminta quote baru; burn tidak diulang.',
       }) }] }
     }
     const destinationPreflight = await destinationMscaPreflight({ route, walletAddress: info.walletAddress })

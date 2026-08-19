@@ -531,6 +531,26 @@ test('unresolved source intent blocks burns but permits approval-only recovery',
     toChain: 'Base_Sepolia',
     walletAddress: MSCA,
   }), null)
+  // A nonce-only reconciliation is also terminal even when the destination
+  // transaction hash was not captured by the webhook/audit path.
+  assert.equal(hasUnresolvedSourceBridgeIntent([{
+    id: 'nonce-reconciled-bridge',
+    action: 'bridge',
+    status: 'success',
+    details: JSON.stringify({
+      fromChain: 'Base_Sepolia',
+      toChain: 'Arc_Testnet',
+      burnTxHash: '0x' + 'a'.repeat(64),
+      settlementStatus: 'success',
+      settlementPhase: 'destination_minted',
+      destinationMintStatus: 'minted',
+      mintTxHash: null,
+    }),
+  }], {
+    fromChain: 'Base_Sepolia',
+    toChain: 'Arc_Testnet',
+    walletAddress: MSCA,
+  }), null)
   assert.equal(hasUnresolvedSourceBridgeIntent([
     {
       id: 'completed-legacy-bridge',
