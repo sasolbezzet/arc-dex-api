@@ -27,6 +27,7 @@ import { encrypt, decrypt } from './crypto.mjs'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { getLimits } from './vaultStore.mjs'
 import { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } from './chains.mjs'
+import { scheduleSessionMetadataSnapshot } from './supabasePersistence.mjs'
 
 const ADD_OWNERS_ABI = [{
   type: 'function',
@@ -130,6 +131,9 @@ function loadStore() {
 
 function saveStore(data) {
   atomicWriteJsonFile(sessionKeysPath(), data)
+  // Supabase receives metadata only. The encrypted delegate private key remains
+  // in the local key store and is never included in the snapshot payload.
+  try { scheduleSessionMetadataSnapshot(data) } catch { /* local session persistence remains authoritative */ }
 }
 
 /** True only for an explicit manual revoke.

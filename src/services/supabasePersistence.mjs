@@ -13,6 +13,9 @@ const paymentInvoiceReadPrimary = enabled && String(process.env.SUPABASE_PAYMENT
 const invoiceEventsReadPrimary = enabled && String(process.env.SUPABASE_INVOICE_EVENTS_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const x402InvoiceReadPrimary = enabled && String(process.env.SUPABASE_X402_INVOICE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const aiUsageReadPrimary = enabled && String(process.env.SUPABASE_AI_USAGE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
+// Session metadata is shadow-only for now. The local encrypted-key store remains
+// the execution authority; this flag is intentionally not a read-primary switch.
+const sessionMetadataReadPrimary = false
 const client = enabled
   ? createClient(url, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -48,6 +51,11 @@ const stats = globalThis.__arcoxSupabasePersistenceStats || {
   webhookShadowMismatches: 0,
   webhookShadowFailures: 0,
   lastWebhookShadowError: '',
+  sessionMetadataWrites: 0,
+  sessionMetadataReads: 0,
+  sessionMetadataMismatches: 0,
+  sessionMetadataFailures: 0,
+  lastSessionMetadataError: '',
 }
 globalThis.__arcoxSupabasePersistenceStats = stats
 
@@ -145,6 +153,14 @@ export function supabasePersistenceStatus() {
     webhookShadowMismatches: stats.webhookShadowMismatches,
     webhookShadowFailures: stats.webhookShadowFailures,
     lastWebhookShadowError: stats.lastWebhookShadowError,
+    // Session metadata is intentionally shadow-only; encrypted delegate keys
+    // and activation authority remain local until a separate cutover review.
+    sessionMetadataReadPrimary,
+    sessionMetadataWrites: stats.sessionMetadataWrites,
+    sessionMetadataReads: stats.sessionMetadataReads,
+    sessionMetadataMismatches: stats.sessionMetadataMismatches,
+    sessionMetadataFailures: stats.sessionMetadataFailures,
+    lastSessionMetadataError: stats.lastSessionMetadataError,
   }
 }
 
@@ -635,9 +651,116 @@ export function scheduleX402InvoiceUpsert(invoice) {
   })
 }
 
+function sessionMetadataComparable(row) {
+  return {
+    walletAddress: String(row?.wallet_address || row?.walletAddress || '').toLowerCase(),
+    ownerAddresses: [...new Set((row?.owner_addresses || row?.ownerAddresses || []).map(value => String(value).toLowerCase()))].sort(),
+    delegateAddress: String(row?.delegate_address || row?.delegateAddress || '').toLowerCase(),
+    chain: String(row?.chain || ''),
+    active: Boolean(row?.active),
+    pendingAuthorization: Boolean(row?.pending_authorization ?? row?.pendingAuthorization),
+    manualRevokePending: Boolean(row?.manual_revoke_pending ?? row?.manualRevokePending),
+    revokeReason: row?.revoke_reason ?? row?.revokeReason ?? null,
+    authorizationUserOpHash: String(row?.authorization_user_op_hash || row?.authorizationUserOpHash || '').toLowerCase(),
+    authorizationUserOpHashes: jsonSafe(row?.authorization_user_op_hashes || row?.authorizationUserOpHashes || {}),
+  }
+}
+
+export function buildSessionMetadataPayloads(data) {
+  const users = data?.users && typeof data.users === 'object' ? data.users : {}
+  const aliasesByWallet = new Map()
+  for (const [owner, wallet] of Object.entries(data?.aliases || {})) {
+    const normalizedOwner = String(owner || '').toLowerCase()
+    const normalizedWallet = String(wallet || '').toLowerCase()
+    if (!isUsableOwner(normalizedOwner) || !isUsableOwner(normalizedWallet)) continue
+    if (!aliasesByWallet.has(normalizedWallet)) aliasesByWallet.set(normalizedWallet, new Set())
+    aliasesByWallet.get(normalizedWallet).add(normalizedOwner)
+  }
+  const rowsByWallet = new Map()
+  for (const [key, entry] of Object.entries(users)) {
+    const walletAddress = String(entry?.walletAddress || key).toLowerCase()
+    if (!isUsableOwner(walletAddress) || !entry) continue
+    const ownerAddresses = [...(aliasesByWallet.get(walletAddress) || new Set())].sort()
+    const candidate = {
+      wallet_address: walletAddress,
+      owner_addresses: ownerAddresses,
+      delegate_address: String(entry.delegateAddress || '').toLowerCase(),
+      chain: String(entry.chain || 'arc-testnet'),
+      active: Boolean(entry.active),
+      pending_authorization: Boolean(entry.pendingAuthorization),
+      manual_revoke_pending: Boolean(entry.manualRevokePending),
+      revoke_reason: entry.revokeReason ? String(entry.revokeReason) : null,
+      authorization_user_op_hash: String(entry.authorizationUserOpHash || '').toLowerCase(),
+      authorization_user_op_hashes: jsonSafe(entry.authorizationUserOpHashes || {}),
+      authorization_attempt_at: toIso(entry.authorizationAttemptAt, null),
+      last_authorized_chain_at: toIso(entry.lastAuthorizedChainAt, null),
+      created_at: toIso(entry.createdAt),
+      activated_at: toIso(entry.activatedAt, null),
+      revoked_at: toIso(entry.revokedAt, null),
+      last_used_at: toIso(entry.lastUsedAt, null),
+      reconciled_at: toIso(entry.reconciledAt, null),
+      reconciled_on_chain: Boolean(entry.reconciledOnChain),
+      // Keep only non-secret diagnostic metadata. In particular, do not spread
+      // entry because it may contain delegatePrivateKey.
+      metadata: { ownerCount: ownerAddresses.length },
+    }
+    const previous = rowsByWallet.get(walletAddress)
+    if (!previous) {
+      rowsByWallet.set(walletAddress, candidate)
+      continue
+    }
+    // A malformed legacy store can contain two records for one MSCA. Pick the
+    // active record first, then the pending record, then the newest record; do
+    // not let iteration order decide which delegate metadata reaches Supabase.
+    const rank = row => [row.active, row.pending_authorization, Date.parse(row.created_at) || 0]
+    const previousRank = rank(previous)
+    const candidateRank = rank(candidate)
+    if (candidateRank[0] > previousRank[0]
+      || (candidateRank[0] === previousRank[0] && candidateRank[1] > previousRank[1])
+      || (candidateRank[0] === previousRank[0] && candidateRank[1] === previousRank[1] && candidateRank[2] > previousRank[2])) {
+      candidate.owner_addresses = [...new Set([...candidate.owner_addresses, ...previous.owner_addresses])].sort()
+      candidate.metadata.ownerCount = candidate.owner_addresses.length
+      rowsByWallet.set(walletAddress, candidate)
+    } else {
+      previous.owner_addresses = [...new Set([...previous.owner_addresses, ...candidate.owner_addresses])].sort()
+      previous.metadata.ownerCount = previous.owner_addresses.length
+    }
+  }
+  return [...rowsByWallet.values()]
+}
+
+export function scheduleSessionMetadataSnapshot(data) {
+  if (!enabled) return
+  for (const payload of buildSessionMetadataPayloads(data)) {
+    queueWrite('session-metadata', payload.wallet_address, async () => {
+      const { error } = await client.from('session_metadata').upsert(payload, { onConflict: 'wallet_address' })
+      if (error) throw error
+      stats.sessionMetadataWrites++
+    })
+  }
+}
+
+export async function shadowReadSessionMetadata(walletAddress, fallback = null) {
+  const local = fallback && typeof fallback === 'object' ? fallback : null
+  if (!enabled || !isUsableOwner(walletAddress)) return { metadata: local, source: 'json', compared: false }
+  try {
+    const { data, error } = await client.from('session_metadata').select('*').eq('wallet_address', String(walletAddress).toLowerCase()).maybeSingle()
+    if (error) throw error
+    stats.sessionMetadataReads++
+    if (!data) return { metadata: local, source: 'json', compared: false, remoteMissing: true }
+    const compared = !local || JSON.stringify(sessionMetadataComparable(data)) === JSON.stringify(sessionMetadataComparable(local))
+    if (!compared) stats.sessionMetadataMismatches++
+    return { metadata: local, source: 'json', compared, remote: data }
+  } catch (error) {
+    stats.sessionMetadataFailures++
+    stats.lastSessionMetadataError = String(error?.message || error).slice(0, 240)
+    return { metadata: local, source: 'json', compared: false, error: stats.lastSessionMetadataError }
+  }
+}
+
 export async function reconcileDualWriteCounts() {
   if (!enabled) return { enabled: false, counts: {} }
-  const tables = ['transaction_history', 'payment_invoices', 'invoice_events', 'webhook_events', 'ai_router_usage', 'x402_invoices']
+  const tables = ['transaction_history', 'payment_invoices', 'invoice_events', 'webhook_events', 'ai_router_usage', 'x402_invoices', 'session_metadata']
   const counts = {}
   for (const table of tables) {
     const { count, error } = await client.from(table).select('*', { count: 'exact', head: true })
