@@ -1506,9 +1506,17 @@ async function findPendingBridgeMint(userId, burnTxHash, toKey) {
       try { details = JSON.parse(approval.details || '{}') } catch { details = null }
       const destinationKey = details?.destinationChainKey || details?.toChain
       if (details?.burnTxHash !== burnTxHash || executionChainKey(destinationKey) !== executionChainKey(toKey)) continue
+      // A source-confirmed approval also contains burnTxHash and has no
+      // destinationUserOpHash yet. It is the parent intent for mint recovery,
+      // not an unknown destination submission. Treating it as the latter
+      // incorrectly returns destination_submission_unknown and blocks the first
+      // legitimate receiveMessage UserOperation.
+      const phase = String(details?.settlementPhase || '')
+      const destinationPhases = new Set(['intent_created', 'destination_pending', 'destination_submitted', 'submission_unknown', 'destination_submission_failed'])
+      if (!destinationPhases.has(phase)) continue
       return {
         approval,
-        phase: details.settlementPhase || (details.destinationUserOpHash ? 'destination_submitted' : 'intent_created'),
+        phase: phase || (details.destinationUserOpHash ? 'destination_submitted' : 'intent_created'),
         userOpHash: details.destinationUserOpHash || null,
         chainKey: details.destinationChainKey || executionChainKey(toKey),
       }
