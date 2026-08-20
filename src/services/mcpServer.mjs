@@ -91,6 +91,12 @@ function saveOAuthState() {
     requests: Object.fromEntries(oauthRequests),
     challenges: Object.fromEntries(siweChallenges),
   })
+  // Supabase receives only hashed, expiring metadata for diagnostics. The
+  // local file plus lock remains authoritative for PKCE/code consumption and
+  // SIWE replay protection; this shadow path must never affect auth decisions.
+  try {
+    scheduleOAuthShadowSnapshot({ codes: authCodes, requests: oauthRequests, challenges: siweChallenges })
+  } catch { /* OAuth remains available when the optional shadow is unavailable */ }
 }
 function withOAuthStateLock(fn) {
   const deadline = Date.now() + 15000
@@ -131,6 +137,7 @@ function withOAuthStateLock(fn) {
 
 // ── Persistent OAuth client store ──
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
+import { scheduleOAuthShadowSnapshot } from './supabaseOAuthShadow.mjs'
 
 function loadClients() {
   const d = readJsonFile(OAUTH_PATH, { clients: {} })
