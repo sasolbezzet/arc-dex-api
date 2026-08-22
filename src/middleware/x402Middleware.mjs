@@ -15,6 +15,15 @@ globalThis.__arcoxX402Invoices = invoices
 const webhookEvents = globalThis.__arcoxX402WebhookEvents || new Map()
 globalThis.__arcoxX402WebhookEvents = webhookEvents
 
+// Per-owner anti-abuse state: last invoice creation time per owner. The unpaid
+// invoice cap is computed from the invoices map itself.
+const ownerActivity = globalThis.__arcoxX402OwnerActivity || new Map()
+globalThis.__arcoxX402OwnerActivity = ownerActivity
+
+// Cached treasury unified-balance health (fail-open when the Gateway is down).
+const treasuryHealthCache = globalThis.__arcoxX402TreasuryHealth || { at: 0, value: null }
+globalThis.__arcoxX402TreasuryHealth = treasuryHealthCache
+
 function scheduleAndShadowX402WebhookEvent(event) {
   scheduleWebhookEventUpsert(event)
   // Offline fallback only. When the operational Supabase claim succeeds,
@@ -151,8 +160,57 @@ function isOpenStatus(status) {
   return OPEN_STATUSES.has(String(status || ''))
 }
 
+function abuseError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  error.statusCode = 429
+  return error
+}
+
+/** Number of open (unpaid, not expired) invoices for an owner. */
+export function countOpenX402Invoices(ownerWallet) {
+  const owner = String(ownerWallet || '').toLowerCase()
+  if (!owner) return 0
+  const seen = new Set()
+  let count = 0
+  for (const invoice of invoices.values()) {
+    if (!invoice?.invoiceId || seen.has(invoice.invoiceId)) continue
+    if (String(invoice.ownerWallet || '').toLowerCase() !== owner) continue
+    seen.add(invoice.invoiceId)
+    if (isOpenStatus(invoice.status)) count += 1
+  }
+  return count
+}
+
+/**
+ * Anti-abuse guard for invoice creation. Enforces a per-owner cap on open
+ * invoices and an optional minimum delay between invoice creations. Throws an
+ * error with statusCode 429 when a guard trips; callers map it to HTTP 429.
+ */
+export function assertX402AbuseLimits(ownerWallet, options = {}) {
+  const owner = String(ownerWallet || '').toLowerCase()
+  if (!owner || options.skipAbuseGuard) return { ok: true }
+  const now = Date.now()
+  const cooldownMs = Number(process.env.X402_INVOICE_COOLDOWN_MS || 0)
+  const activity = ownerActivity.get(owner) || { lastInvoiceAt: 0 }
+  if (cooldownMs > 0 && now - activity.lastInvoiceAt < cooldownMs) {
+    throw abuseError('X402_INVOICE_RATE_LIMITED', `x402 invoice creation rate limit exceeded for this wallet; wait ${Math.ceil((cooldownMs - (now - activity.lastInvoiceAt)) / 1000)}s before creating another invoice`)
+  }
+  const maxUnpaid = Number(process.env.X402_MAX_UNPAID_PER_OWNER || 10)
+  if (maxUnpaid > 0) {
+    const openCount = countOpenX402Invoices(owner)
+    if (openCount >= maxUnpaid) {
+      throw abuseError('X402_MAX_UNPAID_INVOICES', `x402 invoice cap reached for this wallet (${openCount} open invoices, max ${maxUnpaid}); pay or let invoices expire before requesting more`)
+    }
+  }
+  activity.lastInvoiceAt = now
+  ownerActivity.set(owner, activity)
+  return { ok: true }
+}
+
 export function createX402Invoice(input = {}) {
   loadPersistentInvoices()
+  assertX402AbuseLimits(input.ownerWallet, input)
   const cfg = x402Config()
   const now = Date.now()
   const invoiceId = input.invoiceId || `arcox_x402_${randomUUID().replaceAll('-', '').slice(0, 16)}`
@@ -376,6 +434,124 @@ export function markX402ServiceOutcome(invoiceOrId, { status = 'provider_error',
   return invoice
 }
 
+/**
+ * Aggregate x402 analytics from the known invoice set. Used by
+ * /api/x402/stats (owner-gated). Read-only; never mutates invoice state.
+ */
+export function getX402Stats() {
+  const all = getAllX402Invoices()
+  const now = Date.now()
+  const dayMs = 24 * 60 * 60 * 1000
+  const byStatus = {}
+  const byService = {}
+  const byServiceStatus = {}
+  const byRefundStatus = {}
+  let revenueUsdc = 0
+  let revenueLast24hUsdc = 0
+  let paid24h = 0
+  let open = 0
+  const refunds = { pending_review: 0, refund_approved: 0, refunded: 0, manual_review: 0, refund_failed_manual: 0, refundedUsdc: 0 }
+  const providerErrors = { provider_not_found: 0, provider_error: 0 }
+  for (const invoice of all) {
+    const status = invoice.status || 'unknown'
+    byStatus[status] = (byStatus[status] || 0) + 1
+    const service = invoice.service || 'unknown'
+    byService[service] = (byService[service] || 0) + 1
+    const ss = invoice.serviceStatus || ''
+    if (ss) byServiceStatus[ss] = (byServiceStatus[ss] || 0) + 1
+    const rs = invoice.refundStatus || ''
+    if (rs) byRefundStatus[rs] = (byRefundStatus[rs] || 0) + 1
+    if (status === 'paid') {
+      const amount = Number(invoice.uniqueAmount || invoice.amount || 0) || 0
+      revenueUsdc += amount
+      const paidAt = Date.parse(invoice.paidAt || '')
+      if (paidAt && now - paidAt < dayMs) {
+        revenueLast24hUsdc += amount
+        paid24h += 1
+      }
+    }
+    if (isOpenStatus(status)) open += 1
+    if (ss === 'provider_not_found') providerErrors.provider_not_found += 1
+    if (ss === 'provider_error') providerErrors.provider_error += 1
+    if (rs === 'refunded') refunds.refundedUsdc += Number(invoice.uniqueAmount || 0) || 0
+  }
+  refunds.pending_review = byRefundStatus.pending_review || 0
+  refunds.refund_approved = byRefundStatus.refund_approved || 0
+  refunds.refunded = byRefundStatus.refunded || 0
+  refunds.manual_review = byRefundStatus.manual_review || 0
+  refunds.refund_failed_manual = byRefundStatus.refund_failed_manual || 0
+  const round6 = value => Number(value.toFixed(6))
+  return {
+    generatedAt: new Date().toISOString(),
+    totals: {
+      invoices: all.length,
+      paid: byStatus.paid || 0,
+      open,
+      expired: byStatus.expired || 0,
+      failed: byStatus.failed || 0,
+      cancelled: byStatus.cancelled || 0,
+    },
+    byStatus,
+    byService,
+    byServiceStatus,
+    byRefundStatus,
+    revenueUsdc: round6(revenueUsdc),
+    revenueLast24hUsdc: round6(revenueLast24hUsdc),
+    paid24h,
+    refunds: { ...refunds, refundedUsdc: round6(refunds.refundedUsdc) },
+    providerErrors,
+  }
+}
+
+/**
+ * Treasury unified-balance health with a short cache. Fail-open: when the
+ * Gateway is unreachable we never block payments, we only report unknown.
+ */
+export async function x402TreasuryHealth({ force = false } = {}) {
+  const cacheMs = Number(process.env.X402_TREASURY_HEALTH_CACHE_MS || 60_000)
+  if (!force && treasuryHealthCache.value && Date.now() - treasuryHealthCache.at < cacheMs) return treasuryHealthCache.value
+  try {
+    const { readTreasuryUnifiedBalances } = await import('../services/aiRouterSpendService.mjs')
+    const balances = await readTreasuryUnifiedBalances()
+    const totalUsdc = Number(balances.totalUsdc || 0)
+    const minUsdc = Number(process.env.X402_MIN_TREASURY_USDC || 2.0)
+    const value = {
+      known: true,
+      healthy: totalUsdc >= minUsdc,
+      degraded: totalUsdc < minUsdc,
+      totalUsdc,
+      minUsdc,
+      byChain: balances.byChain || {},
+      checkedAt: new Date().toISOString(),
+    }
+    treasuryHealthCache.at = Date.now()
+    treasuryHealthCache.value = value
+    return value
+  } catch (error) {
+    const value = {
+      known: false,
+      healthy: true,
+      degraded: false,
+      error: String(error?.message || error).slice(0, 200),
+      checkedAt: new Date().toISOString(),
+    }
+    treasuryHealthCache.at = Date.now()
+    treasuryHealthCache.value = value
+    return value
+  }
+}
+
+/** Block invoice creation when the treasury cannot honor payments. */
+export async function assertX402TreasuryHealthy() {
+  if (String(process.env.X402_TREASURY_CHECK || 'auto') === 'off') return { ok: true }
+  const blockOnLow = String(process.env.X402_BLOCK_ON_LOW_TREASURY || 'true').toLowerCase() === 'true'
+  if (!blockOnLow) return { ok: true }
+  const health = await x402TreasuryHealth()
+  if (health.known === false) return { ok: true, health }
+  if (!health.healthy) return { ok: false, health }
+  return { ok: true, health }
+}
+
 export function publicInvoice(invoice) {
   if (!invoice) return null
   return {
@@ -422,6 +598,8 @@ export function publicInvoice(invoice) {
     refundApprovedAt: invoice.refundApprovedAt || '',
     refundedAt: invoice.refundedAt || '',
     refundTxHash: invoice.refundTxHash || '',
+    refundAttempts: invoice.refundAttempts || 0,
+    refundExecuteError: invoice.refundExecuteError || '',
     serviceUnlockedAt: invoice.serviceUnlockedAt,
     memoIndex: invoice.memoIndex,
     memoSender: invoice.memoSender,
@@ -793,12 +971,20 @@ export function withArcoxX402(handler, config = {}) {
         return handler(req, res, next)
       }
       if (invoice && normalizeResource(invoice.resource) !== normalizeResource(resource)) {
-        const nextInvoice = createX402Invoice({ ...config, resource, ownerWallet, agentId, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
-        return res.status(402).json({ error: 'x402 payment resource mismatch', x402: publicInvoice(nextInvoice) })
+        try {
+          const nextInvoice = createX402Invoice({ ...config, resource, ownerWallet, agentId, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
+          return res.status(402).json({ error: 'x402 payment resource mismatch', x402: publicInvoice(nextInvoice) })
+        } catch (error) {
+          return res.status(error.statusCode || 429).json({ error: error.message })
+        }
       }
       if (invoice?.status === 'expired') {
-        const nextInvoice = createX402Invoice({ ...config, resource, ownerWallet, agentId, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
-        return res.status(402).json({ error: 'x402 invoice expired', x402: publicInvoice(nextInvoice) })
+        try {
+          const nextInvoice = createX402Invoice({ ...config, resource, ownerWallet, agentId, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
+          return res.status(402).json({ error: 'x402 invoice expired', x402: publicInvoice(nextInvoice) })
+        } catch (error) {
+          return res.status(error.statusCode || 429).json({ error: error.message })
+        }
       }
     }
 
@@ -807,14 +993,23 @@ export function withArcoxX402(handler, config = {}) {
       // created implicitly for remote MCP requests anymore.
       return res.status(400).json({ error: 'Authenticated MSCA owner is required for x402 resource access' })
     }
-    const invoice = createX402Invoice({
-      service: config.service || 'arcox_intel',
-      ownerWallet,
-      agentId,
-      paymentMethod: 'arc-usdc-direct',
-      amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount),
-      resource,
-    })
+    const treasury = await assertX402TreasuryHealthy()
+    if (!treasury.ok) {
+      return res.status(503).json({ error: 'x402 treasury balance is too low; payments are temporarily paused', treasury: treasury.health })
+    }
+    let invoice
+    try {
+      invoice = createX402Invoice({
+        service: config.service || 'arcox_intel',
+        ownerWallet,
+        agentId,
+        paymentMethod: 'arc-usdc-direct',
+        amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount),
+        resource,
+      })
+    } catch (error) {
+      return res.status(error.statusCode || 429).json({ error: error.message })
+    }
     if (!invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) {
       invoice.recipient = 'configure_CIRCLE_X402_TREASURY_ADDRESS'
     }

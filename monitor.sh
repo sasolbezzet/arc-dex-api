@@ -67,12 +67,35 @@ if [ -f "$FAIL_COUNT_FILE" ]; then
   FAIL_COUNT=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)
 fi
 
+# ── Treasury health check ──
+# Runs only when the main health check passes. Alerts (with its own cooldown)
+# when the x402 treasury unified balance is below the configured minimum.
+TREASURY_URL="${ARCOX_TREASURY_URL:-${URL%/health}/api/x402/treasury-health}"
+TREASURY_LAST_ALERT_FILE="$STATE_DIR/monitor.treasury-alert"
+check_treasury() {
+  local treasury_output
+  treasury_output=$(curl -sS --max-time 10 "$TREASURY_URL" 2>/dev/null)
+  if [[ "$treasury_output" == *'"degraded":true'* ]] || [[ "$treasury_output" == *'"healthy":false'* ]]; then
+    local last_alert=0 now_epoch
+    if [ -f "$TREASURY_LAST_ALERT_FILE" ]; then
+      last_alert=$(cat "$TREASURY_LAST_ALERT_FILE" 2>/dev/null || echo 0)
+    fi
+    now_epoch=$(date +%s)
+    if [ $((now_epoch - last_alert)) -ge "$ALERT_COOLDOWN_SECONDS" ]; then
+      send_alert "arc-dex-api x402 treasury LOW BALANCE: $treasury_output"
+      echo "$now_epoch" > "$TREASURY_LAST_ALERT_FILE"
+    fi
+    echo "[$NOW] TREASURY-LOW: $treasury_output" >> "$LOG_FILE"
+  fi
+}
+
 if is_healthy; then
   echo "[$NOW] OK: $RESPONSE" >> "$LOG_FILE"
   if [ "$FAIL_COUNT" -gt 0 ]; then
     send_alert "arc-dex-api is back UP after $FAIL_COUNT failed checks."
     rm -f "$FAIL_COUNT_FILE" "$LAST_ALERT_FILE"
   fi
+  check_treasury
   exit 0
 fi
 

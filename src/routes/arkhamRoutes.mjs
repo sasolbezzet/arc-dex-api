@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { ArkhamService } from '../services/arkhamService.mjs'
+import { ArkhamService, circuitStatus, degradedForProviderPath } from '../services/arkhamService.mjs'
 import { priceFromEnv, withArcoxX402, markX402ServiceOutcome } from '../middleware/x402Middleware.mjs'
 import { buildIntelPresentation } from '../services/intelPresentation.mjs'
 import { getIntelCatalog } from '../services/intelCatalog.mjs'
@@ -94,7 +94,17 @@ function serviceName(routePath) {
 // required parameters, and defaults. This is a free read-only endpoint that
 // helps agents discover available services without guessing.
 router.get('/catalog', (_req, res) => {
-  res.json({ ok: true, readOnly: true, services: getIntelCatalog() })
+  const services = getIntelCatalog().map(entry => ({
+    ...entry,
+    degraded: degradedForProviderPath(entry.provider),
+  }))
+  res.json({ ok: true, readOnly: true, services })
+})
+
+// Free circuit-breaker state per Arkham service group. Agents can check this
+// before paying for a resource so they do not pay for a degraded service.
+router.get('/provider-health', (_req, res) => {
+  res.json({ ok: true, readOnly: true, circuits: circuitStatus() })
 })
 
 router.get('/address/:address', sendArkham(req => `/intelligence/address/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_ADDRESS', '0.005'))

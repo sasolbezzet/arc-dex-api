@@ -5,7 +5,7 @@ import { createSolanaRpc } from '@solana/kit'
 import { Keypair } from '@solana/web3.js'
 import { privateKeyToAccount } from 'viem/accounts'
 import bs58 from 'bs58'
-import { treasuryAddress } from '../config/treasury.mjs'
+import { solanaTreasuryAddress, treasuryAddress } from '../config/treasury.mjs'
 
 let kit
 let adapter
@@ -88,6 +88,28 @@ function delegateSignerAddress() {
   } catch {
     return ''
   }
+}
+
+/**
+ * Read the treasury Unified Balance across all Gateway chains. Used by the
+ * x402 treasury-health gate and low-balance alerting. Returns a plain map;
+ * throws when the Gateway is unreachable (callers decide fail-open policy).
+ */
+export async function readTreasuryUnifiedBalances(sourceAccount = treasuryAddress()) {
+  const sources = GATEWAY_CHAINS
+    .map(({ chain, domain }) => ({ depositor: chain === 'Solana_Devnet' ? solanaTreasuryAddress() : sourceAccount, domain }))
+    .filter(item => Boolean(item.depositor))
+  if (sources.length === 0) return { totalUsdc: '0', byChain: {} }
+  const response = await gatewayRequest('/v1/balances', { token: 'USDC', sources })
+  const byChain = {}
+  let total = 0n
+  for (const item of response?.balances || []) {
+    const chain = GATEWAY_CHAINS.find(entry => Number(entry.domain) === Number(item.domain))?.chain || `domain_${item.domain}`
+    const units = usdcUnits(String(item.balance || '0'))
+    byChain[chain] = formatUsdc(units)
+    total += units
+  }
+  return { totalUsdc: formatUsdc(total), byChain }
 }
 
 export async function estimateDelegatedAiSpend({ sourceAccount, solanaSourceAccount = '', amount, sourceChains = [] }) {
