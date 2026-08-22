@@ -82,7 +82,7 @@ ARCOX Pay adalah USDC payment request dan invoice layer untuk Arc. Fitur yang di
 - Unified Balance / Circle Gateway payment readiness.
 - MCP compatibility.
 - x402 monetization memakai Arc Testnet USDC.
-- ARCOX Intel API: selected Arkham-backed intelligence endpoints protected by x402.
+- ARCOX Intel API: Arkham-backed read-only intelligence endpoints protected by ARCOX x402; Intel tools never execute swaps, bridges, sends, buys, or sells.
 - Future Circle Gateway Nanopayments readiness.
 
 Yang real sekarang: public USDC invoice/payment link di Arc Testnet.
@@ -93,6 +93,7 @@ ARCOX Intel:
 
 - Backend only: `ARKHAM_API_KEY` belongs in `arc-dex-api` env.
 - Frontend and MCP call `/api/intel/*`; they never call Arkham directly.
+- MCP Intel tools are read-only and support address, entity, token, balances, portfolio, contract, transaction lookup, and search services.
 - x402 payment memakai exact USDC amount, 6 decimals, Arc Transaction Memo, dan on-chain reconciliation.
 - See `docs/arcox-intel.md`.
 

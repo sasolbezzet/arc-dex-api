@@ -19,7 +19,7 @@ export function registerDocsCatalogTools(ctx) {
     { id: 'bridge', title: 'Bridge', purpose: 'Bridge USDC across Arc/Base/Arbitrum Sepolia via verified ArcoxRouter + CCTP.', userInputs: ['fromChain', 'toChain', 'token', 'amount'], actions: ['arcox_quote_bridge', 'arcox_execute_bridge', 'arcox_bridge_status', 'arcox_retry_bridge_mint'] },
     { id: 'send', title: 'Send', purpose: 'Send supported tokens to another address from the Agent Wallet.', userInputs: ['recipient', 'token', 'amount'], actions: ['arcox_quote_send', 'arcox_execute_send'] },
     { id: 'pay', title: 'ARCOX Pay', purpose: 'Create and pay USDC invoice/payment requests on Arc Testnet.', userInputs: ['amount', 'merchantAddress'], actions: ['arcox_create_payment_request', 'arcox_quote_payment_request', 'arcox_pay_payment_request', 'arcox_check_payment_status'] },
-    { id: 'intel', title: 'Intel', purpose: 'Address/entity/token/tx intelligence through ARCOX API (x402 paid).', userInputs: ['address/entity/token/hash'], actions: ['arcox_intel_get_address', 'arcox_intel_get_tx', 'arcox_x402_pay_invoice'] },
+    { id: 'intel', title: 'Intel', purpose: 'Read-only Arkham address/entity/token/portfolio intelligence through ARCOX API (x402 paid). No swap, bridge, send, buy, or sell execution.', userInputs: ['address/entity/token'], actions: ['arcox_intel_search', 'arcox_intel_get_address', 'arcox_intel_get_entity', 'arcox_intel_get_token', 'arcox_intel_get_balances', 'arcox_intel_get_portfolio', 'arcox_x402_pay_invoice'] },
     { id: 'ai_router', title: 'AI Router', purpose: 'Manage API keys, list models, call models, and inspect usage.', userInputs: ['prompt'], actions: ['get_ai_router_status', 'create_ai_api_key', 'list_ai_models', 'call_ai_model', 'get_usage_logs'] },
   ]
   const arcoxActions = [
@@ -27,7 +27,7 @@ export function registerDocsCatalogTools(ctx) {
     { id: 'bridge', page: 'bridge', intentExamples: ['bridge 1 usdc dari arc ke base', 'bridge dari arbitrum ke arc'], requiredSlots: ['fromChain', 'toChain', 'token', 'amount'], safeExecution: 'quote_then_confirm' },
     { id: 'send', page: 'send', intentExamples: ['send 5 usdc ke 0x...', 'kirim usdc dari agent wallet'], requiredSlots: ['recipient', 'token', 'amount'], safeExecution: 'quote_then_confirm' },
     { id: 'pay_invoice', page: 'pay', intentExamples: ['create payment request 10 usdc ke 0x...', 'bayar invoice arcox'], requiredSlots: ['amount', 'merchantAddress'], safeExecution: 'quote_then_confirm' },
-    { id: 'intel', page: 'intel', intentExamples: ['analyze address 0x...', 'check token btc'], requiredSlots: ['address/entity/token/hash'], safeExecution: 'x402_paid_read' },
+    { id: 'intel', page: 'intel', intentExamples: ['analyze address 0x...', 'check token btc', 'show wallet balances', 'show token holders'], requiredSlots: ['address/entity/token'], safeExecution: 'x402_paid_read' },
   ]
   const arcoxChainSupport = {
     Arc_Testnet: { bridge: true, router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7', circleWallet: true, aliases: ['arc', 'arc testnet'] },

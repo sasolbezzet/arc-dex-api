@@ -91,7 +91,11 @@ router.get('/contract/:chain/:address', sendArkham(req => `/intelligence/contrac
 router.get('/entity/:entity', sendArkham(req => `/intelligence/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_ENTITY', '0.02'))
 router.get('/entity/:entity/summary', sendArkham(req => `/intelligence/entity/${encodeURIComponent(req.params.entity)}/summary`, 'ARCOX_INTEL_PRICE_ENTITY', '0.02'))
 router.get('/entity/:entity/balances', sendArkham(req => `/balances/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_ENTITY', '0.02'))
-router.get('/entity/:entity/flows', sendArkham(req => `/flow/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_ENTITY', '0.02', { timeLast: '24h' }))
+router.get('/entity/:entity/counterparties', sendArkham(req => `/counterparties/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_COUNTERPARTIES', '0.02', { limit: '100' }))
+router.get('/entity/:entity/flows', sendArkham(req => `/flow/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_FLOWS', '0.02', { timeLast: '24h' }))
+router.get('/entity/:entity/history', sendArkham(req => `/history/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_HISTORY', '0.02', { timeLast: '24h' }))
+router.get('/entity/:entity/volume', sendArkham(req => `/volume/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_VOLUME', '0.02', { timeLast: '24h' }))
+router.get('/entity/:entity/portfolio', sendArkham(req => `/portfolio/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_BALANCES', '0.02', () => ({ time: String(Date.now()) })))
 router.get('/token/trending', sendArkham(() => '/token/trending', 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005'))
 router.get('/token/top', sendArkham(() => '/token/top', 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005', () => ({
   timeframe: '24h',
@@ -103,11 +107,13 @@ router.get('/token/top', sendArkham(() => '/token/top', 'ARCOX_INTEL_PRICE_TOKEN
 })))
 router.get('/token/:chain/:address/holders', sendArkham(req => `/token/holders/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_HOLDERS', '0.03'))
 router.get('/token/:chain/:address/top-flow', sendArkham(req => `/token/top_flow/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_HOLDERS', '0.03', { timeLast: '24h' }))
-router.get('/token/:chain/:address', sendArkham(req => `/intelligence/token/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005'))
-router.get('/token/:id', sendArkham(req => `/intelligence/token/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005'))
+// Keep token-id subresources before the generic chain/address route. Without
+// this order, /token/bitcoin/market is captured as chain=bitcoin,address=market.
 router.get('/token/:id/market', sendArkham(req => `/token/market/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005'))
 router.get('/token/:id/holders', sendArkham(req => `/token/holders/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_HOLDERS', '0.03'))
 router.get('/token/:id/top-flow', sendArkham(req => `/token/top_flow/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_HOLDERS', '0.03', { timeLast: '24h' }))
+router.get('/token/:chain/:address', sendArkham(req => `/intelligence/token/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005'))
+router.get('/token/:id', sendArkham(req => `/intelligence/token/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.005'))
 
 router.get('/report/address/:address', paid('ARCOX_INTEL_PRICE_REPORT_ADDRESS', '0.05', async (req, res) => {
   try {
