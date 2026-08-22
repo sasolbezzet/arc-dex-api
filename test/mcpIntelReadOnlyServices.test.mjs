@@ -97,7 +97,33 @@ test('MCP Intel tools route read-only services and forward filters', async () =>
     assert.match(transfers.requestedUrl, /chain=ethereum/)
     assert.match(transfers.requestedUrl, /transferType=token/)
 
-    assert.equal(requested.length, 12)
+    const priceHistory = resultJson(await tools.arcox_intel_get_token.handler({ id: 'BTC', service: 'price-history', daily: true }))
+    assert.match(priceHistory.requestedUrl, /\/api\/intel\/token\/bitcoin\/price-history\?daily=true$/)
+
+    const priceChange = resultJson(await tools.arcox_intel_get_token.handler({ id: 'ETH', service: 'price-change', pastTime: '2025-01-01T00:00:00Z' }))
+    assert.match(priceChange.requestedUrl, /\/api\/intel\/token\/ethereum\/price-change\?pastTime=/)
+
+    const tokenVolume = resultJson(await tools.arcox_intel_get_token.handler({ id: 'USDC', service: 'volume', granularity: '1h', timeLast: '24h' }))
+    assert.match(tokenVolume.requestedUrl, /\/api\/intel\/token\/usd-coin\/volume\?/)
+    assert.match(tokenVolume.requestedUrl, /granularity=1h/)
+    assert.match(tokenVolume.requestedUrl, /timeLast=24h/)
+
+    const risk = resultJson(await tools.arcox_intel_get_risk.handler({ address: EOA }))
+    assert.match(risk.requestedUrl, /\/api\/intel\/risk\/address\/0x1111111111111111111111111111111111111111$/)
+
+    const riskPaths = resultJson(await tools.arcox_intel_get_risk.handler({ address: EOA, service: 'paths' }))
+    assert.match(riskPaths.requestedUrl, /\/api\/intel\/risk\/address\/0x1111111111111111111111111111111111111111\/paths$/)
+
+    const loans = resultJson(await tools.arcox_intel_get_loans.handler({ address: EOA, chains: 'ethereum,arbitrum_one' }))
+    assert.match(loans.requestedUrl, /\/api\/intel\/loans\/address\/0x1111111111111111111111111111111111111111\?chains=ethereum%2Carbitrum_one$/)
+
+    const network = resultJson(await tools.arcox_intel_get_network.handler({ service: 'status' }))
+    assert.match(network.requestedUrl, /\/api\/intel\/networks\/status$/)
+
+    const chains = resultJson(await tools.arcox_intel_get_network.handler({ service: 'chains' }))
+    assert.match(chains.requestedUrl, /\/api\/intel\/chains$/)
+
+    assert.equal(requested.length, 20)
   } finally {
     globalThis.fetch = previousFetch
     if (previousSessionPath === undefined) delete process.env.SESSION_KEYS_PATH

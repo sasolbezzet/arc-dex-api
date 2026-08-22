@@ -22,6 +22,11 @@ Endpoints:
 - `GET /api/intel/address/:address/history`
 - `GET /api/intel/address/:address/volume`
 - `GET /api/intel/address/:address/portfolio`
+- `GET /api/intel/risk/address/:address`
+- `GET /api/intel/risk/address/:address/paths`
+- `GET /api/intel/loans/address/:address`
+- `GET /api/intel/chains`
+- `GET /api/intel/networks/status`
 - `GET /api/intel/tx/:hash`
 - `GET /api/intel/tx/:hash/transfers`
 - `GET /api/intel/search?query=`
@@ -38,6 +43,9 @@ Endpoints:
 - `GET /api/intel/token/:id/market`
 - `GET /api/intel/token/:id/holders`
 - `GET /api/intel/token/:id/top-flow`
+- `GET /api/intel/token/:id/price-history`
+- `GET /api/intel/token/:id/price-change`
+- `GET /api/intel/token/:id/volume`
 - `GET /api/intel/token/trending`
 - `GET /api/intel/token/top`
 - `GET /api/intel/report/address/:address`
@@ -49,6 +57,9 @@ MCP dedicated read-only tools:
 - `arcox_intel_get_volume`
 - `arcox_intel_get_counterparties`
 - `arcox_intel_get_transfers`
+- `arcox_intel_get_risk`
+- `arcox_intel_get_loans`
+- `arcox_intel_get_network`
 
 x402 example:
 

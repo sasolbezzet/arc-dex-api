@@ -32,8 +32,8 @@ export function registerIntelTools(ctx) {
   }
   const addressServices = ['basic', 'all', 'enriched', 'balances', 'counterparties', 'flows', 'history', 'volume', 'portfolio']
   const entityServices = ['basic', 'summary', 'balances', 'counterparties', 'flows', 'history', 'volume', 'portfolio']
-  const tokenServices = ['basic', 'market', 'holders', 'top-flow', 'trending', 'top', 'contract', 'contract-holders']
-  const timeWindows = ['1h', '24h', '7d', '30d', '1M', '1y']
+  const tokenServices = ['basic', 'market', 'holders', 'top-flow', 'trending', 'top', 'price-history', 'price-change', 'volume', 'contract', 'contract-holders']
+  const timeWindows = ['1h', '24h', '7d', '30d', '1M', '1y', '60d']
 
   const normalizeIntelTokenId = value => {
     const raw = String(value || '').trim()
@@ -78,6 +78,18 @@ export function registerIntelTools(ctx) {
     if (!tokenServices.includes(service)) throw new Error(`Unsupported token service: ${service}`)
     if (service === 'trending') return appendQuery('/token/trending', queryParams(params, ['chains', 'limit', 'offset']))
     if (service === 'top') return appendQuery('/token/top', queryParams(params, ['timeframe', 'from', 'to', 'orderByAgg', 'orderByDesc', 'orderByPercent', 'size', 'limit', 'offset']))
+    if (service === 'price-history') {
+      if (!params.id) throw new Error('Token service price-history requires id')
+      return appendQuery(`/token/${encodeURIComponent(normalizeIntelTokenId(params.id))}/price-history`, queryParams(params, ['daily']))
+    }
+    if (service === 'price-change') {
+      if (!params.id || !params.pastTime) throw new Error('Token service price-change requires id and pastTime')
+      return appendQuery(`/token/${encodeURIComponent(normalizeIntelTokenId(params.id))}/price-change`, queryParams(params, ['pastTime']))
+    }
+    if (service === 'volume') {
+      if (!params.id || !params.granularity) throw new Error('Token service volume requires id and granularity')
+      return appendQuery(`/token/${encodeURIComponent(normalizeIntelTokenId(params.id))}/volume`, queryParams(params, ['granularity', 'timeLast']))
+    }
     if (service === 'contract' || service === 'contract-holders') {
       if (!params.chain || !params.address) throw new Error(`Token service ${service} requires chain and address`)
       const suffix = service === 'contract-holders' ? '/holders' : ''
@@ -190,9 +202,9 @@ export function registerIntelTools(ctx) {
     offset: z.number().int().nonnegative().max(10000).optional(),
     groupByEntity: z.boolean().optional(),
     poolAddress: z.string().optional(),
-    granularity: z.string().optional(),
     daily: z.boolean().optional(),
-    pastTime: z.string().optional(),
+    pastTime: z.string().optional().describe('Required for price-change; RFC3339 timestamp'),
+    granularity: z.string().optional().describe('Required for volume; e.g. 1h, 1d'),
     timeframe: z.string().optional(),
     from: z.string().optional(),
     to: z.string().optional(),
@@ -314,6 +326,36 @@ export function registerIntelTools(ctx) {
   registerScopedReadTool('arcox_intel_get_history', 'history', 'history')
   registerScopedReadTool('arcox_intel_get_volume', 'volume', 'volume')
   registerScopedReadTool('arcox_intel_get_counterparties', 'counterparties', 'counterparties')
+
+  intelTool('arcox_intel_get_risk', 'Read Arkham compliance risk score or traced risk paths for an address through ARCOX x402. This never blocks, freezes, or moves funds.', params => {
+    if (!params.address) throw new Error('address is required')
+    const service = params.service || 'score'
+    if (service !== 'score' && service !== 'paths') throw new Error(`Unsupported risk service: ${service}`)
+    return `/risk/address/${encodeURIComponent(params.address)}${service === 'paths' ? '/paths' : ''}`
+  }, {
+    address: z.string().describe('Address to assess'),
+    service: z.enum(['score', 'paths']).optional().describe('Risk score or traced transaction paths'),
+    paymentId: z.string().optional(),
+  })
+
+  intelTool('arcox_intel_get_loans', 'Read Arkham lending and borrowing positions for an address through ARCOX x402. This never opens, closes, or changes a loan.', params => {
+    if (!params.address) throw new Error('address is required')
+    return appendQuery(`/loans/address/${encodeURIComponent(params.address)}`, queryParams(params, ['chains']))
+  }, {
+    address: z.string().describe('Address to inspect'),
+    chains: z.string().optional().describe('Comma-separated Arkham chain filters'),
+    paymentId: z.string().optional(),
+  })
+
+  intelTool('arcox_intel_get_network', 'Read Arkham supported chains or current network status through ARCOX x402. This is strictly informational.', params => {
+    const service = params.service || 'status'
+    if (service === 'chains') return '/chains'
+    if (service === 'status') return '/networks/status'
+    throw new Error(`Unsupported network service: ${service}`)
+  }, {
+    service: z.enum(['chains', 'status']).optional().describe('Supported chains or current status'),
+    paymentId: z.string().optional(),
+  })
 
   intelTool('arcox_intel_get_transfers', 'Read historical Arkham transaction transfers through ARCOX x402. This tool never submits or modifies a transaction.', params => {
     if (!params.hash) throw new Error('hash is required')
