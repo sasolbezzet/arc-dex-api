@@ -76,6 +76,25 @@ Endpoints:
 - `GET /api/intel/polymarket/*` (market, wallet, position, and activity reads)
 - `GET /api/intel/report/address/:address`
 
+Service catalog (free, no x402 payment required):
+
+- `GET /api/intel/catalog` — structured list of all Intel services, prices, cache tiers, required parameters, and defaults.
+
+Cache TTL per service:
+
+- `static` (1 hour): chains, ARKM circulating, tag params/summary
+- `slow` (30 min): network status, altcoin index, risk score
+- `default` (10 min): balances, portfolio, token intelligence
+- `dynamic` (2 min): flows, transfers, swaps, HyperCore trades, Polymarket activity
+
+Auto-refund worker:
+
+- Paid invoices with `provider_not_found` or `provider_error` are automatically marked `refund_approved` after a cooling-off period.
+- `GET /api/x402/refunds/approved` — list approved refunds
+- `GET /api/x402/refunds/log` — audit log of refund decisions
+- `POST /api/x402/refunds/scan` — trigger a manual scan
+- `POST /api/x402/refunds/:invoiceId/complete` — mark a refund as completed with txHash
+
 MCP dedicated read-only tools:
 
 - `arcox_intel_get_flows`

@@ -10,6 +10,12 @@ import {
 } from '../middleware/x402Middleware.mjs'
 import { verifyAgentOwnership } from '../services/agentIdentityService.mjs'
 import { verifyOwnerToken } from '../services/authToken.mjs'
+import {
+  listApprovedRefunds,
+  markRefundCompleted,
+  scanRefundEligibleInvoices,
+  getRefundLog,
+} from '../services/x402RefundWorker.mjs'
 
 const router = Router()
 
@@ -100,6 +106,33 @@ router.post('/invoices/:invoiceId/spend-submitted', (req, res) => {
 
 router.get('/config', (_req, res) => {
   res.json({ ok: true, config: publicConfig() })
+})
+
+// ── Refund management ──
+// These endpoints list auto-approved refunds and allow a treasury operator
+// to mark them as completed. The actual on-chain USDC transfer must be
+// performed by a separately authenticated treasury process; this API only
+// tracks the state and audit trail.
+
+router.get('/refunds/approved', (_req, res) => {
+  res.json({ ok: true, refunds: listApprovedRefunds() })
+})
+
+router.get('/refunds/log', (_req, res) => {
+  res.json({ ok: true, log: getRefundLog() })
+})
+
+router.post('/refunds/scan', (_req, res) => {
+  const approved = scanRefundEligibleInvoices()
+  res.json({ ok: true, approved, count: approved.length })
+})
+
+router.post('/refunds/:invoiceId/complete', (req, res) => {
+  const txHash = String(req.body?.txHash || '').trim()
+  if (!txHash) return res.status(400).json({ error: 'txHash is required' })
+  const invoice = markRefundCompleted(req.params.invoiceId, txHash)
+  if (!invoice) return res.status(404).json({ error: 'Refund-eligible invoice not found' })
+  res.json({ ok: true, refund: invoice })
 })
 
 function publicConfig() {

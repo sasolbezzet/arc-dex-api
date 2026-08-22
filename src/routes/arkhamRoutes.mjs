@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { ArkhamService } from '../services/arkhamService.mjs'
 import { priceFromEnv, withArcoxX402 } from '../middleware/x402Middleware.mjs'
 import { buildIntelPresentation } from '../services/intelPresentation.mjs'
+import { getIntelCatalog } from '../services/intelCatalog.mjs'
 
 const router = Router()
 const arkham = new ArkhamService()
@@ -74,6 +75,13 @@ function serviceName(routePath) {
     .replace(/\b\w/g, char => char.toUpperCase())
   return label ? `${label} Intel` : 'ARCOX Intel'
 }
+
+// Structured service catalog: lists every Intel route, price, cache tier,
+// required parameters, and defaults. This is a free read-only endpoint that
+// helps agents discover available services without guessing.
+router.get('/catalog', (_req, res) => {
+  res.json({ ok: true, readOnly: true, services: getIntelCatalog() })
+})
 
 router.get('/address/:address', sendArkham(req => `/intelligence/address/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_ADDRESS', '0.005'))
 router.get('/address/:address/all', sendArkham(req => `/intelligence/address/${encodeURIComponent(req.params.address)}/all`, 'ARCOX_INTEL_PRICE_ADDRESS_ALL', '0.01'))

@@ -86,6 +86,19 @@ function persistInvoices() {
   }
 }
 
+/** Iterate all known invoices (deduplicated by invoiceId). */
+export function getAllX402Invoices() {
+  loadPersistentInvoices()
+  const seen = new Set()
+  const result = []
+  for (const invoice of invoices.values()) {
+    if (!invoice?.invoiceId || seen.has(invoice.invoiceId)) continue
+    seen.add(invoice.invoiceId)
+    result.push(invoice)
+  }
+  return result
+}
+
 export function priceFromEnv(name, fallback) {
   return String(process.env[name] || fallback)
 }
@@ -406,6 +419,9 @@ export function publicInvoice(invoice) {
     serviceError: invoice.serviceError || '',
     refundEligible: Boolean(invoice.refundEligible),
     refundStatus: invoice.refundStatus || '',
+    refundApprovedAt: invoice.refundApprovedAt || '',
+    refundedAt: invoice.refundedAt || '',
+    refundTxHash: invoice.refundTxHash || '',
     serviceUnlockedAt: invoice.serviceUnlockedAt,
     memoIndex: invoice.memoIndex,
     memoSender: invoice.memoSender,

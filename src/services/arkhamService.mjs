@@ -1,3 +1,5 @@
+import { cacheTtlForPath } from './intelCatalog.mjs'
+
 const cache = globalThis.__arcoxArkhamCache || new Map()
 globalThis.__arcoxArkhamCache = cache
 
@@ -5,7 +7,14 @@ export class ArkhamService {
   constructor() {
     this.baseUrl = (process.env.ARKHAM_BASE_URL || 'https://api.arkm.com').replace(/\/$/, '')
     this.apiKey = process.env.ARKHAM_API_KEY || ''
-    this.ttlMs = Number(process.env.ARCOX_INTEL_CACHE_TTL_SECONDS || 600) * 1000
+    this.defaultTtlMs = Number(process.env.ARCOX_INTEL_CACHE_TTL_SECONDS || 600) * 1000
+  }
+
+  /** Resolve per-service cache TTL in milliseconds for a given provider path. */
+  ttlMsForPath(path) {
+    const tierSeconds = cacheTtlForPath(path)
+    if (tierSeconds) return tierSeconds * 1000
+    return this.defaultTtlMs
   }
 
   async get(path, query = {}) {
@@ -24,8 +33,9 @@ export class ArkhamService {
       if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, String(value))
     }
     const cacheKey = url.toString()
+    const ttlMs = this.ttlMsForPath(path)
     const hit = cache.get(cacheKey)
-    if (hit && Date.now() - hit.createdAt < this.ttlMs) return { ...hit.data, cached: true }
+    if (hit && Date.now() - hit.createdAt < ttlMs) return { ...hit.data, cached: true }
 
     const response = await fetch(url, {
       headers: {

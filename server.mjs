@@ -34,6 +34,7 @@ import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCirc
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
+import { startRefundWorker } from './src/services/x402RefundWorker.mjs'
 import { readPaymentInvoice, readTransactionHistory, scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, shadowReadWebhookEvent, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
 import { claimWebhookEvent, completeWebhookEvent, listAutoMintJobs, readAutoMintJob, claimAutoMintLease, releaseAutoMintLease, supabaseOperationalStatus, upsertAutoMintJob } from './src/services/supabaseOperationalState.mjs'
 
@@ -3627,5 +3628,6 @@ if (!process.env.VERCEL) {
     console.log('        get-attestation, mint-cctp-solana, mint-cctp-from-solana, send, history')
     console.log('        invoices, circle-gateway webhook, eco route-preview')
     console.log('[supabase] persistence:', JSON.stringify({ ...supabasePersistenceStatus(), ...supabaseOperationalStatus() }))
+    startRefundWorker()
   })
 }
