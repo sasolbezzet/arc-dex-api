@@ -37,26 +37,46 @@ export class ArkhamService {
     const hit = cache.get(cacheKey)
     if (hit && Date.now() - hit.createdAt < ttlMs) return { ...hit.data, cached: true }
 
-    const response = await fetch(url, {
-      headers: {
-        Accept: 'application/json',
-        'API-Key': this.apiKey,
-      },
-      signal: AbortSignal.timeout(15_000),
-    })
-    const text = await response.text()
-    let data = {}
-    try { data = text ? JSON.parse(text) : {} } catch { data = { raw: text } }
-    if (!response.ok) {
-      const message = data?.message || data?.error || `Arkham HTTP ${response.status}`
-      const error = new Error(message)
-      error.status = response.status
-      error.data = data
-      throw error
+    // Heavy analytics endpoints (Solana subaccounts, entity counterparties,
+    // global feeds) regularly exceed a 15s budget at the provider. Use a
+    // generous per-call timeout and retry once on timeout / 5xx so a slow
+    // Arkham response does not fail an already-paid request.
+    const timeoutMs = Number(process.env.ARCOX_INTEL_ARKHAM_TIMEOUT_MS || 45_000)
+    let lastError
+    for (let attempt = 0; attempt <= 1; attempt++) {
+      let response
+      try {
+        response = await fetch(url, {
+          headers: {
+            Accept: 'application/json',
+            'API-Key': this.apiKey,
+          },
+          signal: AbortSignal.timeout(timeoutMs),
+        })
+      } catch (fetchError) {
+        lastError = fetchError
+        if (attempt === 0) continue // retry once on network/timeout error
+        break
+      }
+      if (response.status >= 500 && response.status < 600 && attempt === 0) {
+        await new Promise(resolve => setTimeout(resolve, 1_000))
+        continue // retry once on provider 5xx
+      }
+      const text = await response.text()
+      let data = {}
+      try { data = text ? JSON.parse(text) : {} } catch { data = { raw: text } }
+      if (!response.ok) {
+        const message = data?.message || data?.error || `Arkham HTTP ${response.status}`
+        const error = new Error(message)
+        error.status = response.status
+        error.data = data
+        throw error
+      }
+      const wrapped = { ok: true, mode: 'arkham', data, disclaimer: disclaimer() }
+      cache.set(cacheKey, { createdAt: Date.now(), data: wrapped })
+      return wrapped
     }
-    const wrapped = { ok: true, mode: 'arkham', data, disclaimer: disclaimer() }
-    cache.set(cacheKey, { createdAt: Date.now(), data: wrapped })
-    return wrapped
+    throw lastError || new Error('Arkham request failed')
   }
 
   async reportAddress(address) {
