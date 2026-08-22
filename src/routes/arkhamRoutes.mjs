@@ -87,10 +87,78 @@ router.get('/address/:address/portfolio', sendArkham(req => `/portfolio/address/
 router.get('/risk/address/:address/paths', sendArkham(req => `/risk/address/${encodeURIComponent(req.params.address)}/paths`, 'ARCOX_INTEL_PRICE_RISK_PATHS', '0.05'))
 router.get('/risk/address/:address', sendArkham(req => `/risk/address/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_RISK', '0.03'))
 router.get('/loans/address/:address', sendArkham(req => `/loans/address/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_LOANS', '0.03'))
+router.get('/loans/entity/:entity', sendArkham(req => `/loans/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_LOANS_ENTITY', '0.03'))
+router.get('/risk/entity/:entity', sendArkham(req => `/risk/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_RISK_ENTITY', '0.03'))
+router.get('/intelligence/entity/:entity/predictions', sendArkham(req => `/intelligence/entity_predictions/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_ENTITY_PREDICTIONS', '0.03'))
 router.get('/chains', sendArkham(() => '/chains', 'ARCOX_INTEL_PRICE_NETWORK', '0.005'))
 router.get('/networks/status', sendArkham(() => '/networks/status', 'ARCOX_INTEL_PRICE_NETWORK', '0.005'))
+router.get('/networks/history/:chain', sendArkham(req => `/networks/history/${encodeURIComponent(req.params.chain)}`, 'ARCOX_INTEL_PRICE_NETWORK_HISTORY', '0.02'))
+router.get('/arkm/circulating', sendArkham(() => '/arkm/circulating', 'ARCOX_INTEL_PRICE_ARKM_CIRCULATING', '0.005'))
+router.get('/marketdata/altcoin-index', sendArkham(() => '/marketdata/altcoin_index', 'ARCOX_INTEL_PRICE_ALTCOIN_INDEX', '0.01'))
+router.get('/cluster/:id/summary', sendArkham(req => `/cluster/${encodeURIComponent(req.params.id)}/summary`, 'ARCOX_INTEL_PRICE_CLUSTER', '0.02'))
 router.get('/tx/:hash', sendArkham(req => `/tx/${encodeURIComponent(req.params.hash)}`, 'ARCOX_INTEL_PRICE_TX', '0.005'))
 router.get('/tx/:hash/transfers', sendArkham(req => `/transfers/tx/${encodeURIComponent(req.params.hash)}`, 'ARCOX_INTEL_PRICE_TX', '0.005', { chain: 'ethereum' }))
+router.get('/transfers/histogram', sendArkham(() => '/transfers/histogram', 'ARCOX_INTEL_PRICE_TRANSFERS_HISTOGRAM', '0.03'))
+router.get('/transfers/unenriched', sendArkham(() => '/transfers/unenriched', 'ARCOX_INTEL_PRICE_TRANSFERS_UNENRICHED', '0.03'))
+router.get('/transfers', sendArkham(() => '/transfers', 'ARCOX_INTEL_PRICE_TRANSFERS', '0.03'))
+router.get('/swaps', sendArkham(() => '/swaps', 'ARCOX_INTEL_PRICE_SWAPS', '0.03'))
+router.get('/portfolio/time-series/address/:address', sendArkham(req => `/portfolio/timeSeries/address/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_PORTFOLIO_SERIES', '0.02'))
+router.get('/portfolio/time-series/entity/:entity', sendArkham(req => `/portfolio/timeSeries/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_PORTFOLIO_SERIES', '0.02'))
+
+// HyperCore/Hyperliquid analytics are read-only market and account data.
+const hypercoreAccountServices = new Set(['active', 'perp-positions', 'portfolio-history', 'spot-balances', 'subaccounts', 'summary', 'trades'])
+const hypercoreEntityServices = new Set(['active', 'perp-positions', 'portfolio-history', 'spot-balances', 'summary'])
+router.get('/hypercore/markets', sendArkham(() => '/hypercore/markets', 'ARCOX_INTEL_PRICE_HYPERCORE_MARKETS', '0.02'))
+router.get('/hypercore/account/:address/:service', sendArkham(req => {
+  if (!hypercoreAccountServices.has(req.params.service)) throw Object.assign(new Error('Unsupported HyperCore account service'), { status: 400 })
+  return `/hypercore/account/${encodeURIComponent(req.params.address)}/${req.params.service}`
+}, 'ARCOX_INTEL_PRICE_HYPERCORE_ACCOUNT', '0.03'))
+router.get('/hypercore/entity/:entity/:service', sendArkham(req => {
+  if (!hypercoreEntityServices.has(req.params.service)) throw Object.assign(new Error('Unsupported HyperCore entity service'), { status: 400 })
+  return `/hypercore/entity/${encodeURIComponent(req.params.entity)}/${req.params.service}`
+}, 'ARCOX_INTEL_PRICE_HYPERCORE_ENTITY', '0.03'))
+router.get('/hypercore/token/:pricingId/positions', sendArkham(req => `/hypercore/token/${encodeURIComponent(req.params.pricingId)}/positions`, 'ARCOX_INTEL_PRICE_HYPERCORE_POSITIONS', '0.03'))
+router.get('/hypercore/trades/aggregate', sendArkham(() => '/hypercore/trades/aggregate', 'ARCOX_INTEL_PRICE_HYPERCORE_TRADES', '0.03'))
+router.get('/hypercore/trades', sendArkham(() => '/hypercore/trades', 'ARCOX_INTEL_PRICE_HYPERCORE_TRADES', '0.03'))
+
+// Polymarket analytics are historical/market reads; no order or trade mutation is exposed.
+router.get('/polymarket/events', sendArkham(() => '/polymarket/events', 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/activity', sendArkham(() => '/polymarket/activity', 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/leaderboard', sendArkham(() => '/polymarket/leaderboard', 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/prices', sendArkham(() => '/polymarket/prices', 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/stats', sendArkham(() => '/polymarket/stats', 'ARCOX_INTEL_PRICE_POLYMARKET', '0.02'))
+router.get('/polymarket/top-events', sendArkham(() => '/polymarket/top-events', 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/events/:eventId', sendArkham(req => `/polymarket/events/${encodeURIComponent(req.params.eventId)}`, 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/event-positions/:conditionId', sendArkham(req => `/polymarket/event-positions/${encodeURIComponent(req.params.conditionId)}`, 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/order-book/:conditionId', sendArkham(req => `/polymarket/order-book/${encodeURIComponent(req.params.conditionId)}`, 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/positions/:addr', sendArkham(req => `/polymarket/positions/${encodeURIComponent(req.params.addr)}`, 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/top-holders/:conditionId', sendArkham(req => `/polymarket/top-holders/${encodeURIComponent(req.params.conditionId)}`, 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/top-events/:eventId/breakdown', sendArkham(req => `/polymarket/top-events/${encodeURIComponent(req.params.eventId)}/breakdown`, 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/wallet/:addr/event-history', sendArkham(req => `/polymarket/wallet/${encodeURIComponent(req.params.addr)}/event-history`, 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/wallet/:addr/prediction-history', sendArkham(req => `/polymarket/wallet/${encodeURIComponent(req.params.addr)}/prediction-history`, 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/wallet/:addr/summary/:metric', sendArkham(req => {
+  const allowed = new Set(['balance', 'biggest-win', 'pnl', 'portfolio', 'rewards', 'stats'])
+  if (!allowed.has(req.params.metric)) throw Object.assign(new Error('Unsupported Polymarket wallet summary'), { status: 400 })
+  return `/polymarket/wallet/${encodeURIComponent(req.params.addr)}/summary/${req.params.metric}`
+}, 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+router.get('/polymarket/wallet/:addr/tags', sendArkham(req => `/polymarket/wallet/${encodeURIComponent(req.params.addr)}/tags`, 'ARCOX_INTEL_PRICE_POLYMARKET', '0.02'))
+router.get('/polymarket/pnl/chart', sendArkham(() => '/polymarket/pnl/chart', 'ARCOX_INTEL_PRICE_POLYMARKET', '0.03'))
+
+// The following tag and token metadata endpoints only retrieve Arkham data.
+router.get('/tag/:id/params', sendArkham(req => `/tag/${encodeURIComponent(req.params.id)}/params`, 'ARCOX_INTEL_PRICE_TAG', '0.02'))
+router.get('/tag/:id/summary', sendArkham(req => `/tag/${encodeURIComponent(req.params.id)}/summary`, 'ARCOX_INTEL_PRICE_TAG', '0.02'))
+router.get('/token/arkham-exchange-tokens', sendArkham(() => '/token/arkham_exchange_tokens', 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.01'))
+router.get('/token/addresses/:id', sendArkham(req => `/token/addresses/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.01'))
+router.get('/token/balance/:chain/:address', sendArkham(req => `/token/balance/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_BALANCE', '0.02'))
+router.get('/token/balance/:id', sendArkham(req => `/token/balance/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_BALANCE', '0.02'))
+router.get('/token/trending/:id', sendArkham(req => `/token/trending/${encodeURIComponent(req.params.id)}`, 'ARCOX_INTEL_PRICE_TOKEN_BASIC', '0.01'))
+router.get('/token/:chain/:address/price-history', sendArkham(req => `/token/price/history/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_HISTORY', '0.02'))
+router.get('/token/:chain/:address/volume', sendArkham(req => `/token/volume/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_TOKEN_VOLUME', '0.03'))
+
+// Solana subaccount balances are reads only and are kept separate from EVM balances.
+router.get('/balances/solana/subaccounts/address/:addresses', sendArkham(req => `/balances/solana/subaccounts/address/${encodeURIComponent(req.params.addresses)}`, 'ARCOX_INTEL_PRICE_SOLANA_SUBACCOUNTS', '0.02'))
+router.get('/balances/solana/subaccounts/entity/:entities', sendArkham(req => `/balances/solana/subaccounts/entity/${encodeURIComponent(req.params.entities)}`, 'ARCOX_INTEL_PRICE_SOLANA_SUBACCOUNTS', '0.03'))
+
 router.get('/search', sendArkham(() => '/intelligence/search', 'ARCOX_INTEL_PRICE_ADDRESS', '0.005'))
 router.get('/contract/:chain/:address', sendArkham(req => `/intelligence/contract/${encodeURIComponent(req.params.chain)}/${encodeURIComponent(req.params.address)}`, 'ARCOX_INTEL_PRICE_CONTRACT', '0.01'))
 router.get('/entity/:entity', sendArkham(req => `/intelligence/entity/${encodeURIComponent(req.params.entity)}`, 'ARCOX_INTEL_PRICE_ENTITY', '0.02'))
