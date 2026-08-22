@@ -778,7 +778,12 @@ export function withArcoxX402(handler, config = {}) {
       if (invoice && ((agentId && agentId !== String(invoice.agentId || '')) || (ownerWallet && invoice.ownerWallet && ownerWallet !== invoice.ownerWallet))) {
         return res.status(403).json({ error: 'Agent identity mismatch' })
       }
-      if (invoice?.status === 'paid' && invoice.resource === resource) {
+      // Resource binding compares the path without query parameters: the
+      // query is only a filter (limit, chains, timeLast) and must not turn a
+      // legitimate retry into a new invoice. Path parameters (address, hash,
+      // entity, id) remain strictly bound.
+      const normalizeResource = value => String(value || '').split('?')[0].replace(/\/$/, '')
+      if (invoice?.status === 'paid' && normalizeResource(invoice.resource) === normalizeResource(resource)) {
         invoice.serviceStatus = 'service_unlocked'
         invoice.serviceUnlockedAt = new Date().toISOString()
         invoices.set(invoice.invoiceId, invoice)
@@ -787,7 +792,7 @@ export function withArcoxX402(handler, config = {}) {
         req.arcoxX402 = { mode: 'arc_real_testnet', invoice }
         return handler(req, res, next)
       }
-      if (invoice && invoice.resource !== resource) {
+      if (invoice && normalizeResource(invoice.resource) !== normalizeResource(resource)) {
         const nextInvoice = createX402Invoice({ ...config, resource, ownerWallet, agentId, amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount) })
         return res.status(402).json({ error: 'x402 payment resource mismatch', x402: publicInvoice(nextInvoice) })
       }
