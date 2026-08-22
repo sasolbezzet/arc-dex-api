@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -205,6 +205,43 @@ test('auto-refund respects the daily cap and marks repeated failures manual', as
     else process.env.X402_REFUND_DAILY_CAP_USDC = previousCap
     if (previousAttempts === undefined) delete process.env.X402_REFUND_MAX_ATTEMPTS
     else process.env.X402_REFUND_MAX_ATTEMPTS = previousAttempts
+  }
+})
+
+test('refund state and audit timeline persist to the invoice store', async () => {
+  resetState()
+  const previousCooldown = process.env.X402_REFUND_COOLDOWN_MS
+  const previousExecute = process.env.X402_REFUND_EXECUTE_ENABLED
+  process.env.X402_REFUND_COOLDOWN_MS = '0'
+  process.env.X402_REFUND_EXECUTE_ENABLED = 'true'
+
+  try {
+    const invoice = createX402Invoice({ ownerWallet: MSCA, resource: '/api/intel/token/0xpersist', amount: '0.01' })
+    invoice.status = 'paid'
+    invoice.txHash = '0x' + 'a'.repeat(64)
+    invoice.paidAt = new Date().toISOString()
+    markX402ServiceOutcome(invoice.invoiceId, { status: 'provider_error', reason: 'timeout', refundEligible: true })
+    scanRefundEligibleInvoices()
+    await executeRefund(invoice.invoiceId, {
+      spendFn: async () => ({ txHash: '0x' + 'd'.repeat(64) }),
+    })
+
+    // The refund state must be flushed to the JSON store (and the Supabase
+    // dual-write payload) so it survives a restart.
+    const stored = JSON.parse(await readFile(process.env.X402_INVOICE_DB, 'utf8'))
+    const row = stored.find(entry => entry.invoiceId === invoice.invoiceId)
+    assert.ok(row, 'invoice persisted after refund execution')
+    assert.equal(row.refundStatus, 'refunded')
+    assert.equal(row.refundTxHash, '0x' + 'd'.repeat(64))
+    assert.ok(Array.isArray(row.refundTimeline), 'audit timeline persisted on the invoice')
+    const actions = row.refundTimeline.map(entry => entry.action)
+    assert.ok(actions.includes('refund_approved'), `timeline has refund_approved, got ${actions.join(',')}`)
+    assert.ok(actions.includes('refund_executed'), `timeline has refund_executed, got ${actions.join(',')}`)
+  } finally {
+    if (previousCooldown === undefined) delete process.env.X402_REFUND_COOLDOWN_MS
+    else process.env.X402_REFUND_COOLDOWN_MS = previousCooldown
+    if (previousExecute === undefined) delete process.env.X402_REFUND_EXECUTE_ENABLED
+    else process.env.X402_REFUND_EXECUTE_ENABLED = previousExecute
   }
 })
 

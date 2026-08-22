@@ -12,7 +12,7 @@
 // X402_REFUND_EXECUTE_ENABLED. When the delegated spend path is unavailable
 // (no AI_ROUTER_DELEGATE_PRIVATE_KEY), approved refunds stay in
 // `refund_approved` for a treasury operator to complete manually.
-import { getX402Invoice, publicInvoice, getAllX402Invoices } from '../middleware/x402Middleware.mjs'
+import { getX402Invoice, persistX402Invoices, publicInvoice, getAllX402Invoices } from '../middleware/x402Middleware.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
 
 function refundCooldownMs() { return Number(process.env.X402_REFUND_COOLDOWN_MS || 5 * 60 * 1000) }
@@ -34,6 +34,13 @@ function logRefundDecision(invoiceId, action, details = {}) {
   const entry = { invoiceId, action, at: new Date().toISOString(), ...details }
   refundLog.push(entry)
   if (refundLog.length > 500) refundLog.shift()
+  // Audit trail is also persisted on the invoice itself so it survives
+  // restarts and rides the Supabase x402_invoices dual-write payload.
+  const invoice = getX402Invoice(invoiceId)
+  if (invoice) {
+    invoice.refundTimeline = [...(invoice.refundTimeline || []), entry]
+    if (invoice.refundTimeline.length > 20) invoice.refundTimeline.splice(0, invoice.refundTimeline.length - 20)
+  }
 }
 
 /**
@@ -106,13 +113,13 @@ export function scanRefundEligibleInvoices() {
     if (refundFarmingDetected(invoice)) {
       invoice.refundStatus = 'manual_review'
       invoice.updatedAt = new Date().toISOString()
-      persistInvoiceRef(invoice)
       logRefundDecision(invoice.invoiceId, 'refund_manual_review', {
         ownerWallet: invoice.ownerWallet,
         serviceStatus: invoice.serviceStatus,
         recentRefunds: countOwnerRecentRefunds(invoice.ownerWallet),
         reason: 'repeated provider-failure refunds from the same owner; manual review required',
       })
+      persistInvoiceRef(invoice)
       continue
     }
 
@@ -127,7 +134,6 @@ export function scanRefundEligibleInvoices() {
     invoice.refundStatus = 'refund_approved'
     invoice.refundApprovedAt = new Date().toISOString()
     invoice.updatedAt = invoice.refundApprovedAt
-    persistInvoiceRef(invoice)
 
     approved.push(publicInvoice(invoice))
     logRefundDecision(invoice.invoiceId, 'refund_approved', {
@@ -136,18 +142,24 @@ export function scanRefundEligibleInvoices() {
       serviceStatus: invoice.serviceStatus,
       serviceError: invoice.serviceError,
     })
+    persistInvoiceRef(invoice)
   }
 
   return approved
 }
 
-/** Persist a mutated invoice back through the middleware map (live reference). */
+/**
+ * Persist a mutated invoice back through the middleware map (live reference)
+ * AND flush to JSON + Supabase dual-write. Without this the refund status
+ * changes would only live in memory and vanish on restart.
+ */
 function persistInvoiceRef(invoice) {
   const latest = getX402Invoice(invoice.invoiceId)
   if (!latest) return
-  for (const key of ['refundStatus', 'refundApprovedAt', 'updatedAt', 'refundAttempts', 'refundExecuteError', 'refundedAt', 'refundTxHash']) {
+  for (const key of ['refundStatus', 'refundApprovedAt', 'updatedAt', 'refundAttempts', 'refundExecuteError', 'refundedAt', 'refundTxHash', 'refundTimeline']) {
     if (invoice[key] !== undefined) latest[key] = invoice[key]
   }
+  persistX402Invoices()
 }
 
 /**
@@ -196,15 +208,14 @@ export async function executeRefund(invoiceId, options = {}) {
     invoice.refundAttempts = (invoice.refundAttempts || 0) + 1
     invoice.refundExecuteError = String(error?.message || error).slice(0, 300)
     invoice.updatedAt = new Date().toISOString()
-    persistInvoiceRef(invoice)
     if (invoice.refundAttempts >= refundMaxAttempts()) {
       invoice.refundStatus = 'refund_failed_manual'
       invoice.updatedAt = new Date().toISOString()
-      persistInvoiceRef(invoice)
       logRefundDecision(invoice.invoiceId, 'refund_execute_failed_manual', { error: invoice.refundExecuteError, attempts: invoice.refundAttempts })
     } else {
       logRefundDecision(invoice.invoiceId, 'refund_execute_failed', { error: invoice.refundExecuteError, attempts: invoice.refundAttempts })
     }
+    persistInvoiceRef(invoice)
     return { ok: false, reason: 'spend_failed', error: invoice.refundExecuteError }
   }
 
@@ -213,13 +224,13 @@ export async function executeRefund(invoiceId, options = {}) {
     invoice.refundAttempts = (invoice.refundAttempts || 0) + 1
     invoice.refundExecuteError = 'Unified Balance spend returned no tx hash'
     invoice.updatedAt = new Date().toISOString()
-    persistInvoiceRef(invoice)
     logRefundDecision(invoice.invoiceId, 'refund_execute_failed', { error: invoice.refundExecuteError })
+    persistInvoiceRef(invoice)
     return { ok: false, reason: 'missing_tx_hash' }
   }
-  markRefundCompleted(invoice.invoiceId, txHash)
   logRefundDecision(invoice.invoiceId, 'refund_executed', { txHash, amount, ownerWallet: invoice.ownerWallet })
-  return { ok: true, txHash, amount }
+  const completed = markRefundCompleted(invoice.invoiceId, txHash)
+  return { ok: true, txHash, amount, refund: completed }
 }
 
 /** Sum of refunds executed (refunded) today, used for the daily cap. */
@@ -265,7 +276,8 @@ export function listApprovedRefunds() {
 
 /**
  * Mark a refund as completed (called by the treasury operator after sending
- * USDC back, or automatically after a successful delegated spend).
+ * USDC back, or automatically after a successful delegated spend). Persists
+ * to JSON + Supabase so the refunded state survives restarts.
  */
 export function markRefundCompleted(invoiceId, txHash) {
   const invoice = getX402Invoice(invoiceId)
@@ -276,6 +288,7 @@ export function markRefundCompleted(invoiceId, txHash) {
   invoice.updatedAt = invoice.refundedAt
   // getX402Invoice returns a live reference from the middleware's map
   logRefundDecision(invoice.invoiceId, 'refund_completed', { txHash })
+  persistX402Invoices()
   return publicInvoice(invoice)
 }
 

@@ -95,6 +95,15 @@ function persistInvoices() {
   }
 }
 
+/**
+ * Persist the current invoice map to JSON + queue Supabase dual-write upserts.
+ * Exported for state mutators outside this module (refund worker) so refund
+ * status changes survive restarts and stay visible in Supabase.
+ */
+export function persistX402Invoices() {
+  persistInvoices()
+}
+
 /** Iterate all known invoices (deduplicated by invoiceId). */
 export function getAllX402Invoices() {
   loadPersistentInvoices()
