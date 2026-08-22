@@ -1,0 +1,35 @@
+{
+  "name": "@sasolbezzet/x402-client",
+  "version": "1.0.1",
+  "description": "Pay-per-request read-only access to Arkham intelligence through the ARCOX x402 API (invoice lifecycle, unlock, stats, refunds).",
+  "type": "module",
+  "main": "./arcox-x402.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./arcox-x402.mjs"
+    }
+  },
+  "files": [
+    "arcox-x402.mjs",
+    "index.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --input-type=module -e \"import { createX402Client } from './arcox-x402.mjs'; const c = createX402Client({ baseUrl: 'http://127.0.0.1:3001' }); if (typeof c.createInvoice !== 'function') throw new Error('SDK surface broken'); console.log('SDK OK')\""
+  },
+  "keywords": [
+    "x402",
+    "arkham",
+    "arcox",
+    "arc",
+    "intel",
+    "onchain",
+    "pay-per-request"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
