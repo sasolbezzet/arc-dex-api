@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { ArkhamService } from '../services/arkhamService.mjs'
-import { priceFromEnv, withArcoxX402 } from '../middleware/x402Middleware.mjs'
+import { priceFromEnv, withArcoxX402, markX402ServiceOutcome } from '../middleware/x402Middleware.mjs'
 import { buildIntelPresentation } from '../services/intelPresentation.mjs'
 import { getIntelCatalog } from '../services/intelCatalog.mjs'
 
@@ -61,6 +61,20 @@ function sendArkham(pathBuilder, priceEnv, fallback, defaults = {}) {
         query,
       }))
     } catch (error) {
+      // A paid request that fails at the provider (404 = no data, 5xx/timeout
+      // = provider error) must be recorded as refund-review-eligible so the
+      // auto-refund worker can approve a refund instead of silently losing
+      // the user's payment.
+      const invoice = req.arcoxX402?.invoice
+      if (invoice?.status === 'paid' && !invoice.serviceStatus) {
+        const statusCode = error.status || 502
+        const notFound = statusCode === 404
+        markX402ServiceOutcome(invoice.invoiceId, {
+          status: notFound ? 'provider_not_found' : 'provider_error',
+          reason: String(error?.message || '').slice(0, 300),
+          refundEligible: true,
+        })
+      }
       res.status(error.status || 502).json({ ok: false, mode: 'arkham', error: error.message, disclaimer: 'Informational only. Not financial advice.' })
     }
   })

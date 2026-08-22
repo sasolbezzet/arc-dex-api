@@ -49,8 +49,15 @@ export function registerIntelTools(ctx) {
     const raw = String(value || '').trim()
     return intelTokenAliases[raw.toUpperCase()] || raw
   }
+  // Provider failure detection. 404 = the data does not exist at the
+  // provider; 5xx/timeout = the provider failed after payment. Both must be
+  // recorded as refund-review-eligible so a paid invoice never silently
+  // loses the user's funds.
   const isProviderNotFound = (status, data) => status === 404
     || /\b(?:not[ -]?found|unknown token|token unavailable)\b/i.test(String(data?.error || data?.message || ''))
+  const isProviderFailure = (status, data) => isProviderNotFound(status, data)
+    || (Number(status) >= 500 && Number(status) < 600)
+    || /\b(?:timed? ?out|aborted|temporarily unavailable|5\d\d)\b/i.test(String(data?.error || data?.message || ''))
 
   const appendQuery = (path, params = {}) => {
     const query = new URLSearchParams()
@@ -156,11 +163,14 @@ export function registerIntelTools(ctx) {
     // A paid x402 request can still fail at the provider layer. Mark this as
     // a service outcome rather than reporting a successful unlock; the invoice
     // remains paid, while the explicit refund review state prevents silent loss.
+    // 404 records provider_not_found; 5xx/timeout records provider_error. Both
+    // are refund-eligible and picked up by the auto-refund worker.
     let providerOutcome = null
-    if (normalizedParams.paymentId && isProviderNotFound(r.status, data)) {
+    if (normalizedParams.paymentId && isProviderFailure(r.status, data)) {
+      const notFound = isProviderNotFound(r.status, data)
       providerOutcome = markX402ServiceOutcome(normalizedParams.paymentId, {
-        status: 'provider_not_found',
-        reason: String(data?.error || data?.message || 'Intel provider returned not found'),
+        status: notFound ? 'provider_not_found' : 'provider_error',
+        reason: String(data?.error || data?.message || (notFound ? 'Intel provider returned not found' : `Intel provider returned HTTP ${r.status}`)),
         refundEligible: true,
       })
     }
@@ -170,16 +180,17 @@ export function registerIntelTools(ctx) {
     if (data?.unlockedResult) {
       return { content: [{ type: 'text', text: jsonText({ readOnly: true, intelPresentation: data.intelPresentation, result: data.unlockedResult, x402Payment: data.x402Payment }) }] }
     }
-    if (normalizedParams.paymentId && isProviderNotFound(r.status, data)) {
+    if (normalizedParams.paymentId && isProviderFailure(r.status, data)) {
+      const notFound = isProviderNotFound(r.status, data)
       return { content: [{ type: 'text', text: jsonText({
         readOnly: true,
-        status: 'provider_not_found',
+        status: notFound ? 'provider_not_found' : 'provider_error',
         result: null,
-        x402Payment: data?.x402Payment || (providerOutcome ? publicInvoice(providerOutcome) : { paymentId: normalizedParams.paymentId, serviceStatus: 'provider_not_found', refundEligible: false, refundStatus: 'outcome_unavailable' }),
-        error: data?.error || data?.message || 'Intel provider tidak menemukan data setelah pembayaran.',
+        x402Payment: data?.x402Payment || (providerOutcome ? publicInvoice(providerOutcome) : { paymentId: normalizedParams.paymentId, serviceStatus: notFound ? 'provider_not_found' : 'provider_error', refundEligible: false, refundStatus: 'outcome_unavailable' }),
+        error: data?.error || data?.message || (notFound ? 'Intel provider tidak menemukan data setelah pembayaran.' : 'Intel provider gagal merespons setelah pembayaran (timeout/5xx).'),
         refundReviewRecorded: Boolean(providerOutcome),
         message: providerOutcome
-          ? 'Pembayaran tercatat, tetapi data provider tidak ditemukan. Tidak ada charge ulang; refund ditandai pending_review dan harus diproses melalui treasury/refund workflow.'
+          ? 'Pembayaran tercatat, tetapi data provider gagal/tidak ditemukan. Tidak ada charge ulang; refund ditandai pending_review dan akan diproses oleh auto-refund worker.'
           : 'Pembayaran tercatat, tetapi status refund belum dapat disimpan pada backend invoice. Jangan charge ulang; lakukan rekonsiliasi invoice sebelum memproses refund.',
       }) }] }
     }
