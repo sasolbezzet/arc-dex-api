@@ -78,7 +78,26 @@ test('MCP Intel tools route read-only services and forward filters', async () =>
     assert.match(search.requestedUrl, /arkhamEntities=2/)
     assert.match(search.requestedUrl, /tokens=3/)
 
-    assert.equal(requested.length, 7)
+    const flows = resultJson(await tools.arcox_intel_get_flows.handler({ address: EOA, timeLast: '24h', limit: 25 }))
+    assert.match(flows.requestedUrl, /\/api\/intel\/address\/0x1111111111111111111111111111111111111111\/flows\?/)
+    assert.match(flows.requestedUrl, /timeLast=24h/)
+    assert.match(flows.requestedUrl, /limit=25/)
+
+    const history = resultJson(await tools.arcox_intel_get_history.handler({ address: EOA, target: 'address', chains: 'base' }))
+    assert.match(history.requestedUrl, /\/api\/intel\/address\/0x1111111111111111111111111111111111111111\/history\?chains=base$/)
+
+    const volume = resultJson(await tools.arcox_intel_get_volume.handler({ entity: 'circle', target: 'entity', timeLast: '7d' }))
+    assert.match(volume.requestedUrl, /\/api\/intel\/entity\/circle\/volume\?timeLast=7d$/)
+
+    const counterparties = resultJson(await tools.arcox_intel_get_counterparties.handler({ address: EOA, limit: 10 }))
+    assert.match(counterparties.requestedUrl, /\/api\/intel\/address\/0x1111111111111111111111111111111111111111\/counterparties\?limit=10$/)
+
+    const transfers = resultJson(await tools.arcox_intel_get_transfers.handler({ hash: '0x' + 'a'.repeat(64), chain: 'ethereum', transferType: 'token' }))
+    assert.match(transfers.requestedUrl, /\/api\/intel\/tx\/0x[a]{64}\/transfers\?/)
+    assert.match(transfers.requestedUrl, /chain=ethereum/)
+    assert.match(transfers.requestedUrl, /transferType=token/)
+
+    assert.equal(requested.length, 12)
   } finally {
     globalThis.fetch = previousFetch
     if (previousSessionPath === undefined) delete process.env.SESSION_KEYS_PATH

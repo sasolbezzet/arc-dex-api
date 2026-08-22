@@ -281,6 +281,50 @@ export function registerIntelTools(ctx) {
     paymentId: z.string().optional(),
   })
 
+  const scopedReadSchema = {
+    target: z.enum(['address', 'entity']).optional().describe('Read target; defaults to address'),
+    address: z.string().optional(),
+    entity: z.string().optional(),
+    chains: z.string().optional(),
+    flow: z.enum(['in', 'out', 'self', 'all']).optional(),
+    timeLast: z.enum(timeWindows).optional(),
+    timeGte: z.string().optional(),
+    timeLte: z.string().optional(),
+    usdGte: z.string().optional(),
+    usdLte: z.string().optional(),
+    limit: z.number().int().positive().max(1000).optional(),
+    offset: z.number().int().nonnegative().max(10000).optional(),
+    tags: z.string().optional(),
+    tokens: z.string().optional(),
+    time: z.string().optional(),
+    paymentId: z.string().optional(),
+  }
+
+  const registerScopedReadTool = (name, service, label) => intelTool(name, `Read Arkham ${label} for an address or entity through ARCOX x402. This tool is strictly read-only and never moves funds.`, params => {
+    const target = params.target || 'address'
+    if (target === 'entity') {
+      if (!params.entity) throw new Error(`entity is required when target=entity for ${name}`)
+      return entityPath({ ...params, service })
+    }
+    if (!params.address) throw new Error(`address is required when target=address for ${name}`)
+    return addressPath({ ...params, service })
+  }, scopedReadSchema)
+
+  registerScopedReadTool('arcox_intel_get_flows', 'flows', 'flows')
+  registerScopedReadTool('arcox_intel_get_history', 'history', 'history')
+  registerScopedReadTool('arcox_intel_get_volume', 'volume', 'volume')
+  registerScopedReadTool('arcox_intel_get_counterparties', 'counterparties', 'counterparties')
+
+  intelTool('arcox_intel_get_transfers', 'Read historical Arkham transaction transfers through ARCOX x402. This tool never submits or modifies a transaction.', params => {
+    if (!params.hash) throw new Error('hash is required')
+    return appendQuery(`/tx/${encodeURIComponent(params.hash)}/transfers`, queryParams(params, ['chain', 'transferType']))
+  }, {
+    hash: z.string().describe('Transaction hash to inspect'),
+    chain: z.string().optional().describe('Arkham chain filter'),
+    transferType: z.enum(['external', 'internal', 'token']).optional(),
+    paymentId: z.string().optional(),
+  })
+
   // ── x402 PAYMENT TOOLS (MSCA session-key only) ──
 
   registerTool('arcox_x402_pay_invoice', 'Pay an ARCOX x402 data-access invoice from the Agent Wallet (MSCA via session key). This is only the access payment; it does not execute a swap, bridge, send, or Arkham transaction.', {
