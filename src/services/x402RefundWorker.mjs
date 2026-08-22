@@ -14,6 +14,7 @@
 // `refund_approved` for a treasury operator to complete manually.
 import { getX402Invoice, persistX402Invoices, publicInvoice, getAllX402Invoices } from '../middleware/x402Middleware.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
+import { scheduleRefundAuditLog } from './supabasePersistence.mjs'
 
 function refundCooldownMs() { return Number(process.env.X402_REFUND_COOLDOWN_MS || 5 * 60 * 1000) }
 function scanIntervalMs() { return Number(process.env.X402_REFUND_SCAN_INTERVAL_MS || 60 * 1000) }
@@ -40,8 +41,24 @@ function logRefundDecision(invoiceId, action, details = {}) {
   if (invoice) {
     invoice.refundTimeline = [...(invoice.refundTimeline || []), entry]
     if (invoice.refundTimeline.length > 20) invoice.refundTimeline.splice(0, invoice.refundTimeline.length - 20)
+    // Financial audit row in Supabase refund_audit_log (fire-and-forget via
+    // the dual-write queue; the in-memory log + invoice timeline are the
+    // offline fallback).
+    try {
+      scheduleRefundAuditLog({
+        invoiceId,
+        paymentId: invoice.paymentId,
+        action,
+        amount: invoice.amount,
+        ownerWallet: invoice.ownerWallet,
+        serviceStatus: invoice.serviceStatus,
+        txHash: details.txHash,
+        at: entry.at,
+      })
+    } catch { /* audit write is best-effort */ }
   }
 }
+
 
 /**
  * Count refund-activity events for an owner inside the farming window.

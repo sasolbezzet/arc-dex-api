@@ -139,8 +139,21 @@ router.get('/refunds/approved', (_req, res) => {
   res.json({ ok: true, refunds: listApprovedRefunds() })
 })
 
-router.get('/refunds/log', (_req, res) => {
-  res.json({ ok: true, log: getRefundLog() })
+router.get('/refunds/log', async (req, res) => {
+  // Supabase-primary read with the in-memory log as fallback (including
+  // before the refund_audit_log table exists). Supports invoiceId/ownerWallet
+  // filters and a limit for operator queries.
+  try {
+    const { readRefundAuditLog } = await import('../services/supabasePersistence.mjs')
+    const { entries, source, mismatch } = await readRefundAuditLog({
+      invoiceId: String(req.query.invoiceId || ''),
+      ownerWallet: String(req.query.ownerWallet || ''),
+      limit: Number(req.query.limit) || 200,
+    }, getRefundLog())
+    res.json({ ok: true, log: entries, source, mismatch })
+  } catch (error) {
+    res.json({ ok: true, log: getRefundLog(), source: 'json', mismatch: false, error: String(error?.message || error).slice(0, 200) })
+  }
 })
 
 router.post('/refunds/scan', (_req, res) => {

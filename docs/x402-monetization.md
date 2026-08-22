@@ -45,3 +45,26 @@ ARCOX x402 responses are shaped for Circle Gateway Nanopayments:
 - `settlement.mode: "batched"`
 
 This is readiness metadata only. Production Gateway Nanopayments settlement is not live until ARCOX wires a real Circle-compatible verifier/settlement pipeline.
+
+## Supabase Integration
+
+### Session metadata — Supabase-primary reads
+
+`GET /api/session/status` merges the Supabase `session_metadata` snapshot
+(Supabase-primary) with the local record. Local activation state always wins;
+a remote-only result is a display-only recovery view that is never surfaced
+as active (without the local encrypted-key store the session cannot sign).
+Auth-gating reads (`getSessionKeyInfo`) intentionally stay local-only and
+never touch the network. Roll back with
+`SUPABASE_SESSION_METADATA_READ_PRIMARY=false`.
+
+### Refund audit log — Supabase-primary
+
+Every refund decision (pending_review, refund_approved, refund_manual_review,
+refund_executed, refund_execute_failed, refund_completed, skipped_*) is
+written to `public.refund_audit_log` (migration:
+`supabase/migrations/20260822000001_refund_audit_log.sql`) through the
+dual-write queue, idempotent per (invoiceId, action, at).
+`GET /api/x402/refunds/log` reads Supabase-primary with the in-memory log as
+fallback (including before the table exists). The per-invoice `refundTimeline`
+and the in-memory log remain the offline fallback.

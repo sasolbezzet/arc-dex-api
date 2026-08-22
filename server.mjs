@@ -452,8 +452,16 @@ app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
 app.get('/api/session/status', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { getSessionKeyInfo } = await import('./src/services/vaultStore.mjs')
-    const info = await getSessionKeyInfo(req.owner)
-    res.json({ success: true, session: info })
+    // Local store is the execution authority: auth-gating reads never touch
+    // the network. This display endpoint additionally merges the Supabase
+    // metadata snapshot (Supabase-primary): the local record always wins for
+    // activation fields, and a remote-only result is a display-only recovery
+    // view that is never surfaced as active.
+    const local = await getSessionKeyInfo(req.owner)
+    const { readSessionMetadata } = await import('./src/services/supabasePersistence.mjs')
+    const lookup = String(local?.walletAddress || req.owner).toLowerCase()
+    const { metadata, source, mismatch } = await readSessionMetadata(lookup, local)
+    res.json({ success: true, session: metadata || local, metadataSource: source, metadataCompared: Boolean(local), metadataMismatch: Boolean(mismatch) })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 

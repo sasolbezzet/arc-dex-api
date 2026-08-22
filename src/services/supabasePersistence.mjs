@@ -13,9 +13,13 @@ const paymentInvoiceReadPrimary = enabled && String(process.env.SUPABASE_PAYMENT
 const invoiceEventsReadPrimary = enabled && String(process.env.SUPABASE_INVOICE_EVENTS_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const x402InvoiceReadPrimary = enabled && String(process.env.SUPABASE_X402_INVOICE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const aiUsageReadPrimary = enabled && String(process.env.SUPABASE_AI_USAGE_READ_PRIMARY || 'true').toLowerCase() !== 'false'
-// Session metadata is shadow-only for now. The local encrypted-key store remains
-// the execution authority; this flag is intentionally not a read-primary switch.
-const sessionMetadataReadPrimary = false
+// Session metadata reads are Supabase-primary with the local encrypted-key
+// store as the execution authority. Reads merge remote metadata, but the
+// local record always wins for activation state; when the local record is
+// missing entirely, Supabase only provides a display-only recovery view that
+// is never surfaced as active (without the local keys the session cannot
+// sign). Roll back with SUPABASE_SESSION_METADATA_READ_PRIMARY=false.
+const sessionMetadataReadPrimary = enabled && String(process.env.SUPABASE_SESSION_METADATA_READ_PRIMARY || 'true').toLowerCase() !== 'false'
 const client = enabled
   ? createClient(url, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -56,6 +60,10 @@ const stats = globalThis.__arcoxSupabasePersistenceStats || {
   sessionMetadataMismatches: 0,
   sessionMetadataFailures: 0,
   lastSessionMetadataError: '',
+  refundAuditLogWrites: 0,
+  refundAuditLogReads: 0,
+  refundAuditLogFailures: 0,
+  lastRefundAuditLogError: '',
 }
 globalThis.__arcoxSupabasePersistenceStats = stats
 
@@ -153,14 +161,19 @@ export function supabasePersistenceStatus() {
     webhookShadowMismatches: stats.webhookShadowMismatches,
     webhookShadowFailures: stats.webhookShadowFailures,
     lastWebhookShadowError: stats.lastWebhookShadowError,
-    // Session metadata is intentionally shadow-only; encrypted delegate keys
-    // and activation authority remain local until a separate cutover review.
+    // Session metadata reads are Supabase-primary; the local encrypted-key
+    // store remains the activation authority (local always wins, recovery
+    // views are never active).
     sessionMetadataReadPrimary,
     sessionMetadataWrites: stats.sessionMetadataWrites,
     sessionMetadataReads: stats.sessionMetadataReads,
     sessionMetadataMismatches: stats.sessionMetadataMismatches,
     sessionMetadataFailures: stats.sessionMetadataFailures,
     lastSessionMetadataError: stats.lastSessionMetadataError,
+    refundAuditLogWrites: stats.refundAuditLogWrites,
+    refundAuditLogReads: stats.refundAuditLogReads,
+    refundAuditLogFailures: stats.refundAuditLogFailures,
+    lastRefundAuditLogError: stats.lastRefundAuditLogError,
   }
 }
 
@@ -738,6 +751,155 @@ export function scheduleSessionMetadataSnapshot(data) {
       stats.sessionMetadataWrites++
     })
   }
+}
+
+function sessionMetadataFromSupabase(row) {
+  return {
+    walletAddress: String(row?.wallet_address || '').toLowerCase(),
+    ownerAddresses: Array.isArray(row?.owner_addresses) ? [...new Set(row.owner_addresses.map(value => String(value).toLowerCase()))].sort() : [],
+    delegateAddress: String(row?.delegate_address || '').toLowerCase(),
+    chain: String(row?.chain || 'arc-testnet'),
+    active: Boolean(row?.active),
+    pendingAuthorization: Boolean(row?.pending_authorization ?? row?.pendingAuthorization),
+    manualRevokePending: Boolean(row?.manual_revoke_pending ?? row?.manualRevokePending),
+    revokeReason: row?.revoke_reason ?? row?.revokeReason ?? null,
+    authorizationUserOpHash: String(row?.authorization_user_op_hash || row?.authorizationUserOpHash || '').toLowerCase(),
+    authorizationUserOpHashes: row?.authorization_user_op_hashes && typeof row.authorization_user_op_hashes === 'object' ? row.authorization_user_op_hashes : {},
+    createdAt: row?.created_at || undefined,
+    activatedAt: row?.activated_at || undefined,
+    revokedAt: row?.revoked_at || undefined,
+    lastUsedAt: row?.last_used_at || undefined,
+    updatedAt: row?.updated_at || undefined,
+  }
+}
+
+/**
+ * Pure merge for a Supabase-primary session metadata read.
+ *
+ * - When a local record exists, local fields win for every activation/signer
+ *   field (active, delegateAddress, walletAddress, pendingAuthorization, ...)
+ *   and remote only fills fields the local record does not carry.
+ * - When only the remote record exists, the result is a display-only recovery
+ *   view: active is forced false because without the local encrypted key
+ *   store the session cannot sign anything.
+ */
+export function mergeSessionMetadata(remote, local = null) {
+  if (!remote || typeof remote !== 'object') return local || null
+  if (local && typeof local === 'object') {
+    const localWins = ['walletAddress', 'delegateAddress', 'chain', 'active', 'pendingAuthorization', 'manualRevokePending', 'revokeReason', 'authorizationUserOpHash', 'statusReason', 'createdAt', 'activatedAt', 'lastUsedAt', 'stale', 'recovery']
+    return {
+      ...remote,
+      ...Object.fromEntries(localWins.filter(key => local[key] !== undefined && local[key] !== null).map(key => [key, local[key]])),
+      ownerAddresses: [...new Set([...(remote.ownerAddresses || []), ...(local.ownerAddresses || [])].map(value => String(value).toLowerCase()))].sort(),
+    }
+  }
+  return { ...remote, active: false, stale: true, recovery: true }
+}
+
+/**
+ * Supabase-primary session metadata read with local fallback. Local activation
+ * state always wins; a remote-only result is a recovery view (never active).
+ */
+export async function readSessionMetadata(walletAddress, fallback = null) {
+  const local = fallback && typeof fallback === 'object' ? fallback : null
+  if (!enabled || !sessionMetadataReadPrimary || !isUsableOwner(walletAddress)) {
+    return { metadata: local, source: local ? 'json' : 'none', compared: false }
+  }
+  try {
+    const lookup = String(walletAddress).toLowerCase()
+    const response = await Promise.race([
+      client.from('session_metadata').select('*').eq('wallet_address', lookup).maybeSingle(),
+      new Promise(resolve => setTimeout(() => resolve({ timedOut: true }), 5_000)),
+    ])
+    if (response?.timedOut) throw new Error('session metadata read timed out')
+    const { data, error } = response
+    if (error) throw error
+    stats.sessionMetadataReads++
+    if (!data) {
+      return { metadata: local, source: local ? 'json-fallback' : 'json', compared: Boolean(local), remoteMissing: true }
+    }
+    const remote = sessionMetadataFromSupabase(data)
+    const merged = mergeSessionMetadata(remote, local)
+    const mismatch = Boolean(local) && JSON.stringify(sessionMetadataComparable(remote)) !== JSON.stringify(sessionMetadataComparable(local))
+    if (mismatch) stats.sessionMetadataMismatches++
+    return { metadata: merged, source: local ? 'supabase-merged' : 'supabase-recovery', compared: Boolean(local), mismatch, remote }
+  } catch (error) {
+    stats.sessionMetadataFailures++
+    stats.lastSessionMetadataError = String(error?.message || error).slice(0, 240)
+    return { metadata: local, source: local ? 'json-fallback' : 'json', compared: false, error: stats.lastSessionMetadataError }
+  }
+}
+
+/**
+ * Fire-and-forget write of one refund decision into public.refund_audit_log.
+ * Idempotent per (invoiceId, action, at) via a stable UUID so worker rescans
+ * never duplicate audit rows. Falls back silently to the in-memory log.
+ */
+export function scheduleRefundAuditLog(entry) {
+  if (!enabled || !entry?.invoiceId || !entry?.action) return
+  const payload = {
+    id: stableUuid(`${entry.invoiceId}:${entry.action}:${entry.at || ''}`),
+    invoice_id: String(entry.invoiceId),
+    payment_id: String(entry.paymentId || ''),
+    action: String(entry.action),
+    amount_usdc: Number(entry.amount || 0) || 0,
+    owner_wallet: String(entry.ownerWallet || '').toLowerCase(),
+    service_status: String(entry.serviceStatus || ''),
+    tx_hash: String(entry.txHash || ''),
+    details: jsonSafe(entry),
+    created_at: toIso(entry.at, null),
+  }
+  queueWrite('refund-audit', payload.id, async () => {
+    const { error } = await client.from('refund_audit_log').upsert(payload, { onConflict: 'id' })
+    if (error) throw error
+    stats.refundAuditLogWrites++
+  })
+}
+
+/**
+ * Supabase-primary read of the refund audit log with the in-memory log as
+ * fallback (including when the table has not been migrated yet).
+ */
+export async function readRefundAuditLog(options = {}, fallback = []) {
+  const local = Array.isArray(fallback) ? fallback : []
+  const filteredLocal = local
+    .filter(entry => !options.invoiceId || String(entry.invoiceId || '') === String(options.invoiceId))
+    .filter(entry => !options.ownerWallet || String(entry.ownerWallet || entry.invoiceId || '').toLowerCase() === String(options.ownerWallet).toLowerCase())
+    .slice(0, Math.min(Math.max(Number(options.limit) || 200, 1), 500))
+  if (!enabled) return { entries: filteredLocal, source: 'json', compared: false }
+  try {
+    let query = client.from('refund_audit_log').select('*')
+    if (options.invoiceId) query = query.eq('invoice_id', String(options.invoiceId))
+    if (options.ownerWallet) query = query.eq('owner_wallet', String(options.ownerWallet).toLowerCase())
+    query = query.order('created_at', { ascending: false }).limit(Math.min(Math.max(Number(options.limit) || 200, 1), 500))
+    const { data, error } = await query
+    if (error) throw error
+    stats.refundAuditLogReads++
+    if (!Array.isArray(data) || data.length === 0) {
+      if (filteredLocal.length > 0) stats.refundAuditLogFailures++ // surfaced as a mismatch-style fallback
+      return { entries: filteredLocal, source: filteredLocal.length ? 'json-fallback' : 'json', compared: Boolean(filteredLocal.length), mismatch: Boolean(filteredLocal.length) }
+    }
+    const entries = data.map(row => ({
+      ...(row?.details && typeof row.details === 'object' ? row.details : {}),
+      invoiceId: String(row.invoice_id || ''),
+      paymentId: String(row.payment_id || ''),
+      action: String(row.action || ''),
+      amount: String(row.amount_usdc ?? ''),
+      ownerWallet: String(row.owner_wallet || ''),
+      serviceStatus: String(row.service_status || ''),
+      txHash: String(row.tx_hash || ''),
+      at: row.created_at || row.details?.at || undefined,
+    }))
+    return { entries, source: 'supabase', compared: true, mismatch: JSON.stringify(filteredLocal.map(stripRefundComparable)) !== JSON.stringify(entries.map(stripRefundComparable)) }
+  } catch (error) {
+    stats.refundAuditLogFailures++
+    stats.lastRefundAuditLogError = String(error?.message || error).slice(0, 240)
+    return { entries: filteredLocal, source: filteredLocal.length ? 'json-fallback' : 'json', compared: false, error: stats.lastRefundAuditLogError }
+  }
+}
+
+function stripRefundComparable(entry) {
+  return { invoiceId: entry.invoiceId || '', action: entry.action || '', at: entry.at || '' }
 }
 
 export async function shadowReadSessionMetadata(walletAddress, fallback = null) {
