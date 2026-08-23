@@ -1,0 +1,142 @@
+// ARCOX Card Simulator MCP tools — test-mode virtual Visa cards that an agent
+// can spend at simulated merchants. Fully simulated network: no real money
+// moves. Balances are test USDC credited per owner (default 100 USDC).
+
+/**
+ * @param {Object} ctx
+ * @param {Function} ctx.registerTool registerTool(name, desc, schema, handler)
+ * @param {Object} ctx.z zod
+ * @param {Function} ctx.jsonText JSON stringify helper
+ * @param {Function} ctx.mscaRequiredResult result when no session
+ * @param {Function} ctx.apiGet GET helper with owner bearer
+ * @param {Function} ctx.apiPost POST helper with owner bearer
+ * @param {string} ctx.userId owner identity
+ */
+export function registerCardTools(ctx) {
+  const { registerTool, z, jsonText, mscaRequiredResult, apiGet, apiPost, userId } = ctx
+
+  const requireSession = async () => {
+    const msca = await ctx.resolveMsca()
+    if (!msca) return null
+    return msca
+  }
+
+  registerTool('arcox_card_config', 'Read ARCOX Card Simulator config (brand, limits, note).', {}, async () => {
+    try {
+      const config = await apiGet('/api/cards/config', userId)
+      return { content: [{ type: 'text', text: jsonText(config) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'config failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_card_list_merchants', 'List simulated merchants where a test card can spend (test mode only).', {}, async () => {
+    try {
+      const data = await apiGet('/api/cards/merchants', userId)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'merchants failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_card_balance', 'Read the test USDC balance of the connected agent wallet (card simulator).', {}, async () => {
+    const msca = await requireSession()
+    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+    try {
+      const data = await apiGet('/api/cards/balance', userId)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'balance failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_card_fund', 'Add test USDC to the card simulator balance (test mode only).', {
+    amount: z.string().describe('Amount of test USDC to add'),
+  }, async (params) => {
+    const msca = await requireSession()
+    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+    try {
+      const data = await apiPost('/api/cards/balance/fund', { amount: String(params.amount || '25') }, userId)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'fund failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_card_create', 'Create a test virtual Visa card for the connected agent Wallet (simulator).', {
+    label: z.string().optional().describe('Card label'),
+    perTxLimit: z.string().optional().describe('Max per transaction in USDC'),
+    dailyLimit: z.string().optional().describe('Max per day in USDC'),
+    monthlyLimit: z.string().optional().describe('Max per month in USDC'),
+    blockedCategories: z.array(z.string()).optional(),
+  }, async (params) => {
+    const msca = await requireSession()
+    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+    try {
+      const data = await apiPost('/api/cards', {
+        label: params.label, perTxLimit: params.perTxLimit, dailyLimit: params.dailyLimit,
+        monthlyLimit: params.monthlyLimit, blockedCategories: params.blockedCategories || [],
+      }, userId)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'create card failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_card_list', 'List test cards of the connected agent wallet.', {}, async () => {
+    const msca = await requireSession()
+    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+    try {
+      const data = await apiGet('/api/cards', userId)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'list failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_card_spend', 'Authorize and settle a purchase with a test card at a simulated merchant. Settles immediately.', {
+    cardId: z.string().describe('Card id'),
+    merchantId: z.string().describe('Merchant id from arcox_card_list_merchants'),
+    amount: z.string().describe('Amount in USDC'),
+    description: z.string().optional(),
+  }, async (params) => {
+    const msca = await requireSession()
+    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+    try {
+      const data = await apiPost(`/api/cards/${encodeURIComponent(params.cardId)}/spend`, {
+        merchantId: params.merchantId, amount: String(params.amount), description: params.description,
+      }, userId)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'spend failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_card_transactions', 'List all card transactions of the connected wallet (optionally by card).', {
+    cardId: z.string().optional(),
+  }, async (params) => {
+    const msca = await requireSession()
+    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+    try {
+      const path = params.cardId ? `/api/cards/${encodeURIComponent(params.cardId)}/transactions` : '/api/cards/my-transactions'
+      const data = await apiGet(path, userId)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'transactions failed' }) }] }
+    }
+  })
+
+  registerTool('arcox_card_refund_tx', 'Refund a settled card transaction (test mode; returns test USDC to balance).', {
+    cardId: z.string().describe('Card id'),
+    txId: z.string().describe('Transaction id'),
+  }, async (params) => {
+    const msca = await requireSession()
+    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+    try {
+      const data = await apiPost(`/api/cards/${encodeURIComponent(params.cardId)}/refund`, { txId: params.txId }, userId)
+      return { content: [{ type: 'text', text: jsonText(data) }] }
+    } catch (e) {
+      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'refund failed' }) }] }
+    }
+  })
+}

@@ -652,6 +652,7 @@ import { registerIntelTools } from './mcp/intelTools.mjs'
 import { registerDocsCatalogTools } from './mcp/docsCatalogTools.mjs'
 import { registerAgenticTools } from './mcp/agenticTools.mjs'
 import { registerArcoxPayTools } from './mcp/arcoxPayTools.mjs'
+import { registerCardTools } from './mcp/cardTools.mjs'
 import { registerAiRouterTools } from './mcp/aiRouterTools.mjs'
 import { fetchAllChainBalances } from './multiChainBalance.mjs'
 import { CHAINS } from './chains.mjs'
@@ -3738,6 +3739,7 @@ export function createMcpServer(userId, context = {}) {
   registerDocsCatalogTools(toolCtx)
   registerAgenticTools(toolCtx)
   registerArcoxPayTools(toolCtx)
+  registerCardTools(toolCtx)
   registerAiRouterTools(toolCtx)
   return server
 }
