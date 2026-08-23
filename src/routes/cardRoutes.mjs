@@ -86,6 +86,12 @@ router.post('/', async (req, res) => {
   }
 })
 
+router.get('/my-transactions', async (req, res) => {
+  const auth = await authenticatedOwner(req)
+  if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
+  res.json({ ok: true, transactions: listCardTransactions(auth.walletAddress) })
+})
+
 router.get('/:cardId', async (req, res) => {
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
@@ -171,12 +177,6 @@ router.post('/:cardId/refund', async (req, res) => {
   } catch (error) {
     res.status(error.statusCode || 400).json({ error: error.message })
   }
-})
-
-router.get('/my-transactions', async (req, res) => {
-  const auth = await authenticatedOwner(req)
-  if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
-  res.json({ ok: true, transactions: listCardTransactions(auth.walletAddress) })
 })
 
 router.get('/:cardId/transactions', async (req, res) => {
