@@ -9,6 +9,7 @@ import {
   listMerchants,
   fundTestBalance,
   getOwnerBalance,
+  syncCardBalance,
   listCards,
   createCard,
   updateCardLimits,
@@ -52,7 +53,21 @@ router.get('/merchants', (_req, res) => {
 router.get('/balance', async (req, res) => {
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
-  res.json({ ok: true, ...getOwnerBalance(auth.walletAddress) })
+  try {
+    res.json({ ok: true, ...(await getOwnerBalance(auth.walletAddress, { walletAddress: auth.walletAddress })) })
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ error: error.message })
+  }
+})
+
+router.post('/sync', async (req, res) => {
+  const auth = await authenticatedOwner(req)
+  if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
+  try {
+    res.json({ ok: true, ...(await syncCardBalance(auth.walletAddress, auth.walletAddress, { force: true })) })
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ error: error.message })
+  }
 })
 
 router.post('/balance/fund', async (req, res) => {
@@ -60,7 +75,11 @@ router.post('/balance/fund', async (req, res) => {
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
   const amount = simulateAmount(req.body?.amount, '25')
   if (!/^\d+(\.\d+)?$/.test(amount)) return res.status(400).json({ error: 'amount must be a number in USDC' })
-  res.json({ ok: true, ...fundTestBalance(auth.walletAddress, amount) })
+  try {
+    res.json({ ok: true, ...fundTestBalance(auth.walletAddress, amount) })
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ error: error.message })
+  }
 })
 
 router.get('/', async (req, res) => {
@@ -132,13 +151,18 @@ router.post('/:cardId/spend', async (req, res) => {
   const merchantId = String(req.body?.merchantId || '').trim()
   const amount = String(req.body?.amount ?? '').trim()
   if (!merchantId || !amount) return res.status(400).json({ error: 'merchantId and amount are required' })
-  const result = spendWithCard(auth.walletAddress, req.params.cardId, {
-    merchantId,
-    amount,
-    description: req.body?.description,
-  })
-  if (!result.approved) return res.status(402).json({ ok: false, ...result })
-  res.json({ ok: true, ...result })
+  try {
+    const result = await spendWithCard(auth.walletAddress, req.params.cardId, {
+      merchantId,
+      amount,
+      description: req.body?.description,
+      walletAddress: auth.walletAddress,
+    })
+    if (!result.approved) return res.status(402).json({ ok: false, ...result })
+    res.json({ ok: true, ...result })
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message })
+  }
 })
 
 router.post('/:cardId/authorize', async (req, res) => {
@@ -147,20 +171,25 @@ router.post('/:cardId/authorize', async (req, res) => {
   const merchantId = String(req.body?.merchantId || '').trim()
   const amount = String(req.body?.amount ?? '').trim()
   if (!merchantId || !amount) return res.status(400).json({ error: 'merchantId and amount are required' })
-  const result = authorizeCardSpend(auth.walletAddress, req.params.cardId, {
-    merchantId,
-    amount,
-    description: req.body?.description,
-  })
-  if (!result.approved) return res.status(400).json({ error: false, ...result })
-  res.json({ ok: true, ...result })
+  try {
+    const result = await authorizeCardSpend(auth.walletAddress, req.params.cardId, {
+      merchantId,
+      amount,
+      description: req.body?.description,
+      walletAddress: auth.walletAddress,
+    })
+    if (!result.approved) return res.status(400).json({ ok: false, ...result })
+    res.json({ ok: true, ...result })
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message })
+  }
 })
 
 router.post('/:cardId/settle', async (req, res) => {
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
   try {
-    const result = settleCardTransaction(auth.walletAddress, String(req.body?.txId || ''))
+    const result = await settleCardTransaction(auth.walletAddress, String(req.body?.txId || ''), { walletAddress: auth.walletAddress })
     res.json({ ok: result.settled, ...result })
   } catch (error) {
     res.status(error.statusCode || 400).json({ error: error.message })

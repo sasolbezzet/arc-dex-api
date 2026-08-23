@@ -11,9 +11,16 @@
 
 import { randomUUID } from 'crypto'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
+import {
+  cardMerchantWallet,
+  executeArcTransfer,
+  onchainModeEnabled,
+  readArcUsdcBalance,
+  usdcUnitsToHuman,
+} from './cardOnchain.mjs'
 
 export const CARD_CONFIG = Object.freeze({
-  mode: 'simulator',
+  mode: 'hybrid', // 'hybrid' = balance syncs from MSCA on-chain USDC ; 'simulated' via env CARDS_SYNC_ONCHAIN=false
   brand: 'Visa Test',
   network: 'visa',
   scheme: 'simulated',
@@ -22,7 +29,7 @@ export const CARD_CONFIG = Object.freeze({
   bint: '4485', // test BIN for Visa
   maxCardsPerOwner: Number(process.env.CARDS_MAX_PER_OWNER || 10),
   defaultBalance: String(process.env.CARDS_DEFAULT_BALANCE_USDC || '100'),
-  note: 'Simulated card network. No real money moves; balances are test USDC credited per owner.',
+  note: 'Spend debits real USDC from the Agent Wallet MSCA on Arc Testnet (session-key path). Balance mirrors the MSCA on-chain USDC balance.',
 })
 
 export const MERCHANTS = [
@@ -65,10 +72,11 @@ function dbPath() {
 }
 
 function loadDb() {
-  const db = readJsonFile(dbPath(), { cards: [], transactions: [], ledger: {} })
+  const db = readJsonFile(dbPath(), { cards: [], transactions: [], ledger: {}, onchain: {} })
   if (!Array.isArray(db.cards)) db.cards = []
   if (!Array.isArray(db.transactions)) db.transactions = []
   if (!db.ledger || typeof db.ledger !== 'object') db.ledger = {}
+  if (!db.onchain || typeof db.onchain !== 'object') db.onchain = {}
   return db
 }
 
@@ -92,6 +100,33 @@ function ensureFunding(db, owner) {
     entry.balance = CARD_CONFIG.defaultBalance
     entry.fundedAt = new Date().toISOString()
   }
+  return entry
+}
+
+function onchainEntry(db, owner) {
+  const key = ownerKey(owner)
+  if (!db.onchain[key]) db.onchain[key] = { balance: '0', wallet: '', syncedAt: null }
+  return db.onchain[key]
+}
+
+const SYNC_TTL_MS = Number(process.env.CARDS_SYNC_TTL_MS || 15_000)
+
+async function refreshOnchain(db, owner, walletAddress, { force = false } = {}) {
+  const key = ownerKey(owner)
+  const entry = onchainEntry(db, key)
+  const fresh = entry.syncedAt && Date.now() - new Date(entry.syncedAt).getTime() < SYNC_TTL_MS
+  if (!force && fresh && entry.wallet === String(walletAddress || '').toLowerCase()) return entry
+  let units
+  try {
+    units = await readArcUsdcBalance(walletAddress)
+  } catch (error) {
+    const e = new Error(`On-chain balance sync failed: ${error?.message || error}`)
+    e.statusCode = 502
+    throw e
+  }
+  entry.balance = usdcUnitsToHuman(units)
+  entry.wallet = String(walletAddress || '').toLowerCase()
+  entry.syncedAt = new Date().toISOString()
   return entry
 }
 
@@ -168,7 +203,28 @@ function publicCard(card, includePan = false) {
 // ── Public API ──────────────────────────────────────────────────────────────
 
 export function cardConfig() {
-  return { ...CARD_CONFIG, merchantCount: MERCHANTS.length }
+  return {
+    ...CARD_CONFIG,
+    merchantCount: MERCHANTS.length,
+    onchain: onchainModeEnabled(),
+    merchantSettlementWallet: cardMerchantWallet(),
+  }
+}
+
+export async function syncCardBalance(owner, walletAddress, { force = false } = {}) {
+  const db = loadDb()
+  if (onchainModeEnabled()) {
+    const entry = await refreshOnchain(db, owner, walletAddress, { force })
+    save(db)
+    return { owner: ownerKey(owner), balance: entry.balance, source: 'onchain', mscaAddress: entry.wallet, syncedAt: entry.syncedAt }
+  }
+  const entry = ensureFunding(db, owner)
+  save(db)
+  return { owner: ownerKey(owner), balance: entry.balance, source: 'simulated', syncedAt: entry.fundedAt }
+}
+
+export async function getOwnerBalance(owner, { walletAddress, force = false } = {}) {
+  return syncCardBalance(owner, walletAddress, { force })
 }
 
 export function listMerchants() {
@@ -176,19 +232,17 @@ export function listMerchants() {
 }
 
 export function fundTestBalance(owner, amountUsdc) {
+  if (onchainModeEnabled()) {
+    const error = new Error('Balance is on-chain linked to the MSCA wallet; deposit USDC on Arc Testnet to the MSCA address to fund the card. Virtual top-up is disabled in on-chain mode.')
+    error.statusCode = 400
+    throw error
+  }
   const db = loadDb()
   const entry = ledgerEntry(db, owner)
   const next = toUnits(entry.balance) + toUnits(amountUsdc)
   entry.balance = toUsdc(next)
   save(db)
   return { owner: ownerKey(owner), balance: entry.balance }
-}
-
-export function getOwnerBalance(owner) {
-  const db = loadDb()
-  const entry = ensureFunding(db, owner)
-  save(db)
-  return { owner: ownerKey(owner), balance: entry.balance, asset: 'USDC', simulated: true }
 }
 
 export function listCards(owner, { includePan = false } = {}) {
@@ -288,7 +342,7 @@ export function setCardStatus(owner, cardId, status) {
   return publicCard(card)
 }
 
-function authorizeGuardCheck(card, merchant, amountUnits, now, db) {
+function authorizeGuardCheck(card, merchant, amountUnits, now, db, availableBalance) {
   if (card.status === 'closed') return { code: 'card_closed', message: 'Card is closed' }
   if (card.status === 'frozen') return { code: 'card_frozen', message: 'Card is frozen' }
   const perTx = toUnitsOrNull(card.limits.perTx)
@@ -309,9 +363,8 @@ function authorizeGuardCheck(card, merchant, amountUnits, now, db) {
       return { code: 'monthly_limit_exceeded', message: `Monthly limit reached (${toUsdc(monthly)} USDC / month)` }
     }
   }
-  const entry = ledgerEntry(db, card.owner)
-  if (toUnits(entry.balance) < amountUnits) {
-    return { code: 'insufficient_funds', message: `Insufficient test balance (${entry.balance} USDC available)` }
+  if (toUnits(availableBalance) < amountUnits) {
+    return { code: 'insufficient_funds', message: `Insufficient balance (${availableBalance} USDC available on chain/simulated)` }
   }
   const blocked = card.blockedCategories || []
   if (blocked.includes(merchant.category)) {
@@ -334,26 +387,33 @@ function declined(code, message, merchantId, amount, description) {
   }
 }
 
-export function authorizeCardSpend(owner, cardId, { merchantId, amount, description = '' }) {
+export async function authorizeCardSpend(owner, cardId, { merchantId, amount, description = '', walletAddress } = {}) {
   const db = loadDb()
   const key = ownerKey(owner)
   const card = db.cards.find(c => c.cardId === cardId && ownerKey(c.owner) === key)
   if (!card) return declined('card_not_found', 'Card not found', merchantId, amount, description)
   const merchant = MERCHANT_BY_ID[merchantId]
   if (!merchant) return declined('bad_merchant', `Unknown merchant ${merchantId}`, merchantId, amount, description)
-  let amountUnits = 0n
-  try {
-    amountUnits = toUnits(amount)
-  } catch {
-    return declined('bad_amount', 'Amount must be a valid number', merchantId, amount, description)
-  }
+  const amountUnits = toUnits(amount)
   if (amountUnits <= 0n) return declined('bad_amount', 'Amount must be positive', merchantId, amount, description)
 
-  const guard = authorizeGuardCheck(card, merchant, amountUnits, new Date(), db)
+  let availableBalance
+  if (onchainModeEnabled()) {
+    try {
+      const entry = await refreshOnchain(db, key, walletAddress)
+      availableBalance = entry.balance
+    } catch (error) {
+      return declined('balance_sync_failed', error.message, merchantId, amount, description)
+    }
+  } else {
+    availableBalance = ensureFunding(db, key).balance
+  }
+
+  const guard = authorizeGuardCheck(card, merchant, amountUnits, new Date(), db, availableBalance)
   if (!guard.ok) return declined(guard.code, guard.message, merchantId, amount, description)
 
   const tx = {
-    id: `ctx_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
+    id: `tx_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
     cardId: card.cardId,
     owner: key,
     merchantId,
@@ -367,6 +427,10 @@ export function authorizeCardSpend(owner, cardId, { merchantId, amount, descript
     settledAt: null,
     refundedAt: null,
     declineReason: '',
+    onchain: onchainModeEnabled(),
+    merchantWallet: cardMerchantWallet(),
+    txHash: null,
+    explorerUrl: null,
   }
   db.transactions.push(tx)
   save(db)
@@ -382,7 +446,7 @@ export function authorizeCardSpend(owner, cardId, { merchantId, amount, descript
   }
 }
 
-export function settleCardTransaction(owner, txId) {
+export async function settleCardTransaction(owner, txId, { walletAddress } = {}) {
   const db = loadDb()
   const key = ownerKey(owner)
   const tx = db.transactions.find(t => t.id === txId && t.owner === key)
@@ -393,18 +457,47 @@ export function settleCardTransaction(owner, txId) {
   }
   if (tx.status === 'settled') return { settled: true, tx }
   if (tx.status !== 'authorized') return { settled: false, tx }
-  const entry = ledgerEntry(db, key)
+
   const amountUnits = toUnits(tx.amount)
-  if (toUnits(entry.balance) < amountUnits) {
-    tx.status = 'declined'
-    tx.declineReason = 'insufficient_funds'
+
+  if (tx.onchain) {
+    // Real on-chain debit from the MSCA wallet via session-key path.
+    const balanceEntry = await refreshOnchain(db, key, walletAddress, { force: true })
+    if (toUnits(balanceEntry.balance) < amountUnits) {
+      tx.status = 'declined'
+      tx.declineReason = 'insufficient_funds'
+      tx.settledAt = new Date().toISOString()
+      save(db)
+      return { settled: false, tx }
+    }
+    const transfer = await executeArcTransfer(walletAddress, { to: tx.merchantWallet, amountUnits })
+    if (transfer.status !== 'success') {
+      tx.status = 'declined'
+      tx.declineReason = 'settlement_failed'
+      tx.settledAt = new Date().toISOString()
+      tx.txHash = transfer.txHash || null
+      tx.error = transfer.reason || transfer.error || 'on-chain transfer failed'
+      save(db)
+      return { settled: false, tx }
+    }
+    tx.status = 'settled'
     tx.settledAt = new Date().toISOString()
-    save(db)
-    return { settled: false, tx }
+    tx.txHash = transfer.txHash
+    tx.explorerUrl = transfer.explorerUrl
+  } else {
+    const entry = ledgerEntry(db, key)
+    if (toUnits(entry.balance) < amountUnits) {
+      tx.status = 'declined'
+      tx.declineReason = 'insufficient_funds'
+      tx.settledAt = new Date().toISOString()
+      save(db)
+      return { settled: false, tx }
+    }
+    entry.balance = toUsdc(toUnits(entry.balance) - amountUnits)
+    tx.status = 'settled'
+    tx.settledAt = new Date().toISOString()
   }
-  entry.balance = toUsdc(toUnits(entry.balance) - amountUnits)
-  tx.status = 'settled'
-  tx.settledAt = new Date().toISOString()
+
   const card = db.cards.find(c => c.cardId === tx.cardId)
   if (card) {
     card.usage.today = toUsdc(usedToday(db, card, new Date()))
@@ -414,12 +507,12 @@ export function settleCardTransaction(owner, txId) {
   return { settled: true, tx }
 }
 
-export function spendWithCard(owner, cardId, { merchantId, amount, description = '' }) {
-  const auth = authorizeCardSpend(owner, cardId, { merchantId, amount, description })
+export async function spendWithCard(owner, cardId, { merchantId, amount, description = '', walletAddress } = {}) {
+  const auth = await authorizeCardSpend(owner, cardId, { merchantId, amount, description, walletAddress })
   if (!auth.approved) return auth
-  const { settled, tx } = settleCardTransaction(owner, auth.txId)
+  const { settled, tx } = await settleCardTransaction(owner, auth.txId, { walletAddress })
   if (!settled) {
-    return { approved: false, declineReason: 'settlement_failed', message: 'Authorization cleared but settlement failed (insufficient funds)', tx }
+    return { approved: false, declineReason: tx.declineReason || 'settlement_failed', message: tx.error || 'Authorization cleared but settlement failed', tx }
   }
   return {
     approved: true,
@@ -430,6 +523,9 @@ export function spendWithCard(owner, cardId, { merchantId, amount, description =
     amount: tx.amount,
     status: 'settled',
     settledAt: tx.settledAt,
+    txHash: tx.txHash || null,
+    explorerUrl: tx.explorerUrl || null,
+    onchain: Boolean(tx.onchain),
   }
 }
 
@@ -444,6 +540,16 @@ export function refundCardTransaction(owner, txId) {
   }
   if (tx.status !== 'settled') {
     return { refunded: false, reason: `only settled transactions can be refunded (current: ${tx.status})`, tx }
+  }
+  if (tx.onchain) {
+    // Refunding an on-chain spend requires the merchant/treasury operator to
+    // send USDC back to the MSCA; the simulator never holds those keys.
+    return {
+      refunded: false,
+      reason: 'onchain_refund_manual',
+      message: 'This on-chain spend settled from the MSCA wallet. Refund must be executed by the operator sending the settled USDC back to the MSCA (manual path) OR handled before settlement.' + ' Simulated-mode refunds are automatic.',
+      tx,
+    }
   }
   const entry = ledgerEntry(db, key)
   entry.balance = toUsdc(toUnits(entry.balance) + toUnits(tx.amount))

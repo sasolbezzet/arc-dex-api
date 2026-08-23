@@ -36,3 +36,6 @@ data/
 .claude/
 skills-lock.json
 supabase/.temp/
+
+# card simulator runtime state
+agent-cards-db.json

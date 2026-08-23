@@ -94,12 +94,20 @@ export function registerCardTools(ctx) {
     }
   })
 
-  registerTool('arcox_card_spend', 'Authorize and settle a purchase with a test card at a simulated merchant. Settles immediately.', {
+  registerTool('arcox_card_spend', 'Authorize and settle a purchase with a test card at a simulated merchant. In on-chain mode this moves real testnet USDC from the Agent Wallet MSCA (session-key path). Requires explicit user confirmation.', {
     cardId: z.string().describe('Card id'),
     merchantId: z.string().describe('Merchant id from arcox_card_list_merchants'),
     amount: z.string().describe('Amount in USDC'),
     description: z.string().optional(),
+    confirmed: z.boolean().optional().describe('Must be true after the user agrees'),
+    confirmationText: z.string().optional().describe('yes/ya after user approval'),
   }, async (params) => {
+    if (!params.confirmed || !['yes', 'ya'].includes(String(params.confirmationText || '').trim().toLowerCase())) {
+      return { content: [{ type: 'text', text: jsonText({
+        status: 'confirmation_required', reason: 'Card spend moves USDC from the Agent Wallet MSCA on-chain. Tunjukkan merchant, amount, dan peringatan ini ke user; setelah user setuju, panggil ulang dengan confirmed=true dan confirmationText=yes/ya.',
+        merchant: params.merchantId, amount: params.amount, description: params.description,
+      }) }] }
+    }
     const msca = await requireSession()
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     try {
