@@ -187,6 +187,8 @@ function publicCard(card, includePan = false) {
     label: card.label,
     brand: card.brand,
     network: card.network,
+    provider: card.provider || 'simulator',
+    providerCardId: card.providerCardId || null,
     last4: card.pan.slice(-4),
     pan: includePan ? card.pan : maskPan(card.pan),
     cvv: includePan ? card.cvv : undefined,
@@ -279,6 +281,8 @@ export function createCard(owner, { label = 'Agent Card', perTxLimit, dailyLimit
     cardId: `acard_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
     owner: key,
     label: String(label || 'Agent Card').slice(0, 60),
+    provider: 'simulator',
+    providerCardId: null,
     brand: CARD_CONFIG.brand,
     network: CARD_CONFIG.network,
     pan,
@@ -570,6 +574,61 @@ export function listCardTransactions(owner, cardId = null) {
     .filter(t => t.owner === ownerKey(owner) && (!cardId || t.cardId === cardId))
     .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
     .map(t => ({ ...t }))
+}
+
+export function recordExternalTransaction(tx) {
+  // Webhook-injected tx from a real issuer (stripe/lithic): merged into the
+  // local store keyed by cardId so the Cards UI stays the single timeline.
+  const db = loadDb()
+  const card = db.cards.find(c => c.cardId === tx.cardId)
+  if (!card) return { recorded: false, reason: 'unknown local card' }
+  const existing = db.transactions.find(t => t.id === (tx.id || tx.providerTxId))
+  if (existing) {
+    existing.status = tx.status || existing.status
+    existing.settledAt = tx.settledAt || existing.settledAt
+    existing.declineReason = tx.declineReason || existing.declineReason
+    save(db)
+    return { recorded: true, updated: true, tx: existing }
+  }
+  const entry = {
+    id: tx.id || `pctx_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
+    cardId: tx.cardId,
+    owner: card.owner,
+    merchantId: tx.merchantId || 'issuer',
+    merchantName: tx.merchantName || 'Issuer merchant',
+    category: tx.category || 'unsorted',
+    description: tx.description || 'Issuer transaction',
+    amount: String(tx.amount ?? '0'),
+    status: tx.status || 'authorized',
+    authCode: tx.authCode || '',
+    createdAt: tx.createdAt || new Date().toISOString(),
+    settledAt: tx.settledAt || null,
+    refundedAt: tx.refundedAt || null,
+    declineReason: tx.declineReason || '',
+    onchain: false,
+    provider: tx.provider || 'issuer',
+    txHash: tx.txHash || null,
+    explorerUrl: tx.explorerUrl || null,
+  }
+  db.transactions.unshift(entry)
+  save(db)
+  return { recorded: true, tx: entry }
+}
+
+export function findCardByProvider(providerCardId) {
+  const db = loadDb()
+  return db.cards.find(c => c.providerCardId === providerCardId) || null
+}
+
+export function setProviderCard(owner, cardId, provider, providerCardId, providerPan) {
+  const db = loadDb()
+  const card = db.cards.find(c => c.cardId === cardId && ownerKey(c.owner) === ownerKey(owner))
+  if (!card) return null
+  card.provider = provider
+  card.providerCardId = String(providerCardId || '')
+  if (providerPan) card.pan = providerPan
+  save(db)
+  return publicCard(card)
 }
 
 export function clearAllCards(owner) {

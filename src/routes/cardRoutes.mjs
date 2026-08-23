@@ -2,7 +2,7 @@
 // All endpoints are owner-gated (same pattern as x402 routes). The card
 // network itself is simulated; balances are test USDC.
 
-import { Router } from 'express'
+import express, { Router } from 'express'
 import { verifyOwnerToken } from '../services/authToken.mjs'
 import {
   cardConfig,
@@ -19,7 +19,11 @@ import {
   spendWithCard,
   refundCardTransaction,
   listCardTransactions,
+  setProviderCard,
+  findCardByProvider,
+  recordExternalTransaction,
 } from '../services/cardSimulator.mjs'
+import { getIssuer, cardIssuerConfig } from '../services/cardIssuer.mjs'
 
 const router = Router()
 
@@ -43,11 +47,28 @@ function simulateAmount(value, fallback) {
 }
 
 router.get('/config', (_req, res) => {
-  res.json({ ok: true, ...cardConfig() })
+  res.json({ ok: true, ...cardConfig(), issuer: cardIssuerConfig() })
 })
 
 router.get('/merchants', (_req, res) => {
   res.json({ ok: true, merchants: listMerchants() })
+})
+
+router.post('/:cardId/provision', async (req, res) => {
+  const auth = await authenticatedOwner(req)
+  if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
+  const issuer = getIssuer()
+  if (issuer.provider === 'simulator') {
+    return res.status(400).json({ error: 'CARD_PROVIDER still simulator — set CARD_PROVIDER=lithic|stripe with keys to issue a real test card.' })
+  }
+  try {
+    const result = await issuer.issueCard({ label: req.body?.label || 'ARCOX Agent Card' })
+    const card = setProviderCard(auth.walletAddress, req.params.cardId, issuer.provider, result.providerCardId, result.pan)
+    if (!card) return res.status(404).json({ error: 'Card not found' })
+    res.json({ ok: true, card: { ...card, pan: result.pan, cvv: result.cvv }, provider: issuer.provider, providerCardId: result.providerCardId })
+  } catch (error) {
+    res.status(error.status || 502).json({ error: error.message })
+  }
 })
 
 router.get('/balance', async (req, res) => {
@@ -102,6 +123,34 @@ router.post('/', async (req, res) => {
     res.json({ ok: true, card })
   } catch (error) {
     res.status(error.statusCode || 400).json({ error: error.message })
+  }
+})
+
+router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  // Issuer webhook (stripe/lithic test mode). Signature verification is
+  // dashboard-configured; test-mode events are parsed without secret.
+  try {
+    const issuer = getIssuer()
+    let payload = req.body
+    if (Buffer.isBuffer(payload)) {
+      try { payload = JSON.parse(payload.toString('utf8')) } catch { payload = {} }
+    }
+    const event = issuer.parseWebhookEvent ? issuer.parseWebhookEvent(payload) : null
+    if (!event || !event.cardId) return res.status(200).json({ ok: true, ignored: true })
+    const local = findCardByProvider(event.cardId)
+    if (!local) return res.status(200).json({ ok: true, ignored: true, reason: 'unknown provider card' })
+    recordExternalTransaction({
+      id: payload?.id || payload?.event?.id,
+      cardId: local.cardId,
+      merchantName: event.merchantName,
+      category: event.category,
+      amount: event.amount,
+      status: event.status,
+      provider: issuer.provider,
+    })
+    res.json({ ok: true, recorded: true, event: event.eventType })
+  } catch {
+    res.status(200).json({ ok: true, ignored: true })
   }
 })
 
