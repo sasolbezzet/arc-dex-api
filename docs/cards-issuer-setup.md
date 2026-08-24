@@ -37,6 +37,10 @@ provider.
 - Klik **Enable Issuing** (aktifkan program; untuk test mode tidak perlu
   approval bisnis yang lama — bisa langsung pakai test keys).
 - Nanti di dashboard akan ada menu **Issuing** sidebar.
+- ⚠️ Jika API mengembalikan `Your account is not set up to use Issuing`,
+  berarti langkah ini belum selesai — buka
+  `https://dashboard.stripe.com/issuing/overview` dan klik **Get started**
+  sampai sidebar **Issuing** muncul, lalu ulangi test provision.
 
 ### 3. Ambil API keys (TEST MODE)
 - **Developer → API keys**: `https://dashboard.stripe.com/apikeys`
