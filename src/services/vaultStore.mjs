@@ -493,7 +493,7 @@ export function listActivity(owner, limit = 50) {
   return a.filter(x => x.owner === owner).slice(-limit).reverse()
 }
 
-function logActivity(owner, type, data = {}) {
+export function logActivity(owner, type, data = {}) {
   const a = loadActivity()
   a.push({ id: randomUUID(), owner, type, data, ts: Date.now() })
   saveActivity(a)
