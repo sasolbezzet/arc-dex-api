@@ -25,6 +25,7 @@ import {
   recordExternalTransaction,
 } from '../services/cardSimulator.mjs'
 import { getIssuer, cardIssuerConfig } from '../services/cardIssuer.mjs'
+import { readCardRecords, readCardTransactions } from '../services/supabasePersistence.mjs'
 
 const router = Router()
 
@@ -148,7 +149,9 @@ router.post('/balance/fund', async (req, res) => {
 router.get('/', async (req, res) => {
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
-  res.json({ ok: true, cards: listCards(auth.walletAddress) })
+  const localCards = listCards(auth.walletAddress)
+  const read = await readCardRecords(auth.walletAddress, localCards)
+  res.json({ ok: true, cards: read.cards, persistenceSource: read.source })
 })
 
 router.post('/', async (req, res) => {
@@ -205,7 +208,9 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
 router.get('/my-transactions', async (req, res) => {
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
-  res.json({ ok: true, transactions: listCardTransactions(auth.walletAddress) })
+  const localTransactions = listCardTransactions(auth.walletAddress)
+  const read = await readCardTransactions(auth.walletAddress, localTransactions)
+  res.json({ ok: true, transactions: read.transactions, persistenceSource: read.source })
 })
 
 router.get('/:cardId/reveal', async (req, res) => {
@@ -332,7 +337,9 @@ router.post('/:cardId/refund', async (req, res) => {
 router.get('/:cardId/transactions', async (req, res) => {
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
-  res.json({ ok: true, transactions: listCardTransactions(auth.walletAddress, req.params.cardId) })
+  const localTransactions = listCardTransactions(auth.walletAddress, req.params.cardId)
+  const read = await readCardTransactions(auth.walletAddress, localTransactions, req.params.cardId)
+  res.json({ ok: true, transactions: read.transactions, persistenceSource: read.source })
 })
 
 export default router

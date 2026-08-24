@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { listCredentials, addCredential, deduplicateCredentials, revealCredential, deleteCredential, getLimits, setLimits, listApprovals, createApproval, approveRequest, rejectRequest, listActivity, createChallenge, consumeChallenge, createSession, validateSession, listMcpSessions } from '../services/vaultStore.mjs'
+import { readAgentActivity, readAgentApprovals } from '../services/supabasePersistence.mjs'
 import { listRelatedAddresses } from '../services/sessionKeyService.mjs'
 import { verifyMessage } from 'viem'
 
@@ -116,8 +117,10 @@ vault.post('/limits', requireAuth, (req, res) => {
 })
 
 // ── Approvals ──
-vault.get('/approvals', requireAuth, (req, res) => {
-  res.json({ approvals: listApprovals(req.owner) })
+vault.get('/approvals', requireAuth, async (req, res) => {
+  const localApprovals = listApprovals(req.owner)
+  const read = await readAgentApprovals(req.owner, localApprovals)
+  res.json({ approvals: read.approvals, persistenceSource: read.source })
 })
 
 vault.post('/approvals', requireAuth, (req, res) => {
@@ -144,9 +147,14 @@ vault.post('/approvals/:id/reject', requireAuth, (req, res) => {
 })
 
 // ── Activity ──
-vault.get('/activity', requireAuth, (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 50, 200)
-  res.json({ activity: listActivity(req.owner, limit) })
+vault.get('/activity', requireAuth, async (req, res) => {
+  // The Plugin intentionally exposes only the five newest Agent Activity
+  // entries. Keep the cap server-side so clients cannot accidentally request
+  // the entire financial/audit stream into the browser.
+  const limit = Math.min(Number(req.query.limit) || 5, 5)
+  const localActivity = listActivity(req.owner, limit)
+  const read = await readAgentActivity(req.owner, localActivity, limit)
+  res.json({ activity: read.activity, persistenceSource: read.source })
 })
 
 export default vault

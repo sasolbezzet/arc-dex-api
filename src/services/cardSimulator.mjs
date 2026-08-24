@@ -18,6 +18,12 @@ import {
   readArcUsdcBalance,
   usdcUnitsToHuman,
 } from './cardOnchain.mjs'
+import {
+  scheduleCardAccountUpsert,
+  scheduleCardRecordUpsert,
+  scheduleCardTransactionUpsert,
+} from './supabasePersistence.mjs'
+import { logActivity } from './vaultStore.mjs'
 
 export const CARD_CONFIG = Object.freeze({
   mode: 'hybrid', // 'hybrid' = balance syncs from MSCA on-chain USDC ; 'simulated' via env CARDS_SYNC_ONCHAIN=false
@@ -82,10 +88,30 @@ function loadDb() {
 
 function save(db) {
   atomicWriteJsonFile(dbPath(), db)
+  // Supabase stores the financial card projection after the local write. The
+  // queue is non-blocking and deduplicated, so a temporary Supabase outage
+  // cannot break card authorization or settlement. Card secrets (PAN/CVV) are
+  // stripped by the persistence adapter before any remote write.
+  for (const card of db.cards) scheduleCardRecordUpsert(card)
+  for (const tx of db.transactions) scheduleCardTransactionUpsert(tx)
+  for (const [owner, account] of Object.entries(db.ledger || {})) {
+    scheduleCardAccountUpsert({ owner, balance: account?.balance, source: 'simulated', syncedAt: account?.fundedAt })
+  }
+  for (const [owner, account] of Object.entries(db.onchain || {})) {
+    scheduleCardAccountUpsert({ owner, mscaAddress: account?.wallet, balance: account?.balance, source: 'onchain', syncedAt: account?.syncedAt })
+  }
 }
 
 function ownerKey(owner) {
   return String(owner || '').toLowerCase()
+}
+
+function recordCardActivity(owner, type, data) {
+  const normalizedOwner = ownerKey(owner)
+  if (!/^0x[a-f0-9]{40}$/i.test(normalizedOwner)) return
+  // Keep the local activity feed available during a Supabase outage while the
+  // persistence adapter performs the same sanitized dual-write.
+  logActivity(normalizedOwner, type, data)
 }
 
 function ledgerEntry(db, owner) {
@@ -301,6 +327,7 @@ export function createCard(owner, { label = 'Agent Card', perTxLimit, dailyLimit
   }
   db.cards.push(card)
   save(db)
+  recordCardActivity(key, 'card_created', { cardId: card.cardId, label: card.label, provider: card.provider })
   return publicCard(card, true)
 }
 
@@ -482,6 +509,7 @@ export async function settleCardTransaction(owner, txId, { walletAddress } = {})
       tx.txHash = transfer.txHash || null
       tx.error = transfer.reason || transfer.error || 'on-chain transfer failed'
       save(db)
+      recordCardActivity(key, 'card_payment_declined', { cardId: tx.cardId, txId: tx.id, amount: tx.amount, token: 'USDC', merchantId: tx.merchantId, status: tx.status, reason: tx.error })
       return { settled: false, tx }
     }
     tx.status = 'settled'
@@ -495,6 +523,7 @@ export async function settleCardTransaction(owner, txId, { walletAddress } = {})
       tx.declineReason = 'insufficient_funds'
       tx.settledAt = new Date().toISOString()
       save(db)
+      recordCardActivity(key, 'card_payment_declined', { cardId: tx.cardId, txId: tx.id, amount: tx.amount, token: 'USDC', merchantId: tx.merchantId, status: tx.status, reason: tx.declineReason })
       return { settled: false, tx }
     }
     entry.balance = toUsdc(toUnits(entry.balance) - amountUnits)
@@ -508,6 +537,7 @@ export async function settleCardTransaction(owner, txId, { walletAddress } = {})
     card.usage.month = toUsdc(usedThisMonth(db, card, new Date()))
   }
   save(db)
+  recordCardActivity(key, 'card_payment_settled', { cardId: tx.cardId, txId: tx.id, amount: tx.amount, token: 'USDC', merchantId: tx.merchantId, merchantName: tx.merchantName, status: tx.status, txHash: tx.txHash || '' })
   return { settled: true, tx }
 }
 

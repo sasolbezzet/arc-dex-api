@@ -2,6 +2,7 @@ import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { randomUUID } from 'crypto'
 import { mkdirSync, rmSync, statSync } from 'fs'
 import { dirname } from 'path'
+import { scheduleAgentActivityUpsert, scheduleApprovalUpsert } from './supabasePersistence.mjs'
 
 function vaultPath() { return process.env.VAULT_PATH || './data/vault.json' }
 function activityPath() { return process.env.VAULT_ACTIVITY_PATH || './data/vault-activity.json' }
@@ -314,6 +315,7 @@ export function createApproval(owner, { agent, action, amount, token, source, to
   }
   v.approvals.push(approval)
   saveVault(v)
+  scheduleApprovalUpsert(approval)
   logActivity(owner, withinLimit ? 'auto_approved' : 'approval_requested', { action, amount, token, source })
   return approval
 }
@@ -327,6 +329,7 @@ export function approveRequest(owner, id, extra = {}) {
   if (extra.txHash) a.txHash = extra.txHash
   if (extra.explorerUrl) a.explorerUrl = extra.explorerUrl
   saveVault(v)
+  scheduleApprovalUpsert(a)
   logActivity(owner, 'approval_approved', { id, action: a.action, amount: a.amount, txHash: extra.txHash || '' })
   return a
 }
@@ -338,6 +341,7 @@ export function rejectRequest(owner, id) {
   a.status = 'rejected'
   a.rejectedAt = Date.now()
   saveVault(v)
+  scheduleApprovalUpsert(a)
   logActivity(owner, 'approval_rejected', { id, action: a.action, amount: a.amount })
   return a
 }
@@ -367,6 +371,7 @@ export function updateApprovalStatus(owner, id, status, extra = {}) {
   if (['approved', 'auto_approved'].includes(status) && !a.approvedAt) a.approvedAt = Date.now()
   if (['success', 'error', 'rejected', 'denied'].includes(status) && !a.completedAt) a.completedAt = Date.now()
   saveVault(v)
+  scheduleApprovalUpsert(a)
   logActivity(owner, `approval_${status}`, { id, action: a.action, txHash: extra.txHash || '' })
   return a
 }
@@ -507,9 +512,14 @@ export function listActivity(owner, limit = 50) {
 }
 
 export function logActivity(owner, type, data = {}) {
+  const entry = { id: randomUUID(), owner, type, data, ts: Date.now() }
   const a = loadActivity()
-  a.push({ id: randomUUID(), owner, type, data, ts: Date.now() })
+  a.push(entry)
   saveActivity(a)
+  // Supabase receives a sanitized financial/agent activity event. The local
+  // file remains the synchronous fallback so an outage never breaks a vault
+  // operation or approval decision.
+  scheduleAgentActivityUpsert(entry)
 }
 
 // ── Masking ──

@@ -3498,7 +3498,7 @@ export function createMcpServer(userId, context = {}) {
           version: '1.1.0',
           url: SERVER_URL,
           userId,
-          services: ['wallet_balances', 'swap', 'bridge', 'send', 'intel', 'x402', 'vault', 'transaction_history', 'route_status', 'session_key', 'get_request'],
+          services: ['wallet_balances', 'swap', 'bridge', 'send', 'cards', 'intel', 'x402', 'vault', 'transaction_history', 'route_status', 'session_key', 'get_request'],
           sources: {
             session: 'Agent Session Key (MSCA) — passkey-gated setup, gasless, within limits. SATU-SATUNYA sumber untuk agent remote.',
           },
@@ -3510,6 +3510,7 @@ export function createMcpServer(userId, context = {}) {
               ? ['arcox_quote_bridge → show preview → user ya → arcox_execute_bridge → jika pending, arcox_bridge_status. Supported MSCA routes: Arc↔Base Sepolia and Arc↔Arbitrum Sepolia USDC via verified ArcoxRouter deployments.']
               : ['arcox_route_status(action=bridge) → bridge MSCA masih disabled sampai ArcoxRouter, destination relayer, dan CCTP route tervalidasi. Tidak ada dana yang dipindahkan.'],
             send: ['arcox_quote_send → show preview → user ya → arcox_execute_send (source=session)'],
+            cards: ['arcox_card_list → pilih cardId → arcox_card_spend → show merchant/amount → user ya → ulangi dengan confirmed=true dan confirmationText=yes/ya. MCP card spend memakai active MSCA/session key; PAN/CVV tidak pernah dikembalikan oleh list.'],
             intel_x402: ['arcox_intel_get_* → jika paymentRequired → arcox_x402_pay_invoice (tanpa confirmed) preview → user ya → confirmed=true → retry intel tool dengan paymentId yang sama'],
             poll: ['After execute returns pending_* → arcox_get_request(approvalId) → poll until success/error'],
           },

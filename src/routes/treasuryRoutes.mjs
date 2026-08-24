@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { randomUUID } from 'crypto'
 import { solanaTreasuryAddress, treasuryAddress } from '../config/treasury.mjs'
+import { scheduleTreasuryFinancialEvent } from '../services/supabasePersistence.mjs'
 
 const router = Router()
 const ledger = globalThis.__arcoxTreasuryLedger || { deposits: [], spends: [], settlements: [] }
@@ -68,12 +69,24 @@ router.post('/quote-settlement', (req, res) => {
 router.post('/simulate-settlement', requireDevTools, (req, res) => {
   const rec = { id: `settle_${randomUUID().slice(0, 8)}`, createdAt: new Date().toISOString(), mode: 'testnet-ledger', status: 'settlement_pending', ...req.body }
   ledger.settlements.push(rec)
+  scheduleTreasuryFinancialEvent({
+    id: rec.id, eventType: 'settlement_intent', owner: rec.owner || rec.ownerAddress || '',
+    amount: rec.amount, token: rec.asset || rec.token || 'USDC', chain: rec.chain || 'arc-testnet',
+    status: rec.status, txHash: rec.txHash || '', createdAt: rec.createdAt,
+    metadata: { source: 'treasury.simulate-settlement', request: rec },
+  })
   res.json({ ok: true, settlement: rec, config: cfg() })
 })
 
 router.post('/unified-balance/deposit', requireDevTools, (req, res) => {
   const rec = { id: `ub_dep_${randomUUID().slice(0, 8)}`, createdAt: new Date().toISOString(), mode: 'real-testnet-intent', asset: 'USDC', status: 'awaiting_signature', ...req.body }
   ledger.deposits.push(rec)
+  scheduleTreasuryFinancialEvent({
+    id: rec.id, eventType: 'unified_balance_deposit_intent', owner: rec.owner || rec.ownerAddress || '',
+    amount: rec.amount, token: rec.asset || rec.token || 'USDC', chain: rec.chain || 'arc-testnet',
+    status: rec.status, txHash: rec.txHash || '', createdAt: rec.createdAt,
+    metadata: { source: 'treasury.unified-balance.deposit', request: rec },
+  })
   res.json({ ok: true, deposit: rec, note: 'Use Circle AppKit deposit/spend in the frontend wallet session; backend records intent only.' })
 })
 
@@ -101,6 +114,12 @@ router.post('/unified-balance/estimate-spend', (req, res) => {
 router.post('/unified-balance/spend', requireDevTools, (req, res) => {
   const rec = { id: `ub_spend_${randomUUID().slice(0, 8)}`, createdAt: new Date().toISOString(), mode: 'real-testnet-ledger', asset: 'USDC', status: 'settlement_pending', ...req.body }
   ledger.spends.push(rec)
+  scheduleTreasuryFinancialEvent({
+    id: rec.id, eventType: 'unified_balance_spend_intent', owner: rec.owner || rec.ownerAddress || '',
+    amount: rec.amount, token: rec.asset || rec.token || 'USDC', chain: rec.chain || rec.destinationChain || 'arc-testnet',
+    status: rec.status, txHash: rec.txHash || '', createdAt: rec.createdAt,
+    metadata: { source: 'treasury.unified-balance.spend', request: rec },
+  })
   res.json({ ok: true, spend: rec, note: 'Spend submitted. Wait for on-chain transfer or Circle webhook before marking paid.' })
 })
 

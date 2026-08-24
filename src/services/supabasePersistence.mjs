@@ -20,6 +20,13 @@ const aiUsageReadPrimary = enabled && String(process.env.SUPABASE_AI_USAGE_READ_
 // is never surfaced as active (without the local keys the session cannot
 // sign). Roll back with SUPABASE_SESSION_METADATA_READ_PRIMARY=false.
 const sessionMetadataReadPrimary = enabled && String(process.env.SUPABASE_SESSION_METADATA_READ_PRIMARY || 'true').toLowerCase() !== 'false'
+// Financial card records and Agent Activity are read from Supabase when the
+// migration is present, with JSON fallback during rollout or an outage. PAN,
+// CVV, private keys, and bearer tokens are never sent to these tables.
+const cardReadPrimary = enabled && String(process.env.SUPABASE_CARD_READ_PRIMARY || 'true').toLowerCase() !== 'false'
+const activityReadPrimary = enabled && String(process.env.SUPABASE_ACTIVITY_READ_PRIMARY || 'true').toLowerCase() !== 'false'
+const approvalReadPrimary = enabled && String(process.env.SUPABASE_APPROVAL_READ_PRIMARY || 'true').toLowerCase() !== 'false'
+const financialSyncEnabled = enabled
 const client = enabled
   ? createClient(url, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -64,6 +71,22 @@ const stats = globalThis.__arcoxSupabasePersistenceStats || {
   refundAuditLogReads: 0,
   refundAuditLogFailures: 0,
   lastRefundAuditLogError: '',
+  activityWrites: 0,
+  activityReads: 0,
+  activityFailures: 0,
+  lastActivityError: '',
+  approvalReads: 0,
+  approvalFailures: 0,
+  lastApprovalError: '',
+  approvalWrites: 0,
+  cardAccountWrites: 0,
+  cardRecordWrites: 0,
+  cardTransactionWrites: 0,
+  cardReads: 0,
+  cardTransactionReads: 0,
+  cardReadFailures: 0,
+  lastCardReadError: '',
+  treasuryEventWrites: 0,
 }
 globalThis.__arcoxSupabasePersistenceStats = stats
 
@@ -165,6 +188,26 @@ export function supabasePersistenceStatus() {
     // store remains the activation authority (local always wins, recovery
     // views are never active).
     sessionMetadataReadPrimary,
+    activityReadPrimary,
+    approvalReadPrimary,
+    cardReadPrimary,
+    financialSyncEnabled,
+    activityWrites: stats.activityWrites,
+    activityReads: stats.activityReads,
+    activityFailures: stats.activityFailures,
+    lastActivityError: stats.lastActivityError,
+    approvalReads: stats.approvalReads,
+    approvalFailures: stats.approvalFailures,
+    lastApprovalError: stats.lastApprovalError,
+    approvalWrites: stats.approvalWrites,
+    cardAccountWrites: stats.cardAccountWrites,
+    cardRecordWrites: stats.cardRecordWrites,
+    cardTransactionWrites: stats.cardTransactionWrites,
+    cardReads: stats.cardReads,
+    cardTransactionReads: stats.cardTransactionReads,
+    cardReadFailures: stats.cardReadFailures,
+    lastCardReadError: stats.lastCardReadError,
+    treasuryEventWrites: stats.treasuryEventWrites,
     sessionMetadataWrites: stats.sessionMetadataWrites,
     sessionMetadataReads: stats.sessionMetadataReads,
     sessionMetadataMismatches: stats.sessionMetadataMismatches,
@@ -920,9 +963,342 @@ export async function shadowReadSessionMetadata(walletAddress, fallback = null) 
   }
 }
 
+function ownerAddress(value) {
+  return String(value || '').toLowerCase()
+}
+
+function localActivityPayload(entry) {
+  return {
+    id: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(entry?.id || '')) ? String(entry.id) : stableUuid(`${entry?.owner || ''}:${entry?.type || ''}:${entry?.ts || ''}:${JSON.stringify(entry?.data || {})}`),
+    owner_address: ownerAddress(entry?.owner),
+    activity_type: String(entry?.type || 'activity'),
+    data: jsonSafe(entry?.data || {}),
+    occurred_at: toIso(entry?.ts),
+    created_at: toIso(entry?.ts),
+  }
+}
+
+export function scheduleAgentActivityUpsert(entry) {
+  const payload = localActivityPayload(entry)
+  if (!enabled || !isUsableOwner(payload.owner_address)) return
+  queueWrite('agent-activity', payload.id, async () => {
+    const { error } = await client.from('agent_activity').upsert(payload, { onConflict: 'id' })
+    if (error) throw error
+    stats.activityWrites++
+  })
+}
+
+export async function readAgentActivity(owner, fallback = [], limit = 5) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 5, 1), 5)
+  // Callers normally pass listActivity(), which is already newest-first.
+  const local = Array.isArray(fallback) ? fallback.slice(0, safeLimit) : []
+  if (!enabled || !activityReadPrimary || !isUsableOwner(owner)) return { activity: local, source: 'json', compared: false }
+  try {
+    const { data, error } = await client.from('agent_activity').select('*').eq('owner_address', ownerAddress(owner)).order('occurred_at', { ascending: false }).limit(safeLimit)
+    if (error) throw error
+    const remoteActivity = (data || []).map(row => ({
+      id: String(row?.id || ''),
+      owner: ownerAddress(row?.owner_address),
+      type: String(row?.activity_type || 'activity'),
+      data: row?.data && typeof row.data === 'object' ? row.data : {},
+      ts: Date.parse(String(row?.occurred_at || row?.created_at || '')) || Date.now(),
+    }))
+    // A queued local event can be newer than the remote read. Merge by ID so
+    // the five-entry UI never hides a just-completed transaction during the
+    // async dual-write window, while still recovering remote history after a
+    // restart or local-file loss.
+    const byId = new Map(remoteActivity.map(entry => [entry.id, entry]))
+    for (const entry of local) byId.set(String(entry.id), entry)
+    const activity = [...byId.values()].sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0)).slice(0, safeLimit)
+    stats.activityReads++
+    if (activity.length === 0 && local.length > 0) return { activity: local, source: 'json-fallback', compared: true, mismatch: true }
+    return { activity, source: local.length ? 'supabase-merged' : 'supabase', compared: true, mismatch: JSON.stringify(local) !== JSON.stringify(activity) }
+  } catch (error) {
+    stats.activityFailures++
+    stats.lastActivityError = String(error?.message || error).slice(0, 240)
+    return { activity: local, source: local.length ? 'json-fallback' : 'json', compared: false, error: stats.lastActivityError }
+  }
+}
+
+function approvalFromSupabase(row) {
+  const details = row?.details && typeof row.details === 'object' ? row.details : {}
+  return {
+    ...details,
+    id: String(row?.id || ''),
+    owner: ownerAddress(row?.owner_address),
+    agent: String(row?.agent || ''),
+    action: String(row?.action || ''),
+    amount: String(row?.amount || ''),
+    token: String(row?.token || 'USDC'),
+    source: String(row?.source || ''),
+    to: String(row?.destination || ''),
+    status: String(row?.status || 'pending'),
+    txHash: String(row?.tx_hash || ''),
+    explorerUrl: String(row?.explorer_url || ''),
+    error: String(row?.error || ''),
+    details: JSON.stringify(details),
+    createdAt: row?.created_at ? Date.parse(row.created_at) : Date.now(),
+    approvedAt: row?.approved_at ? Date.parse(row.approved_at) : undefined,
+    completedAt: row?.completed_at ? Date.parse(row.completed_at) : undefined,
+    updatedAt: row?.updated_at ? Date.parse(row.updated_at) : undefined,
+  }
+}
+
+export async function readAgentApprovals(owner, fallback = [], limit = 200) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 200, 1), 500)
+  const local = Array.isArray(fallback) ? fallback.filter(item => ownerAddress(item?.owner) === ownerAddress(owner)).slice(0, safeLimit) : []
+  if (!enabled || !approvalReadPrimary || !isUsableOwner(owner)) return { approvals: local, source: 'json', compared: false }
+  try {
+    const { data, error } = await client.from('agent_approvals').select('*').eq('owner_address', ownerAddress(owner)).order('updated_at', { ascending: false }).limit(safeLimit)
+    if (error) throw error
+    const remote = (data || []).map(approvalFromSupabase)
+    const byId = new Map(remote.map(item => [item.id, item]))
+    // Local state is the synchronous execution authority. Prefer it during
+    // the queued-write window, and use Supabase rows to recover after restart.
+    for (const item of local) byId.set(String(item.id), item)
+    const approvals = [...byId.values()].sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0)).slice(0, safeLimit)
+    stats.approvalReads++
+    if (approvals.length === 0 && local.length > 0) return { approvals: local, source: 'json-fallback', compared: true, mismatch: true }
+    return { approvals, source: local.length ? 'supabase-merged' : 'supabase', compared: true, mismatch: remote.length !== local.length }
+  } catch (error) {
+    stats.approvalFailures++
+    stats.lastApprovalError = String(error?.message || error).slice(0, 240)
+    return { approvals: local, source: local.length ? 'json-fallback' : 'json', compared: false, error: stats.lastApprovalError }
+  }
+}
+
+function approvalPayload(approval) {
+  let details = {}
+  try { details = typeof approval?.details === 'string' ? JSON.parse(approval.details || '{}') : (approval?.details || {}) } catch { details = {} }
+  return {
+    id: String(approval?.id || stableUuid(`${approval?.owner || ''}:${approval?.action || ''}:${approval?.createdAt || ''}`)),
+    owner_address: ownerAddress(approval?.owner),
+    agent: String(approval?.agent || ''),
+    action: String(approval?.action || ''),
+    amount: String(approval?.amount || ''),
+    token: String(approval?.token || 'USDC'),
+    source: String(approval?.source || ''),
+    destination: String(approval?.to || ''),
+    status: String(approval?.status || 'pending'),
+    tx_hash: String(approval?.txHash || ''),
+    explorer_url: String(approval?.explorerUrl || ''),
+    error: String(approval?.error || ''),
+    details: jsonSafe(details),
+    created_at: toIso(approval?.createdAt),
+    approved_at: approval?.approvedAt ? toIso(approval.approvedAt, null) : null,
+    completed_at: approval?.completedAt ? toIso(approval.completedAt, null) : null,
+    updated_at: toIso(approval?.updatedAt || approval?.createdAt),
+  }
+}
+
+export function scheduleApprovalUpsert(approval) {
+  const payload = approvalPayload(approval)
+  if (!enabled || !isUsableOwner(payload.owner_address)) return
+  queueWrite('agent-approval', payload.id, async () => {
+    const { error } = await client.from('agent_approvals').upsert(payload, { onConflict: 'id' })
+    if (error) throw error
+    stats.approvalWrites++
+  })
+}
+
+function cardRecordPayload(card) {
+  return {
+    card_id: String(card?.cardId || ''),
+    owner_address: ownerAddress(card?.owner),
+    label: String(card?.label || ''),
+    brand: String(card?.brand || 'Visa Test'),
+    network: String(card?.network || 'visa'),
+    provider: String(card?.provider || 'simulator'),
+    provider_card_id: card?.providerCardId ? String(card.providerCardId) : null,
+    last4: String(card?.last4 || card?.pan || '').slice(-4),
+    exp_month: String(card?.expMonth || ''),
+    exp_year: String(card?.expYear || ''),
+    status: String(card?.status || 'active'),
+    blocked_categories: Array.isArray(card?.blockedCategories) ? card.blockedCategories.map(String).slice(0, 10) : [],
+    limits: jsonSafe(card?.limits || {}),
+    usage: jsonSafe(card?.usage || {}),
+    created_at: toIso(card?.createdAt),
+    updated_at: new Date().toISOString(),
+  }
+}
+
+export function scheduleCardRecordUpsert(card) {
+  const payload = cardRecordPayload(card)
+  if (!enabled || !payload.card_id || !isUsableOwner(payload.owner_address)) return
+  queueWrite('card-record', payload.card_id, async () => {
+    const { error } = await client.from('card_records').upsert(payload, { onConflict: 'card_id' })
+    if (error) throw error
+    stats.cardRecordWrites++
+  })
+}
+
+export function scheduleCardAccountUpsert(account) {
+  const payload = {
+    owner_address: ownerAddress(account?.owner || account?.ownerAddress),
+    msca_address: ownerAddress(account?.mscaAddress || account?.wallet || account?.walletAddress),
+    balance: String(account?.balance || '0'),
+    source: String(account?.source || 'onchain'),
+    synced_at: account?.syncedAt ? toIso(account.syncedAt, null) : null,
+    metadata: jsonSafe(account?.metadata || {}),
+    updated_at: new Date().toISOString(),
+  }
+  if (!enabled || !isUsableOwner(payload.owner_address)) return
+  queueWrite('card-account', payload.owner_address, async () => {
+    const { error } = await client.from('card_accounts').upsert(payload, { onConflict: 'owner_address' })
+    if (error) throw error
+    stats.cardAccountWrites++
+  })
+}
+
+function cardTransactionPayload(tx) {
+  return {
+    transaction_id: String(tx?.id || tx?.txId || ''),
+    card_id: String(tx?.cardId || ''),
+    owner_address: ownerAddress(tx?.owner),
+    merchant_id: String(tx?.merchantId || ''),
+    merchant_name: String(tx?.merchantName || tx?.merchant?.name || ''),
+    category: String(tx?.category || tx?.merchant?.category || ''),
+    description: String(tx?.description || ''),
+    amount: String(tx?.amount || '0'),
+    status: String(tx?.status || ''),
+    auth_code: String(tx?.authCode || ''),
+    onchain: Boolean(tx?.onchain),
+    provider: String(tx?.provider || ''),
+    tx_hash: String(tx?.txHash || ''),
+    explorer_url: String(tx?.explorerUrl || ''),
+    created_at: toIso(tx?.createdAt),
+    settled_at: tx?.settledAt ? toIso(tx.settledAt, null) : null,
+    refunded_at: tx?.refundedAt ? toIso(tx.refundedAt, null) : null,
+    decline_reason: String(tx?.declineReason || ''),
+    metadata: jsonSafe(tx?.metadata || {}),
+  }
+}
+
+export function scheduleCardTransactionUpsert(tx) {
+  const payload = cardTransactionPayload(tx)
+  if (!enabled || !payload.transaction_id || !payload.card_id || !isUsableOwner(payload.owner_address)) return
+  queueWrite('card-transaction', payload.transaction_id, async () => {
+    const { error } = await client.from('card_transactions').upsert(payload, { onConflict: 'transaction_id' })
+    if (error) throw error
+    stats.cardTransactionWrites++
+  })
+}
+
+function cardFromSupabase(row) {
+  const last4 = String(row?.last4 || '').slice(-4)
+  return {
+    cardId: String(row?.card_id || ''),
+    owner: ownerAddress(row?.owner_address),
+    label: String(row?.label || ''),
+    brand: String(row?.brand || 'Visa Test'),
+    network: String(row?.network || 'visa'),
+    provider: String(row?.provider || 'simulator'),
+    providerCardId: row?.provider_card_id || null,
+    last4,
+    expMonth: String(row?.exp_month || ''),
+    expYear: String(row?.exp_year || ''),
+    // Supabase intentionally stores only the masked representation. Reveal
+    // always reads the local/provider secret store after fresh Passkey auth.
+    pan: `••••••••••••${last4}`,
+    status: row?.status || 'active',
+    blockedCategories: Array.isArray(row?.blocked_categories) ? row.blocked_categories : [],
+    limits: row?.limits && typeof row.limits === 'object' ? row.limits : {},
+    usage: row?.usage && typeof row.usage === 'object' ? row.usage : { today: '0', month: '0' },
+    createdAt: row?.created_at || new Date().toISOString(),
+  }
+}
+
+export async function readCardRecords(owner, fallback = [], limit = 100) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 100)
+  const local = Array.isArray(fallback) ? fallback.slice(0, safeLimit) : []
+  if (!enabled || !cardReadPrimary || !isUsableOwner(owner)) return { cards: local, source: 'json', compared: false }
+  try {
+    const { data, error } = await client.from('card_records').select('*').eq('owner_address', ownerAddress(owner)).order('created_at', { ascending: false }).limit(safeLimit)
+    if (error) throw error
+    const remoteCards = (data || []).map(cardFromSupabase)
+    const byId = new Map(remoteCards.map(card => [card.cardId, card]))
+    for (const card of local) byId.set(String(card.cardId), card)
+    const cards = [...byId.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, safeLimit)
+    stats.cardReads++
+    if (cards.length === 0 && local.length > 0) return { cards: local, source: 'json-fallback', compared: true, mismatch: true }
+    return { cards, source: local.length ? 'supabase-merged' : 'supabase', compared: true, mismatch: cards.length !== local.length }
+  } catch (error) {
+    stats.cardReadFailures++
+    stats.lastCardReadError = String(error?.message || error).slice(0, 240)
+    return { cards: local, source: local.length ? 'json-fallback' : 'json', compared: false, error: stats.lastCardReadError }
+  }
+}
+
+function cardTransactionFromSupabase(row) {
+  return {
+    id: String(row?.transaction_id || ''),
+    cardId: String(row?.card_id || ''),
+    owner: ownerAddress(row?.owner_address),
+    merchantId: String(row?.merchant_id || ''),
+    merchantName: String(row?.merchant_name || ''),
+    category: String(row?.category || ''),
+    description: String(row?.description || ''),
+    amount: String(row?.amount || '0'),
+    status: String(row?.status || 'authorized'),
+    authCode: String(row?.auth_code || ''),
+    onchain: Boolean(row?.onchain),
+    provider: String(row?.provider || ''),
+    txHash: String(row?.tx_hash || ''),
+    explorerUrl: String(row?.explorer_url || ''),
+    createdAt: row?.created_at || new Date().toISOString(),
+    settledAt: row?.settled_at || null,
+    refundedAt: row?.refunded_at || null,
+    declineReason: String(row?.decline_reason || ''),
+  }
+}
+
+export async function readCardTransactions(owner, fallback = [], cardId = null, limit = 100) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 100)
+  const local = (Array.isArray(fallback) ? fallback : []).filter(tx => !cardId || tx.cardId === cardId).slice(0, safeLimit)
+  if (!enabled || !cardReadPrimary || !isUsableOwner(owner)) return { transactions: local, source: 'json', compared: false }
+  try {
+    let query = client.from('card_transactions').select('*').eq('owner_address', ownerAddress(owner))
+    if (cardId) query = query.eq('card_id', String(cardId))
+    const { data, error } = await query.order('created_at', { ascending: false }).limit(safeLimit)
+    if (error) throw error
+    const remoteTransactions = (data || []).map(cardTransactionFromSupabase)
+    const byId = new Map(remoteTransactions.map(tx => [tx.id, tx]))
+    for (const tx of local) byId.set(String(tx.id), tx)
+    const transactions = [...byId.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, safeLimit)
+    stats.cardTransactionReads++
+    if (transactions.length === 0 && local.length > 0) return { transactions: local, source: 'json-fallback', compared: true, mismatch: true }
+    return { transactions, source: local.length ? 'supabase-merged' : 'supabase', compared: true, mismatch: transactions.length !== local.length }
+  } catch (error) {
+    stats.cardReadFailures++
+    stats.lastCardReadError = String(error?.message || error).slice(0, 240)
+    return { transactions: local, source: local.length ? 'json-fallback' : 'json', compared: false, error: stats.lastCardReadError }
+  }
+}
+
+export function scheduleTreasuryFinancialEvent(entry) {
+  const payload = {
+    id: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(entry?.id || '')) ? String(entry.id) : stableUuid(`${entry?.id || ''}:${entry?.eventType || entry?.type || ''}:${entry?.createdAt || ''}`),
+    owner_address: ownerAddress(entry?.ownerAddress || entry?.owner),
+    event_type: String(entry?.eventType || entry?.type || 'treasury_event'),
+    amount: String(entry?.amount || ''),
+    token: String(entry?.token || 'USDC'),
+    chain: String(entry?.chain || entry?.network || ''),
+    status: String(entry?.status || ''),
+    tx_hash: String(entry?.txHash || ''),
+    metadata: jsonSafe(entry),
+    occurred_at: toIso(entry?.createdAt || entry?.ts),
+  }
+  if (!enabled) return
+  queueWrite('treasury-financial-event', payload.id, async () => {
+    const { error } = await client.from('treasury_financial_events').upsert(payload, { onConflict: 'id' })
+    if (error) throw error
+    stats.treasuryEventWrites++
+  })
+}
+
 export async function reconcileDualWriteCounts() {
   if (!enabled) return { enabled: false, counts: {} }
-  const tables = ['transaction_history', 'payment_invoices', 'invoice_events', 'webhook_events', 'ai_router_usage', 'x402_invoices', 'session_metadata']
+  const tables = ['transaction_history', 'payment_invoices', 'invoice_events', 'webhook_events', 'ai_router_usage', 'x402_invoices', 'session_metadata', 'agent_activity', 'agent_approvals', 'card_accounts', 'card_records', 'card_transactions', 'treasury_financial_events']
   const counts = {}
   for (const table of tables) {
     const { count, error } = await client.from(table).select('*', { count: 'exact', head: true })

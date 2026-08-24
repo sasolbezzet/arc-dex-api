@@ -1,6 +1,10 @@
-// ARCOX Card Simulator MCP tools — test-mode virtual Visa cards that an agent
-// can spend at simulated merchants. Fully simulated network: no real money
-// moves. Balances are test USDC credited per owner (default 100 USDC).
+// ARCOX Card MCP tools — list owner-scoped test cards and spend at simulated
+// merchants. MCP execution is restricted to an OAuth-authenticated active MSCA
+// and requires explicit confirmation before a spend. In on-chain card mode,
+// settlement debits testnet USDC from that MSCA through the session key.
+
+import { listCards, spendWithCard } from '../cardSimulator.mjs'
+import { readCardRecords } from '../supabasePersistence.mjs'
 
 /**
  * @param {Object} ctx
@@ -83,11 +87,22 @@ export function registerCardTools(ctx) {
     }
   })
 
-  registerTool('arcox_card_list', 'List test cards of the connected agent wallet.', {}, async () => {
+  registerTool('arcox_card_list', 'List masked test cards owned by the active Agent Wallet MSCA. PAN and CVV are never returned.', {}, async () => {
     const msca = await requireSession()
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     try {
-      const data = await apiGet('/api/cards', userId)
+      // Read directly from the same card service used by the HTTP route. This
+      // binds the result to the exact MSCA resolved by the MCP OAuth session,
+      // not merely to the SIWE/EOA tenant identity.
+      const localCards = listCards(msca.walletAddress)
+      const read = await readCardRecords(msca.walletAddress, localCards)
+      const data = {
+        ok: true,
+        walletAddress: msca.walletAddress,
+        walletType: 'MSCA',
+        cards: read.cards,
+        persistenceSource: read.source,
+      }
       return { content: [{ type: 'text', text: jsonText(data) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'list failed' }) }] }
@@ -111,10 +126,25 @@ export function registerCardTools(ctx) {
     const msca = await requireSession()
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     try {
-      const data = await apiPost(`/api/cards/${encodeURIComponent(params.cardId)}/spend`, {
-        merchantId: params.merchantId, amount: String(params.amount), description: params.description,
-      }, userId)
-      return { content: [{ type: 'text', text: jsonText(data) }] }
+      // MCP already has two independent controls before reaching this point:
+      // OAuth was bound to the active MSCA, and the user explicitly confirmed
+      // the merchant/amount above. Call the shared service directly so the
+      // browser-only fresh-WebAuthn guard does not incorrectly block a valid
+      // MCP agent payment. The service still enforces card ownership, status,
+      // limits, balance, merchant policy, and on-chain settlement.
+      const result = await spendWithCard(msca.walletAddress, params.cardId, {
+        merchantId: params.merchantId,
+        amount: String(params.amount),
+        description: params.description,
+        walletAddress: msca.walletAddress,
+      })
+      return { content: [{ type: 'text', text: jsonText({
+        ok: Boolean(result.approved),
+        ...result,
+        walletAddress: msca.walletAddress,
+        walletType: 'MSCA',
+        source: 'mcp-session',
+      }) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'spend failed' }) }] }
     }

@@ -23,7 +23,7 @@ import { logActivity } from '../services/vaultStore.mjs'
 
 const router = Router()
 
-async function authenticatedOwner(req) {
+async function authenticatedIdentity(req) {
   const auth = String(req.headers.authorization || '')
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
   let owner = verifyOwnerToken(token)
@@ -34,7 +34,18 @@ async function authenticatedOwner(req) {
   if (!owner) return null
   const { getSessionKeyInfo } = await import('../services/vaultStore.mjs')
   const session = await getSessionKeyInfo(owner)
-  return session?.active ? { owner, walletAddress: String(session.walletAddress).toLowerCase() } : null
+  return {
+    owner,
+    session,
+    walletAddress: session?.walletAddress ? String(session.walletAddress).toLowerCase() : '',
+  }
+}
+
+async function authenticatedOwner(req) {
+  const identity = await authenticatedIdentity(req)
+  return identity?.session?.active && identity.walletAddress
+    ? { owner: identity.owner, walletAddress: identity.walletAddress }
+    : null
 }
 
 function handleError(res, e, fallback = 'connect error') {
@@ -51,6 +62,19 @@ router.get('/config', (_req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message })
   }
+})
+
+// GET /api/connect/access — non-mutating MSCA session preflight for the Merchant UI
+router.get('/access', async (req, res) => {
+  const identity = await authenticatedIdentity(req)
+  if (!identity) return res.status(401).json({ error: 'Wallet authentication required', active: false })
+  res.json({
+    ok: true,
+    active: identity.session?.active === true,
+    walletAddress: identity.walletAddress || null,
+    statusReason: identity.session?.statusReason || 'setup_required',
+    requiresPasskey: identity.session?.active !== true,
+  })
 })
 
 // GET /api/connect/account — current owner's connected account + live status
