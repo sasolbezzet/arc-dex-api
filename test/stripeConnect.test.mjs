@@ -136,6 +136,7 @@ describe('stripe connect service', () => {
     // Must NOT pass top-level type per the markdown.
     assert.equal(createParams.type, undefined)
     assert.equal(createParams.configuration.merchant.capabilities.card_payments.requested, true)
+    assert.deepEqual(createParams.configuration.customer, {})
     assert.equal(createParams.defaults.responsibilities.fees_collector, 'stripe')
     // Mapping persisted.
     const mapping = getAccountForOwner('0xowner1')

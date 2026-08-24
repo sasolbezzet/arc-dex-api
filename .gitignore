@@ -39,3 +39,4 @@ supabase/.temp/
 
 # card simulator runtime state
 agent-cards-db.json
+connect-accounts.json

@@ -133,6 +133,7 @@ export async function createConnectedAccount(owner, { displayName, contactEmail 
       },
     },
     configuration: {
+      // Merchant: lets the account accept card payments.
       merchant: {
         capabilities: {
           card_payments: {
@@ -140,6 +141,10 @@ export async function createConnectedAccount(owner, { displayName, contactEmail 
           },
         },
       },
+      // Customer: lets the account be charged as a customer (subscriptions,
+      // billing portal). Kept in sync with the account-link configurations so
+      // v2/core/account_links accepts ['merchant', 'customer'].
+      customer: {},
     },
   })
   const mapping = saveAccountMapping(owner, account.id, { displayName, contactEmail })
