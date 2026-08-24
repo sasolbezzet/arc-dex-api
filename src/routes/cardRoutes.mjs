@@ -53,6 +53,12 @@ async function authenticatedOwner(req) {
     : null
 }
 
+async function hasFreshPasskey(req) {
+  const rawToken = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '')
+  const { isRecentSession } = await import('../services/vaultStore.mjs')
+  return rawToken.startsWith('arx_vs_') && isRecentSession(rawToken, 120000)
+}
+
 function simulateAmount(value, fallback) {
   if (value === undefined || value === null || value === '') return fallback
   return String(value)
@@ -258,6 +264,7 @@ router.post('/:cardId/status', async (req, res) => {
 })
 
 router.post('/:cardId/spend', async (req, res) => {
+  if (!await hasFreshPasskey(req)) return res.status(401).json({ error: 'Fresh fingerprint/passkey authentication required before merchant payment' })
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
   const merchantId = String(req.body?.merchantId || '').trim()
@@ -278,6 +285,7 @@ router.post('/:cardId/spend', async (req, res) => {
 })
 
 router.post('/:cardId/authorize', async (req, res) => {
+  if (!await hasFreshPasskey(req)) return res.status(401).json({ error: 'Fresh fingerprint/passkey authentication required before merchant authorization' })
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
   const merchantId = String(req.body?.merchantId || '').trim()
@@ -298,6 +306,7 @@ router.post('/:cardId/authorize', async (req, res) => {
 })
 
 router.post('/:cardId/settle', async (req, res) => {
+  if (!await hasFreshPasskey(req)) return res.status(401).json({ error: 'Fresh fingerprint/passkey authentication required before merchant settlement' })
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
   try {
