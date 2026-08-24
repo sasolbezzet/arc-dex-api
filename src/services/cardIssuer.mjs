@@ -32,6 +32,7 @@ function config() {
     lithicBin: String(process.env.LITHIC_BIN || '').trim(),
     stripeKey: String(process.env.STRIPE_SECRET_KEY || '').trim(),
     stripeFunding: String(process.env.STRIPE_FUNDING_ACCOUNT || '').trim(),
+    stripeCardholder: String(process.env.STRIPE_CARDHOLDER_ID || '').trim(),
     webhookPath: '/api/cards/webhook',
     note: 'Adapter over Card Simulator. Provider only touched when CARD_PROVIDER!=simulator.',
   }
@@ -143,11 +144,39 @@ function lithicDriver({ apiKey, bin }) {
 
 function stripeDriver(stripeKey) {
   const basic = `Basic ${Buffer.from(`${stripeKey}:`).toString('base64')}`
+  // Stripe Issuing requires a cardholder when creating a card. In test mode we
+  // create one automatically (dummy US billing) unless STRIPE_CARDHOLDER_ID is
+  // already set in the dashboard.
+  let cachedCardholderId = String(process.env.STRIPE_CARDHOLDER_ID || '').trim()
+  async function ensureCardholder() {
+    if (cachedCardholderId) return cachedCardholderId
+    const ch = await requestJson(STRIPE_BASE, '/v1/issuing/cardholders', {
+      method: 'POST', headers: { Authorization: basic },
+      body: {
+        type: 'individual',
+        name: 'ARCOX Agent',
+        email: 'agent@arcox.test',
+        billing: {
+          address: {
+            line1: '1 Market Street',
+            city: 'San Francisco',
+            state: 'CA',
+            postal_code: '94105',
+            country: 'US',
+          },
+        },
+      },
+    })
+    cachedCardholderId = ch.id
+    return ch.id
+  }
   return {
     provider: 'stripe',
     async issueCard({ label = 'ARCOX Agent Card' } = {}) {
       const funding = config().stripeFunding
-      const body = [['type', 'virtual'], ['status', 'active']]
+      const cardholder = await ensureCardholder()
+      const body = [['type', 'virtual'], ['status', 'active'], ['cardholder', cardholder]]
+      if (label) body.push(['metadata[arcox_label]', label])
       if (funding) body.push(['funding', funding])
       const card = await requestJson(STRIPE_BASE, '/v1/issuing/cards', {
         method: 'POST', headers: { Authorization: basic }, body: Object.fromEntries(body),

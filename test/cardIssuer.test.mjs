@@ -62,6 +62,9 @@ describe('card issuer adapter', () => {
     const calls = []
     globalThis.fetch = async (url, init = {}) => {
       calls.push([url, init])
+      if (String(url).includes('/v1/issuing/cardholders')) {
+        return { ok: true, json: async () => ({ id: 'ich_9' }), text: async () => '' }
+      }
       if (String(url).includes('/v1/issuing/cards')) {
         return { ok: true, json: async () => ({ id: 'ic_77', last4: '4242', exp_month: 8, exp_year: 2030, cvc: '777', number: '4242424242424242' }), text: async () => '' }
       }
@@ -73,7 +76,8 @@ describe('card issuer adapter', () => {
       const card = await issuer.issueCard({})
       assert.equal(card.providerCardId, 'ic_77')  // stub returns id; see stub below
       assert.match(calls[0][1].headers.Authorization, /^Basic /)
-      assert.ok(String(calls[0][0]).includes('api.stripe.com/v1/issuing/cards'))
+      assert.ok(String(calls[0][0]).includes('api.stripe.com/v1/issuing/cardholders'))
+      assert.ok(String(calls[1][0]).includes('api.stripe.com/v1/issuing/cards'))
     } finally {
       delete globalThis.fetch
       delete process.env.CARD_PROVIDER
