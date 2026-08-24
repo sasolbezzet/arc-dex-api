@@ -152,9 +152,13 @@ vault.get('/activity', requireAuth, async (req, res) => {
   // entries. Keep the cap server-side so clients cannot accidentally request
   // the entire financial/audit stream into the browser.
   const limit = Math.min(Number(req.query.limit) || 5, 5)
-  const localActivity = listActivity(req.owner, limit)
-  const read = await readAgentActivity(req.owner, localActivity, limit)
-  res.json({ activity: read.activity, persistenceSource: read.source })
+  const relatedOwners = listRelatedAddresses(req.owner)
+  const localActivity = relatedOwners
+    .flatMap(owner => listActivity(owner, limit))
+    .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
+    .slice(0, limit)
+  const read = await readAgentActivity(relatedOwners, localActivity, limit)
+  res.json({ activity: read.activity, persistenceSource: read.source, ownerScope: 'eoa-and-linked-msca' })
 })
 
 export default vault

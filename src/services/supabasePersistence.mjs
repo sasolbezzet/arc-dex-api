@@ -990,11 +990,18 @@ export function scheduleAgentActivityUpsert(entry) {
 
 export async function readAgentActivity(owner, fallback = [], limit = 5) {
   const safeLimit = Math.min(Math.max(Number(limit) || 5, 1), 5)
-  // Callers normally pass listActivity(), which is already newest-first.
-  const local = Array.isArray(fallback) ? fallback.slice(0, safeLimit) : []
-  if (!enabled || !activityReadPrimary || !isUsableOwner(owner)) return { activity: local, source: 'json', compared: false }
+  const owners = [...new Set((Array.isArray(owner) ? owner : [owner]).map(ownerAddress).filter(isUsableOwner))]
+  // Callers normally pass listActivity(), which is already newest-first. The
+  // owner list lets the EOA Plugin session see Activity written under its
+  // explicitly linked MSCA address as well.
+  const local = Array.isArray(fallback)
+    ? fallback.filter(entry => owners.length === 0 || owners.includes(ownerAddress(entry?.owner))).slice(0, safeLimit)
+    : []
+  if (!enabled || !activityReadPrimary || owners.length === 0) return { activity: local, source: 'json', compared: false }
   try {
-    const { data, error } = await client.from('agent_activity').select('*').eq('owner_address', ownerAddress(owner)).order('occurred_at', { ascending: false }).limit(safeLimit)
+    let query = client.from('agent_activity').select('*')
+    query = owners.length === 1 ? query.eq('owner_address', owners[0]) : query.in('owner_address', owners)
+    const { data, error } = await query.order('occurred_at', { ascending: false }).limit(safeLimit)
     if (error) throw error
     const remoteActivity = (data || []).map(row => ({
       id: String(row?.id || ''),

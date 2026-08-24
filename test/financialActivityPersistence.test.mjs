@@ -28,6 +28,11 @@ test('Agent Activity returns newest five entries only', async () => {
   assert.equal(read.activity.length, 5)
   assert.equal(read.activity[0].type, 'tx_7')
   assert.equal(read.source, 'json')
+
+  const linked = await readAgentActivity([OWNER, '0x2222222222222222222222222222222222222222'], [
+    { id: 'linked_1', owner: '0x2222222222222222222222222222222222222222', type: 'card_payment_settled', data: {}, ts: Date.now() },
+  ], 5)
+  assert.equal(linked.activity[0].type, 'card_payment_settled')
 })
 
 test('approval reads and financial card reads fall back safely when Supabase is disabled', async () => {
