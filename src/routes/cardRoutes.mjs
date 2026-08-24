@@ -27,7 +27,7 @@ import { getIssuer, cardIssuerConfig } from '../services/cardIssuer.mjs'
 
 const router = Router()
 
-async function authenticatedOwner(req) {
+async function authenticatedIdentity(req) {
   const auth = String(req.headers.authorization || '')
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
   let owner = verifyOwnerToken(token)
@@ -38,7 +38,18 @@ async function authenticatedOwner(req) {
   if (!owner) return null
   const { getSessionKeyInfo } = await import('../services/vaultStore.mjs')
   const session = await getSessionKeyInfo(owner)
-  return session?.active ? { owner, walletAddress: String(session.walletAddress).toLowerCase() } : null
+  return {
+    owner,
+    session,
+    walletAddress: session?.walletAddress ? String(session.walletAddress).toLowerCase() : '',
+  }
+}
+
+async function authenticatedOwner(req) {
+  const identity = await authenticatedIdentity(req)
+  return identity?.session?.active && identity.walletAddress
+    ? { owner: identity.owner, walletAddress: identity.walletAddress }
+    : null
 }
 
 function simulateAmount(value, fallback) {
@@ -52,6 +63,21 @@ router.get('/config', (_req, res) => {
 
 router.get('/merchants', (_req, res) => {
   res.json({ ok: true, merchants: listMerchants() })
+})
+
+// Non-mutating preflight used by the Cards UI. A valid wallet login alone is
+// not enough for card operations: balance sync and provisioning must be bound
+// to an active Passkey-authorized MSCA session.
+router.get('/access', async (req, res) => {
+  const identity = await authenticatedIdentity(req)
+  if (!identity) return res.status(401).json({ error: 'Wallet authentication required', active: false })
+  res.json({
+    ok: true,
+    active: identity.session?.active === true,
+    walletAddress: identity.walletAddress || null,
+    statusReason: identity.session?.statusReason || 'setup_required',
+    requiresPasskey: identity.session?.active !== true,
+  })
 })
 
 router.post('/:cardId/provision', async (req, res) => {
