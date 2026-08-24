@@ -586,6 +586,11 @@ export function recordExternalTransaction(tx) {
   if (existing) {
     existing.status = tx.status || existing.status
     existing.settledAt = tx.settledAt || existing.settledAt
+    existing.refundedAt = tx.refundedAt || existing.refundedAt
+    existing.merchantName = tx.merchantName || existing.merchantName
+    existing.category = tx.category || existing.category
+    existing.amount = tx.amount ?? existing.amount
+    existing.provider = tx.provider || existing.provider
     existing.declineReason = tx.declineReason || existing.declineReason
     save(db)
     return { recorded: true, updated: true, tx: existing }
@@ -620,13 +625,20 @@ export function findCardByProvider(providerCardId) {
   return db.cards.find(c => c.providerCardId === providerCardId) || null
 }
 
-export function setProviderCard(owner, cardId, provider, providerCardId, providerPan) {
+export function setProviderCard(owner, cardId, provider, providerCardId, providerPan, details = {}) {
   const db = loadDb()
   const card = db.cards.find(c => c.cardId === cardId && ownerKey(c.owner) === ownerKey(owner))
   if (!card) return null
   card.provider = provider
   card.providerCardId = String(providerCardId || '')
   if (providerPan) card.pan = providerPan
+  // Issuer credentials are returned by Lithic only during provisioning. Keep
+  // the encrypted-at-rest/local JSON model compatible with the existing card
+  // engine, but never expose these values from listCards() without an explicit
+  // authenticated provisioning response.
+  if (details.cvv) card.cvv = String(details.cvv)
+  if (details.expMonth) card.expMonth = String(details.expMonth).padStart(2, '0')
+  if (details.expYear) card.expYear = String(details.expYear)
   save(db)
   return publicCard(card)
 }

@@ -91,18 +91,20 @@ async function requestJson(baseUrl, path, { method = 'GET', headers = {}, body, 
 // Sandbox semantics: api.financial_account is created implicitly; card issuing
 // uses the Account (funding) token; velocity controls go on the card.
 function lithicDriver({ apiKey, bin }) {
-  const auth = { Authorization: `Basic ${Buffer.from(`${apiKey}:`).toString('base64')}` }
+  // Lithic expects the sandbox API key directly in Authorization, not Basic auth.
+  const auth = { Authorization: apiKey, Accept: 'application/json' }
   return {
     provider: 'lithic',
     async issueCard({ label = 'ARCOX Agent Card', spendLimit } = {}) {
-      const account = await requestJson(LITHIC_BASE, '/accounts', {
-        method: 'POST', headers: auth,
-        body: { type: 'operating', name: 'ARCOX Agent Funding' },
-      })
-      const accountToken = account.token
-      const body = { type: 'VIRTUAL', spend_limit_duration: 'TRANSACTION' }
-      if (spendLimit) body.spend_limit = Math.round(Number(spendLimit) * 100) // cents
-      if (bin) body.bin = bin // when the program's BINs are not auto
+      // Lithic creates a virtual card in one request. Account holders and
+      // account_token are optional program-specific features and are not
+      // required for the default sandbox card program.
+      const body = { type: 'VIRTUAL', memo: label }
+      if (spendLimit) {
+        body.spend_limit = Math.round(Number(spendLimit) * 100) // cents
+        body.spend_limit_duration = 'TRANSACTION'
+      }
+      if (bin) body.bin = bin
       const card = await requestJson(LITHIC_BASE, '/cards', { method: 'POST', headers: auth, body })
       return {
         providerCardId: card.token,
@@ -110,7 +112,7 @@ function lithicDriver({ apiKey, bin }) {
         last4: card.last_four,
         expMonth: card.exp_month,
         expYear: card.exp_year,
-        cvv: card.cvc || null,
+        cvv: card.cvv || card.cvc || null,
         status: 'active',
       }
     },
@@ -134,22 +136,36 @@ function lithicDriver({ apiKey, bin }) {
       const cents = Math.round(Number(amountUsdc) * 100)
       return { ok: true, amountCents: cents, note: 'Provider funding configured separately' }
     },
-    parseWebhook(payload) {
-      // Lithic event type field: event.type in [card.created, auth.authorization_created, ...]
-      const type = payload?.type || payload?.event?.type || ''
-      const cardId = payload?.data?.card_token || payload?.card_token || payload?.data?.card?.token || ''
-      const amountCents = Number(payload?.auth?.amount || payload?.data?.amount || 0)
-      const merchant = payload?.auth?.merchant || payload?.merchant || {}
+    parseWebhookEvent(payload) {
+      // Lithic transaction webhooks are transaction-shaped objects. Newer
+      // payloads expose status/card_token/amounts/merchant directly, while
+      // older integrations may wrap them in data or use event.type.
+      const source = payload?.data?.object || payload?.data || payload || {}
+      const type = String(payload?.type || payload?.event?.type || source?.type || source?.status || '')
+      const cardId = source?.card_token || source?.card?.token || source?.card?.card_token || payload?.card_token || ''
+      const amountCandidates = [
+        source?.amounts?.settlement?.amount,
+        source?.amounts?.cardholder?.amount,
+        source?.amounts?.merchant?.amount,
+        source?.settled_amount,
+        source?.amount,
+        source?.authorization_amount,
+        source?.auth?.amount,
+      ]
+      const amountCents = amountCandidates.map(Number).find(Number.isFinite) || 0
+      const merchant = source?.merchant || source?.merchant_data || source?.auth?.merchant || {}
+      const rawStatus = String(source?.status || '').toUpperCase()
+      const normalizedStatus = rawStatus === 'SETTLED' || type.includes('settled') || type.includes('clearing') ? 'settled'
+        : rawStatus === 'DECLINED' || type.includes('decline') ? 'declined'
+        : rawStatus === 'VOIDED' || rawStatus === 'EXPIRED' || type.includes('refund') || type.includes('return') ? 'refunded'
+        : rawStatus === 'PENDING' || type.includes('authorization') ? 'authorized' : 'unknown'
       return {
         eventType: type,
         cardId: cardId || null,
-        amount: String((amountCents / 100).toFixed(6)),
-        merchantName: merchant?.name || merchant?.legal_name || '',
-        category: merchant?.category || '',
-        status: type.includes('authorization') ? 'authorized'
-          : type.includes('settled') ? 'settled'
-          : type.includes('refund') ? 'refunded'
-          : type.includes('decline') ? 'declined' : 'unknown',
+        amount: String((Math.abs(amountCents) / 100).toFixed(6)),
+        merchantName: merchant?.descriptor || merchant?.name || merchant?.legal_name || '',
+        category: merchant?.category || merchant?.mcc || '',
+        status: normalizedStatus,
       }
     },
   }
@@ -196,7 +212,7 @@ function stripeDriver(stripeKey) {
         last4: card.last4,
         expMonth: card.exp_month,
         expYear: card.exp_year,
-        cvv: card.cvc || null,
+        cvv: card.cvv || card.cvc || null,
         status: 'active',
       }
     },
@@ -246,7 +262,7 @@ function stripeDriver(stripeKey) {
 
 export function getIssuer() {
   const cfg = config()
-  if (cfg.provider === 'lithic' && cfg.lithicApiKey) return lithicDriver(cfg.lithicApiKey, cfg.lithicBin)
+  if (cfg.provider === 'lithic' && cfg.lithicApiKey) return lithicDriver({ apiKey: cfg.lithicApiKey, bin: cfg.lithicBin })
   if (cfg.provider === 'stripe' && cfg.stripeKey) return stripeDriver(cfg.stripeKey)
   return {
     provider: 'simulator',

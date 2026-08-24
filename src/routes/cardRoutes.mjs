@@ -63,9 +63,17 @@ router.post('/:cardId/provision', async (req, res) => {
   }
   try {
     const result = await issuer.issueCard({ label: req.body?.label || 'ARCOX Agent Card' })
-    const card = setProviderCard(auth.walletAddress, req.params.cardId, issuer.provider, result.providerCardId, result.pan)
+    const card = setProviderCard(auth.walletAddress, req.params.cardId, issuer.provider, result.providerCardId, result.pan, result)
     if (!card) return res.status(404).json({ error: 'Card not found' })
-    res.json({ ok: true, card: { ...card, pan: result.pan, cvv: result.cvv }, provider: issuer.provider, providerCardId: result.providerCardId })
+    // PAN/CVV are returned only in this authenticated, one-time provisioning
+    // response. Subsequent list/detail endpoints keep them masked by default.
+    res.json({
+      ok: true,
+      card: { ...card, pan: result.pan || card.pan, cvv: result.cvv || null },
+      provider: issuer.provider,
+      providerCardId: result.providerCardId,
+      sensitive: Boolean(result.pan || result.cvv),
+    })
   } catch (error) {
     res.status(error.status || 502).json({ error: error.message })
   }
@@ -140,12 +148,16 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
     const local = findCardByProvider(event.cardId)
     if (!local) return res.status(200).json({ ok: true, ignored: true, reason: 'unknown provider card' })
     recordExternalTransaction({
-      id: payload?.id || payload?.event?.id,
+      // Lithic transaction webhooks use `token` as the stable transaction ID;
+      // keep classic event IDs as a fallback for Stripe/legacy payloads.
+      id: payload?.id || payload?.event?.id || payload?.token || payload?.data?.token || payload?.data?.object?.id,
       cardId: local.cardId,
       merchantName: event.merchantName,
       category: event.category,
       amount: event.amount,
       status: event.status,
+      settledAt: event.status === 'settled' ? (payload?.updated_at || payload?.created_at || new Date().toISOString()) : null,
+      refundedAt: event.status === 'refunded' ? (payload?.updated_at || payload?.created_at || new Date().toISOString()) : null,
       provider: issuer.provider,
     })
     res.json({ ok: true, recorded: true, event: event.eventType })
@@ -163,7 +175,9 @@ router.get('/my-transactions', async (req, res) => {
 router.get('/:cardId', async (req, res) => {
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
-  const card = listCards(auth.walletAddress, { includePan: true }).find(c => c.cardId === req.params.cardId)
+  // Card details remain masked after provisioning. The issuer's PAN/CVV are
+  // intentionally available only in the authenticated provisioning response.
+  const card = listCards(auth.walletAddress).find(c => c.cardId === req.params.cardId)
   if (!card) return res.status(404).json({ error: 'Card not found' })
   res.json({ ok: true, card })
 })

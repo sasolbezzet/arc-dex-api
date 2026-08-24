@@ -47,7 +47,8 @@ describe('card issuer adapter', () => {
       assert.equal(card.providerCardId, 'card_9')
       assert.equal(card.last4, '1111')
       const accountCall = calls.find(c => c[0].includes('/accounts'))
-      assert.match(String(accountCall[1].headers.Authorization), /^Basic /)
+      assert.equal(accountCall, undefined)
+      assert.equal(calls[0][1].headers.Authorization, 'lithic_test_xyz')
       assert.ok(calls.some(c => c[0].includes('/cards')))
     } finally {
       delete globalThis.fetch
@@ -112,6 +113,37 @@ describe('card issuer adapter', () => {
     delete process.env.STRIPE_SECRET_KEY
   })
 
+  test('lithic parser maps transaction-shaped pending and settled webhooks', async () => {
+    process.env.CARD_PROVIDER = 'lithic'
+    process.env.LITHIC_API_KEY = 'lithic_test_xyz'
+    const issuer = getIssuer()
+    const pending = issuer.parseWebhookEvent({
+      token: 'txn_pending',
+      status: 'PENDING',
+      card_token: 'card_lithic_1',
+      amount: 3831,
+      amounts: { hold: { amount: -3831, currency: 'USD' } },
+      merchant: { descriptor: 'ARCOX COFFEE', mcc: '5814' },
+    })
+    assert.equal(pending.cardId, 'card_lithic_1')
+    assert.equal(pending.amount, '38.310000')
+    assert.equal(pending.status, 'authorized')
+    assert.equal(pending.merchantName, 'ARCOX COFFEE')
+    assert.equal(pending.category, '5814')
+
+    const settled = issuer.parseWebhookEvent({
+      token: 'txn_pending',
+      status: 'SETTLED',
+      card_token: 'card_lithic_1',
+      amounts: { settlement: { amount: -3831, currency: 'USD' } },
+      merchant: { descriptor: 'ARCOX COFFEE', mcc: '5814' },
+    })
+    assert.equal(settled.amount, '38.310000')
+    assert.equal(settled.status, 'settled')
+    delete process.env.CARD_PROVIDER
+    delete process.env.LITHIC_API_KEY
+  })
+
   test('webhook-injected issuer tx appears in simulator timeline', async () => {
     process.env.CARD_PROVIDER = 'lithic'
     process.env.LITHIC_API_KEY = 'k'
@@ -127,8 +159,24 @@ describe('card issuer adapter', () => {
       status: 'authorized',
     })
     assert.equal(rec.recorded, true)
+    const settled = sim.recordExternalTransaction({
+      id: 'evt_1',
+      cardId: card.cardId,
+      merchantName: 'Lithic E2E Merchant',
+      category: '5814',
+      amount: '38.31',
+      status: 'settled',
+      settledAt: '2026-08-24T04:49:02.000Z',
+      provider: 'lithic',
+    })
+    assert.equal(settled.updated, true)
     const txs = sim.listCardTransactions(owner, card.cardId)
-    assert.ok(txs.some(t => t.merchantName === 'Stripe Test Merchant'))
+    assert.equal(txs.length, 1)
+    assert.equal(txs[0].status, 'settled')
+    assert.equal(txs[0].amount, '38.31')
+    assert.equal(txs[0].merchantName, 'Lithic E2E Merchant')
+    assert.equal(txs[0].provider, 'lithic')
+    assert.equal(txs[0].settledAt, '2026-08-24T04:49:02.000Z')
     // provider matching
     const found = sim.findCardByProvider('card_webhook_1')
     assert.equal(found?.cardId, card.cardId)
