@@ -25,6 +25,7 @@ import x402Routes from './src/routes/x402Routes.mjs'
 import aiRouterRoutes, { openAiChatCompletions, openAiModels } from './src/routes/aiRouterRoutes.mjs'
 import vaultRoutes from './src/routes/vaultRoutes.mjs'
 import cardRoutes from './src/routes/cardRoutes.mjs'
+import connectRoutes from './src/routes/connectRoutes.mjs'
 import { oauthMetadataHandler, protectedResourceHandler, oauthAuthorizeHandler, siweMessageHandler, siweVerifyHandler, oauthTokenHandler, oauthRegisterHandler, mcpHttpHandler } from './src/services/mcpServer.mjs'
 import { estimateUnifiedBalanceX402, getX402Invoice, markUnifiedBalanceSpendSubmitted, processCircleX402Webhook, publicInvoice, reconcileX402Invoice, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
 import { paymentLogMatches } from './src/services/invoiceVerify.mjs'
@@ -118,6 +119,7 @@ app.use('/api/intel', apiLimiter, arkhamRoutes)
 app.use('/api/treasury', apiLimiter, treasuryRoutes)
 app.use('/api/x402', apiLimiter, x402Routes)
 app.use('/api/cards', apiLimiter, cardRoutes)
+app.use('/api/connect', apiLimiter, connectRoutes)
 app.use('/api/ai-router', apiLimiter, aiRouterRoutes)
 app.use('/api/vault', vaultLimiter, vaultRoutes)
 
