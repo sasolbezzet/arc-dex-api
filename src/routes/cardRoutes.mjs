@@ -11,6 +11,7 @@ import {
   getOwnerBalance,
   syncCardBalance,
   listCards,
+  getCard,
   createCard,
   updateCardLimits,
   setCardStatus,
@@ -91,14 +92,15 @@ router.post('/:cardId/provision', async (req, res) => {
     const result = await issuer.issueCard({ label: req.body?.label || 'ARCOX Agent Card' })
     const card = setProviderCard(auth.walletAddress, req.params.cardId, issuer.provider, result.providerCardId, result.pan, result)
     if (!card) return res.status(404).json({ error: 'Card not found' })
-    // PAN/CVV are returned only in this authenticated, one-time provisioning
-    // response. Subsequent list/detail endpoints keep them masked by default.
+    // Never return PAN/CVV from provisioning. The card remains masked until
+    // the owner completes a fresh biometric/passkey assertion at /reveal.
+    res.setHeader('Cache-Control', 'no-store')
     res.json({
       ok: true,
-      card: { ...card, pan: result.pan || card.pan, cvv: result.cvv || null },
+      card,
       provider: issuer.provider,
       providerCardId: result.providerCardId,
-      sensitive: Boolean(result.pan || result.cvv),
+      sensitive: false,
     })
   } catch (error) {
     res.status(error.status || 502).json({ error: error.message })
@@ -154,7 +156,9 @@ router.post('/', async (req, res) => {
       monthlyLimit: simulateAmount(req.body?.monthlyLimit, undefined),
       blockedCategories: Array.isArray(req.body?.blockedCategories) ? req.body.blockedCategories : [],
     })
-    res.json({ ok: true, card })
+    // Creation only returns a masked record. Full PAN/CVV requires the
+    // separate fingerprint/passkey-gated reveal flow below.
+    res.json({ ok: true, card: getCard(auth.walletAddress, card.cardId) })
   } catch (error) {
     res.status(error.statusCode || 400).json({ error: error.message })
   }
@@ -198,11 +202,30 @@ router.get('/my-transactions', async (req, res) => {
   res.json({ ok: true, transactions: listCardTransactions(auth.walletAddress) })
 })
 
+router.get('/:cardId/reveal', async (req, res) => {
+  const rawToken = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '')
+  // The browser performs a fresh WebAuthn assertion (fingerprint, Face ID,
+  // Windows Hello, or security key) before calling this endpoint. Require the
+  // resulting short-lived vault session as well as the active MSCA binding;
+  // an old stored token can never reveal PAN/CVV by itself.
+  const { isRecentSession } = await import('../services/vaultStore.mjs')
+  if (!rawToken.startsWith('arx_vs_') || !isRecentSession(rawToken, 120000)) {
+    return res.status(401).json({ error: 'Fresh fingerprint/passkey authentication required' })
+  }
+  const auth = await authenticatedOwner(req)
+  if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
+  const card = getCard(auth.walletAddress, req.params.cardId, { includePan: true })
+  if (!card) return res.status(404).json({ error: 'Card not found' })
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('Pragma', 'no-cache')
+  res.json({ ok: true, sensitive: true, card })
+})
+
 router.get('/:cardId', async (req, res) => {
   const auth = await authenticatedOwner(req)
   if (!auth) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
-  // Card details remain masked after provisioning. The issuer's PAN/CVV are
-  // intentionally available only in the authenticated provisioning response.
+  // Card details remain masked after provisioning. Full PAN/CVV is available
+  // only through the fresh fingerprint/passkey reveal endpoint above.
   const card = listCards(auth.walletAddress).find(c => c.cardId === req.params.cardId)
   if (!card) return res.status(404).json({ error: 'Card not found' })
   res.json({ ok: true, card })

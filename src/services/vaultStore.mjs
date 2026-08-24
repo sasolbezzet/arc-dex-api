@@ -32,9 +32,22 @@ const sessionTokens = loadSessions() // token -> { userId, expires }
 
 export function createSession(userId) {
   const token = 'arx_vs_' + randomUUID().replace(/-/g, '')
-  sessionTokens.set(token, { userId, expires: Date.now() + SESSION_TTL_MS })
+  const createdAt = Date.now()
+  sessionTokens.set(token, { userId, createdAt, expires: createdAt + SESSION_TTL_MS })
   persistSessions(sessionTokens)
   return token
+}
+
+export function isRecentSession(token, maxAgeMs = 120000) {
+  const session = sessionTokens.get(token)
+  if (!session) return false
+  const now = Date.now()
+  if (now > session.expires) {
+    sessionTokens.delete(token)
+    persistSessions(sessionTokens)
+    return false
+  }
+  return now - Number(session.createdAt || 0) <= maxAgeMs
 }
 
 export function validateSession(token) {

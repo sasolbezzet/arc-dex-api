@@ -8,10 +8,13 @@ async function withVault(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-vault-test-'))
   const previousVault = process.env.VAULT_PATH
   const previousActivity = process.env.VAULT_ACTIVITY_PATH
+  const previousSession = process.env.VAULT_SESSION_PATH
   process.env.VAULT_PATH = join(dir, 'vault.json')
   process.env.VAULT_ACTIVITY_PATH = join(dir, 'activity.json')
+  process.env.VAULT_SESSION_PATH = join(dir, 'sessions.json')
   await writeFile(process.env.VAULT_PATH, JSON.stringify({ credentials: [], limits: {}, approvals: [] }), 'utf8')
   await writeFile(process.env.VAULT_ACTIVITY_PATH, '[]', 'utf8')
+  await writeFile(process.env.VAULT_SESSION_PATH, JSON.stringify({ tokens: {} }), 'utf8')
   try {
     const store = await import('../src/services/vaultStore.mjs?vault-test-' + Date.now() + '-' + Math.random())
     return await fn(store)
@@ -20,6 +23,8 @@ async function withVault(fn) {
     else process.env.VAULT_PATH = previousVault
     if (previousActivity === undefined) delete process.env.VAULT_ACTIVITY_PATH
     else process.env.VAULT_ACTIVITY_PATH = previousActivity
+    if (previousSession === undefined) delete process.env.VAULT_SESSION_PATH
+    else process.env.VAULT_SESSION_PATH = previousSession
     await rm(dir, { recursive: true, force: true })
   }
 }
@@ -41,6 +46,15 @@ test('vault credential registration is idempotent and legacy duplicates can be c
     const result = deduplicateCredentials(owner)
     assert.equal(result.removed, 1)
     assert.equal(result.credentials.length, 1)
+  })
+})
+
+test('fresh passkey session is required for card-detail reveal', async () => {
+  await withVault(async ({ createSession, validateSession, isRecentSession }) => {
+    const token = createSession('0xowner')
+    assert.equal(validateSession(token), '0xowner')
+    assert.equal(isRecentSession(token), true)
+    assert.equal(isRecentSession('arx_vs_missing'), false)
   })
 })
 
