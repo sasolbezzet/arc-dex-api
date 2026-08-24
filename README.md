@@ -181,7 +181,7 @@ X402_USDC_ADDRESS=0x3600000000000000000000000000000000000000
 X402_BASE_AMOUNT=0.005
 X402_PAYMENT_TTL_SECONDS=300
 X402_RECONCILE_LOOKBACK_BLOCKS=8000
-ARC_RPC_URL=https://rpc.testnet.arc.network
+ARC_RPC_URL=https://rpc.testnet.arc.io
 CIRCLE_X402_TREASURY_WALLET_ID=
 CIRCLE_X402_NETWORK=arc-testnet
 ARC_MEMO_CONTRACT=0x5294E9927c3306DcBaDb03fe70b92e01cCede505
@@ -213,7 +213,7 @@ yang sudah ter-deploy menyimpan treasury on-chain; owner juga harus memanggil
 
 Catatan teknis:
 
-- RPC publik `rpc.testnet.arc.network` adalah fallback yang sinkron. Production backend dan local agent dapat memakai RPC Canteen melalui environment lokal (`arc-canteen rpc-url`); jangan commit URL bertoken ke repository.
+- RPC publik `rpc.testnet.arc.io` adalah fallback yang sinkron (RPC resmi sesuai docs.arc.io). Production backend dan local agent dapat memakai RPC Canteen melalui environment lokal (`arc-canteen rpc-url`); jangan commit URL bertoken ke repository.
 - `eth_getLogs` pada RPC Canteen memiliki batas parameter/ukuran respons yang lebih ketat daripada RPC publik. Semua scan Arc memakai chunk konservatif 2,000 block agar tidak gagal `-32602` atau response-size limit.
 - Invoice yang sudah `expired` tetap di-reconcile jika ada bukti pembayaran on-chain (memo atau Gateway). Ini mencegah dana terkunci saat TTL 300 detik berlalu sebelum reconcile sempat berjalan.
 - PM2 membutuhkan `--update-env` setelah mengubah `.env` agar env baru dimuat. Tanpa ini, process restart dengan env lama.

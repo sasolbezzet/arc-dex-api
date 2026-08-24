@@ -55,7 +55,7 @@ export function usdcUnitsToHuman(units) {
 export async function executeArcTransfer(walletAddress, { to, amountUnits } = {}) {
   const fake = String(process.env.CARDS_FAKE_TRANSFER || '').trim()
   if (fake === 'true') {
-    return { status: 'success', txHash: '0xfake'.padEnd(66, 'f'), explorerUrl: 'https://explorer.testnet.arc.network/tx/fake' }
+    return { status: 'success', txHash: '0xfake'.padEnd(66, 'f'), explorerUrl: 'https://testnet.arcscan.app/tx/fake' }
   }
   const { executeViaSession } = await import('./sessionKeyService.mjs')
   const result = await executeViaSession(walletAddress, [{

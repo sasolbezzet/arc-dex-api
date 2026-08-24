@@ -1,7 +1,9 @@
 import { existsSync, readFileSync } from 'fs'
 import { homedir } from 'os'
 
-export const PUBLIC_ARC_RPC = 'https://rpc.testnet.arc.network'
+// Official public Arc Testnet RPC (docs.arc.io). Kept in sync with the
+// frontend (domain/arcNetwork.ts) which migrated to this endpoint.
+export const PUBLIC_ARC_RPC = 'https://rpc.testnet.arc.io'
 export const DRPC_ARC_RPC = 'https://arc-testnet.drpc.org'
 // Canteen rejects the public-RPC 8k log window and can hit its response-size
 // limit sooner when a high-volume ERC-20 event is queried. Keep all Arc scans
