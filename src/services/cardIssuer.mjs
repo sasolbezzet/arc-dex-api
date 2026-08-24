@@ -43,15 +43,28 @@ function maskPan(value) {
   return String(value || '').replace(/\d(?=\d{4})/g, '•')
 }
 
-async function requestJson(baseUrl, path, { method = 'GET', headers = {}, body } = {}) {
+async function requestJson(baseUrl, path, { method = 'GET', headers = {}, body, form = false } = {}) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), Number(process.env.CARD_ISSUER_TIMEOUT_MS || 8_000))
+  let payload
+  let contentType = 'application/json'
+  if (form && body !== undefined) {
+    // Stripe's API only accepts application/x-www-form-urlencoded for writes.
+    const params = new URLSearchParams()
+    for (const [k, v] of Object.entries(body)) {
+      if (v !== undefined && v !== null) params.append(k, v)
+    }
+    payload = params.toString()
+    contentType = 'application/x-www-form-urlencoded'
+  } else if (body !== undefined) {
+    payload = JSON.stringify(body)
+  }
   try {
     const resp = await fetch(`${baseUrl}${path}`, {
       method,
       signal: controller.signal,
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'arcox-api/2.0', ...headers },
-      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      headers: { 'Content-Type': contentType, 'User-Agent': 'arcox-api/2.0', ...headers },
+      ...(payload !== undefined ? { body: payload } : {}),
     })
     const text = await resp.text()
     let data = {}
@@ -151,20 +164,16 @@ function stripeDriver(stripeKey) {
   async function ensureCardholder() {
     if (cachedCardholderId) return cachedCardholderId
     const ch = await requestJson(STRIPE_BASE, '/v1/issuing/cardholders', {
-      method: 'POST', headers: { Authorization: basic },
+      method: 'POST', headers: { Authorization: basic }, form: true,
       body: {
         type: 'individual',
         name: 'ARCOX Agent',
         email: 'agent@arcox.test',
-        billing: {
-          address: {
-            line1: '1 Market Street',
-            city: 'San Francisco',
-            state: 'CA',
-            postal_code: '94105',
-            country: 'US',
-          },
-        },
+        'billing[address][line1]': '1 Market Street',
+        'billing[address][city]': 'San Francisco',
+        'billing[address][state]': 'CA',
+        'billing[address][postal_code]': '94105',
+        'billing[address][country]': 'US',
       },
     })
     cachedCardholderId = ch.id
@@ -179,7 +188,7 @@ function stripeDriver(stripeKey) {
       if (label) body.push(['metadata[arcox_label]', label])
       if (funding) body.push(['funding', funding])
       const card = await requestJson(STRIPE_BASE, '/v1/issuing/cards', {
-        method: 'POST', headers: { Authorization: basic }, body: Object.fromEntries(body),
+        method: 'POST', headers: { Authorization: basic }, form: true, body: Object.fromEntries(body),
       })
       return {
         providerCardId: card.id,
@@ -194,11 +203,11 @@ function stripeDriver(stripeKey) {
     async setCard(cardToken, { perTxLimit, dailyLimit }) {
       const body = {}
       if (perTxLimit) body.spending_controls = JSON.stringify({ monthly_limit: Math.round(Number(perTxLimit) * 100) })
-      return requestJson(STRIPE_BASE, `/v1/issuing/cards/${cardToken}`, { method: 'POST', headers: { Authorization: basic }, body })
+      return requestJson(STRIPE_BASE, `/v1/issuing/cards/${cardToken}`, { method: 'POST', headers: { Authorization: basic }, form: true, body })
     },
     async freeze(cardToken, frozen = true) {
       const form = new URLSearchParams({ status: frozen ? 'paused' : 'active' })
-      return requestJson(STRIPE_BASE, `/v1/issuing/cards/${cardToken}`, { method: 'POST', headers: { Authorization: basic }, body: Object.fromEntries(form) })
+      return requestJson(STRIPE_BASE, `/v1/issuing/cards/${cardToken}`, { method: 'POST', headers: { Authorization: basic }, form: true, body: Object.fromEntries(form) })
     },
     async getCard(cardToken) {
       return requestJson(STRIPE_BASE, `/v1/issuing/cards/${cardToken}`, { headers: { Authorization: basic } })
@@ -254,11 +263,11 @@ export function getIssuer() {
 
 export function cardIssuerConfig() {
   const cfg = config()
-  const active = (cfg.provider !== 'simulator') && (cfg.lithicKey || cfg.stripeKey)
+  const active = (cfg.provider !== 'simulator') && Boolean(cfg.lithicApiKey || cfg.stripeKey)
   return {
     provider: active ? cfg.provider : 'simulator',
     configured: active,
-    lithicSandbox: Boolean(cfg.lithicKey),
+    lithicSandbox: Boolean(cfg.lithicApiKey),
     stripeTestMode: Boolean(cfg.stripeKey),
     simulator: !active,
     note: 'Real issuer active only when CARD_PROVIDER matches and keys are present.',
