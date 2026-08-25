@@ -2,7 +2,7 @@
 // Streamable HTTP transport + OAuth 2.1 with SIWE wallet auth
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
-import { randomUUID, createHash } from 'crypto'
+import { randomUUID, createHash, randomBytes } from 'crypto'
 import { z } from 'zod'
 import { readFileSync, existsSync, writeFileSync, mkdirSync, rmSync, statSync } from 'fs'
 import { dirname } from 'path'
@@ -19,6 +19,10 @@ const refreshTokens = new Map() // refresh token -> { userId, clientId, resource
 // A pending destination UserOperation must remain discoverable until its
 // receipt is known; a plain Set would lose the hash on timeout/restart.
 const destinationMintLocks = new Map()
+// RFC 8628 device authorization grants: deviceCode -> grant record.
+// Lets headless MCP clients (Hermes on a VPS) pair through a short user code
+// entered at /activate, without any loopback redirect or tunnel.
+const deviceGrants = new Map()
 
 // MCP responses may include decoded CCTP uint256 fields represented as BigInt.
 // Always serialize them as decimal strings so direct handler execution and
@@ -65,6 +69,7 @@ function loadOAuthState() {
     requests: state?.requests && typeof state.requests === 'object' ? state.requests : {},
     challenges: state?.challenges && typeof state.challenges === 'object' ? state.challenges : {},
     codes: state?.codes && typeof state.codes === 'object' ? state.codes : {},
+    deviceGrants: state?.deviceGrants && typeof state.deviceGrants === 'object' ? state.deviceGrants : {},
   }
 }
 function refreshOAuthState() {
@@ -77,6 +82,13 @@ function refreshOAuthState() {
   for (const [key, value] of Object.entries(state.codes)) authCodes.set(key, value)
   for (const [key, value] of Object.entries(state.requests)) oauthRequests.set(key, value)
   for (const [key, value] of Object.entries(state.challenges)) siweChallenges.set(key, value)
+  // Disk is authoritative for device grants too: the token poll may land on a
+  // different worker than the one that created the grant or recorded approval.
+  const nowMs = Date.now()
+  deviceGrants.clear()
+  for (const [key, value] of Object.entries(state.deviceGrants)) {
+    if (value?.expires > nowMs) deviceGrants.set(key, value)
+  }
   return state
 }
 function refreshOAuthClients() {
@@ -90,6 +102,7 @@ function saveOAuthState() {
     codes: Object.fromEntries(authCodes),
     requests: Object.fromEntries(oauthRequests),
     challenges: Object.fromEntries(siweChallenges),
+    deviceGrants: Object.fromEntries(deviceGrants),
   })
   // Supabase receives only hashed, expiring metadata for diagnostics. The
   // local file plus lock remains authoritative for PKCE/code consumption and
@@ -338,6 +351,7 @@ const _authSweep = setInterval(() => {
       for (const [code, v] of authCodes) if (now > v.expires) authCodes.delete(code)
       for (const [requestId, v] of oauthRequests) if (now > v.expires) oauthRequests.delete(requestId)
       for (const [nonce, v] of siweChallenges) if (now > v.expires) siweChallenges.delete(nonce)
+      for (const [code, v] of deviceGrants) if (now > v.expires) deviceGrants.delete(code)
       saveOAuthState()
       // Token cleanup shares the OAuth lock, so a sweep cannot overwrite a
       // token issued concurrently by another worker.
@@ -364,6 +378,7 @@ export function resolveAgentName(clientId) {
   const name = (client?.clientName || '').toLowerCase()
   if (name.includes('claude')) return 'claude-mcp'
   if (name.includes('chatgpt') || name.includes('openai') || name.includes('gpt')) return 'chatgpt-mcp'
+  if (name.includes('hermes')) return 'hermes-mcp'
   // Unknown client — return the registered name if any, else generic.
   return client?.clientName || 'mcp-agent'
 }
@@ -377,7 +392,10 @@ export function oauthMetadataHandler(req, res) {
     registration_endpoint: `${SERVER_URL}/api/auth/register`,
     jwks_uri: `${SERVER_URL}/.well-known/jwks.json`,
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code', 'refresh_token'],
+    grant_types_supported: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'],
+    // RFC 8628: headless MCP clients (Hermes on a VPS) pair through a short
+    // user code entered at /activate instead of a loopback redirect.
+    device_authorization_endpoint: `${SERVER_URL}/api/auth/device/authorize`,
     token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
     code_challenge_methods_supported: ['S256'],
     resource_indicators_supported: true,
@@ -607,7 +625,258 @@ export function oauthTokenHandler(req, res) {
     if (result.error) return res.status(400).json(result)
     return res.json(result)
   }
+  if (grant_type === 'urn:ietf:params:oauth:grant-type:device_code') {
+    const { device_code } = req.body || {}
+    let result
+    try {
+      result = exchangeDeviceCodeForToken(device_code, client_id)
+    } catch (error) {
+      return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+    }
+    // RFC 8628 pending/slow_down responses use HTTP 400 with the error code.
+    if (result.error) return res.status(400).json(result)
+    return res.json(result)
+  }
   res.status(400).json({ error: 'unsupported_grant_type' })
+}
+
+// ── RFC 8628 Device Authorization Grant ──
+// Flow: client POSTs to /api/auth/device/authorize → user opens /activate on
+// any device, enters the short user_code, completes SIWE + Passkey MSCA
+// binding → client polls /api/auth/token with grant_type=device_code until the
+// grant is approved. No loopback redirect, no tunnel, no domain needed.
+const DEVICE_GRANT_TTL_MS = 10 * 60 * 1000 // user codes expire after 10 minutes
+const DEVICE_POLL_INTERVAL_MS = 5 * 1000
+const DEVICE_USER_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // no I/O/0/1 ambiguity
+
+function generateDeviceUserCode() {
+  const bytes = randomBytes(8)
+  let out = ''
+  for (let i = 0; i < 6; i++) out += DEVICE_USER_CODE_ALPHABET[bytes[i] % DEVICE_USER_CODE_ALPHABET.length]
+  return `ARCX-${out.slice(0, 3)}-${out.slice(3)}`
+}
+
+function normalizeUserCode(value) {
+  return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+}
+
+function findDeviceGrantByUserCode(userCode) {
+  const needle = normalizeUserCode(userCode)
+  if (!needle) return null
+  for (const [, grant] of deviceGrants) {
+    if (normalizeUserCode(grant.userCode) === needle && Date.now() <= grant.expires && grant.status === 'pending') return grant
+  }
+  return null
+}
+
+export function deviceAuthorizeHandler(req, res) {
+  const { client_id, client_name } = req.body || {}
+  refreshOAuthClients()
+  let clientId = ''
+  if (client_id && oauthClients.get(String(client_id))) {
+    clientId = String(client_id)
+  } else {
+    // Headless clients may skip dynamic registration because they never need a
+    // redirect URI. Issue them a stable internal client bound to this flow so
+    // issued tokens still carry a real clientId for revocation/audit.
+    clientId = 'arcox_device_flow'
+    if (!oauthClients.get(clientId)) {
+      try {
+        withOAuthStateLock(() => {
+          refreshOAuthClients()
+          if (!oauthClients.get(clientId)) {
+            oauthClients.set(clientId, { clientSecret: randomUUID(), redirectUris: [`${SERVER_URL}/activate`], clientName: String(client_name || 'Hermes Agent').slice(0, 64) })
+            saveClients(oauthClients)
+          }
+        })
+      } catch { /* fall through; client existence is re-checked below */ }
+      refreshOAuthClients()
+    }
+  }
+  const deviceCode = 'arx_dc_' + randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')
+  const userCode = generateDeviceUserCode()
+  const grant = {
+    deviceCode,
+    userCode,
+    clientId,
+    clientName: String(client_name || oauthClients.get(clientId)?.clientName || 'MCP Agent').slice(0, 64),
+    status: 'pending',
+    userId: '',
+    mscaWalletAddress: '',
+    attempts: 0,
+    lastPoll: 0,
+    createdAt: Date.now(),
+    expires: Date.now() + DEVICE_GRANT_TTL_MS,
+  }
+  try {
+    withOAuthStateLock(() => {
+      deviceGrants.set(deviceCode, grant)
+      saveOAuthState()
+    })
+  } catch (error) {
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
+  // RFC 8628 §3.2 response.
+  res.json({
+    device_code: deviceCode,
+    user_code: userCode,
+    verification_uri: `${SERVER_URL}/activate`,
+    verification_uri_complete: `${SERVER_URL}/arc-dex/plugin?auth=device&user_code=${encodeURIComponent(userCode)}`,
+    expires_in: Math.round(DEVICE_GRANT_TTL_MS / 1000),
+    interval: Math.round(DEVICE_POLL_INTERVAL_MS / 1000),
+  })
+}
+
+// Lightweight lookup for the /activate page: shows which agent is asking
+// before the user proves anything. Exposes only the registered client name.
+export function deviceStatusHandler(req, res) {
+  try {
+    withOAuthStateLock(() => { refreshOAuthState() })
+  } catch { /* stale cache is acceptable for a read-only status probe */ }
+  const grant = findDeviceGrantByUserCode(req.query?.user_code)
+  if (!grant) return res.status(404).json({ error: 'invalid_user_code', message: 'Kode tidak dikenal atau sudah kedaluwarsa' })
+  res.json({ status: grant.status, clientName: grant.clientName, expiresIn: Math.max(0, Math.round((grant.expires - Date.now()) / 1000)) })
+}
+
+// SIWE challenge for device approval. Mirrors siweMessageHandler bindings but
+// keys off the device grant instead of an authorization_request record.
+export function deviceMessageHandler(req, res) {
+  const { address, user_code } = req.body || {}
+  if (!address || !user_code) return res.status(400).json({ error: 'missing_fields' })
+  let result
+  try {
+    result = withOAuthStateLock(() => {
+      refreshOAuthState()
+      const grant = findDeviceGrantByUserCode(user_code)
+      if (!grant) return { error: 'invalid_user_code' }
+      const nonce = randomUUID().slice(0, 8)
+      const message = `${CANONICAL_SERVER_HOST} wants you to sign in with your Ethereum account:\n${address}\n\nAuthorize ARCOX agent "${grant.clientName}" via device code ${grant.userCode}\n\nURI: ${SERVER_URL}\nVersion: 1\nChain ID: 5042002\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`
+      siweChallenges.set(nonce, {
+        address: String(address).toLowerCase(),
+        clientId: grant.clientId,
+        requestId: `device:${grant.deviceCode}`,
+        message,
+        expires: Date.now() + 300000,
+      })
+      saveOAuthState()
+      return { message, nonce }
+    })
+  } catch (error) {
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
+  if (result.error) return res.status(404).json(result)
+  res.json(result)
+}
+
+// Approve (or deny) a pending device grant from the /activate page. The same
+// identity rules as the loopback OAuth consent apply: the browser must prove
+// EOA control via SIWE signature, and any selected Agent Wallet must be proven
+// with an active passkey session token before it can be bound to the grant.
+export async function deviceApproveHandler(req, res) {
+  const { address, message, signature, user_code, mscaWalletAddress, mscaSessionToken, approve } = req.body || {}
+  if (!address || !message || !signature || !user_code) return res.status(400).json({ error: 'missing_fields' })
+  if (approve === false) {
+    try {
+      withOAuthStateLock(() => {
+        refreshOAuthState()
+        const grant = findDeviceGrantByUserCode(user_code)
+        if (grant) { grant.status = 'denied'; saveOAuthState() }
+      })
+    } catch { /* denial best-effort */ }
+    return res.json({ ok: true, denied: true })
+  }
+
+  let initial
+  try {
+    initial = withOAuthStateLock(() => {
+      refreshOAuthState()
+      const grant = findDeviceGrantByUserCode(user_code)
+      if (!grant) return { error: 'invalid_user_code' }
+      const nonceMatch = String(message).match(/\nNonce: ([^\n]+)\n/)
+      const challenge = nonceMatch ? siweChallenges.get(nonceMatch[1]) : null
+      if (!challenge || Date.now() > challenge.expires || challenge.consumed || challenge.requestId !== `device:${grant.deviceCode}` || challenge.address !== String(address).toLowerCase() || challenge.message !== message) return { error: 'invalid_or_expired_siwe_challenge' }
+      return { nonce: nonceMatch[1], grant }
+    })
+  } catch (error) {
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
+  if (initial.error) return res.status(400).json(initial)
+
+  try {
+    const valid = await verifyMessage({ address, message, signature })
+    if (!valid) return res.status(401).json({ error: 'invalid_signature' })
+  } catch {
+    return res.status(401).json({ error: 'signature_verification_failed' })
+  }
+
+  // Identical binding rule to the loopback flow: without a passkey-proven
+  // active MSCA session, no Agent Wallet is bound (protocol test path).
+  const binding = await bindMcpIdentityToActiveSession({
+    userId: String(address).toLowerCase(),
+    mscaWalletAddress,
+    mscaSessionToken,
+  })
+  if (!binding.ok) return res.status(403).json({ error: 'session_identity_binding_failed', error_description: binding.error })
+
+  try {
+    withOAuthStateLock(() => {
+      refreshOAuthState()
+      const grant = deviceGrants.get(initial.grant.deviceCode)
+      const challenge = siweChallenges.get(initial.nonce)
+      if (!grant || grant.status !== 'pending' || !challenge || challenge.consumed || Date.now() > grant.expires) throw Object.assign(new Error('invalid_or_expired_device_grant'), { code: 'invalid_grant' })
+      grant.status = 'approved'
+      grant.userId = String(address).toLowerCase()
+      grant.mscaWalletAddress = mscaWalletAddress || ''
+      challenge.completedCode = `device:${grant.deviceCode}`
+      saveOAuthState()
+    })
+  } catch (error) {
+    if (error?.code === 'invalid_grant') return res.status(400).json({ error: 'invalid_grant', error_description: error.message })
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
+  res.json({ ok: true, approved: true })
+}
+
+// Token poll for an approved device grant. Enforces the RFC 8628 polling
+// interval (authorization_pending / slow_down) and consumes the grant exactly
+// once before issuing the same access+refresh token pair as the code exchange.
+export function exchangeDeviceCodeForToken(deviceCode, clientId) {
+  return withOAuthStateLock(() => {
+    refreshOAuthState()
+    refreshOAuthClients()
+    const grant = deviceGrants.get(String(deviceCode || ''))
+    if (!grant) return { error: 'invalid_grant', error_description: 'Invalid device_code' }
+    if (Date.now() > grant.expires) {
+      deviceGrants.delete(grant.deviceCode)
+      saveOAuthState()
+      return { error: 'expired_token', error_description: 'Device code expired; start pairing again' }
+    }
+    if (clientId && grant.clientId !== String(clientId)) return { error: 'invalid_grant', error_description: 'client_id mismatch' }
+    if (grant.status === 'denied') return { error: 'access_denied', error_description: 'User denied the request' }
+    if (grant.status === 'pending') {
+      const sincePoll = Date.now() - Number(grant.lastPoll || 0)
+      grant.lastPoll = Date.now()
+      saveOAuthState()
+      if (Number(grant.lastPoll) - sincePoll < DEVICE_POLL_INTERVAL_MS && sincePoll < DEVICE_POLL_INTERVAL_MS) {
+        return { error: 'slow_down', error_description: 'Poll faster than allowed interval' }
+      }
+      return { error: 'authorization_pending', error_description: 'User has not yet approved the code' }
+    }
+    if (grant.status !== 'approved') return { error: 'invalid_grant', error_description: 'Device grant not approvable' }
+    if (grant.consumed) return { error: 'invalid_grant', error_description: 'Device code already used' }
+    const client = oauthClients.get(grant.clientId)
+    if (!client) return { error: 'invalid_client', error_description: 'Unknown client_id' }
+    // Persist single-use consumption before returning tokens.
+    grant.consumed = true
+    saveOAuthState()
+    refreshAccessTokens()
+    const token = 'arx_at_' + randomUUID().replace(/-/g, '')
+    const refreshToken = 'arx_rt_' + randomUUID().replace(/-/g, '')
+    accessTokens.set(token, { userId: grant.userId, clientId: grant.clientId, resource: MCP_RESOURCE_URL, mscaWalletAddress: grant.mscaWalletAddress || '', expires: Date.now() + TOKEN_TTL * 1000 })
+    refreshTokens.set(refreshToken, { userId: grant.userId, clientId: grant.clientId, resource: MCP_RESOURCE_URL, mscaWalletAddress: grant.mscaWalletAddress || '', expires: Date.now() + REFRESH_TOKEN_TTL_MS })
+    saveTokens()
+    return { access_token: token, token_type: 'Bearer', expires_in: TOKEN_TTL, refresh_token: refreshToken, scope: 'mcp:tools' }
+  })
 }
 
 // ── Dynamic Client Registration ──
@@ -3375,7 +3644,7 @@ export function createMcpServer(userId, context = {}) {
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol. Default USDC'),
     fromChain: z.string().describe('Source chain (for example arc-testnet or base-sepolia). Required.'),
-    source: z.string().optional().describe('session'),
+    source: z.string().optional().describe('session (MSCA Agent Wallet)'),
   }, async (params) => {
     const token = String(params.token || 'USDC').toUpperCase()
     const src = params.source || 'session'
@@ -3412,7 +3681,7 @@ export function createMcpServer(userId, context = {}) {
       note: 'Send via Agent Wallet (MSCA/session key): chain wajib eksplisit dan session chain authorization harus aktif.',
       previewId: q.previewId,
       expiresAt: new Date(q.expires).toISOString(),
-      safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_send dengan fromChain, source=session, confirmed=true.',
+      safeNextStep: 'Tampilkan preview ini ke user. Setelah user setuju, panggil arcox_execute_send dengan fromChain, source=session, confirmed=true. Sesi OAuth MCP sudah terikat ke MSCA; tidak perlu token MSCA di env Hermes.',
     }) }] }
   })
 
