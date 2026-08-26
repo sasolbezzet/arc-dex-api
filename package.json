@@ -9,7 +9,8 @@
     "test:solana-e2e": "node scripts/test-solana-unified-e2e.mjs",
     "supabase:reconcile": "node --env-file=.env scripts/supabase-backfill-dry-run.mjs",
     "supabase:backfill:apply": "node --env-file=.env scripts/supabase-backfill-apply.mjs",
-    "maintenance:prune": "node scripts/prune-runtime.mjs"
+    "maintenance:prune": "node scripts/prune-runtime.mjs",
+    "maintenance:purge-oauth-dry-run": "node scripts/purge-test-oauth-state.mjs"
   },
   "keywords": [],
   "author": "",

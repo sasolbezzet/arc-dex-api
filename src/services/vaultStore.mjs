@@ -265,11 +265,13 @@ export function deleteCredential(owner, id) {
 // ── Limits ──
 export function getLimits(owner) {
   const v = loadVault()
-  return v.limits[owner] || { maxPerTx: 100, dailyLimit: 500, autoApprove: true, whitelist: [] }
+  const limits = v.limits && typeof v.limits === 'object' ? v.limits : {}
+  return limits[owner] || { maxPerTx: 100, dailyLimit: 500, autoApprove: true, whitelist: [] }
 }
 
 export function setLimits(owner, limits) {
   const v = loadVault()
+  if (!v.limits || typeof v.limits !== 'object') v.limits = {}
   v.limits[owner] = { ...getLimits(owner), ...limits }
   saveVault(v)
   logActivity(owner, 'limits_updated', limits)

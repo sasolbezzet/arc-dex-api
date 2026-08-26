@@ -17,7 +17,7 @@ async function withVault(fn) {
   }
   process.env.VAULT_PATH = join(dir, 'vault.json')
   process.env.VAULT_ACTIVITY_PATH = join(dir, 'activity.json')
-  await writeFile(process.env.VAULT_PATH, JSON.stringify({ credentials: [], limits: {}, approvals: [], agentCardLinks: {} }))
+  await writeFile(process.env.VAULT_PATH, JSON.stringify({ credentials: [], approvals: [], agentCardLinks: {} }))
   await writeFile(process.env.VAULT_ACTIVITY_PATH, '[]')
   try {
     const vault = await import('../src/services/vaultStore.mjs?agent-card-links-' + Date.now() + '-' + Math.random())
@@ -47,6 +47,14 @@ test('agent card links upsert limits and removes only the selected agent link', 
     assert.equal(listAgentCardLinks(AGENT).length, 0)
     assert.equal(listAgentCardLinks(`client-b|${OTHER}`).length, 1)
     assert.equal(removeAgentCardLink(AGENT, CARD), false)
+  })
+})
+
+test('legacy vault shape without limits still gets safe per-owner defaults', async () => {
+  await withVault(async ({ getLimits, setLimits }) => {
+    assert.deepEqual(getLimits(OWNER), { maxPerTx: 100, dailyLimit: 500, autoApprove: true, whitelist: [] })
+    assert.equal(setLimits(OWNER, { dailyLimit: 25 }).dailyLimit, 25)
+    assert.equal(getLimits(OWNER).maxPerTx, 100)
   })
 })
 
