@@ -398,6 +398,90 @@ export function bindSessionAlias(userId, ownerAddress, walletAddress, { allowReb
   return { ownerAddress: owner, walletAddress: wallet, rebound: Boolean(conflicts) }
 }
 
+// ── Per-agent binding store ──
+// One row per agent identity (`userId|delegateEoa`) mapping it to the Agent
+// Wallet MSCA selected for that agent. Rows live beside users/aliases in the
+// same atomic-write session key store; all addresses are stored lowercase.
+function normalizeAgentKey(agentKey) {
+  return String(agentKey || '').trim().toLowerCase()
+}
+
+function normalizeAddressHex(value, label) {
+  const address = String(value || '').trim().toLowerCase()
+  if (!/^0x[0-9a-f]{40}$/.test(address)) throw new Error(`${label} must be a valid address`)
+  return address
+}
+
+/** Bind one agent identity to its Agent Wallet MSCA. Also fills the legacy
+ * userId → wallet alias so getSessionKey(userId) keeps resolving to the
+ * agent's wallet. An alias that already resolves to an existing user session
+ * record (e.g. the passkey flow) is never clobbered here. */
+export function bindAgent(agentKey, ownerAddress, walletAddress) {
+  const key = normalizeAgentKey(agentKey)
+  if (!key) throw new Error('agentKey required')
+  const owner = normalizeAddressHex(ownerAddress, 'ownerAddress')
+  const wallet = normalizeAddressHex(walletAddress, 'walletAddress')
+  const store = loadStore()
+  if (!store.agentBindings || typeof store.agentBindings !== 'object') store.agentBindings = {}
+  const previous = store.agentBindings[key]
+  const now = Date.now()
+  store.agentBindings[key] = {
+    ownerAddress: owner,
+    walletAddress: wallet,
+    boundAt: previous?.boundAt ?? now,
+    lastUsedAt: now,
+  }
+  const legacyUserId = key.includes('|') ? key.slice(0, key.indexOf('|')) : ''
+  if (legacyUserId) {
+    if (!store.aliases || typeof store.aliases !== 'object') store.aliases = {}
+    const currentAliasWallet = String(store.aliases[legacyUserId] || '').toLowerCase()
+    if (!currentAliasWallet || !store.users?.[currentAliasWallet]) {
+      store.aliases[legacyUserId] = wallet
+    }
+  }
+  saveStore(store)
+  return { agentKey: key, ownerAddress: owner, walletAddress: wallet, rebound: Boolean(previous) }
+}
+
+/** Return the binding row for one agent key, or null when unbound. */
+export function getAgentBinding(agentKey) {
+  const store = loadStore()
+  return store.agentBindings?.[normalizeAgentKey(agentKey)] || null
+}
+
+/** List every binding owned by one owner EOA. */
+export function listAgentBindings(ownerAddress) {
+  const owner = normalizeAgentKey(ownerAddress)
+  const store = loadStore()
+  return Object.entries(store.agentBindings || {})
+    .filter(([, binding]) => String(binding?.ownerAddress || '').toLowerCase() === owner)
+    .map(([agentKey, binding]) => ({ agentKey, ...binding }))
+}
+
+/** Remove exactly one agent binding row. Returns whether a row was removed;
+ * aliases and user session records are left untouched. */
+export function revokeAgentBinding(agentKey) {
+  const key = normalizeAgentKey(agentKey)
+  const store = loadStore()
+  const bindings = store.agentBindings
+  if (!bindings || typeof bindings !== 'object' || !bindings[key]) return false
+  delete bindings[key]
+  saveStore(store)
+  return true
+}
+
+/** Advance lastUsedAt on one binding without touching any other field.
+ * Returns the updated binding, or null when the key is unknown. */
+export function touchAgentBinding(agentKey) {
+  const key = normalizeAgentKey(agentKey)
+  const store = loadStore()
+  const binding = store.agentBindings?.[key]
+  if (!binding) return null
+  binding.lastUsedAt = Date.now()
+  saveStore(store)
+  return { ...binding }
+}
+
 /**
  * Persist a submitted authorization hash without activating the signer.
  * This closes the browser/backend race where the browser receives a hash but
