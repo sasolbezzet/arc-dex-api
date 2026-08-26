@@ -151,7 +151,7 @@ function withOAuthStateLock(fn) {
 // ── Persistent OAuth client store ──
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { scheduleOAuthShadowSnapshot } from './supabaseOAuthShadow.mjs'
-import { registerMscaLiveTokenProbe } from './sessionKeyService.mjs'
+import { bindAgent, registerMscaLiveTokenProbe, revokeAgentBinding } from './sessionKeyService.mjs'
 import { getLimits } from './vaultStore.mjs'
 
 function loadClients() {
@@ -391,6 +391,54 @@ export function resolveAgentName(clientId) {
 // TTL, the MSCA locked at issuance, and resource pinned to the MCP endpoint,
 // so /mcp needs no new middleware and revoke-per-agent (Fase 4) kills it via
 // the shared clientId.
+function ensureConnectionClient(clientName, requestedClientId = '') {
+  let cid = String(requestedClientId || '').split('|')[0] || ''
+  refreshOAuthClients()
+  if (cid && oauthClients.get(cid)) return cid
+  cid = 'arcox_conn_' + randomUUID().slice(0, 12)
+  withOAuthStateLock(() => {
+    refreshOAuthClients()
+    if (!oauthClients.get(cid)) {
+      oauthClients.set(cid, {
+        clientSecret: randomUUID(),
+        redirectUris: [`${SERVER_URL}/activate`],
+        clientName: String(clientName || 'MCP Agent').slice(0, 64),
+        connectionToken: true,
+      })
+      saveClients(oauthClients)
+    }
+  })
+  refreshOAuthClients()
+  if (!oauthClients.get(cid)) throw new Error('Connection client could not be persisted')
+  return cid
+}
+
+export function issueBootstrapConnectionToken({ clientName, userId, mscaWalletAddress, ttlDays = 90 }) {
+  const owner = String(userId || '').trim().toLowerCase()
+  const wallet = String(mscaWalletAddress || '').trim().toLowerCase()
+  if (!/^0x[0-9a-f]{40}$/.test(owner)) throw new Error('userId (owner address) required')
+  if (!/^0x[0-9a-f]{40}$/.test(wallet)) throw new Error('mscaWalletAddress required')
+
+  // Bind first, then issue. If token creation fails, remove the new binding so
+  // neither side of the connection can be left in a half-created state.
+  const cid = ensureConnectionClient(clientName || 'MCP Agent')
+  const agentKey = `${cid}|${owner}`
+  const binding = bindAgent(agentKey, owner, wallet)
+  try {
+    const issued = issueConnectionToken({
+      agentKey,
+      clientName: clientName || 'MCP Agent',
+      userId: owner,
+      mscaWalletAddress: wallet,
+      ttlDays,
+    })
+    return { ...issued, agentKey, binding }
+  } catch (error) {
+    revokeAgentBinding(agentKey)
+    throw error
+  }
+}
+
 export function issueConnectionToken({ agentKey, clientName, userId, mscaWalletAddress, ttlDays = 90 }) {
   const owner = String(userId || '').trim().toLowerCase()
   if (!/^0x[0-9a-f]{40}$/.test(owner)) throw new Error('userId (owner EOA) required')
@@ -398,21 +446,7 @@ export function issueConnectionToken({ agentKey, clientName, userId, mscaWalletA
   const ttlMs = Math.max(1, Number(ttlDays) || 90) * 24 * 60 * 60 * 1000
   // Reuse the agent's existing client when present; otherwise mint a dedicated
   // connection client so the token is revocable per agent.
-  let cid = String(agentKey || '').split('|')[0] || ''
-  refreshOAuthClients()
-  if (!cid || !oauthClients.get(cid)) {
-    cid = 'arcox_conn_' + randomUUID().slice(0, 12)
-    try {
-      withOAuthStateLock(() => {
-        refreshOAuthClients()
-        if (!oauthClients.get(cid)) {
-          oauthClients.set(cid, { clientSecret: randomUUID(), redirectUris: [`${SERVER_URL}/activate`], clientName: String(clientName || 'MCP Agent').slice(0, 64), connectionToken: true })
-          saveClients(oauthClients)
-        }
-      })
-    } catch { /* client existence is re-checked below */ }
-    refreshOAuthClients()
-  }
+  const cid = ensureConnectionClient(clientName || 'MCP Agent', agentKey)
   refreshAccessTokens()
   // Connection-token issuance is also rotation: only the previous
   // connection tokens for this agent are invalidated. Device-flow access

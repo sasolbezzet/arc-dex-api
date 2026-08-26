@@ -73,7 +73,10 @@ await context.addInitScript(({ addr, token }) => {
   }
   window.__storageLog = storageLog
   localStorage.setItem('arc-dex-auth', JSON.stringify({ address: addr, token, issuedAt: Date.now() }))
-  localStorage.setItem('arx_vault_token', token)
+  // Keep the EOA login token in arc-dex-auth only. arx_vault_token is reserved
+  // for the passkey/MSCA vault session and must not be populated with an EOA token.
+  localStorage.removeItem('arx_vault_token')
+  localStorage.removeItem('arx_passkey_vault_token')
   localStorage.removeItem('arx_msca_state')
 }, { addr: account.address.toLowerCase(), token: session.token })
 
@@ -114,18 +117,30 @@ await page.goto(`${BASE}/plugin`, { waitUntil: 'domcontentloaded', timeout: 6000
 await page.waitForTimeout(7000)
 console.log('   url:', page.url())
 const buttons = await page.$$eval('button', els => els.map(b => (b.textContent || '').trim()).filter(Boolean))
+const initialBody = await page.evaluate(() => document.body.innerText)
 console.log('   buttons:', JSON.stringify(buttons).slice(0, 700))
+console.log('   empty agent state:', /No agents connected yet|Belum ada agent terhubung/i.test(initialBody) ? 'detected' : 'not active')
 
-const buatBaru = page.locator('button:has-text("Buat Baru")').first()
+const emptyState = /No agents connected yet|Belum ada agent terhubung/i.test(initialBody)
+const bootstrapButton = page.locator('button:has-text("Create Connection Token"), button:has-text("Buat Token Koneksi")').first()
+if (emptyState && await bootstrapButton.count() === 0) {
+  console.log('❌ empty agent state is missing the bootstrap connection-token button.')
+  console.log('   body:', initialBody.slice(0, 1200))
+  await browser.close()
+  process.exit(2)
+}
+if (emptyState) console.log('   ✅ empty agent state exposes the bootstrap connection-token button')
+
+const buatBaru = page.locator('button:has-text("Create New"), button:has-text("Buat Baru")').first()
 if (await buatBaru.count() === 0) {
-  console.log('❌ "✨ Buat Baru" not found.')
+  console.log('❌ Agent Wallet creation button not found.')
   console.log('   body:', (await page.evaluate(() => document.body.innerText)).slice(0, 900))
   console.log('logs:\n' + logs.slice(-15).join('\n'))
   await browser.close()
   process.exit(2)
 }
 
-console.log('③ clicking ✨ Buat Baru (register passkey via virtual authenticator)…')
+console.log('③ clicking Agent Wallet creation button (register passkey via virtual authenticator)…')
 await buatBaru.click()
 
 let active = false
@@ -162,6 +177,55 @@ while (Date.now() < deadline) {
   }
 }
 console.log('   token seen at:', tokenSeenAt || 'never', '| gone at:', tokenGoneAt || 'still present')
+
+// Verify the first-agent path that is used when the owner has no bindings.
+// The test creates no blockchain transaction; the resulting binding/token are
+// revoked immediately after the browser-level assertions below.
+let bootstrapAgentKey = ''
+let bootstrapToken = ''
+if (emptyState && active) {
+  const bootstrapButton = page.locator('button:has-text("Create Connection Token"), button:has-text("Buat Token Koneksi")').first()
+  const nameInput = page.locator('input[aria-label="Nama agent"]').first()
+  if (await bootstrapButton.count() === 0 || await nameInput.count() === 0) throw new Error('bootstrap controls are missing from the empty Agent Connections state')
+  await nameInput.fill('Chrome Bootstrap E2E')
+  await bootstrapButton.click()
+  await page.waitForTimeout(1200)
+  bootstrapToken = await page.locator('code').filter({ hasText: /^arx_at_/ }).first().textContent() || ''
+  const setupText = await page.locator('textarea').first().inputValue().catch(() => '')
+  if (!bootstrapToken.startsWith('arx_at_') || !setupText.includes(`${BASE}/mcp`) || !setupText.includes(bootstrapToken)) {
+    throw new Error('empty-state bootstrap did not display a usable MCP setup token')
+  }
+  const bootstrapMcp = await page.evaluate(async ({ token }) => {
+    const response = await fetch('/mcp', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 17, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'chrome-bootstrap-e2e', version: '1' } } }),
+    })
+    return { status: response.status, body: (await response.text()).slice(0, 250) }
+  }, { token: bootstrapToken })
+  if (bootstrapMcp.status !== 200) throw new Error(`bootstrap MCP initialize failed: ${JSON.stringify(bootstrapMcp)}`)
+  const passkeyToken = await page.evaluate(() => localStorage.getItem('arx_passkey_vault_token') || localStorage.getItem('arx_vault_token') || '')
+  const bootstrapAgents = await page.evaluate(async () => {
+    const token = localStorage.getItem('arx_passkey_vault_token') || localStorage.getItem('arx_vault_token') || ''
+    const response = await fetch('/api/vault/agents', { headers: { Authorization: `Bearer ${token}` } })
+    return { status: response.status, data: await response.json().catch(() => ({})) }
+  })
+  const created = (bootstrapAgents.data?.agents || []).find(agent => agent.clientName === 'Chrome Bootstrap E2E')
+  bootstrapAgentKey = created?.agentKey || ''
+  if (bootstrapAgents.status !== 200 || !bootstrapAgentKey) throw new Error(`bootstrap binding missing from owner view: ${JSON.stringify(bootstrapAgents)}`)
+  console.log('   ✅ empty-state bootstrap issued token + MCP initialize 200 + owner binding')
+  const revoked = await page.evaluate(async ({ agentKey, token }) => {
+    const response = await fetch(`/api/vault/agents/${encodeURIComponent(agentKey)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } })
+    return { status: response.status, data: await response.json().catch(() => ({})) }
+  }, { agentKey: bootstrapAgentKey, token: passkeyToken })
+  if (revoked.status !== 200) throw new Error(`bootstrap cleanup failed: ${JSON.stringify(revoked)}`)
+  const oldTokenResponse = await page.evaluate(async ({ token }) => {
+    const response = await fetch('/mcp', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 18, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'chrome-bootstrap-revoked', version: '1' } } }) })
+    return response.status
+  }, { token: bootstrapToken })
+  if (oldTokenResponse !== 401) throw new Error(`revoked bootstrap token remained valid: ${oldTokenResponse}`)
+  console.log('   ✅ bootstrap test binding revoked and token now returns 401')
+}
 const storageOps = await page.evaluate(() => window.__storageLog || [])
 console.log('   arx_vault_token storage ops:\n' + storageOps.slice(-25).join('\n') || '   (none)')
 

@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { listCredentials, addCredential, deduplicateCredentials, revealCredential, deleteCredential, getLimits, setLimits, listApprovals, createApproval, approveRequest, rejectRequest, listActivity, listAgentCardLinks, upsertAgentCardLink, removeAgentCardLink, createChallenge, consumeChallenge, createSession, validateSession, listMcpSessions } from '../services/vaultStore.mjs'
 import { readAgentActivity, readAgentApprovals } from '../services/supabasePersistence.mjs'
-import { listRelatedAddresses, listAgentBindings, listAgentBindingsForIdentity, identityOwnsAgentBinding, revokeAgentBinding, getAgentBinding } from '../services/sessionKeyService.mjs'
+import { listRelatedAddresses, listAgentBindings, listAgentBindingsForIdentity, identityOwnsAgentBinding, resolveOwnerAddressForWallet, revokeAgentBinding, getAgentBinding } from '../services/sessionKeyService.mjs'
 import { getDailySpend } from '../services/agentSpendLedger.mjs'
 import { verifyMessage } from 'viem'
 
@@ -353,6 +353,43 @@ vault.delete('/cards/:cardId/agent-link', requireAuth, async (req, res) => {
     res.json({ ok: true, removed })
   } catch (error) {
     res.status(500).json({ error: error?.message || 'Failed to unlink card' })
+  }
+})
+
+// POST /api/vault/agents/bootstrap-connection-token — create the first
+// connection-token agent directly from an active owner/passkey session. This is
+// the entry point for Hermes default mode, before an OAuth/device binding exists.
+vault.post('/agents/bootstrap-connection-token', requireAuth, async (req, res) => {
+  try {
+    const { getSessionKeyInfo } = await import('../services/vaultStore.mjs')
+    const session = await getSessionKeyInfo(req.owner)
+    if (!session?.active || !session.walletAddress) {
+      return res.status(409).json({ error: 'agent_wallet_session_required', message: 'Aktifkan Agent Wallet terlebih dahulu.' })
+    }
+    const { issueBootstrapConnectionToken } = await import('../services/mcpServer.mjs')
+    const ttlDays = Math.min(Math.max(Number(req.body?.ttlDays) || 90, 1), 3650)
+    const clientName = String(req.body?.clientName || 'Hermes Agent').trim().slice(0, 64) || 'Hermes Agent'
+    const ownerAddress = resolveOwnerAddressForWallet(req.owner, session.walletAddress)
+    if (!ownerAddress) {
+      return res.status(409).json({ error: 'owner_identity_required', message: 'Identitas owner EOA belum terhubung ke Agent Wallet.' })
+    }
+    const issued = issueBootstrapConnectionToken({
+      clientName,
+      userId: ownerAddress,
+      mscaWalletAddress: session.walletAddress,
+      ttlDays,
+    })
+    res.json({
+      token: issued.token,
+      agentKey: issued.agentKey,
+      agentName: clientName,
+      walletAddress: session.walletAddress,
+      expiresAt: issued.expiresAt,
+      mcpUrl: `${process.env.ARCOX_PAY_BASE_URL || 'https://arcoxdex.vercel.app'}/mcp`,
+      message: 'Hubungkan ARCOX ke agent ini. Token ditampilkan sekali; simpan sebelum menutup modal.',
+    })
+  } catch (error) {
+    res.status(500).json({ error: error?.message || 'Failed to bootstrap connection token' })
   }
 })
 

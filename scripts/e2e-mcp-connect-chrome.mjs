@@ -298,16 +298,94 @@ ok(`arcox_session_status → active, wallet ${String(status.walletAddress).slice
 const quote = await callTool('arcox_quote_send', { to: RECIPIENT, token: 'USDC', amount: '0.01', fromChain: 'arc-testnet', source: 'session' })
 if (!quote.preview) throw new Error(`quote: ${JSON.stringify(quote)}`)
 ok(`arcox_quote_send preview → ${quote.amount} USDC → ${quote.to.slice(0, 10)}… (READY TO TX)`)
+// L4 is deliberately opt-in. The default production check is read-only;
+// RUN_L4=1 is required before sending testnet funds from the Agent Wallet.
+let executed = null
+if (process.env.RUN_L4 === '1') {
+  executed = await callTool('arcox_execute_send', {
+    to: RECIPIENT,
+    token: 'USDC',
+    amount: '0.01',
+    fromChain: 'arc-testnet',
+    source: 'session',
+    previewId: quote.previewId,
+    confirmed: true,
+    confirmationText: 'ya',
+  })
+  if (executed.status !== 'executed' && executed.executed !== true) throw new Error(`execute failed: ${JSON.stringify(executed)}`)
+  ok(`arcox_execute_send → ${executed.status} tx ${String(executed.txHash || '').slice(0, 18)}…`)
+} else {
+  ok('L4 skipped by default; set RUN_L4=1 for the explicit testnet transaction')
+}
 
-// ── 8. Verify session visible in the UI agents list ──
-const agents = await page.evaluate(() => document.body.innerText.includes('Terhubung')).catch(() => false)
-ok(`plugin page reflects connection (Terhubung=${agents})`)
+// ── 8. Verify the owner UI sees the newly bound agent ──
+// The callback capture is on localhost; return to the production Plugin page
+// before checking UI state.
+step('⑧', 'return to production Plugin and verify owner-scoped agent controls…')
+await page.goto(`${BASE}/plugin`, { waitUntil: 'domcontentloaded', timeout: 60000 })
+await page.waitForTimeout(7000)
+const pluginUi = await page.evaluate(async ({ clientId }) => {
+  const body = document.body.innerText
+  const token = localStorage.getItem('arx_passkey_vault_token') || localStorage.getItem('arx_vault_token') || ''
+  const response = token ? await fetch('/api/vault/agents', { headers: { Authorization: `Bearer ${token}` } }) : null
+  const data = response ? await response.json().catch(() => ({})) : {}
+  const agents = Array.isArray(data?.agents) ? data.agents : []
+  const matching = agents.filter(agent => String(agent.agentKey || '').startsWith(`${clientId}|`))
+  return {
+    hasPluginHeading: /Plugin/i.test(body),
+    hasAgentConnectionsSection: /Connected Agents|Agent Terhubung|已连接的 Agent/i.test(body),
+    hasMatchingBinding: matching.length > 0,
+    matchingCount: matching.length,
+    apiStatus: response?.status || 0,
+  }
+}, { clientId: reg.client_id })
+if (pluginUi.apiStatus !== 200 || !pluginUi.hasMatchingBinding) throw new Error(`owner Plugin did not load the OAuth agent binding: ${JSON.stringify(pluginUi)}`)
+ok(`Plugin owner view → ${pluginUi.matchingCount} binding for client ${reg.client_id.slice(0, 12)}…`)
+if (!pluginUi.hasAgentConnectionsSection) throw new Error('per-agent connection section is missing from production Plugin')
+const agentRow = page.locator('button').filter({ hasText: 'e2e-chrome-mcp' }).first()
+if (!(await agentRow.count())) throw new Error('matching agent row was not rendered in production Plugin')
+await agentRow.click()
+await page.waitForTimeout(1200)
+const detailText = await page.evaluate(() => document.body.innerText)
+if (!/Catatan aktivitas|Activity log|Kartu tertaut|Linked cards|活动记录/i.test(detailText)) throw new Error('expanded agent detail did not render activity/card controls')
+ok('expanded agent detail → activity and linked-card controls rendered')
+
+// Exercise the same long-lived token the owner copies into Hermes.
+const createTokenButton = page.locator('button:has-text("Create Connection Token"), button:has-text("Buat Token Koneksi")').first()
+if (!(await createTokenButton.count())) throw new Error('connection-token button was not rendered in production Plugin')
+await createTokenButton.click()
+await page.waitForTimeout(800)
+const firstConnectionToken = await page.locator('code').filter({ hasText: /^arx_at_/ }).first().textContent()
+if (!firstConnectionToken?.startsWith('arx_at_')) throw new Error('production Plugin did not display a connection token')
+const setupMessage = await page.locator('textarea').first().inputValue()
+if (!setupMessage.includes(`${BASE}/mcp`) || !setupMessage.includes(firstConnectionToken)) throw new Error('connection setup message is missing MCP URL or token')
+ok('owner UI issued connection token with MCP setup message')
+const browserMcp = async (token) => page.evaluate(async ({ token, base }) => {
+  const response = await fetch(`${base}/mcp`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 91, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'chrome-connection-token', version: '1' } } }),
+  })
+  return { status: response.status, body: (await response.text()).slice(0, 500) }
+}, { token, base: BASE })
+const firstTokenStatus = await browserMcp(firstConnectionToken)
+if (firstTokenStatus.status !== 200) throw new Error(`connection token failed in browser: ${JSON.stringify(firstTokenStatus)}`)
+ok('browser MCP initialize with UI-issued connection token → 200')
+await createTokenButton.click()
+await page.waitForTimeout(800)
+const secondConnectionToken = await page.locator('code').filter({ hasText: /^arx_at_/ }).first().textContent()
+if (!secondConnectionToken?.startsWith('arx_at_') || secondConnectionToken === firstConnectionToken) throw new Error('production UI did not rotate the connection token')
+const oldTokenStatus = await browserMcp(firstConnectionToken)
+const newTokenStatus = await browserMcp(secondConnectionToken)
+if (oldTokenStatus.status !== 401 || newTokenStatus.status !== 200) throw new Error(`connection token rotation failed: old=${oldTokenStatus.status}, new=${newTokenStatus.status}`)
+ok('production UI token rotation → old 401 / new 200')
 
 console.log('\n=== SUMMARY ===')
-console.log('Chrome MCP connection E2E: ✅ PASSED — real Chrome → passkey login → SIWE → code → token → MCP session → READY TO TX')
+console.log(`Chrome MCP connection E2E: ✅ PASSED — real Chrome → OAuth/passkey → MCP → owner controls → quote${executed ? ' → REAL TESTNET TX' : ' (read-only)'}`)
 console.log('EOA   :', eoa)
 console.log('MSCA  :', newMsca || msca)
 console.log('code  :', authCode.slice(0, 12) + '…')
 console.log('tools :', (toolsList?.result?.tools || []).length)
+console.log('tx    :', executed?.txHash || '(read-only run)')
 
 await browser.close()

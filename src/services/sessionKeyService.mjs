@@ -473,6 +473,17 @@ export function listAgentBindingsForIdentity(identityAddress) {
     .map(([agentKey, binding]) => ({ agentKey, ...binding }))
 }
 
+/** Resolve the canonical EOA owner for an authenticated identity/MSCA pair. */
+export function resolveOwnerAddressForWallet(identityAddress, walletAddress = '') {
+  const identity = normalizeAgentKey(identityAddress)
+  const wallet = normalizeAgentKey(walletAddress || identity)
+  const store = loadStore()
+  for (const [ownerAddress, boundWallet] of Object.entries(store.aliases || {})) {
+    if (String(boundWallet || '').toLowerCase() === wallet && /^0x[0-9a-f]{40}$/i.test(ownerAddress)) return ownerAddress.toLowerCase()
+  }
+  return /^0x[0-9a-f]{40}$/i.test(identity) ? identity : ''
+}
+
 /** True when an identity (EOA or its bound MSCA) owns the binding. */
 export function identityOwnsAgentBinding(identityAddress, binding) {
   if (!binding) return false
