@@ -1,7 +1,8 @@
 import { Router } from 'express'
-import { listCredentials, addCredential, deduplicateCredentials, revealCredential, deleteCredential, getLimits, setLimits, listApprovals, createApproval, approveRequest, rejectRequest, listActivity, createChallenge, consumeChallenge, createSession, validateSession, listMcpSessions } from '../services/vaultStore.mjs'
+import { listCredentials, addCredential, deduplicateCredentials, revealCredential, deleteCredential, getLimits, setLimits, listApprovals, createApproval, approveRequest, rejectRequest, listActivity, listAgentCardLinks, upsertAgentCardLink, removeAgentCardLink, createChallenge, consumeChallenge, createSession, validateSession, listMcpSessions } from '../services/vaultStore.mjs'
 import { readAgentActivity, readAgentApprovals } from '../services/supabasePersistence.mjs'
 import { listRelatedAddresses, listAgentBindings, listAgentBindingsForIdentity, identityOwnsAgentBinding, revokeAgentBinding, getAgentBinding } from '../services/sessionKeyService.mjs'
+import { getDailySpend } from '../services/agentSpendLedger.mjs'
 import { verifyMessage } from 'viem'
 
 const vault = Router()
@@ -9,7 +10,7 @@ const vault = Router()
 // ── Auth middleware: require SIWE session token ──
 // Flow: POST /api/vault/challenge → sign with MetaMask → POST /api/vault/verify → get session token
 // All subsequent requests: Authorization: Bearer <sessionToken>
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const auth = req.headers['authorization']
   if (!auth || !auth.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Authentication required', hint: 'POST /api/vault/challenge to start SIWE login' })
@@ -17,6 +18,13 @@ function requireAuth(req, res, next) {
   const token = auth.slice(7)
   const userId = validateSession(token)
   if (!userId) {
+    // OAuth/MCP bearer tokens authenticate an agent, not the vault owner. Keep
+    // the distinction explicit so owner-only management endpoints do not look
+    // like an expired login to a connected agent (and remain easy to audit).
+    try {
+      const { validateAccessToken } = await import('../services/mcpServer.mjs')
+      if (validateAccessToken(token)) return res.status(403).json({ error: 'owner_authentication_required', message: 'Agent token cannot manage owner vault settings' })
+    } catch { /* invalid/non-OAuth tokens remain a normal 401 */ }
     return res.status(401).json({ error: 'Session expired or invalid', hint: 'Re-authenticate via /api/vault/challenge' })
   }
   req.owner = userId
@@ -186,12 +194,160 @@ vault.get('/agents', requireAuth, async (req, res) => {
         walletAddress: binding.walletAddress,
         boundAt: binding.boundAt,
         lastUsedAt: binding.lastUsedAt,
+        spentToday: getDailySpend(binding.agentKey),
         clientName: await resolveClientName(binding.agentKey.split('|')[0] || ''),
       })
     }
     res.json({ agents })
   } catch (error) {
     res.status(500).json({ error: error?.message || 'Failed to list agents' })
+  }
+})
+
+function agentClientId(agentKey) {
+  return String(agentKey || '').split('|', 1)[0].trim().toLowerCase()
+}
+
+function activityBelongsToAgent(entry, binding, clientId) {
+  const entryOwner = String(entry?.owner || '').toLowerCase()
+  const data = entry?.data && typeof entry.data === 'object' ? entry.data : {}
+  const dataAgentKey = String(data.agentKey || '').trim().toLowerCase()
+  return entryOwner === String(binding.walletAddress || '').toLowerCase()
+    || (entryOwner === String(binding.ownerAddress || '').toLowerCase()
+      && (String(data.agentClientId || '').toLowerCase() === clientId || Boolean(dataAgentKey && dataAgentKey === `${clientId}|${String(binding.ownerAddress || '').toLowerCase()}`)))
+}
+
+// GET /api/vault/agents/:agentKey/activity — recent activity for exactly one
+// agent. EOA-level events are included only when their audit payload carries
+// this OAuth clientId; MSCA-level events are scoped to the binding's wallet.
+vault.get('/agents/:agentKey/activity', requireAuth, async (req, res) => {
+  try {
+    const agentKey = String(req.params.agentKey || '')
+    const binding = getAgentBinding(agentKey)
+    if (!binding) return res.status(404).json({ error: 'agent_not_found' })
+    if (!identityOwnsAgentBinding(req.owner, binding)) {
+      return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
+    }
+    const limit = Math.min(Math.max(Number(req.query.limit) || 5, 1), 5)
+    const clientId = agentClientId(agentKey)
+    const local = [
+      ...listActivity(binding.ownerAddress, 100),
+      ...listActivity(binding.walletAddress, 100),
+    ].filter(entry => activityBelongsToAgent(entry, binding, clientId))
+    const [ownerRead, walletRead] = await Promise.all([
+      readAgentActivity(binding.ownerAddress, local.filter(entry => String(entry.owner).toLowerCase() === String(binding.ownerAddress).toLowerCase()), limit),
+      readAgentActivity(binding.walletAddress, local.filter(entry => String(entry.owner).toLowerCase() === String(binding.walletAddress).toLowerCase()), limit),
+    ])
+    const byId = new Map([...ownerRead.activity, ...walletRead.activity]
+      .filter(entry => activityBelongsToAgent(entry, binding, clientId))
+      .map(entry => [String(entry.id), entry]))
+    const activity = [...byId.values()]
+      .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
+      .slice(0, limit)
+      .map(entry => ({
+        id: entry.id,
+        at: entry.ts,
+        type: entry.type,
+        amount: entry.data?.amount,
+        detail: entry.data?.action || entry.data?.merchantName || entry.data?.label || entry.data?.status || '',
+        data: entry.data || {},
+      }))
+    res.json({ activity, persistenceSource: ownerRead.source === 'json' && walletRead.source === 'json' ? 'json' : 'supabase-merged' })
+  } catch (error) {
+    res.status(500).json({ error: error?.message || 'Failed to read agent activity' })
+  }
+})
+
+async function cardsForWallet(walletAddress) {
+  const { listCards } = await import('../services/cardSimulator.mjs')
+  return listCards(walletAddress).map(card => ({
+    cardId: card.cardId,
+    label: card.label,
+    last4: card.last4,
+    maxPerTx: card.limits?.perTx || '',
+    daily: card.limits?.daily || '',
+  }))
+}
+
+// GET /api/vault/cards — masked owner cards available for manual agent linking.
+vault.get('/cards', requireAuth, async (req, res) => {
+  try {
+    const bindings = listAgentBindingsForIdentity(req.owner)
+    const cards = []
+    const seen = new Set()
+    for (const binding of bindings) {
+      for (const card of await cardsForWallet(binding.walletAddress)) {
+        if (!seen.has(card.cardId)) {
+          seen.add(card.cardId)
+          cards.push(card)
+        }
+      }
+    }
+    res.json({ cards })
+  } catch (error) {
+    res.status(500).json({ error: error?.message || 'Failed to list owner cards' })
+  }
+})
+
+// GET /api/vault/agents/:agentKey/cards — linked cards expose only masked
+// metadata. PAN/CVV stay behind the existing fresh-passkey card route.
+vault.get('/agents/:agentKey/cards', requireAuth, async (req, res) => {
+  try {
+    const agentKey = String(req.params.agentKey || '')
+    const binding = getAgentBinding(agentKey)
+    if (!binding) return res.status(404).json({ error: 'agent_not_found' })
+    if (!identityOwnsAgentBinding(req.owner, binding)) return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
+    const { getCard } = await import('../services/cardSimulator.mjs')
+    const linked = listAgentCardLinks(agentKey)
+    const cards = linked.map(link => {
+      const card = getCard(binding.walletAddress, link.cardId)
+      if (!card) return null
+      return { cardId: card.cardId, label: card.label, last4: card.last4, maxPerTx: link.maxPerTx, daily: link.daily, linkedAt: link.linkedAt }
+    }).filter(Boolean)
+    res.json({ cards })
+  } catch (error) {
+    res.status(500).json({ error: error?.message || 'Failed to list agent cards' })
+  }
+})
+
+// POST /api/vault/agents/:agentKey/cards — owner explicitly links one of the
+// binding MSCA's cards to this agent and sets optional agent-specific caps.
+vault.post('/agents/:agentKey/cards', requireAuth, async (req, res) => {
+  try {
+    const agentKey = String(req.params.agentKey || '')
+    const binding = getAgentBinding(agentKey)
+    if (!binding) return res.status(404).json({ error: 'agent_not_found' })
+    if (!identityOwnsAgentBinding(req.owner, binding)) return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
+    const cardId = String(req.body?.cardId || '').trim()
+    const { getCard } = await import('../services/cardSimulator.mjs')
+    const card = getCard(binding.walletAddress, cardId)
+    if (!card) return res.status(404).json({ error: 'card_not_found' })
+    const link = upsertAgentCardLink(agentKey, {
+      cardId,
+      maxPerTx: req.body?.maxPerTx ?? card.limits?.perTx,
+      daily: req.body?.daily ?? card.limits?.daily,
+    })
+    res.json({ ok: true, card: { cardId: card.cardId, label: card.label, last4: card.last4, ...link } })
+  } catch (error) {
+    res.status(400).json({ error: error?.message || 'Failed to link card' })
+  }
+})
+
+// DELETE /api/vault/cards/:cardId/agent-link — remove this card from every
+// agent link owned by the authenticated identity, without touching the card.
+vault.delete('/cards/:cardId/agent-link', requireAuth, async (req, res) => {
+  try {
+    const cardId = String(req.params.cardId || '').trim()
+    const bindings = listAgentBindingsForIdentity(req.owner)
+    const { getCard } = await import('../services/cardSimulator.mjs')
+    let removed = 0
+    for (const binding of bindings) {
+      if (!getCard(binding.walletAddress, cardId)) continue
+      if (removeAgentCardLink(binding.agentKey, cardId)) removed++
+    }
+    res.json({ ok: true, removed })
+  } catch (error) {
+    res.status(500).json({ error: error?.message || 'Failed to unlink card' })
   }
 })
 

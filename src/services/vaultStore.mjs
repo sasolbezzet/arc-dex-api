@@ -101,7 +101,7 @@ export function listMcpSessions(userId) {
 
 // ── Helpers ──
 function loadVault() {
-  return readJsonFile(vaultPath(), { credentials: [], limits: {}, approvals: [] })
+  return readJsonFile(vaultPath(), { credentials: [], limits: {}, approvals: [], agentCardLinks: {} })
 }
 function saveVault(v) {
   atomicWriteJsonFile(vaultPath(), v)
@@ -504,6 +504,65 @@ export function clearSessionKeyInfo(owner) {
     logActivity(owner, 'session_key_revoked', {})
   }
   return v.sessionKeys?.[owner] || null
+}
+
+// ── Per-agent card links ──
+// Card links are owner-controlled metadata. The card simulator remains the
+// source of truth for card ownership and sensitive fields; this store keeps
+// only the agent-to-card relationship and optional agent-specific caps.
+function normalizedAgentKey(agentKey) {
+  return String(agentKey || '').trim().toLowerCase()
+}
+
+function normalizedLinkLimit(value, label, { allowEmpty = true } = {}) {
+  if (value === undefined || value === null || value === '') {
+    if (allowEmpty) return ''
+    throw new Error(`${label} is required`)
+  }
+  const number = Number(value)
+  if (!Number.isFinite(number) || number < 0) throw new Error(`${label} must be a non-negative number`)
+  return String(value).trim()
+}
+
+export function listAgentCardLinks(agentKey) {
+  const key = normalizedAgentKey(agentKey)
+  const vault = loadVault()
+  const links = vault.agentCardLinks?.[key]
+  return Array.isArray(links) ? links.map(link => ({ ...link })) : []
+}
+
+export function upsertAgentCardLink(agentKey, { cardId, maxPerTx, daily } = {}) {
+  const key = normalizedAgentKey(agentKey)
+  const id = String(cardId || '').trim()
+  if (!key) throw new Error('agentKey required')
+  if (!id) throw new Error('cardId required')
+  const vault = loadVault()
+  if (!vault.agentCardLinks || typeof vault.agentCardLinks !== 'object') vault.agentCardLinks = {}
+  if (!Array.isArray(vault.agentCardLinks[key])) vault.agentCardLinks[key] = []
+  const existing = vault.agentCardLinks[key].find(link => link.cardId === id)
+  const link = {
+    cardId: id,
+    maxPerTx: normalizedLinkLimit(maxPerTx ?? existing?.maxPerTx, 'maxPerTx'),
+    daily: normalizedLinkLimit(daily ?? existing?.daily, 'daily'),
+    linkedAt: existing?.linkedAt || new Date().toISOString(),
+  }
+  if (existing) Object.assign(existing, link)
+  else vault.agentCardLinks[key].push(link)
+  saveVault(vault)
+  return { ...link }
+}
+
+export function removeAgentCardLink(agentKey, cardId) {
+  const key = normalizedAgentKey(agentKey)
+  const id = String(cardId || '').trim()
+  const vault = loadVault()
+  const links = vault.agentCardLinks?.[key]
+  if (!Array.isArray(links)) return false
+  const next = links.filter(link => link.cardId !== id)
+  if (next.length === links.length) return false
+  vault.agentCardLinks[key] = next
+  saveVault(vault)
+  return true
 }
 
 // ── Activity ──
