@@ -4095,6 +4095,7 @@ export function createMcpServer(userId, context = {}) {
     mintOwnerToken: () => mintOwnerToken(userId),
     getToolHandler: (name) => server._registeredTools?.[name]?.handler,
     userId,
+    agentKey,
     markX402ServiceOutcome, previewX402Pay, executeX402Pay, getX402Invoice, publicInvoice,
   }
   registerIntelTools(toolCtx)

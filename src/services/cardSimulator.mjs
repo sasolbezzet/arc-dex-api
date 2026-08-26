@@ -110,7 +110,9 @@ function recordCardActivity(owner, type, data) {
   const normalizedOwner = ownerKey(owner)
   if (!/^0x[a-f0-9]{40}$/i.test(normalizedOwner)) return
   // Keep the local activity feed available during a Supabase outage while the
-  // persistence adapter performs the same sanitized dual-write.
+  // persistence adapter performs the same sanitized dual-write. For MCP
+  // activity, agentKey is the audit boundary when multiple agents share an
+  // MSCA/card owner.
   logActivity(normalizedOwner, type, data)
 }
 
@@ -196,6 +198,14 @@ function usedToday(db, card, now) {
   const { todayStart } = usageWindow(now)
   return db.transactions
     .filter(t => t.cardId === card.cardId && t.status === 'settled' && t.createdAt >= todayStart)
+    .reduce((sum, t) => sum + toUnits(t.amount), 0n)
+}
+
+function usedTodayByAgent(db, card, agentKey, now) {
+  const { todayStart } = usageWindow(now)
+  const key = String(agentKey || '').trim().toLowerCase()
+  return db.transactions
+    .filter(t => t.cardId === card.cardId && t.agentKey === key && t.status === 'settled' && t.createdAt >= todayStart)
     .reduce((sum, t) => sum + toUnits(t.amount), 0n)
 }
 
@@ -373,9 +383,20 @@ export function setCardStatus(owner, cardId, status) {
   return publicCard(card)
 }
 
-function authorizeGuardCheck(card, merchant, amountUnits, now, db, availableBalance) {
+function authorizeGuardCheck(card, merchant, amountUnits, now, db, availableBalance, { agentKey = '', agentLimits = null } = {}) {
   if (card.status === 'closed') return { code: 'card_closed', message: 'Card is closed' }
   if (card.status === 'frozen') return { code: 'card_frozen', message: 'Card is frozen' }
+  const agentPerTx = toUnitsOrNull(agentLimits?.maxPerTx)
+  if (agentPerTx !== null && amountUnits > agentPerTx) {
+    return { code: 'card_agent_limit_exceeded', message: `Amount exceeds this agent card limit (${toUsdc(agentPerTx)} USDC / transaction)` }
+  }
+  const agentDaily = toUnitsOrNull(agentLimits?.daily)
+  if (agentDaily !== null) {
+    const spentByAgent = usedTodayByAgent(db, card, agentKey, now)
+    if (spentByAgent + amountUnits > agentDaily) {
+      return { code: 'card_agent_limit_exceeded', message: `This agent card daily limit reached (${toUsdc(agentDaily)} USDC / day)` }
+    }
+  }
   const perTx = toUnitsOrNull(card.limits.perTx)
   if (perTx !== null && amountUnits > perTx) {
     return { code: 'per_tx_limit_exceeded', message: `Amount exceeds per-transaction limit (${toUsdc(perTx)} USDC)` }
@@ -418,7 +439,7 @@ function declined(code, message, merchantId, amount, description) {
   }
 }
 
-export async function authorizeCardSpend(owner, cardId, { merchantId, amount, description = '', walletAddress } = {}) {
+export async function authorizeCardSpend(owner, cardId, { merchantId, amount, description = '', walletAddress, agentKey = '', agentLimits = null } = {}) {
   const db = loadDb()
   const key = ownerKey(owner)
   const card = db.cards.find(c => c.cardId === cardId && ownerKey(c.owner) === key)
@@ -440,13 +461,15 @@ export async function authorizeCardSpend(owner, cardId, { merchantId, amount, de
     availableBalance = ensureFunding(db, key).balance
   }
 
-  const guard = authorizeGuardCheck(card, merchant, amountUnits, new Date(), db, availableBalance)
+  const normalizedAgentKey = String(agentKey || '').trim().toLowerCase()
+  const guard = authorizeGuardCheck(card, merchant, amountUnits, new Date(), db, availableBalance, { agentKey: normalizedAgentKey, agentLimits })
   if (!guard.ok) return declined(guard.code, guard.message, merchantId, amount, description)
 
   const tx = {
     id: `tx_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
     cardId: card.cardId,
     owner: key,
+    agentKey: normalizedAgentKey || null,
     merchantId,
     merchantName: merchant.name,
     category: merchant.category,
@@ -509,7 +532,7 @@ export async function settleCardTransaction(owner, txId, { walletAddress } = {})
       tx.txHash = transfer.txHash || null
       tx.error = transfer.reason || transfer.error || 'on-chain transfer failed'
       save(db)
-      recordCardActivity(key, 'card_payment_declined', { cardId: tx.cardId, txId: tx.id, amount: tx.amount, token: 'USDC', merchantId: tx.merchantId, status: tx.status, reason: tx.error })
+      recordCardActivity(key, 'card_payment_declined', { cardId: tx.cardId, txId: tx.id, agentKey: tx.agentKey, amount: tx.amount, token: 'USDC', merchantId: tx.merchantId, status: tx.status, reason: tx.error })
       return { settled: false, tx }
     }
     tx.status = 'settled'
@@ -523,7 +546,7 @@ export async function settleCardTransaction(owner, txId, { walletAddress } = {})
       tx.declineReason = 'insufficient_funds'
       tx.settledAt = new Date().toISOString()
       save(db)
-      recordCardActivity(key, 'card_payment_declined', { cardId: tx.cardId, txId: tx.id, amount: tx.amount, token: 'USDC', merchantId: tx.merchantId, status: tx.status, reason: tx.declineReason })
+      recordCardActivity(key, 'card_payment_declined', { cardId: tx.cardId, txId: tx.id, agentKey: tx.agentKey, amount: tx.amount, token: 'USDC', merchantId: tx.merchantId, status: tx.status, reason: tx.declineReason })
       return { settled: false, tx }
     }
     entry.balance = toUsdc(toUnits(entry.balance) - amountUnits)
@@ -537,12 +560,12 @@ export async function settleCardTransaction(owner, txId, { walletAddress } = {})
     card.usage.month = toUsdc(usedThisMonth(db, card, new Date()))
   }
   save(db)
-  recordCardActivity(key, 'card_payment_settled', { cardId: tx.cardId, txId: tx.id, amount: tx.amount, token: 'USDC', merchantId: tx.merchantId, merchantName: tx.merchantName, status: tx.status, txHash: tx.txHash || '' })
+  recordCardActivity(key, 'card_payment_settled', { cardId: tx.cardId, txId: tx.id, agentKey: tx.agentKey, amount: tx.amount, token: 'USDC', merchantId: tx.merchantId, merchantName: tx.merchantName, status: tx.status, txHash: tx.txHash || '' })
   return { settled: true, tx }
 }
 
-export async function spendWithCard(owner, cardId, { merchantId, amount, description = '', walletAddress } = {}) {
-  const auth = await authorizeCardSpend(owner, cardId, { merchantId, amount, description, walletAddress })
+export async function spendWithCard(owner, cardId, { merchantId, amount, description = '', walletAddress, agentKey = '', agentLimits = null } = {}) {
+  const auth = await authorizeCardSpend(owner, cardId, { merchantId, amount, description, walletAddress, agentKey, agentLimits })
   if (!auth.approved) return auth
   const { settled, tx } = await settleCardTransaction(owner, auth.txId, { walletAddress })
   if (!settled) {
@@ -563,10 +586,11 @@ export async function spendWithCard(owner, cardId, { merchantId, amount, descrip
   }
 }
 
-export function refundCardTransaction(owner, txId) {
+export function refundCardTransaction(owner, txId, { agentKey = '' } = {}) {
   const db = loadDb()
   const key = ownerKey(owner)
-  const tx = db.transactions.find(t => t.id === txId && t.owner === key)
+  const normalizedAgentKey = String(agentKey || '').trim().toLowerCase()
+  const tx = db.transactions.find(t => t.id === txId && t.owner === key && (!normalizedAgentKey || t.agentKey === normalizedAgentKey))
   if (!tx) {
     const error = new Error('Transaction not found')
     error.statusCode = 404
@@ -598,10 +622,13 @@ export function refundCardTransaction(owner, txId) {
   return { refunded: true, txId: tx.id, amount: tx.amount, balance: entry.balance }
 }
 
-export function listCardTransactions(owner, cardId = null) {
+export function listCardTransactions(owner, cardId = null, { agentKey = '' } = {}) {
   const db = loadDb()
+  const key = String(agentKey || '').trim().toLowerCase()
   return db.transactions
-    .filter(t => t.owner === ownerKey(owner) && (!cardId || t.cardId === cardId))
+    .filter(t => t.owner === ownerKey(owner)
+      && (!cardId || t.cardId === cardId)
+      && (!key || t.agentKey === key))
     .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
     .map(t => ({ ...t }))
 }

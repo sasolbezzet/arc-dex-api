@@ -3,8 +3,9 @@
 // and requires explicit confirmation before a spend. In on-chain card mode,
 // settlement debits testnet USDC from that MSCA through the session key.
 
-import { listCards, spendWithCard } from '../cardSimulator.mjs'
+import { getOwnerBalance, listCards, listCardTransactions, refundCardTransaction, spendWithCard } from '../cardSimulator.mjs'
 import { readCardRecords } from '../supabasePersistence.mjs'
+import { listAgentCardLinks } from '../vaultStore.mjs'
 
 /**
  * @param {Object} ctx
@@ -15,9 +16,23 @@ import { readCardRecords } from '../supabasePersistence.mjs'
  * @param {Function} ctx.apiGet GET helper with owner bearer
  * @param {Function} ctx.apiPost POST helper with owner bearer
  * @param {string} ctx.userId owner identity
+ * @param {string} ctx.agentKey composite OAuth client/owner binding
  */
 export function registerCardTools(ctx) {
-  const { registerTool, z, jsonText, mscaRequiredResult, apiGet, apiPost, userId } = ctx
+  const { registerTool, z, jsonText, mscaRequiredResult, apiGet, apiPost, userId, agentKey } = ctx
+
+  const linkedCardsForAgent = () => {
+    const links = listAgentCardLinks(agentKey)
+    return {
+      links,
+      byCardId: new Map(links.map(link => [String(link.cardId), link])),
+    }
+  }
+
+  const requireLinkedCard = (cardId) => {
+    const link = linkedCardsForAgent().byCardId.get(String(cardId || '').trim())
+    return link || null
+  }
 
   const requireSession = async () => {
     const msca = await ctx.resolveMsca()
@@ -47,45 +62,28 @@ export function registerCardTools(ctx) {
     const msca = await requireSession()
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     try {
-      const data = await apiGet('/api/cards/balance', userId)
-      return { content: [{ type: 'text', text: jsonText(data) }] }
+      const data = await getOwnerBalance(msca.walletAddress, { walletAddress: msca.walletAddress })
+      return { content: [{ type: 'text', text: jsonText({ ok: true, ...data, agentKey, walletType: 'MSCA' }) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'balance failed' }) }] }
     }
   })
 
-  registerTool('arcox_card_fund', 'Add test USDC to the card simulator balance (test mode only).', {
+  registerTool('arcox_card_fund', 'Owner-only card balance funding is managed in the ARCOX Plugin, not by an agent token.', {
     amount: z.string().describe('Amount of test USDC to add'),
-  }, async (params) => {
-    const msca = await requireSession()
-    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
-    try {
-      const data = await apiPost('/api/cards/balance/fund', { amount: String(params.amount || '25') }, userId)
-      return { content: [{ type: 'text', text: jsonText(data) }] }
-    } catch (e) {
-      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'fund failed' }) }] }
-    }
-  })
+  }, async () => ({
+    content: [{ type: 'text', text: jsonText({ status: 'rejected', reason: 'owner_authentication_required', message: 'Pendanaan kartu hanya dapat dilakukan owner melalui Plugin.' }) }],
+  }))
 
-  registerTool('arcox_card_create', 'Create a test virtual Visa card for the connected agent Wallet (simulator).', {
+  registerTool('arcox_card_create', 'Owner-only card creation is managed in the ARCOX Plugin, not by an agent token.', {
     label: z.string().optional().describe('Card label'),
     perTxLimit: z.string().optional().describe('Max per transaction in USDC'),
     dailyLimit: z.string().optional().describe('Max per day in USDC'),
     monthlyLimit: z.string().optional().describe('Max per month in USDC'),
     blockedCategories: z.array(z.string()).optional(),
-  }, async (params) => {
-    const msca = await requireSession()
-    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
-    try {
-      const data = await apiPost('/api/cards', {
-        label: params.label, perTxLimit: params.perTxLimit, dailyLimit: params.dailyLimit,
-        monthlyLimit: params.monthlyLimit, blockedCategories: params.blockedCategories || [],
-      }, userId)
-      return { content: [{ type: 'text', text: jsonText(data) }] }
-    } catch (e) {
-      return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'create card failed' }) }] }
-    }
-  })
+  }, async () => ({
+    content: [{ type: 'text', text: jsonText({ status: 'rejected', reason: 'owner_authentication_required', message: 'Pembuatan kartu dan pengaturan limit hanya dapat dilakukan owner melalui Plugin.' }) }],
+  }))
 
   registerTool('arcox_card_list', 'List masked test cards owned by the active Agent Wallet MSCA. PAN and CVV are never returned.', {}, async () => {
     const msca = await requireSession()
@@ -94,13 +92,15 @@ export function registerCardTools(ctx) {
       // Read directly from the same card service used by the HTTP route. This
       // binds the result to the exact MSCA resolved by the MCP OAuth session,
       // not merely to the SIWE/EOA tenant identity.
-      const localCards = listCards(msca.walletAddress)
+      const { byCardId } = linkedCardsForAgent()
+      const localCards = listCards(msca.walletAddress).filter(card => byCardId.has(card.cardId))
       const read = await readCardRecords(msca.walletAddress, localCards)
       const data = {
         ok: true,
         walletAddress: msca.walletAddress,
         walletType: 'MSCA',
-        cards: read.cards,
+        agentKey,
+        cards: read.cards.filter(card => byCardId.has(card.cardId)),
         persistenceSource: read.source,
       }
       return { content: [{ type: 'text', text: jsonText(data) }] }
@@ -125,6 +125,8 @@ export function registerCardTools(ctx) {
     }
     const msca = await requireSession()
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+    const link = requireLinkedCard(params.cardId)
+    if (!link) return { content: [{ type: 'text', text: jsonText({ approved: false, ok: false, declineReason: 'card_not_linked_to_agent', message: 'Kartu harus ditautkan owner ke agent ini sebelum digunakan.' }) }] }
     try {
       // MCP already has two independent controls before reaching this point:
       // OAuth was bound to the active MSCA, and the user explicitly confirmed
@@ -137,6 +139,8 @@ export function registerCardTools(ctx) {
         amount: String(params.amount),
         description: params.description,
         walletAddress: msca.walletAddress,
+        agentKey,
+        agentLimits: link,
       })
       return { content: [{ type: 'text', text: jsonText({
         ok: Boolean(result.approved),
@@ -156,9 +160,10 @@ export function registerCardTools(ctx) {
     const msca = await requireSession()
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     try {
-      const path = params.cardId ? `/api/cards/${encodeURIComponent(params.cardId)}/transactions` : '/api/cards/my-transactions'
-      const data = await apiGet(path, userId)
-      return { content: [{ type: 'text', text: jsonText(data) }] }
+      const { byCardId } = linkedCardsForAgent()
+      const rows = listCardTransactions(msca.walletAddress, params.cardId || null, { agentKey })
+        .filter(row => byCardId.has(row.cardId))
+      return { content: [{ type: 'text', text: jsonText({ ok: true, walletAddress: msca.walletAddress, agentKey, transactions: rows }) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'transactions failed' }) }] }
     }
@@ -170,8 +175,10 @@ export function registerCardTools(ctx) {
   }, async (params) => {
     const msca = await requireSession()
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+    const link = requireLinkedCard(params.cardId)
+    if (!link) return { content: [{ type: 'text', text: jsonText({ refunded: false, reason: 'card_not_linked_to_agent' }) }] }
     try {
-      const data = await apiPost(`/api/cards/${encodeURIComponent(params.cardId)}/refund`, { txId: params.txId }, userId)
+      const data = refundCardTransaction(msca.walletAddress, params.txId, { agentKey })
       return { content: [{ type: 'text', text: jsonText(data) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ error: e?.message || 'refund failed' }) }] }

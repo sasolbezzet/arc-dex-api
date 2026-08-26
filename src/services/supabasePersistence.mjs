@@ -1177,7 +1177,9 @@ function cardTransactionPayload(tx) {
     settled_at: tx?.settledAt ? toIso(tx.settledAt, null) : null,
     refunded_at: tx?.refundedAt ? toIso(tx.refundedAt, null) : null,
     decline_reason: String(tx?.declineReason || ''),
-    metadata: jsonSafe(tx?.metadata || {}),
+    // agentKey remains metadata-only: it is an audit boundary, not a secret or
+    // authorization input for Supabase reads.
+    metadata: jsonSafe({ ...(tx?.metadata || {}), ...(tx?.agentKey ? { agentKey: tx.agentKey } : {}) }),
   }
 }
 

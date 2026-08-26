@@ -212,9 +212,14 @@ function activityBelongsToAgent(entry, binding, clientId) {
   const entryOwner = String(entry?.owner || '').toLowerCase()
   const data = entry?.data && typeof entry.data === 'object' ? entry.data : {}
   const dataAgentKey = String(data.agentKey || '').trim().toLowerCase()
-  return entryOwner === String(binding.walletAddress || '').toLowerCase()
+  const expectedAgentKey = `${clientId}|${String(binding.ownerAddress || '').toLowerCase()}`
+  // Wallet-level activity is not automatically visible to every agent sharing
+  // that MSCA. Agent-scoped events must carry the exact composite key; this
+  // prevents one agent from reading another agent's card/payment history.
+  return (entryOwner === String(binding.walletAddress || '').toLowerCase()
+      && dataAgentKey === expectedAgentKey)
     || (entryOwner === String(binding.ownerAddress || '').toLowerCase()
-      && (String(data.agentClientId || '').toLowerCase() === clientId || Boolean(dataAgentKey && dataAgentKey === `${clientId}|${String(binding.ownerAddress || '').toLowerCase()}`)))
+      && (String(data.agentClientId || '').toLowerCase() === clientId || Boolean(dataAgentKey && dataAgentKey === expectedAgentKey)))
 }
 
 // GET /api/vault/agents/:agentKey/activity — recent activity for exactly one
