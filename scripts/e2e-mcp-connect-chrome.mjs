@@ -108,14 +108,32 @@ await context.addInitScript(({ addr, authToken }) => {
   localStorage.setItem('arc-dex-auth', JSON.stringify({ address: addr, token: authToken, issuedAt: Date.now() }))
 }, { addr: eoa.toLowerCase(), authToken: session.token })
 
-// Fresh virtual authenticator: the passkey is created natively by the browser
-// during the flow (Register), exactly like a new user on the deployed site.
 const cdp = await context.newCDPSession(page)
 await cdp.send('WebAuthn.enable')
-await cdp.send('WebAuthn.addVirtualAuthenticator', {
+const auth = await cdp.send('WebAuthn.addVirtualAuthenticator', {
   options: { protocol: 'ctap2', transport: 'internal', hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true, rpId: 'arcoxdex.vercel.app' },
 })
-ok('virtual authenticator ready (passkey will be created natively)')
+if (state.credentialId && state.pkcs8) {
+  // Existing passkey from a prior production run: seed it into the virtual
+  // authenticator so "Login Passkey" answers without re-registering.
+  // CDP requires padded standard base64 for all binary credential fields.
+  const b64 = s => Buffer.from(s, 'base64url').toString('base64')
+  await cdp.send('WebAuthn.addCredential', {
+    authenticatorId: auth.authenticatorId,
+    credential: {
+      credentialId: b64(state.credentialId),
+      isResidentCredential: true,
+      rpId: state.rpId || 'arcoxdex.vercel.app',
+      privateKey: Buffer.from(state.pkcs8, 'base64url').toString('base64'),
+      userHandle: state.userHandle ? b64(state.userHandle) : undefined,
+      signCount: 0,
+    },
+  })
+  ok(`virtual authenticator seeded with existing passkey ${state.credentialId.slice(0, 10)}…`)
+} else {
+  ok('virtual authenticator ready (passkey will be created natively)')
+}
+const hasExistingPasskey = !!(state.credentialId && state.pkcs8)
 
 // ── 4. Route intercept: localhost callback capture only (SIWE signs via CDP) ──
 let authCode = null
@@ -143,6 +161,11 @@ page.on('response', async r => {
 })
 
 // ── 5. Phase A: register the passkey through the real /plugin UI ──
+let newMsca = ''
+if (hasExistingPasskey) {
+  step('④', 'skip passkey register — existing Agent Wallet from state')
+  newMsca = msca
+} else {
 step('④', 'open /plugin and register a new passkey (user baru flow)…')
 await page.goto(`${BASE}/plugin`, { waitUntil: 'domcontentloaded', timeout: 60000 })
 await page.waitForTimeout(6000)
@@ -154,7 +177,6 @@ if (await buatBaru.count() === 0) {
 }
 await buatBaru.click()
 const phaseADeadline = Date.now() + 5 * 60 * 1000
-let newMsca = ''
 while (Date.now() < phaseADeadline) {
   await page.waitForTimeout(4000)
   const st = await page.evaluate(() => {
@@ -172,6 +194,7 @@ if (!newMsca) {
   process.exit(2)
 }
 ok(`passkey registered in real Chrome → Agent Wallet ${newMsca} ACTIVE`)
+}
 
 // ── 6. Phase B: open the OAuth authorize URL and approve with passkey login ──
 let lastUi = ''
