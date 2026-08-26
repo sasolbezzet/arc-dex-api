@@ -190,6 +190,39 @@ vault.get('/agents', requireAuth, async (req, res) => {
   }
 })
 
+// POST /api/vault/agents/:agentKey/connection-token — issue a long-lived MCP
+// bearer token bound to this agent's MSCA (Fase 4B). Owner-only; the token
+// works immediately at /mcp without any device-flow pairing.
+vault.post('/agents/:agentKey/connection-token', requireAuth, async (req, res) => {
+  try {
+    const agentKey = String(req.params.agentKey || '')
+    const binding = getAgentBinding(agentKey)
+    if (!binding) return res.status(404).json({ error: 'agent_not_found' })
+    if (String(binding.ownerAddress || '').toLowerCase() !== String(req.owner || '').toLowerCase()) {
+      return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
+    }
+    const ttlDays = Math.min(Math.max(Number(req.body?.ttlDays) || 90, 1), 365)
+    const { issueConnectionToken } = await import('../services/mcpServer.mjs')
+    const issued = issueConnectionToken({
+      agentKey,
+      clientName: resolveClientName(agentKey.split('|')[0] || ''),
+      userId: binding.ownerAddress,
+      mscaWalletAddress: binding.walletAddress,
+      ttlDays,
+    })
+    res.json({
+      token: issued.token,
+      agentName: resolveClientName(agentKey.split('|')[0] || '') || 'MCP Agent',
+      walletAddress: binding.walletAddress,
+      expiresAt: issued.expiresAt,
+      mcpUrl: `${process.env.ARCOX_PAY_BASE_URL || 'https://arcoxdex.vercel.app'}/mcp`,
+      message: 'Hubungkan ARCOX ke agent ini. Token ditampilkan sekali; simpan sebelum menutup modal.',
+    })
+  } catch (error) {
+    res.status(500).json({ error: error?.message || 'Failed to issue connection token' })
+  }
+})
+
 // DELETE /api/vault/agents/:agentKey — revoke exactly one agent binding and
 // kill every OAuth token (access + refresh) issued under that clientId so the
 // agent is truly offline. Owner-only.

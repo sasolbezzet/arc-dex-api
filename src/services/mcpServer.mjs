@@ -384,6 +384,41 @@ export function resolveAgentName(clientId) {
   return client?.clientName || 'mcp-agent'
 }
 
+// ── Connection token (Fase 4B) ──
+// A long-lived bearer for Hermes-style agents that pair via `--auth header`
+// instead of the device flow. It is an ordinary access-token row with a long
+// TTL, the MSCA locked at issuance, and resource pinned to the MCP endpoint,
+// so /mcp needs no new middleware and revoke-per-agent (Fase 4) kills it via
+// the shared clientId.
+export function issueConnectionToken({ agentKey, clientName, userId, mscaWalletAddress, ttlDays = 90 }) {
+  const owner = String(userId || '').trim().toLowerCase()
+  if (!/^0x[0-9a-f]{40}$/.test(owner)) throw new Error('userId (owner EOA) required')
+  if (!/^0x[0-9a-f]{40}$/.test(String(mscaWalletAddress || '').toLowerCase())) throw new Error('mscaWalletAddress required')
+  const ttlMs = Math.max(1, Number(ttlDays) || 90) * 24 * 60 * 60 * 1000
+  // Reuse the agent's existing client when present; otherwise mint a dedicated
+  // connection client so the token is revocable per agent.
+  let cid = String(agentKey || '').split('|')[0] || ''
+  refreshOAuthClients()
+  if (!cid || !oauthClients.get(cid)) {
+    cid = 'arcox_conn_' + randomUUID().slice(0, 12)
+    try {
+      withOAuthStateLock(() => {
+        refreshOAuthClients()
+        if (!oauthClients.get(cid)) {
+          oauthClients.set(cid, { clientSecret: randomUUID(), redirectUris: [`${SERVER_URL}/activate`], clientName: String(clientName || 'MCP Agent').slice(0, 64), connectionToken: true })
+          saveClients(oauthClients)
+        }
+      })
+    } catch { /* client existence is re-checked below */ }
+    refreshOAuthClients()
+  }
+  refreshAccessTokens()
+  const token = 'arx_at_' + randomUUID().replace(/-/g, '')
+  accessTokens.set(token, { userId: owner, clientId: cid, resource: MCP_RESOURCE_URL, mscaWalletAddress: String(mscaWalletAddress).toLowerCase(), expires: Date.now() + ttlMs })
+  saveTokens()
+  return { token, clientId: cid, expiresAt: new Date(Date.now() + ttlMs).toISOString() }
+}
+
 // ── Token revocation for one client (Fase 4: DELETE /api/vault/agents/:key) ──
 // Removes every access + refresh token issued under a clientId so a revoked
 // agent is truly offline, not just unbound.
