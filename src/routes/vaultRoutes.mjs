@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { listCredentials, addCredential, deduplicateCredentials, revealCredential, deleteCredential, getLimits, setLimits, listApprovals, createApproval, approveRequest, rejectRequest, listActivity, createChallenge, consumeChallenge, createSession, validateSession, listMcpSessions } from '../services/vaultStore.mjs'
 import { readAgentActivity, readAgentApprovals } from '../services/supabasePersistence.mjs'
-import { listRelatedAddresses, listAgentBindings, revokeAgentBinding, getAgentBinding } from '../services/sessionKeyService.mjs'
+import { listRelatedAddresses, listAgentBindings, listAgentBindingsForIdentity, identityOwnsAgentBinding, revokeAgentBinding, getAgentBinding } from '../services/sessionKeyService.mjs'
 import { verifyMessage } from 'viem'
 
 const vault = Router()
@@ -164,10 +164,10 @@ vault.get('/activity', requireAuth, async (req, res) => {
 // ── Per-agent management (Fase 4) ──
 // GET /api/vault/agents — every agent binding owned by this passkey session,
 // enriched with the OAuth client name (agent display name) and daily spend.
-function resolveClientName(clientId) {
+async function resolveClientName(clientId) {
   if (!clientId) return ''
   try {
-    const { resolveAgentName } = require('../services/mcpServer.mjs')
+    const { resolveAgentName } = await import('../services/mcpServer.mjs')
     return resolveAgentName(clientId)
   } catch {
     return ''
@@ -176,14 +176,19 @@ function resolveClientName(clientId) {
 
 vault.get('/agents', requireAuth, async (req, res) => {
   try {
-    const bindings = listAgentBindings(req.owner)
-    const agents = bindings.map(binding => ({
-      agentKey: binding.agentKey,
-      walletAddress: binding.walletAddress,
-      boundAt: binding.boundAt,
-      lastUsedAt: binding.lastUsedAt,
-      clientName: resolveAgentName(binding.agentKey.split('|')[0] || ''),
-    }))
+    // The passkey session identifies the MSCA; bindings are keyed to the
+    // owner EOA. Accept an identity that matches either side.
+    const bindings = listAgentBindingsForIdentity(req.owner)
+    const agents = []
+    for (const binding of bindings) {
+      agents.push({
+        agentKey: binding.agentKey,
+        walletAddress: binding.walletAddress,
+        boundAt: binding.boundAt,
+        lastUsedAt: binding.lastUsedAt,
+        clientName: await resolveClientName(binding.agentKey.split('|')[0] || ''),
+      })
+    }
     res.json({ agents })
   } catch (error) {
     res.status(500).json({ error: error?.message || 'Failed to list agents' })
@@ -198,21 +203,21 @@ vault.post('/agents/:agentKey/connection-token', requireAuth, async (req, res) =
     const agentKey = String(req.params.agentKey || '')
     const binding = getAgentBinding(agentKey)
     if (!binding) return res.status(404).json({ error: 'agent_not_found' })
-    if (String(binding.ownerAddress || '').toLowerCase() !== String(req.owner || '').toLowerCase()) {
+    if (!identityOwnsAgentBinding(req.owner, binding)) {
       return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
     }
-    const ttlDays = Math.min(Math.max(Number(req.body?.ttlDays) || 90, 1), 365)
+    const ttlDays = Math.min(Math.max(Number(req.body?.ttlDays) || 90, 1), 3650)
     const { issueConnectionToken } = await import('../services/mcpServer.mjs')
     const issued = issueConnectionToken({
       agentKey,
-      clientName: resolveClientName(agentKey.split('|')[0] || ''),
+      clientName: await resolveClientName(agentKey.split('|')[0] || ''),
       userId: binding.ownerAddress,
       mscaWalletAddress: binding.walletAddress,
       ttlDays,
     })
     res.json({
       token: issued.token,
-      agentName: resolveClientName(agentKey.split('|')[0] || '') || 'MCP Agent',
+      agentName: (await resolveClientName(agentKey.split('|')[0] || '')) || 'MCP Agent',
       walletAddress: binding.walletAddress,
       expiresAt: issued.expiresAt,
       mcpUrl: `${process.env.ARCOX_PAY_BASE_URL || 'https://arcoxdex.vercel.app'}/mcp`,
@@ -226,21 +231,23 @@ vault.post('/agents/:agentKey/connection-token', requireAuth, async (req, res) =
 // DELETE /api/vault/agents/:agentKey — revoke exactly one agent binding and
 // kill every OAuth token (access + refresh) issued under that clientId so the
 // agent is truly offline. Owner-only.
-vault.delete('/agents/:agentKey', requireAuth, (req, res) => {
+vault.delete('/agents/:agentKey', requireAuth, async (req, res) => {
   try {
     const agentKey = String(req.params.agentKey || '')
     const binding = getAgentBinding(agentKey)
     if (!binding) return res.status(404).json({ error: 'agent_not_found' })
-    if (String(binding.ownerAddress || '').toLowerCase() !== String(req.owner || '').toLowerCase()) {
+    if (!identityOwnsAgentBinding(req.owner, binding)) {
       return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
     }
     const removed = revokeAgentBinding(agentKey)
     // Kill the OAuth tokens for this clientId (access + refresh).
     const clientId = agentKey.split('|')[0]
     try {
-      const { revokeTokensForClient } = require('../services/mcpServer.mjs')
+      const { revokeTokensForClient } = await import('../services/mcpServer.mjs')
       revokeTokensForClient(clientId)
-    } catch { /* best-effort; binding removal is the source of truth */ }
+    } catch (error) {
+      console.warn('[vault] token revoke best-effort failed:', error?.message || error)
+    }
     res.json({ ok: true, removed, agentKey })
   } catch (error) {
     res.status(500).json({ error: error?.message || 'Failed to revoke agent' })

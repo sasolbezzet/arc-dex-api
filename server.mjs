@@ -640,10 +640,12 @@ app.post('/v1/chat/completions', apiLimiter, openAiChatCompletions)
 
 const KIT_KEY = process.env.KIT_KEY
 const PORT = process.env.PORT || 3001
-const WALLET_DB = './wallets-db.json'
-const TX_HISTORY_DB = './tx-history-db.json'
-const INVOICE_DB = './invoices-db.json'
-const WEBHOOK_DB = './webhook-events-db.json'
+// Data paths are env-overridable so a staging instance (:3901) can run from
+// the same checkout without touching production files (Fase 6 isolation).
+const WALLET_DB = process.env.WALLET_DB || './wallets-db.json'
+const TX_HISTORY_DB = process.env.TX_HISTORY_DB || './tx-history-db.json'
+const INVOICE_DB = process.env.INVOICE_DB || './invoices-db.json'
+const WEBHOOK_DB = process.env.WEBHOOK_DB || './webhook-events-db.json'
 const JSON_BACKUP_DIR = './runtime-backups'
 const AUTH_SECRET = process.env.AUTH_SECRET || ''
 const ARCOX_PAY_BASE_URL = (process.env.ARCOX_PAY_BASE_URL || process.env.ARCOX_WEB_URL || 'https://arcoxdex.vercel.app').replace(/\/$/, '')
@@ -2897,7 +2899,7 @@ app.post('/api/mint-cctp-from-solana', apiLimiter, requireServerSignedMintAuth, 
 // ── Auto-mint worker (for web bridge) ───────────────────────────
 // Background worker yang poll attestation untuk bridge yang timeout di frontend.
 // Saat attestation siap, frontend bisa mint via MetaMask menggunakan data dari worker.
-const AUTO_MINT_DB = './auto-mint-jobs.json'
+const AUTO_MINT_DB = process.env.AUTO_MINT_DB || './auto-mint-jobs.json'
 const autoMintJobs = new Map(Object.entries(readJsonObject(AUTO_MINT_DB)).map(([jobId, job]) => [jobId, { ...(job || {}), jobId: job?.jobId || jobId }])) // fallback/cache; Supabase is primary when available
 const autoMintWorkers = new Set()
 const autoMintRetryTimers = new Map()

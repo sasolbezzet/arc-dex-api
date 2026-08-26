@@ -458,6 +458,28 @@ export function listAgentBindings(ownerAddress) {
     .map(([agentKey, binding]) => ({ agentKey, ...binding }))
 }
 
+/** List bindings visible to a passkey session identity. The vault session
+ * token authenticates the MSCA (passkey login), while bindings are keyed to
+ * the owner EOA — so an identity is authoritative when it matches either the
+ * binding owner EOA or the bound wallet MSCA (Fase 4/5 flow). */
+export function listAgentBindingsForIdentity(identityAddress) {
+  const identity = normalizeAgentKey(identityAddress)
+  const store = loadStore()
+  return Object.entries(store.agentBindings || {})
+    .filter(([, binding]) =>
+      String(binding?.ownerAddress || '').toLowerCase() === identity ||
+      String(binding?.walletAddress || '').toLowerCase() === identity)
+    .map(([agentKey, binding]) => ({ agentKey, ...binding }))
+}
+
+/** True when an identity (EOA or its bound MSCA) owns the binding. */
+export function identityOwnsAgentBinding(identityAddress, binding) {
+  if (!binding) return false
+  const identity = normalizeAgentKey(identityAddress)
+  return String(binding.ownerAddress || '').toLowerCase() === identity ||
+    String(binding.walletAddress || '').toLowerCase() === identity
+}
+
 /** Remove exactly one agent binding row. Returns whether a row was removed;
  * aliases and user session records are left untouched. */
 export function revokeAgentBinding(agentKey) {
