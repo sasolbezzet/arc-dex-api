@@ -413,8 +413,14 @@ export function issueConnectionToken({ agentKey, clientName, userId, mscaWalletA
     refreshOAuthClients()
   }
   refreshAccessTokens()
+  // Connection-token issuance is also rotation: only the previous
+  // connection tokens for this agent are invalidated. Device-flow access
+  // tokens on the same client remain valid and are not part of this rotation.
+  for (const [existingToken, existingAuth] of accessTokens) {
+    if (existingAuth.clientId === cid && existingAuth.connectionToken === true) accessTokens.delete(existingToken)
+  }
   const token = 'arx_at_' + randomUUID().replace(/-/g, '')
-  accessTokens.set(token, { userId: owner, clientId: cid, resource: MCP_RESOURCE_URL, mscaWalletAddress: String(mscaWalletAddress).toLowerCase(), expires: Date.now() + ttlMs })
+  accessTokens.set(token, { userId: owner, clientId: cid, resource: MCP_RESOURCE_URL, mscaWalletAddress: String(mscaWalletAddress).toLowerCase(), connectionToken: true, expires: Date.now() + ttlMs })
   saveTokens()
   return { token, clientId: cid, expiresAt: new Date(Date.now() + ttlMs).toISOString() }
 }

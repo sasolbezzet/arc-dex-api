@@ -66,6 +66,18 @@ test('connection token is issued, validates at MCP, and is revoked per agent', a
   })
 })
 
+test('issuing a new connection token rotates the previous token for that agent', async () => {
+  await withEnvPaths(async () => {
+    const mcp = await import('../src/services/mcpServer.mjs?conn-rotate-' + Date.now())
+    const first = mcp.issueConnectionToken({ agentKey: 'agent_rotate|' + EOA, clientName: 'Hermes', userId: EOA, mscaWalletAddress: W1, ttlDays: 30 })
+    assert.ok(mcp.validateAccessToken(first.token), 'first token initially valid')
+
+    const second = mcp.issueConnectionToken({ agentKey: first.clientId + '|' + EOA, clientName: 'Hermes', userId: EOA, mscaWalletAddress: W1, ttlDays: 30 })
+    assert.equal(mcp.validateAccessToken(first.token), null, 'old connection token is rotated out')
+    assert.ok(mcp.validateAccessToken(second.token), 'new connection token is valid')
+  })
+})
+
 test('connection token for a second agent survives revoke of the first', async () => {
   await withEnvPaths(async () => {
     const mcp = await import('../src/services/mcpServer.mjs?conn2-' + Date.now())

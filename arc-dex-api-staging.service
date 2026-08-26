@@ -1,0 +1,32 @@
+# Install as /etc/systemd/system/arc-dex-api-staging.service
+# This unit is intentionally not enabled; start it manually for L1/L2 tests.
+[Unit]
+Description=ARCOX DEX API (staging :3901)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/arc-dex-api
+ExecStart=/usr/bin/node --env-file=.env server.mjs
+Restart=on-failure
+RestartSec=3
+Environment=PORT=3901
+Environment=SERVER_URL=http://localhost:3901
+Environment=OAUTH_TOKENS_PATH=./data-staging/oauth-tokens.json
+Environment=OAUTH_STATE_PATH=./data-staging/oauth-state.json
+Environment=OAUTH_PATH=./data-staging/oauth-clients.json
+Environment=SESSION_KEYS_PATH=./data-staging/session-keys.json
+Environment=VAULT_PATH=./data-staging/vault.json
+Environment=VAULT_ACTIVITY_PATH=./data-staging/vault-activity.json
+Environment=VAULT_SESSION_PATH=./data-staging/vault-sessions.json
+Environment=AGENT_SPEND_PATH=./data-staging/agent-spend.json
+Environment=WALLET_DB=./data-staging/wallets-db.json
+Environment=TX_HISTORY_DB=./data-staging/tx-history-db.json
+Environment=INVOICE_DB=./data-staging/invoices-db.json
+Environment=WEBHOOK_DB=./data-staging/webhook-events-db.json
+Environment=AUTO_MINT_DB=./data-staging/auto-mint-jobs.json
+Environment=X402_INVOICE_DB=./data-staging/x402-invoices-db.json
+
+[Install]
+WantedBy=multi-user.target
