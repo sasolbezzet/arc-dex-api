@@ -151,6 +151,7 @@ function withOAuthStateLock(fn) {
 // ── Persistent OAuth client store ──
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { scheduleOAuthShadowSnapshot } from './supabaseOAuthShadow.mjs'
+import { registerMscaLiveTokenProbe } from './sessionKeyService.mjs'
 
 function loadClients() {
   const d = readJsonFile(OAUTH_PATH, { clients: {} })
@@ -383,6 +384,40 @@ export function resolveAgentName(clientId) {
   return client?.clientName || 'mcp-agent'
 }
 
+// ── Token revocation for one client (Fase 4: DELETE /api/vault/agents/:key) ──
+// Removes every access + refresh token issued under a clientId so a revoked
+// agent is truly offline, not just unbound.
+export function revokeTokensForClient(clientId) {
+  const cid = String(clientId || '')
+  if (!cid) return 0
+  let removed = 0
+  for (const [token, value] of accessTokens) {
+    if (value.clientId === cid) { accessTokens.delete(token); removed++ }
+  }
+  for (const [token, value] of refreshTokens) {
+    if (value.clientId === cid) { refreshTokens.delete(token); removed++ }
+  }
+  if (removed > 0) saveTokens()
+  return removed
+}
+
+// ── Anti-cross-agent revoke probe ──
+// True when any live access OR refresh token is still bound to this MSCA.
+// Registered into sessionKeyService so storeSessionKey refuses to auto-revoke
+// an MSCA that another agent's live connection still depends on.
+export function hasLiveTokenForMsca(walletAddress) {
+  const target = String(walletAddress || '').toLowerCase()
+  if (!target) return false
+  for (const t of accessTokens.values()) {
+    if (String(t.mscaWalletAddress || '').toLowerCase() === target && Date.now() < Number(t.expires)) return true
+  }
+  for (const t of refreshTokens.values()) {
+    if (String(t.mscaWalletAddress || '').toLowerCase() === target && Date.now() < Number(t.expires)) return true
+  }
+  return false
+}
+registerMscaLiveTokenProbe(hasLiveTokenForMsca)
+
 // ── OAuth metadata endpoints ──
 export function oauthMetadataHandler(req, res) {
   res.json({
@@ -506,7 +541,7 @@ import { createPublicClient, decodeEventLog, defineChain, encodeFunctionData, fa
 // when the browser proves control of that exact MSCA with its vault token.
 // This keeps MCP MSCA-only while allowing Claude/ChatGPT's EOA identity to
 // resolve the Agent Wallet after the user explicitly approves OAuth.
-export async function bindMcpIdentityToActiveSession({ userId, mscaWalletAddress, mscaSessionToken } = {}) {
+export async function bindMcpIdentityToActiveSession({ userId, mscaWalletAddress, mscaSessionToken, clientId } = {}) {
   if (!mscaWalletAddress && !mscaSessionToken) return { ok: true, skipped: true }
   if (!userId || !mscaWalletAddress || !mscaSessionToken) {
     return { ok: false, error: 'Both active MSCA address and passkey session token are required for identity binding' }
@@ -521,12 +556,19 @@ export async function bindMcpIdentityToActiveSession({ userId, mscaWalletAddress
     if (!session?.active || getAddress(session.walletAddress || '') !== getAddress(mscaWalletAddress)) {
       return { ok: false, error: 'Selected MSCA does not have an active session key' }
     }
-    const { bindSessionAlias } = await import('./sessionKeyService.mjs')
+    const { bindSessionAlias, bindAgent } = await import('./sessionKeyService.mjs')
     // The passkey-backed session token above proves control of this exact
     // active MSCA. Permit this OAuth flow to replace a stale EOA alias so a
     // newly selected Agent Wallet can connect without a manual cleanup step.
     // The ordinary session setup path keeps the strict no-rebind default.
-    return { ok: true, bound: bindSessionAlias(userId, userId, mscaWalletAddress, { allowRebind: true }) }
+    const bound = bindSessionAlias(userId, userId, mscaWalletAddress, { allowRebind: true })
+    // Per-agent isolation: key the durable binding by <clientId>|<userId> so
+    // two agents sharing one owner EOA each keep their own Agent Wallet.
+    // The legacy userId alias above stays written for old tokens.
+    let agentBound = null
+    const cid = String(clientId || '').trim()
+    if (cid && !cid.includes('|')) agentBound = bindAgent(`${cid}|${userId}`, userId, mscaWalletAddress)
+    return { ok: true, bound, agentBound }
   } catch (error) {
     return { ok: false, error: error?.message || 'MCP identity binding failed' }
   }
@@ -567,6 +609,7 @@ export async function siweVerifyHandler(req, res) {
     userId: String(address).toLowerCase(),
     mscaWalletAddress,
     mscaSessionToken,
+    clientId,
   })
   if (!binding.ok) return res.status(403).json({ error: 'session_identity_binding_failed', error_description: binding.error })
 
@@ -677,21 +720,20 @@ export function deviceAuthorizeHandler(req, res) {
     clientId = String(client_id)
   } else {
     // Headless clients may skip dynamic registration because they never need a
-    // redirect URI. Issue them a stable internal client bound to this flow so
-    // issued tokens still carry a real clientId for revocation/audit.
-    clientId = 'arcox_device_flow'
-    if (!oauthClients.get(clientId)) {
-      try {
-        withOAuthStateLock(() => {
-          refreshOAuthClients()
-          if (!oauthClients.get(clientId)) {
-            oauthClients.set(clientId, { clientSecret: randomUUID(), redirectUris: [`${SERVER_URL}/activate`], clientName: String(client_name || 'Hermes Agent').slice(0, 64) })
-            saveClients(oauthClients)
-          }
-        })
-      } catch { /* fall through; client existence is re-checked below */ }
-      refreshOAuthClients()
-    }
+    // redirect URI. Issue a UNIQUE internal client per device grant so two
+    // device-flow agents on the same owner EOA never collide on the composite
+    // <clientId>|<userId> binding key, and revoke/audit stay per-agent. The
+    // RFC 8628 response carries nothing new for the client; it learns its
+    // client_id implicitly through the token it receives after polling.
+    clientId = 'arcox_dev_' + randomUUID().slice(0, 8)
+    try {
+      withOAuthStateLock(() => {
+        refreshOAuthClients()
+        oauthClients.set(clientId, { clientSecret: randomUUID(), redirectUris: [`${SERVER_URL}/activate`], clientName: String(client_name || 'Hermes Agent').slice(0, 64), deviceFlow: true })
+        saveClients(oauthClients)
+      })
+    } catch { /* fall through; client existence is re-checked below */ }
+    refreshOAuthClients()
   }
   const deviceCode = 'arx_dc_' + randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')
   const userCode = generateDeviceUserCode()
@@ -815,6 +857,7 @@ export async function deviceApproveHandler(req, res) {
     userId: String(address).toLowerCase(),
     mscaWalletAddress,
     mscaSessionToken,
+    clientId: initial.grant.clientId,
   })
   if (!binding.ok) return res.status(403).json({ error: 'session_identity_binding_failed', error_description: binding.error })
 
@@ -2736,6 +2779,11 @@ async function executeX402Pay(userId, invoiceId) {
 export function createMcpServer(userId, context = {}) {
   const requestAgent = context.agent || resolveAgentForUser(userId)
   const boundMscaWalletAddress = context.boundMscaWalletAddress || ''
+  // Per-agent identity (Fase 2/3): composite key + optional daily limit from
+  // the OAuth clientId so limits/audit are scoped to one agent.
+  const clientId = context.clientId || ''
+  const agentKey = clientId && !clientId.includes('|') ? `${clientId}|${userId}` : ''
+  const dailyLimit = Number(context.dailyLimit || 0) || 0
   const server = new McpServer({
     name: 'arcox-mcp',
     version: '1.0.0',
@@ -2981,7 +3029,7 @@ export function createMcpServer(userId, context = {}) {
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: preparedResult.reason || 'swap_calldata_unavailable', message }) }] }
       }
       const { swapViaSession } = await import('./sessionKeyService.mjs')
-      const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: 'arc-testnet' })
+      const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: 'arc-testnet', agentKey, dailyLimit })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: requestAgent, action: 'swap', amount: params.amountIn, token: params.tokenIn,
@@ -3715,7 +3763,7 @@ export function createMcpServer(userId, context = {}) {
     if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     try {
       const { sendViaSession } = await import('./sessionKeyService.mjs')
-      const result = await sendViaSession(userId, params.to, params.amount, token, { chainKey: fromChain })
+      const result = await sendViaSession(userId, params.to, params.amount, token, { chainKey: fromChain, agentKey, agentLimit: dailyLimit })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: requestAgent, action: 'send', amount: params.amount, token,
@@ -4068,7 +4116,7 @@ export async function mcpHttpHandler(req, res) {
   }
   if (!session) {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId })
-    const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress })
+    const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress, clientId: auth.clientId })
     await server.connect(transport)
     session = { transport, server, userId: auth.userId, clientId: auth.clientId, boundMscaWalletAddress, lastActivity: Date.now() }
     sessions.set(sessionId, session)

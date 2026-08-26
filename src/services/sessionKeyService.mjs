@@ -934,6 +934,25 @@ export function touchSessionKey(userId) {
  * delegatePrivateKey is encrypted at rest using SESSION_KEY_ENCRYPTION_KEY.
  * @param options.chain — chain key (e.g., 'arc-testnet', 'ethereum-sepolia')
  */
+// ── MSCA live-token probe (anti-cross-agent revoke) ──
+// mcpServer.mjs registers this probe so storeSessionKey can ask whether any
+// live OAuth token still references an MSCA before auto-revoking its session
+// record during a new setup. One-way registration avoids an import cycle.
+let mscaLiveTokenProbe = null
+export function registerMscaLiveTokenProbe(fn) {
+  mscaLiveTokenProbe = typeof fn === 'function' ? fn : null
+}
+
+function mscaHasLiveToken(walletAddress) {
+  try {
+    return mscaLiveTokenProbe ? Boolean(mscaLiveTokenProbe(String(walletAddress || '').toLowerCase())) : false
+  } catch {
+    // Fail open on probe errors: keep the old session alive rather than
+    // killing another agent's active wallet because of a transient error.
+    return true
+  }
+}
+
 export function storeSessionKey(userId, { walletAddress, delegateAddress, delegatePrivateKey, chain = 'arc-testnet', ownerAddress }) {
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
@@ -944,11 +963,15 @@ export function storeSessionKey(userId, { walletAddress, delegateAddress, delega
     const staleAlias = store.aliases?.[ownerKey]
     if (staleAlias && staleAlias.toLowerCase() !== getAddress(walletAddress).toLowerCase()) {
       const old = store.users[staleAlias.toLowerCase()]
-      if (old && old.active !== false) { old.active = false; old.revokedAt = Date.now(); old.replacedBy = getAddress(walletAddress) }
+      if (old && old.active !== false && !mscaHasLiveToken(staleAlias)) {
+        // Only deactivate when NO other agent still holds a live OAuth token
+        // bound to this wallet (per-agent isolation).
+        old.active = false; old.revokedAt = Date.now(); old.replacedBy = getAddress(walletAddress)
+      }
     }
     // Also revoke old EOA entry if it exists with a different delegate
     const oldEoa = store.users[ownerKey]
-    if (oldEoa && oldEoa.active !== false && oldEoa.delegateAddress !== delegateAddress) {
+    if (oldEoa && oldEoa.active !== false && oldEoa.delegateAddress !== delegateAddress && !mscaHasLiveToken(oldEoa.walletAddress)) {
       oldEoa.active = false; oldEoa.revokedAt = Date.now(); oldEoa.replacedBy = getAddress(walletAddress)
     }
   }
@@ -1042,7 +1065,7 @@ export function revokeSessionKey(userId) {
 /**
  * Check if user has an active session key and is within spending limits.
  */
-export function canExecuteViaSession(userId, amount, chainKey) {
+export function canExecuteViaSession(userId, amount, chainKey, options = {}) {
   const entry = getSessionKey(userId)
   if (!entry || !entry.active) return { ok: false, reason: 'no_session' }
   if (chainKey !== undefined && !MSCA_SUPPORTED_CHAIN_KEYS.includes(String(chainKey))) {
@@ -1060,7 +1083,25 @@ export function canExecuteViaSession(userId, amount, chainKey) {
   const amt = parsed
   if (limits.autoApprove === false) return { ok: false, reason: 'auto_off' }
   if (amt > Number(limits.maxPerTx)) return { ok: false, reason: 'over_limit', limit: limits.maxPerTx }
+  // Per-agent daily limit (Fase 3): enforced ONLY when a positive dailyLimit
+  // is configured for this agent, and only when the caller identifies itself
+  // with an agentKey. Owner-originated (web UI) paths stay on vault limits.
+  const agentKey = String(options.agentKey || '').trim()
+  const dailyLimit = Number(options.dailyLimit || 0)
+  if (agentKey && Number.isFinite(dailyLimit) && dailyLimit > 0) {
+    const { wouldExceedDailyLimit } = requireAgentSpendLedger()
+    if (wouldExceedDailyLimit(agentKey, amt, dailyLimit)) {
+      return { ok: false, reason: 'daily_limit_exceeded', limit: dailyLimit, agentKey }
+    }
+  }
   return { ok: true, entry, limits }
+}
+
+// Lazy require to avoid a static import cycle (agentSpendLedger imports
+// jsonFileStore only; this keeps the gate side-effect free when unused).
+function requireAgentSpendLedger() {
+  // eslint-disable-next-line no-global-assign
+  return globalThis.__agentSpendLedger || (globalThis.__agentSpendLedger = require('./agentSpendLedger.mjs'))
 }
 
 // Extract a positive number from a human amount string. Accepted: "1.5",
@@ -1350,7 +1391,8 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
   if (requestedChain !== undefined && !MSCA_SUPPORTED_CHAIN_KEYS.includes(requestedChain)) {
     return { status: 'denied', reason: 'msca_unsupported_chain', chain: requestedChain }
   }
-  const gate = canExecuteViaSession(userId, amount, requestedChain)
+  const agentKey = String(options.agentKey || '').trim()
+  const gate = canExecuteViaSession(userId, amount, requestedChain, { agentKey, dailyLimit: options.dailyLimit || options.agentLimit })
   if (!gate.ok) return { status: 'denied', reason: gate.reason, chain: requestedChain }
 
   const chainKey = requestedChain || gate.entry?.chain || 'arc-testnet'
@@ -1378,12 +1420,17 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
   const amountBigInt = amountToUnits(amount, decimals)
   if (amountBigInt === null) return { status: 'denied', reason: 'bad_amount' }
 
-  return executeViaSession(userId, [{
+  const executed = await executeViaSession(userId, [{
     to: tokenAddress,
     abi: erc20Abi,
     functionName: 'transfer',
     args: [getAddress(to), amountBigInt],
   }], { paymaster: true, chainKey })
+  if (executed?.status === 'success' && agentKey) {
+    const { recordSpend } = requireAgentSpendLedger()
+    recordSpend(agentKey, parsedAmount)
+  }
+  return executed
 }
 
 /**
@@ -1395,8 +1442,8 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
  * treasury. Full AMM routing via MSCA needs the swap router calldata. Upgrade
  * by passing prepared calldata from /api/eoa-swap-prepare.
  */
-export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, preparedCalldata, preparedCalls, chainKey }) {
-  const gate = canExecuteViaSession(userId, amountIn)
+export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, preparedCalldata, preparedCalls, chainKey, agentKey, dailyLimit }) {
+  const gate = canExecuteViaSession(userId, amountIn, chainKey, { agentKey, dailyLimit })
   if (!gate.ok) return { status: 'denied', reason: gate.reason }
 
   const chain = chainKey || gate.entry?.chain || 'arc-testnet'
@@ -1407,11 +1454,16 @@ export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, prep
       ? [{ to: preparedCalldata.to, data: preparedCalldata.data, value: preparedCalldata.value || 0n }]
       : []
   if (calls.length > 0 && calls.every(call => call?.to && call?.data)) {
-    return executeViaSession(userId, calls.map(call => ({
+    const executed = await executeViaSession(userId, calls.map(call => ({
       to: getAddress(call.to),
       data: call.data,
       value: call.value || 0n,
     })), { paymaster: true, chainKey: chain })
+    if (executed?.status === 'success' && agentKey) {
+      const { recordSpend } = requireAgentSpendLedger()
+      recordSpend(agentKey, parseHumanAmount(amountIn) || 0)
+    }
+    return executed
   }
 
   // Never silently turn a swap into a treasury transfer. The caller must
