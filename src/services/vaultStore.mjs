@@ -282,7 +282,7 @@ export function listApprovals(owner) {
   return v.approvals.filter(a => a.owner === owner)
 }
 
-export function createApproval(owner, { agent, action, amount, token, source, to, details, forcePending }) {
+export function createApproval(owner, { agent, agentClientId, action, amount, token, source, to, details, forcePending }) {
   const v = loadVault()
   const limits = getLimits(owner)
   // Agent-initiated (MCP) transactions ALWAYS require the user to sign via
@@ -305,6 +305,7 @@ export function createApproval(owner, { agent, action, amount, token, source, to
     // Lifecycle: pending → approved → pending_signature → pending_confirmation → success/error
     // Or: pending → rejected, denied, error
     status: withinLimit ? 'auto_approved' : 'pending',
+    ...(agentClientId ? { agentClientId: String(agentClientId) } : {}),
     paramHash: '', // ponytail: operation-bound hash — add when security hardened
     createdAt,
     // `auto_approved` records the approval decision, not completion of a
@@ -316,7 +317,7 @@ export function createApproval(owner, { agent, action, amount, token, source, to
   v.approvals.push(approval)
   saveVault(v)
   scheduleApprovalUpsert(approval)
-  logActivity(owner, withinLimit ? 'auto_approved' : 'approval_requested', { action, amount, token, source })
+  logActivity(owner, withinLimit ? 'auto_approved' : 'approval_requested', { action, amount, token, source, ...(agentClientId ? { agentClientId: String(agentClientId) } : {}) })
   return approval
 }
 

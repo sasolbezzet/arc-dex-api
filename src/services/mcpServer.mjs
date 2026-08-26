@@ -152,6 +152,7 @@ function withOAuthStateLock(fn) {
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { scheduleOAuthShadowSnapshot } from './supabaseOAuthShadow.mjs'
 import { registerMscaLiveTokenProbe } from './sessionKeyService.mjs'
+import { getLimits } from './vaultStore.mjs'
 
 function loadClients() {
   const d = readJsonFile(OAUTH_PATH, { clients: {} })
@@ -2460,9 +2461,9 @@ async function canAutoExecute(userId, source, amount, chainKey) {
 
 // Record an auto-executed action into the vault as an approved entry (for the
 // Plugin history + audit trail), with the on-chain txHash.
-async function recordAutoExec(userId, { agent, action, amount, token, source, to, details, txHash, explorerUrl }) {
+async function recordAutoExec(userId, { agent, agentClientId, action, amount, token, source, to, details, txHash, explorerUrl }) {
   const vault = await import('./vaultStore.mjs')
-  const approval = vault.createApproval(userId, { agent, action, amount, token, source, to, details, forcePending: true })
+  const approval = vault.createApproval(userId, { agent, agentClientId, action, amount, token, source, to, details, forcePending: true })
   vault.approveRequest(userId, approval.id, { txHash, explorerUrl })
   return vault.updateApprovalStatus(userId, approval.id, 'success', { txHash, explorerUrl }) || approval
 }
@@ -2824,7 +2825,9 @@ export function createMcpServer(userId, context = {}) {
   // the OAuth clientId so limits/audit are scoped to one agent.
   const clientId = context.clientId || ''
   const agentKey = clientId && !clientId.includes('|') ? `${clientId}|${userId}` : ''
-  const dailyLimit = Number(context.dailyLimit || 0) || 0
+  // MCP callers carry an OAuth clientId; use the owner's configured limit
+  // when the caller did not provide an explicit per-server override.
+  const dailyLimit = Number(context.dailyLimit || getLimits(userId)?.dailyLimit || 0) || 0
   const server = new McpServer({
     name: 'arcox-mcp',
     version: '1.0.0',
@@ -3073,7 +3076,7 @@ export function createMcpServer(userId, context = {}) {
       const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: 'arc-testnet', agentKey, dailyLimit })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
-          agent: requestAgent, action: 'swap', amount: params.amountIn, token: params.tokenIn,
+          agent: requestAgent, agentClientId: clientId, action: 'swap', amount: params.amountIn, token: params.tokenIn,
           source: 'session', details: jsonText({ tokenOut: params.tokenOut, previewId: params.previewId }),
           txHash: result.txHash, explorerUrl: result.explorerUrl,
         })
@@ -3512,7 +3515,7 @@ export function createMcpServer(userId, context = {}) {
       } else if (mint.success) {
         try {
           await recordAutoExec(userId, {
-            agent: requestAgent, action: 'bridge', amount: params.amount, token: 'USDC',
+            agent: requestAgent, agentClientId: clientId, action: 'bridge', amount: params.amount, token: 'USDC',
             source: 'session', details: jsonText({ fromChain: route.fromKey, toChain: route.toKey, previewId: params.previewId, burnTxHash: result.txHash, destinationMint: true }),
             txHash: result.txHash, explorerUrl: result.explorerUrl,
           })
@@ -3807,7 +3810,7 @@ export function createMcpServer(userId, context = {}) {
       const result = await sendViaSession(userId, params.to, params.amount, token, { chainKey: fromChain, agentKey, agentLimit: dailyLimit })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
-          agent: requestAgent, action: 'send', amount: params.amount, token,
+          agent: requestAgent, agentClientId: clientId, action: 'send', amount: params.amount, token,
           source: 'session', to: params.to, details: jsonText({ previewId: params.previewId, fromChain }),
           txHash: result.txHash, explorerUrl: result.explorerUrl,
         })

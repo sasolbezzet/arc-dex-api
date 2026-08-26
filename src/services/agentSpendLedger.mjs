@@ -10,7 +10,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { atomicWriteJsonFile } from './jsonFileStore.mjs'
 
-const DEFAULT_PATH = process.env.AGENT_SPEND_PATH || 'data/agent-spend.json'
+function ledgerPath() {
+  return process.env.AGENT_SPEND_PATH || 'data/agent-spend.json'
+}
 
 function utcDayKey(now = Date.now()) {
   const d = new Date(now)
@@ -18,9 +20,10 @@ function utcDayKey(now = Date.now()) {
 }
 
 function loadLedger() {
-  if (!existsSync(DEFAULT_PATH)) return { day: utcDayKey(), agents: {} }
+  const path = ledgerPath()
+  if (!existsSync(path)) return { day: utcDayKey(), agents: {} }
   try {
-    const data = JSON.parse(readFileSync(DEFAULT_PATH, 'utf8'))
+    const data = JSON.parse(readFileSync(path, 'utf8'))
     if (!data || typeof data !== 'object') return { day: utcDayKey(), agents: {} }
     return data
   } catch {
@@ -30,8 +33,9 @@ function loadLedger() {
 
 function saveLedger(ledger) {
   try {
-    mkdirSync(dirname(DEFAULT_PATH), { recursive: true })
-    atomicWriteJsonFile(DEFAULT_PATH, ledger)
+    const path = ledgerPath()
+    mkdirSync(dirname(path), { recursive: true })
+    atomicWriteJsonFile(path, ledger)
   } catch (error) {
     // Non-fatal for execution: the daily gate still works in-memory for this
     // process; persistence failure only loses the running tally on restart.

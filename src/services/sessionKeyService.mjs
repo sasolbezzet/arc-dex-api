@@ -28,6 +28,7 @@ import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { getLimits } from './vaultStore.mjs'
 import { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } from './chains.mjs'
 import { scheduleSessionMetadataSnapshot } from './supabasePersistence.mjs'
+import { recordSpend, wouldExceedDailyLimit } from './agentSpendLedger.mjs'
 
 const ADD_OWNERS_ABI = [{
   type: 'function',
@@ -1111,19 +1112,11 @@ export function canExecuteViaSession(userId, amount, chainKey, options = {}) {
   const agentKey = String(options.agentKey || '').trim()
   const dailyLimit = Number(options.dailyLimit || 0)
   if (agentKey && Number.isFinite(dailyLimit) && dailyLimit > 0) {
-    const { wouldExceedDailyLimit } = requireAgentSpendLedger()
     if (wouldExceedDailyLimit(agentKey, amt, dailyLimit)) {
       return { ok: false, reason: 'daily_limit_exceeded', limit: dailyLimit, agentKey }
     }
   }
   return { ok: true, entry, limits }
-}
-
-// Lazy require to avoid a static import cycle (agentSpendLedger imports
-// jsonFileStore only; this keeps the gate side-effect free when unused).
-function requireAgentSpendLedger() {
-  // eslint-disable-next-line no-global-assign
-  return globalThis.__agentSpendLedger || (globalThis.__agentSpendLedger = require('./agentSpendLedger.mjs'))
 }
 
 // Extract a positive number from a human amount string. Accepted: "1.5",
@@ -1449,7 +1442,6 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
     args: [getAddress(to), amountBigInt],
   }], { paymaster: true, chainKey })
   if (executed?.status === 'success' && agentKey) {
-    const { recordSpend } = requireAgentSpendLedger()
     recordSpend(agentKey, parsedAmount)
   }
   return executed
@@ -1482,7 +1474,6 @@ export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, prep
       value: call.value || 0n,
     })), { paymaster: true, chainKey: chain })
     if (executed?.status === 'success' && agentKey) {
-      const { recordSpend } = requireAgentSpendLedger()
       recordSpend(agentKey, parseHumanAmount(amountIn) || 0)
     }
     return executed
