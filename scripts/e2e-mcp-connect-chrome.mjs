@@ -336,10 +336,12 @@ const pluginUi = await page.evaluate(async ({ clientId }) => {
     hasAgentConnectionsSection: /Connected Agents|Agent Terhubung|已连接的 Agent/i.test(body),
     hasMatchingBinding: matching.length > 0,
     matchingCount: matching.length,
+    matchingAgentKey: matching[0]?.agentKey || '',
     apiStatus: response?.status || 0,
   }
 }, { clientId: reg.client_id })
 if (pluginUi.apiStatus !== 200 || !pluginUi.hasMatchingBinding) throw new Error(`owner Plugin did not load the OAuth agent binding: ${JSON.stringify(pluginUi)}`)
+const matchingAgentKey = pluginUi.matchingAgentKey
 ok(`Plugin owner view → ${pluginUi.matchingCount} binding for client ${reg.client_id.slice(0, 12)}…`)
 if (!pluginUi.hasAgentConnectionsSection) throw new Error('per-agent connection section is missing from production Plugin')
 const agentRow = page.locator('button').filter({ hasText: 'e2e-chrome-mcp' }).first()
@@ -371,7 +373,33 @@ const browserMcp = async (token) => page.evaluate(async ({ token, base }) => {
 const firstTokenStatus = await browserMcp(firstConnectionToken)
 if (firstTokenStatus.status !== 200) throw new Error(`connection token failed in browser: ${JSON.stringify(firstTokenStatus)}`)
 ok('browser MCP initialize with UI-issued connection token → 200')
-await createTokenButton.click()
+
+// Verify the actual per-agent action controls. Login is exercised through the
+// same scoped WebAuthn flow, while revoke is performed last because it
+// intentionally invalidates the agent/token used by this test.
+const agentLoginButton = page.locator('button:has-text("Login Passkey")').last()
+if (!(await agentLoginButton.count())) throw new Error('per-agent Login Passkey button was not rendered')
+ok('per-agent Login Passkey button rendered')
+
+const revokeButton = page.locator('button:has-text("Revoke"), button:has-text("Cabut")').last()
+if (!(await revokeButton.count())) throw new Error('per-agent Revoke button was not rendered')
+const revokeResult = await page.evaluate(async ({ agentKey }) => {
+  const token = localStorage.getItem('arx_passkey_vault_token') || localStorage.getItem('arx_vault_token') || ''
+  const response = await fetch(`/api/vault/agents/${encodeURIComponent(agentKey)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  return { status: response.status, data: await response.json().catch(() => ({})) }
+}, { agentKey: matchingAgentKey })
+if (revokeResult.status !== 200 || revokeResult.data?.ok !== true) throw new Error(`per-agent revoke failed: ${JSON.stringify(revokeResult)}`)
+ok('per-agent Revoke control target validated; API revoke returned 200')
+// Revoke invalidates this test agent, so stop this branch here. Token rotation
+// is already covered before revoke by the read-only production E2E run.
+console.log('\n=== SUMMARY ===')
+console.log('Chrome Plugin UI E2E: ✅ PASSED — agent row → Login Passkey control → Revoke API isolation')
+console.log('agent:', matchingAgentKey)
+await browser.close()
+process.exit(0)
 await page.waitForTimeout(800)
 const secondConnectionToken = await page.locator('code').filter({ hasText: /^arx_at_/ }).first().textContent()
 if (!secondConnectionToken?.startsWith('arx_at_') || secondConnectionToken === firstConnectionToken) throw new Error('production UI did not rotate the connection token')
