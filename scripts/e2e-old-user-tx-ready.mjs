@@ -77,6 +77,9 @@ try {
     // Aged-out session: simulate the recurring "old user visits again" state.
     localStorage.removeItem('arx_vault_token')
     localStorage.removeItem('arx_passkey_vault_token')
+    // Pin the UI language the assertions below expect (fresh profiles would
+    // otherwise follow navigator.language and render English labels).
+    localStorage.setItem('arc-dex-lang', 'id')
     localStorage.setItem('arc-dex-auth', JSON.stringify({ address: addr, token: authToken, issuedAt: Date.now() }))
     window.__signQueue = []
     window.__signResolvers = {}
@@ -154,7 +157,7 @@ try {
   const uiText = await page.locator('body').innerText()
   if (!uiText.includes('Aktifkan Agent Wallet')) await failExit(page, 4, 'stepper lost its step-1 label')
   if (!uiText.includes('Agent Terhubung')) await failExit(page, 4, 'Agent Terhubung section missing')
-  const agentRows = page.locator('button').filter({ hasText: /hermes|agent|mcp/i })
+  const agentRows = page.locator('button').filter({ hasText: /[0-9a-fA-F]{6}\u2026|\u2026[0-9a-fA-F]{6}/ })
   if (await agentRows.count() === 0) await failExit(page, 4, 'no existing agent rows for the saved wallet')
   if (!uiText.includes('Daftar wallet agent')) await failExit(page, 4, '"Daftar wallet agent" summary missing')
   const copyAffordance = page.locator('[aria-label="Salin alamat wallet agent"]')
@@ -163,13 +166,33 @@ try {
 
   // ── ⑤ rotate credentials: Buat Token Koneksi ──
   step('⑤', 'Buat Token Koneksi (old-user rotation habit)…')
-  await agentRows.first().click()
-  await page.waitForTimeout(1200)
+  const agentToggle = agentRows.first()
+  await agentToggle.scrollIntoViewIfNeeded().catch(() => {})
+  try {
+    await agentToggle.click({ timeout: 8000 })
+  } catch (e) {
+    const btns = await page.evaluate(() => [...document.querySelectorAll('button')].map(b => (b.textContent || '').trim().slice(0, 40)).filter(Boolean))
+    await failExit(page, 5, `agent-row click failed (${e.message?.slice(0, 80)}); visible buttons:\n${btns.join(' | ')}`)
+  }
+  await page.waitForTimeout(1500)
+  let expandProbe
+  try {
+    expandProbe = await page.waitForSelector('button:has-text("Buat Token Koneksi"), button:has-text("Create Connection Token")', { state: 'visible', timeout: 8000 })
+  } catch {
+    const btns = await page.evaluate(() => [...document.querySelectorAll('button')].map(b => (b.textContent || '').trim().slice(0, 40)).filter(Boolean))
+    await failExit(page, 5, `token button not visible after expand; buttons present:\n${btns.join(' | ')}`)
+  }
+  void expandProbe
   const expandedText = await page.locator('body').innerText()
-  for (const needed of ['Buat Token Koneksi', 'Login Passkey']) {
+  for (const needed of ['Login Passkey']) {
     if (!expandedText.includes(needed)) await failExit(page, 5, `agent card missing "${needed}"`)
   }
-  await page.locator('button:has-text("Buat Token Koneksi")').first().click()
+  try {
+    await page.locator('button:has-text("Buat Token Koneksi"), button:has-text("Create Connection Token")').first().click({ timeout: 10000 })
+  } catch {
+    const btns = await page.evaluate(() => [...document.querySelectorAll('button')].map(b => (b.textContent || '').trim().slice(0, 40)).filter(Boolean))
+      await failExit(page, 5, `create-token button vanished before click; buttons:\n${btns.join(' | ')}`)
+  }
   await page.waitForTimeout(1200)
   const connectionToken = ((await page.locator('code').filter({ hasText: /^arx_at_/ }).first().textContent()) || '').trim()
   if (!connectionToken.startsWith('arx_at_')) await failExit(page, 5, 'one-time connection token not displayed')
