@@ -1025,10 +1025,23 @@ export function oauthRegisterHandler(req, res) {
 }
 
 // ── Bearer token extraction ──
+// Standard clients (Claude/ChatGPT/MCP SDKs) always use the RFC 7235 form
+// "Authorization: Bearer <token>". CLI agents configured with plain header
+// auth sometimes post the connection token as the whole header value or under
+// a vendor key header. Tokens are self-identifying (arx_at_ / arx_rt_) and are
+// still fully validated below, so accepting those shapes only widens input
+// formats without weakening authentication.
 function extractBearer(req) {
-  const auth = req.headers['authorization']
-  if (!auth || !auth.startsWith('Bearer ')) return null
-  return auth.slice(7)
+  const authorization = String(req.headers['authorization'] || '').trim()
+  if (authorization) {
+    const bearerMatch = /^bearer\s+(.+)$/i.exec(authorization)
+    if (bearerMatch) return bearerMatch[1].trim()
+    // Some CLI agents send the raw token as the entire Authorization value.
+    if (/^arx_(at|rt)_/.test(authorization)) return authorization
+  }
+  const altToken = String(req.headers['x-arcox-token'] || req.headers['x-api-key'] || '').trim()
+  if (/^arx_(at|rt)_/.test(altToken)) return altToken
+  return null
 }
 
 // ── Backend API helper ──
@@ -4144,6 +4157,31 @@ export function createMcpServer(userId, context = {}) {
 
 // ── Streamable HTTP MCP handler ──
 export async function mcpHttpHandler(req, res) {
+  // ── CLI-client interoperability (default Hermes configs) ──
+  // The Streamable HTTP SDK rejects every request whose Accept header does
+  // not list BOTH application/json and text/event-stream (HTTP 406).
+  // Hermes's default MCP client sends `Accept: application/json` only (or
+  // omits the header), so its very first initialize failed with an opaque
+  // "Server mengembalikan respons error" even though the bearer token was
+  // valid. Normalize Accept instead of rejecting: strict clients such as
+  // Claude/ChatGPT already send both media types, so this is a no-op for
+  // them. The @hono/node-server adapter reads incoming.rawHeaders — not the
+  // mutable req.headers object — so the rewrite must happen on rawHeaders.
+  const acceptTypes = []
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    if (String(req.rawHeaders[i]).toLowerCase() === 'accept') {
+      for (const part of String(req.rawHeaders[i + 1] || '').split(',')) {
+        const mediaType = part.trim().split(';')[0].toLowerCase()
+        if (mediaType && !acceptTypes.includes(mediaType)) acceptTypes.push(mediaType)
+      }
+      req.rawHeaders.splice(i, 2)
+      i -= 2
+    }
+  }
+  if (!acceptTypes.includes('application/json')) acceptTypes.push('application/json')
+  if (!acceptTypes.includes('text/event-stream')) acceptTypes.push('text/event-stream')
+  req.rawHeaders.push('accept', acceptTypes.join(', '))
+
   // Validate bearer token
   const token = extractBearer(req)
   if (!token) {

@@ -1,105 +1,57 @@
-# Koneksi Hermes Agent ke ARCOX DEX (MCP)
+# Koneksi Hermes ke ARCOX DEX (Token Koneksi)
 
-Panduan flow koneksi plugin/MCP client (Hermes, Claude, ChatGPT) ke ARCOX DEX,
-berdasarkan implementasi di `src/services/mcpServer.mjs` dan hasil E2E
-production terverifikasi.
+Flow resmi untuk Hermes adalah **Agent Terhubung → Buat Token Koneksi** di web ARCOX. User tidak perlu menjalankan `hermes mcp login arcox`, OAuth login khusus, atau menyalin token Passkey.
 
-## Endpoint Production
+## 1. Buat token di web ARCOX
 
-```text
-Web        : https://arcoxdex.vercel.app
-MCP        : https://arcoxdex.vercel.app/mcp          (Streamable HTTP)
-Metadata   : https://arcoxdex.vercel.app/.well-known/oauth-authorization-server
-Resource   : https://arcoxdex.vercel.app/mcp          (RFC 9728 protected resource)
-Scope      : mcp:tools
+1. Buka `https://arcoxdex.vercel.app` dan masuk ke menu **Plugin**.
+2. Pastikan Agent Wallet sudah aktif dengan Passkey.
+3. Pada bagian **Agent Terhubung**, buka agent yang ingin digunakan.
+4. Klik **Buat Token Koneksi**.
+5. Salin token atau seluruh pesan setup yang tampil. Token hanya ditampilkan sekali.
+
+Token ini adalah kredensial akses MCP untuk **satu agent dan satu Agent Wallet**. Token bukan private key, bukan token Passkey, dan jangan digunakan untuk agent lain.
+
+## 2. Tambahkan MCP di Hermes dengan konfigurasi default
+
+Tambahkan server MCP ARCOX melalui mekanisme konfigurasi MCP bawaan Hermes:
+
+```yaml
+mcp_servers:
+  arcox:
+    url: https://arcoxdex.vercel.app/mcp
+    auth: header
+    enabled: true
 ```
 
-## Ringkasan Arsitektur
+Saat Hermes meminta token header, tempel token yang baru dibuat dari menu **Buat Token Koneksi**.
 
-- Auth layer: OAuth 2.1 (authorization code + PKCE S256), Dynamic Client
-  Registration (DCR), refresh token, dan RFC 8628 device flow.
-- Identity binding: token OAuth terikat ke EOA (SIWE signature) DAN Agent Wallet
-  MSCA (passkey session aktif via `bindMcpIdentityToActiveSession`). Tanpa
-  binding MSCA, execute tools tidak aktif (read-only).
-- Hermes dikenali sebagai `hermes-mcp` oleh `resolveAgentName()` (client_name
-  mengandung "hermes").
+Jangan menaruh token di `~/.arcox/agent.env` atau mengirimkannya ke chat publik. Simpan menggunakan penyimpanan credential bawaan Hermes.
 
-## Jalur A — Device Flow RFC 8628 (utama Hermes di VPS/headless)
+## 3. Verifikasi
 
-```text
-Hermes                                Browser user (device apa pun)
-  │ POST /api/auth/device/authorize
-  │   body: { client_name: 'Hermes Agent' }
-  │ ◄─ { device_code, user_code "ARCX-XXX-XXX",
-  │      verification_uri:  /activate,
-  │      verification_uri_complete: /arc-dex/plugin?auth=device&user_code=…,
-  │      expires_in: 600, interval: 5 }
-  │                                     user buka verification_uri(_complete),
-  │ poll POST /api/auth/token           login passkey + approve:
-  │   grant_type=device_code            POST /api/auth/device/message → SIWE
-  │   device_code=…                     sign → POST /api/auth/device/approve
-  │ ◄─ 400 authorization_pending        (+ mscaWalletAddress + mscaSessionToken)
-  │ …poll tiap ≥5 detik…
-  │ ◄─ 200 { access_token arx_at_…, refresh_token arx_rt_… }   (single-use)
-  │ POST /mcp (Bearer) → initialize → notifications/initialized → tools/list
-```
+Gunakan pemeriksaan MCP bawaan Hermes atau mulai sesi baru. Pastikan server berhasil melakukan `initialize` dan `tools/list`.
 
-Catatan:
+Jika Hermes tidak melihat tools:
 
-- Headless client boleh skip DCR: server membuat internal client
-  `arcox_device_flow`.
-- Poll terlalu cepat → `slow_down`. Kode kedaluwarsa → `expired_token`.
-- Approve tanpa MSCA valid untuk protocol test, tapi execute tools tetap
-  nonaktif sampai Agent Wallet ter-bind.
+- pastikan URL tepat: `https://arcoxdex.vercel.app/mcp`;
+- pastikan token dimulai dengan `arx_at_`;
+- pastikan token belum pernah dirotasi atau dicabut;
+- buat token baru dari agent yang sama, lalu perbarui credential Hermes;
+- mulai sesi Hermes baru setelah konfigurasi berubah.
 
-## Jalur B — Authorization Code + PKCE via browser (loopback)
+## 4. Isolasi dan revoke
 
-1. DCR: `POST /api/auth/register` `{ client_name, redirect_uris: ['http://127.0.0.1:<port>/callback'] }`
-2. `GET /api/auth/authorize?response_type=code&client_id=…&redirect_uri=…&state=…&code_challenge=…&code_challenge_method=S256&resource=https://arcoxdex.vercel.app/mcp`
-3. Redirect 302 ke `/arc-dex/plugin?auth=mcp&request_id=…` (params disimpan
-   server-side; browser tidak bisa mengubah redirect/state/PKCE).
-4. UI plugin: Login Passkey → WebAuthn → sesi MSCA ACTIVE.
-5. SIWE: `GET /api/auth/siwe-message` → wallet sign → `POST /api/auth/siwe-verify`
-   dengan `mscaWalletAddress` + `mscaSessionToken` → `{ code }`.
-6. Browser redirect ke loopback callback `?code=…&state=…`.
-7. `POST /api/auth/token` grant_type=authorization_code + code_verifier.
-8. `POST /mcp` Bearer → initialize → tools/list.
+Token koneksi terikat ke satu agent dan Agent Wallet. Token agent A tidak dapat digunakan sebagai token agent B.
 
-## Setelah Terhubung — Eksekusi (dua langkah wajib)
+- **Buat Token Koneksi**: menerbitkan token baru untuk agent yang dipilih dan merotasi token koneksi lama agent tersebut.
+- **Cabut akses**: mematikan token access/refresh dan binding agent yang dipilih saja.
+- Agent lain tetap aktif dan tidak ikut terdampak.
 
-Semua eksekusi hanya lewat Agent Wallet MSCA (`source: 'session'`).
+## 5. Eksekusi transaksi
 
-```text
-arcox_session_status                    → cek active + walletAddress
-arcox_quote_send  { to, token, amount, fromChain, source:'session' }
-                                        → preview + previewId (expired)
-arcox_execute_send { to, amount, token, fromChain, source:'session',
-                     previewId, confirmed:true, confirmationText:'ya'|'yes' }
-                                        → { status:'executed', txHash, explorerUrl }
-```
+Setelah koneksi aktif, Hermes harus meminta quote terlebih dahulu. Semua transaksi membutuhkan preview dan konfirmasi eksplisit sebelum eksekusi. Private key tetap berada di backend/runtime yang dikonfigurasi dan tidak dikirim ke Hermes.
 
-Guard yang ditegakkan server: previewId single-use dan terikat wallet/chain,
-`confirmed=true` + confirmationText eksplisit, session key chain authorization
-harus aktif, tidak ada fallback diam-diam ke transfer treasury.
+## Catatan implementasi
 
-## E2E Production (semua PASS, Agustus 2026)
-
-| Script | Cakupan | Hasil |
-|---|---|---|
-| `scripts/e2e-mcp-connect-chrome.mjs` | Real Chrome + WebAuthn CDP: passkey login → SIWE → code → token → MCP → quote READY TO TX | ✅ PASSED (88 tools) |
-| `scripts/e2e-device-flow.mjs` BASE=https://arcoxdex.vercel.app | RFC 8628 penuh: authorize, pending, status, SIWE, approve, token single-use, MCP authorized/401 | ✅ ALL PASS 16/16 |
-| `scripts/e2e-execute-send-prod.mjs` | Loopback OAuth headless + MSCA binding → quote → **eksekusi nyata** send USDC Arc Testnet | ✅ PASSED (tx on-chain) |
-
-Contoh konfigurasi Hermes:
-
-```text
-MCP URL   : https://arcoxdex.vercel.app/mcp
-Auth      : Dynamic Client Registration (DCR), PKCE S256
-Manual    : Auth URL = https://arcoxdex.vercel.app/api/auth/authorize
-            Token URL = https://arcoxdex.vercel.app/api/auth/token
-Headless  : device flow — POST https://arcoxdex.vercel.app/api/auth/device/authorize,
-            user buka https://arcoxdex.vercel.app/activate, masukkan ARCX-XXX-XXX
-```
-
-Tidak perlu token MSCA di env Hermes: sesi OAuth sudah terikat ke MSCA saat
-user approve di browser.
+Endpoint OAuth/device tetap tersedia di backend untuk kompatibilitas protokol dan client lain, tetapi bukan flow onboarding Hermes yang ditampilkan atau direkomendasikan pada web ARCOX.
