@@ -450,6 +450,19 @@ export function getAgentBinding(agentKey) {
   return store.agentBindings?.[normalizeAgentKey(agentKey)] || null
 }
 
+export function bindAgentCredential(agentKey, credentialId, walletAddress) {
+  const key = normalizeAgentKey(agentKey)
+  const id = String(credentialId || '').trim()
+  if (!key || !id) throw new Error('agentKey and credentialId required')
+  const store = loadStore()
+  const binding = store.agentBindings?.[key]
+  if (!binding) throw new Error('agent_not_found')
+  if (walletAddress && String(binding.walletAddress).toLowerCase() !== String(walletAddress).toLowerCase()) throw new Error('agent_wallet_mismatch')
+  binding.credentialIds = Array.from(new Set([...(binding.credentialIds || []), id]))
+  saveStore(store)
+  return { ...binding }
+}
+
 /** List every binding owned by one owner EOA. */
 export function listAgentBindings(ownerAddress) {
   const owner = normalizeAgentKey(ownerAddress)
@@ -499,7 +512,15 @@ export function revokeAgentBinding(agentKey) {
   const store = loadStore()
   const bindings = store.agentBindings
   if (!bindings || typeof bindings !== 'object' || !bindings[key]) return false
+  const binding = bindings[key]
   delete bindings[key]
+  // Revoke only this agent's session key and aliases when they point to the
+  // same wallet; never invalidate another agent sharing the owner identity.
+  if (store.users?.[binding.walletAddress]) {
+    store.users[binding.walletAddress].active = false
+    store.users[binding.walletAddress].revokedAt = Date.now()
+    store.users[binding.walletAddress].revokeReason = 'agent_manual'
+  }
   saveStore(store)
   return true
 }

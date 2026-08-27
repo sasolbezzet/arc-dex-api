@@ -208,6 +208,10 @@ function passkeyPublicKeyFromAttestation(credential) {
   }
 }
 
+function normalizedCredentialId(input) {
+  try { return normalizeCredentialId(normalizeIncomingWebAuthnCredential(input).id) } catch { return '' }
+}
+
 function normalizeIncomingWebAuthnCredential(input) {
   const candidates = []
   let current = input
@@ -244,6 +248,40 @@ const PASSKEY_FLOW_TTL_MS = 5 * 60 * 1000
 function cleanupPasskeyFlows() {
   const now = Date.now()
   for (const [flowId, flow] of passkeyFlows) if (flow.expiresAt <= now) passkeyFlows.delete(flowId)
+}
+
+function normalizeCredentialId(value) {
+  return String(value || '').trim()
+}
+
+function credentialIdsForAgent(agentKey) {
+  const key = String(agentKey || '').trim().toLowerCase()
+  if (!key) return []
+  try {
+    const { getAgentBinding } = requireAgentBindingStore()
+    const binding = getAgentBinding(key)
+    return Array.isArray(binding?.credentialIds) ? binding.credentialIds.map(normalizeCredentialId).filter(Boolean) : []
+  } catch {
+    return []
+  }
+}
+
+// Avoid a static import cycle: sessionKeyService imports vaultStore, while the
+// auth handlers are defined in this bootstrap module.
+let agentBindingStoreModule
+function requireAgentBindingStore() {
+  if (!agentBindingStoreModule) throw new Error('agent binding store unavailable')
+  return agentBindingStoreModule
+}
+import('./src/services/sessionKeyService.mjs').then(module => { agentBindingStoreModule = module }).catch(() => {})
+
+function bindPasskeyCredential(agentKey, credentialId, walletAddress) {
+  const key = String(agentKey || '').trim().toLowerCase()
+  const id = normalizeCredentialId(credentialId)
+  if (!key || !id) return
+  const binding = agentBindingStoreModule?.getAgentBinding(key)
+  if (!binding) return
+  agentBindingStoreModule.bindAgentCredential(key, id, walletAddress)
 }
 
 async function verifiedPasskeyWalletAddress({ credential, mode = 'Login', flowId = '' } = {}) {
@@ -293,7 +331,7 @@ async function verifiedPasskeyWalletAddress({ credential, mode = 'Login', flowId
 
 app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
   try {
-    const { mode = 'Login', username = '' } = req.body || {}
+    const { mode = 'Login', username = '', agentKey = '' } = req.body || {}
     if (mode !== 'Login' && mode !== 'Register') return res.status(400).json({ error: 'Invalid passkey mode' })
     const clientUrl = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc/w3s/buidl').replace(/\/+$/, '')
     const clientKey = process.env.CIRCLE_CLIENT_KEY || ''
@@ -306,6 +344,11 @@ app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
       signal: AbortSignal.timeout(12_000),
     })
     const body = await upstream.json().catch(() => ({}))
+    if (agentKey && mode === 'Login') {
+      const allowed = credentialIdsForAgent(agentKey)
+      if (allowed.length === 0) return res.status(403).json({ error: 'agent_passkey_binding_required' })
+      body.result.allowCredentials = allowed.map(id => ({ type: 'public-key', id }))
+    }
     if (!upstream.ok || body?.error || !body?.result?.challenge) {
       throw new Error(body?.error?.message || `Circle passkey options failed (HTTP ${upstream.status})`)
     }
@@ -333,7 +376,7 @@ app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
 
 app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
   try {
-    const { walletAddress, credential, mode = 'Login', flowId = '' } = req.body || {}
+    const { walletAddress, credential, mode = 'Login', flowId = '', agentKey = '' } = req.body || {}
     if (walletAddress && !isAddress(walletAddress)) {
       return res.status(400).json({ error: 'walletAddress must be a valid address when supplied' })
     }
@@ -345,6 +388,13 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
     const verified = await verifiedPasskeyWalletAddress({ credential, mode, flowId })
     if (walletAddress && verified.walletAddress.toLowerCase() !== getAddress(walletAddress).toLowerCase()) {
       return res.status(403).json({ error: 'Passkey wallet address mismatch' })
+    }
+    if (agentKey) {
+      const binding = agentBindingStoreModule?.getAgentBinding(agentKey)
+      const credentialId = normalizeCredentialId(normalizedCredentialId(credential))
+      const allowed = credentialIdsForAgent(agentKey)
+      if (!binding || !allowed.includes(credentialId)) return res.status(403).json({ error: 'agent_passkey_not_bound' })
+      if (binding.walletAddress.toLowerCase() !== verified.walletAddress.toLowerCase()) return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
     }
     const { createSession } = await import('./src/services/vaultStore.mjs')
     const token = createSession(verified.walletAddress.toLowerCase())
