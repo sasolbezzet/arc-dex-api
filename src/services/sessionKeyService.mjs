@@ -381,6 +381,22 @@ export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet'
  * of the new MSCA (currently the passkey-backed MCP OAuth flow). Ordinary
  * owner/session setup remains fail-closed and must explicitly revoke first.
  */
+// ── Wallet family (append-only) ──
+// Every Agent Wallet created or re-bound from a SIWE-verified EOA is linked to
+// that EOA forever. The live `aliases` map keeps only the LATEST wallet per
+// owner, so without this history a newly created wallet would orphan every
+// earlier agent wallet (they would silently vanish from Connected Agents).
+// Family links are display-only (agent/wallet listing) and never grant
+// execution rights.
+function recordWalletFamily(store, walletAddress, rootAddress) {
+  const wallet = String(walletAddress || '').toLowerCase()
+  const root = String(rootAddress || '').toLowerCase()
+  if (!/^0x[0-9a-f]{40}$/.test(wallet) || !/^0x[0-9a-f]{40}$/.test(root) || wallet === root) return
+  if (!store.walletFamily || typeof store.walletFamily !== 'object') store.walletFamily = {}
+  // First root wins: append-only, a later rebind must never re-parent a wallet.
+  if (!store.walletFamily[wallet]) store.walletFamily[wallet] = root
+}
+
 export function bindSessionAlias(userId, ownerAddress, walletAddress, { allowRebind = false } = {}) {
   const store = loadStore()
   const wallet = getAddress(walletAddress)
@@ -393,8 +409,12 @@ export function bindSessionAlias(userId, ownerAddress, walletAddress, { allowReb
     throw new Error('Identity is already bound to another MSCA; revoke the old session before rebinding.')
   }
   if (!store.aliases) store.aliases = {}
+  // Preserve family history BEFORE the alias overwrite orphans the old wallet.
+  if (existingOwner && existingOwner !== wallet.toLowerCase()) recordWalletFamily(store, existingOwner, owner)
+  if (existingRequester && existingRequester !== wallet.toLowerCase()) recordWalletFamily(store, existingRequester, owner)
   store.aliases[requester] = wallet
   store.aliases[owner] = wallet
+  recordWalletFamily(store, wallet, owner)
   saveStore(store)
   return { ownerAddress: owner, walletAddress: wallet, rebound: Boolean(conflicts) }
 }
@@ -491,9 +511,18 @@ export function resolveOwnerAddressForWallet(identityAddress, walletAddress = ''
   const identity = normalizeAgentKey(identityAddress)
   const wallet = normalizeAgentKey(walletAddress || identity)
   const store = loadStore()
+  // Prefer a distinct owner EOA over a self-alias: connection tokens issued
+  // with ownerAddress = the MSCA itself used to trip the self-identity guard
+  // in resolveActiveMsca. An EOA root keeps bindings stable across wallet
+  // rotation (1 agent = 1 wallet, forever).
+  let selfAlias = ''
   for (const [ownerAddress, boundWallet] of Object.entries(store.aliases || {})) {
-    if (String(boundWallet || '').toLowerCase() === wallet && /^0x[0-9a-f]{40}$/i.test(ownerAddress)) return ownerAddress.toLowerCase()
+    if (String(boundWallet || '').toLowerCase() !== wallet || !/^0x[0-9a-f]{40}$/i.test(ownerAddress)) continue
+    const ownerK = ownerAddress.toLowerCase()
+    if (ownerK !== wallet) return ownerK
+    if (!selfAlias) selfAlias = ownerK
   }
+  if (selfAlias) return selfAlias
   return /^0x[0-9a-f]{40}$/i.test(identity) ? identity : ''
 }
 
@@ -938,10 +967,25 @@ export function listRelatedAddresses(userId) {
   const set = new Set([key])
   const users = Object.entries(store.users || {})
   const aliases = Object.entries(store.aliases || {})
+  // Wallet family links: persisted (recorded at bind/rebind time) merged with
+  // links derivable from the current store (agent bindings with a distinct
+  // owner EOA + current alias rows). This keeps earlier agent wallets visible
+  // no matter which wallet of the same account is currently active.
+  const family = new Map()
+  const addFamily = (wallet, root) => {
+    const wk = String(wallet || '').toLowerCase()
+    const rk = String(root || '').toLowerCase()
+    if (!/^0x[0-9a-f]{40}$/.test(wk) || !/^0x[0-9a-f]{40}$/.test(rk) || wk === rk) return
+    if (!family.has(wk)) family.set(wk, rk)
+  }
+  for (const [w, root] of Object.entries(store.walletFamily || {})) addFamily(w, root)
+  for (const [, b] of Object.entries(store.agentBindings || {})) addFamily(b?.walletAddress, b?.ownerAddress)
+  for (const [aliasOwner, wallet] of aliases) addFamily(wallet, aliasOwner)
   // Forward and reverse alias links (EOA <-> MSCA)
   const aliasWallet = store.aliases?.[key]
   if (aliasWallet) set.add(aliasWallet.toLowerCase())
-  // Single-pass transitive closure over owner <-> walletAddress and alias links.
+  // Single-pass transitive closure over owner <-> walletAddress, alias, and
+  // family links.
   let grew = true
   while (grew) {
     grew = false
@@ -957,6 +1001,10 @@ export function listRelatedAddresses(userId) {
       const walletK = entry.walletAddress ? String(entry.walletAddress).toLowerCase() : null
       if (set.has(ownerK) && walletK && !set.has(walletK)) { set.add(walletK); grew = true }
       if (walletK && set.has(walletK) && !set.has(ownerK)) { set.add(ownerK); grew = true }
+    }
+    for (const [wallet, root] of family) {
+      if (set.has(wallet) && !set.has(root)) { set.add(root); grew = true }
+      if (set.has(root) && !set.has(wallet)) { set.add(wallet); grew = true }
     }
   }
   return [...set]

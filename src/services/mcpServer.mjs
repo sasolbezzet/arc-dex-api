@@ -1073,7 +1073,13 @@ export async function resolveActiveMsca(userId, boundMscaWalletAddress = '') {
     if (!info?.active || !info.walletAddress) return null
     if (boundMscaWalletAddress) {
       if (String(info.walletAddress).toLowerCase() !== String(boundMscaWalletAddress).toLowerCase()) return null
-      if (String(info.walletAddress).toLowerCase() === String(userId).toLowerCase()) return null
+      if (String(info.walletAddress).toLowerCase() === String(userId).toLowerCase()) {
+        // Connection tokens issued by a passkey-only session legitimately carry
+        // the MSCA itself as userId (bootstrap has no EOA). Allow it exactly
+        // like the self-alias rule below: only when the wallet is really a
+        // deployed smart account on-chain.
+        if (!(await isDeployedSmartAccount(info.walletAddress))) return null
+      }
       return info
     }
     // MCP is MSCA-only. An authenticated identity must resolve through an
@@ -1083,11 +1089,7 @@ export async function resolveActiveMsca(userId, boundMscaWalletAddress = '') {
     const isSelfAlias = String(info.walletAddress).toLowerCase() === String(userId).toLowerCase()
     if (isSelfAlias) {
       // Self-alias is allowed only if the address is a deployed contract (MSCA)
-      const { createPublicClient, http, defineChain } = await import('viem')
-      const arcRpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
-      const client = createPublicClient({ chain: defineChain({ id: 5042002, name: 'Arc Testnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [arcRpc] } } }), transport: http(arcRpc) })
-      const code = await client.getBytecode({ address: info.walletAddress }).catch(() => undefined)
-      if (!code || code === '0x') return null
+      if (!(await isDeployedSmartAccount(info.walletAddress))) return null
     } else if (!hasExplicitSessionAlias(userId, info.walletAddress)) {
       return null
     }
@@ -1095,6 +1097,14 @@ export async function resolveActiveMsca(userId, boundMscaWalletAddress = '') {
   } catch {
     return null
   }
+}
+
+async function isDeployedSmartAccount(address) {
+  const { createPublicClient, http, defineChain } = await import('viem')
+  const arcRpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
+  const client = createPublicClient({ chain: defineChain({ id: 5042002, name: 'Arc Testnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [arcRpc] } } }), transport: http(arcRpc) })
+  const code = await client.getBytecode({ address }).catch(() => undefined)
+  return Boolean(code && code !== '0x')
 }
 
 function mscaRequiredResult() {
