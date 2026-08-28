@@ -27,7 +27,7 @@ import vaultRoutes from './src/routes/vaultRoutes.mjs'
 import cardRoutes from './src/routes/cardRoutes.mjs'
 import connectRoutes from './src/routes/connectRoutes.mjs'
 import mscaRoutes from './src/routes/mscaRoutes.mjs'
-import { oauthMetadataHandler, protectedResourceHandler, oauthAuthorizeHandler, siweMessageHandler, siweVerifyHandler, oauthTokenHandler, oauthRegisterHandler, mcpHttpHandler, deviceAuthorizeHandler, deviceStatusHandler, deviceMessageHandler, deviceApproveHandler } from './src/services/mcpServer.mjs'
+import { oauthMetadataHandler, protectedResourceHandler, oauthAuthorizeHandler, siweMessageHandler, siweVerifyHandler, oauthTokenHandler, oauthRegisterHandler, mcpHttpHandler } from './src/services/mcpServer.mjs'
 import { estimateUnifiedBalanceX402, getX402Invoice, markUnifiedBalanceSpendSubmitted, processCircleX402Webhook, publicInvoice, reconcileX402Invoice, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
 import { paymentLogMatches } from './src/services/invoiceVerify.mjs'
 import { getPolicy } from './src/services/aiRouterStore.mjs'
@@ -687,11 +687,6 @@ app.get('/api/auth/siwe-message', siweMessageHandler)
 app.post('/api/auth/siwe-verify', siweVerifyHandler)
 app.post('/api/auth/token', oauthTokenHandler)
 app.post('/api/auth/register', oauthRegisterHandler)
-// RFC 8628 device authorization grant (headless MCP client pairing)
-app.post('/api/auth/device/authorize', apiLimiter, deviceAuthorizeHandler)
-app.get('/api/auth/device/status', apiLimiter, deviceStatusHandler)
-app.post('/api/auth/device/message', apiLimiter, deviceMessageHandler)
-app.post('/api/auth/device/approve', apiLimiter, deviceApproveHandler)
 app.all('/mcp', mcpHttpHandler)
 app.get('/v1/models', apiLimiter, openAiModels)
 app.post('/v1/chat/completions', apiLimiter, openAiChatCompletions)
