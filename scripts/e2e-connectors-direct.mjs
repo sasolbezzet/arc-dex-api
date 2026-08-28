@@ -64,7 +64,7 @@ const resolveSignatures = async (page, stopAt) => {
   }
 }
 
-const runConnector = async (page, { name, redirectUri }) => {
+const runConnector = async (page, context, { name, redirectUri }) => {
   // 1. DCR exactly like the connector does.
   const dcr = await fetch(`${BASE}/api/auth/register`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -139,6 +139,28 @@ const runConnector = async (page, { name, redirectUri }) => {
   })
   if (initRes.status !== 200) throw new Error(`${name}: /mcp initialize with OAuth token → ${initRes.status}`)
   ok(`${name}: OAuth access token accepted by /mcp → connector LIVE, ready to chat`)
+
+  // Cleanup: revoke the agent binding this run just created so repeated E2E
+  // runs never accumulate test agents/wallets in the owner's list.
+  try {
+    // The page already redirected to the connector origin, so read the vault
+    // token from the captured storage of every origin we visited.
+    const ss = await context.storageState()
+    const origin = ss.origins.find(o => o.origin.includes('arcoxdex'))
+    const vaultToken = origin?.localStorage?.find(i => i.name === 'arx_vault_token')?.value || ''
+    if (vaultToken) {
+      const list = await (await fetch(`${BASE}/api/vault/agents`, { headers: { Authorization: `Bearer ${vaultToken}` } })).json()
+      const agents = Array.isArray(list) ? list : (list.agents || [])
+      const mine = agents.filter(a => String(a.agentKey || a.key || '').startsWith(`${client.client_id}|`))
+      for (const a of mine) {
+        const key = a.agentKey || a.key
+        const del = await fetch(`${BASE}/api/vault/agents/${encodeURIComponent(key)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${vaultToken}` } })
+        if (del.ok) console.log(`   🧹 cleaned up test agent ${String(key).slice(0, 40)}…`)
+      }
+    }
+  } catch (e) {
+    console.log('   ⚠️ cleanup skipped:', String(e?.message || e).slice(0, 120))
+  }
   return { callbackUrl, tokenScope: tokenBody.scope || '' }
 }
 
@@ -257,14 +279,14 @@ try {
   let claude = null
   if (ONLY !== 'chatgpt') {
     step('⑤', 'CLAUDE: authorize → web approval → redirect back to claude.ai…')
-    claude = await runConnector(page, { name: 'Claude', redirectUri: 'https://claude.ai/api/mcp/auth_callback' })
+    claude = await runConnector(page, context, { name: 'Claude', redirectUri: 'https://claude.ai/api/mcp/auth_callback' })
   }
 
   // ── ⑥ CHATGPT: same direct path to chatgpt.com ──
   let chatgpt = null
   if (ONLY !== 'claude') {
     step('⑥', 'CHATGPT: authorize → web approval → redirect back to chatgpt.com…')
-    chatgpt = await runConnector(page, { name: 'ChatGPT', redirectUri: 'https://chatgpt.com/connector_platform_oauth/callback' })
+    chatgpt = await runConnector(page, context, { name: 'ChatGPT', redirectUri: 'https://chatgpt.com/connector_platform_oauth/callback' })
   }
 
   console.log('\n=== SUMMARY ===')
