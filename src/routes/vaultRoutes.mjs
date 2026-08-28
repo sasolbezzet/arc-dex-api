@@ -184,11 +184,31 @@ async function resolveClientName(clientId) {
 
 vault.get('/agents', requireAuth, async (req, res) => {
   try {
-    // The passkey session identifies the MSCA; bindings are keyed to the
-    // owner EOA. Accept an identity that matches either side.
-    const bindings = listAgentBindingsForIdentity(req.owner)
+    // The passkey session identifies ONE Agent Wallet MSCA, but every agent
+    // keeps its own wallet for good (1 agent = 1 wallet). Aggregate bindings
+    // across the whole owner cluster (EOA + every linked MSCA, expanded
+    // through the matched bindings themselves) so switching the browser
+    // passkey to another wallet — e.g. after connecting Claude/ChatGPT —
+    // never hides the other agents' wallets from this list.
+    const seen = new Map()
+    const queue = listRelatedAddresses(req.owner).map(addr => String(addr).toLowerCase())
+    const visited = new Set()
+    while (queue.length > 0) {
+      const identity = queue.shift()
+      if (!identity || visited.has(identity)) continue
+      visited.add(identity)
+      for (const binding of listAgentBindingsForIdentity(identity)) {
+        if (!seen.has(binding.agentKey)) seen.set(binding.agentKey, binding)
+        // Expand through each matched binding so a stale EOA alias (rewritten
+        // by a later OAuth rebind) can no longer orphan earlier agent wallets.
+        for (const addr of [binding.ownerAddress, binding.walletAddress]) {
+          const next = String(addr || '').toLowerCase()
+          if (next && !visited.has(next)) queue.push(next)
+        }
+      }
+    }
     const agents = []
-    for (const binding of bindings) {
+    for (const binding of seen.values()) {
       agents.push({
         agentKey: binding.agentKey,
         walletAddress: binding.walletAddress,
@@ -198,6 +218,7 @@ vault.get('/agents', requireAuth, async (req, res) => {
         clientName: await resolveClientName(binding.agentKey.split('|')[0] || ''),
       })
     }
+    agents.sort((a, b) => Number(a.boundAt || 0) - Number(b.boundAt || 0))
     res.json({ agents })
   } catch (error) {
     res.status(500).json({ error: error?.message || 'Failed to list agents' })
