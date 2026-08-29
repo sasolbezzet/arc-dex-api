@@ -13,7 +13,7 @@
 import { readFileSync } from 'node:fs'
 import { privateKeyToAccount } from 'viem/accounts'
 import { hexToBytes } from 'viem'
-import { chromium } from '/tmp/browser-test/node_modules/playwright-core/index.mjs'
+import { chromium } from '/home/ubuntu/arc-dex/node_modules/playwright-core/index.mjs'
 
 const BASE = process.env.E2E_BASE_URL || 'https://arcoxdex.vercel.app'
 const STATE_PATH = process.env.PROD_STATE_PATH || '/tmp/arcox-e2e-prod-state.json'
