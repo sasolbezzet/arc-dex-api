@@ -234,13 +234,19 @@ try {
 
   // ── ③ HERMES: token + ready-to-paste setup + Hermes-readable tools ──
   step('③', 'HERMES: Buat Token Koneksi → direct setup message…')
-  const agentRows = page.locator('button').filter({ hasText: /…[0-9a-fA-F]{6}/ })
-  if (await agentRows.count() === 0) await failExit(page, 4, 'no agent rows visible')
+  // Select the actual connected-agent card; wallet overview rows are not
+  // actionable and can have the same shortened address.
+  const agentSection = page.locator('[data-testid="connected-agent-actions"]').locator('..')
+  const agentRows = agentSection.locator('button').filter({ hasText: /…[0-9a-fA-F]{6}/ })
+  if (await agentRows.count() === 0) await failExit(page, 4, 'no agent rows visible in Connected Agents')
   await agentRows.first().click()
   await page.waitForTimeout(1500)
-  await page.locator('button:has-text("Buat Token Koneksi"), button:has-text("Create Connection Token")').first().click({ timeout: 10_000 })
+  const tokenButton = page.locator('button:has-text("Buat Token Koneksi"), button:has-text("Create Connection Token"), button:has-text("Create connection token")').last()
+  await tokenButton.click({ timeout: 10_000 })
   await page.waitForTimeout(1500)
-  connectionToken = ((await page.locator('code').filter({ hasText: /^arx_at_/ }).first().textContent()) || '').trim()
+  // The UI may render the token in a code element or in the token dialog text.
+  const tokenText = await page.locator('#arx-hermes-token-dialog').innerText({ timeout: 10_000 })
+  connectionToken = (tokenText.match(/arx_at_[a-f0-9]+/i) || [])[0] || ''
   if (!connectionToken.startsWith('arx_at_')) await failExit(page, 4, 'connection token not displayed')
   const setupMessage = await page.locator('textarea').first().inputValue()
   const directCommand = `hermes mcp add arcox --url ${BASE}/mcp --auth header`

@@ -3958,10 +3958,14 @@ export async function mcpHttpHandler(req, res) {
   mcpSessionsRef = listMcpSessions
 
   // Handle MCP initialize and tool calls via Streamable HTTP
-  const sessionId = req.headers['mcp-session-id'] || randomUUID()
+  // The SDK owns the authoritative session id. Passing a generated id for
+  // every request makes the transport believe it is already initialized when
+  // Hermes performs its default POST probe. Keep a stable id only when the
+  // client explicitly sent one; initialization gets a fresh id from the SDK.
+  const sessionId = req.headers['mcp-session-id'] || undefined
   
   const boundMscaWalletAddress = auth.mscaWalletAddress || ''
-  let session = sessions.get(sessionId)
+  let session = sessionId ? sessions.get(sessionId) : null
   // Claude may reuse an MCP session id after OAuth reconnect/rebinding. Never
   // reuse a server created for a different verified MSCA context; otherwise the
   // request's fresh OAuth token is silently ignored by the old tool closure.
@@ -3973,12 +3977,14 @@ export async function mcpHttpHandler(req, res) {
     session = null
   }
   if (!session) {
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId })
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId || randomUUID() })
     const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress, clientId: auth.clientId })
     await server.connect(transport)
     session = { transport, server, userId: auth.userId, clientId: auth.clientId, boundMscaWalletAddress, lastActivity: Date.now() }
-    sessions.set(sessionId, session)
-    scheduleMcpSessionCleanup(sessionId, session)
+    // The transport may generate its own id during initialize. Register the
+    // request alias now and the generated id after initialization below.
+    if (sessionId) sessions.set(sessionId, session)
+    scheduleMcpSessionCleanup(sessionId || '__pending__', session)
   } else {
     // A valid OAuth request keeps the same MCP transport alive. This is not
     // session-key authorization and does not revoke/reactivate anything.
@@ -3986,6 +3992,15 @@ export async function mcpHttpHandler(req, res) {
   }
 
   await session.transport.handleRequest(req, res, req.body)
+  // The SDK writes the authoritative session id onto the transport after an
+  // initialize request. Alias it so subsequent Hermes requests reuse the same
+  // server without making a second initialize against an already initialized
+  // transport.
+  const generatedSessionId = session.transport.sessionId
+  if (generatedSessionId && sessions.get(generatedSessionId) !== session) {
+    sessions.set(generatedSessionId, session)
+    scheduleMcpSessionCleanup(generatedSessionId, session)
+  }
 }
 
 function scheduleMcpSessionCleanup(sessionId, session) {
