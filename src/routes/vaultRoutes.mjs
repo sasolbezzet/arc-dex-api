@@ -383,9 +383,19 @@ vault.delete('/cards/:cardId/agent-link', requireAuth, async (req, res) => {
 vault.post('/agents/bootstrap-connection-token', requireAuth, async (req, res) => {
   try {
     const { getSessionKeyInfo } = await import('../services/vaultStore.mjs')
-    const session = await getSessionKeyInfo(req.owner)
+    // Hermes must be explicitly bound to the wallet created for Hermes. The
+    // optional walletAddress is supplied after the dedicated Passkey ceremony;
+    // falling back to the owner's active session would silently reuse Claude's
+    // wallet and violate the one-agent/one-wallet invariant.
+    const requestedWallet = String(req.body?.walletAddress || '').trim().toLowerCase()
+    const session = requestedWallet
+      ? await getSessionKeyInfo(requestedWallet)
+      : await getSessionKeyInfo(req.owner)
     if (!session?.active || !session.walletAddress) {
-      return res.status(409).json({ error: 'agent_wallet_session_required', message: 'Aktifkan Agent Wallet terlebih dahulu.' })
+      return res.status(409).json({ error: 'agent_wallet_session_required', message: 'Aktifkan Agent Wallet Hermes terlebih dahulu.' })
+    }
+    if (requestedWallet && String(session.walletAddress).toLowerCase() !== requestedWallet) {
+      return res.status(409).json({ error: 'agent_wallet_mismatch', message: 'Wallet Hermes tidak cocok dengan session Passkey.' })
     }
     const { issueBootstrapConnectionToken } = await import('../services/mcpServer.mjs')
     const ttlDays = Math.min(Math.max(Number(req.body?.ttlDays) || 90, 1), 3650)

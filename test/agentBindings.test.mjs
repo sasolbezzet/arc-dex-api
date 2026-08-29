@@ -76,6 +76,18 @@ test('different agent keys keep different wallets without overwriting each other
   })
 })
 
+test('agent bindings reject reusing one wallet for another agent', async () => {
+  await withSessionStore({}, async ({ bindAgent }) => {
+    process.env.ENFORCE_UNIQUE_AGENT_WALLETS = 'true'
+    try {
+      bindAgent(AGENT_A, OWNER, W1)
+      assert.throws(() => bindAgent(AGENT_B, OWNER, W1), /wallet.*already.*agent|wallet.*reuse|agent.*wallet/i)
+    } finally {
+      delete process.env.ENFORCE_UNIQUE_AGENT_WALLETS
+    }
+  })
+})
+
 test('revokeAgentBinding removes exactly one row', async () => {
   await withSessionStore({
     agentBindings: {

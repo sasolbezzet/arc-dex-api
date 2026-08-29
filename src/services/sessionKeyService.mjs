@@ -445,6 +445,12 @@ export function bindAgent(agentKey, ownerAddress, walletAddress) {
   const store = loadStore()
   if (!store.agentBindings || typeof store.agentBindings !== 'object') store.agentBindings = {}
   const previous = store.agentBindings[key]
+  const reusedBy = Object.entries(store.agentBindings).find(([otherKey, binding]) =>
+    otherKey !== key && String(binding?.walletAddress || '').toLowerCase() === wallet
+  )
+  // Existing persisted data may contain legacy duplicate rows. Preserve those
+  // rows for migration/read compatibility; reject only new cross-agent reuse.
+  if (reusedBy && !previous && process.env.ENFORCE_UNIQUE_AGENT_WALLETS === 'true') throw new Error(`wallet_already_bound_to_agent:${reusedBy[0]}`)
   const now = Date.now()
   store.agentBindings[key] = {
     ownerAddress: owner,
