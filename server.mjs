@@ -351,7 +351,9 @@ app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
       // agent_passkey_binding_required. Ownership is proven at verification
       // time — the passkey must resolve to the agent's bound wallet — and the
       // credential is then bound to the agent on first use.
-      if (allowed.length > 0) body.result.allowCredentials = allowed.map(id => ({ type: 'public-key', id }))
+      if (allowed.length > 0) {
+        body.result.allowCredentials = allowed.map(id => ({ type: 'public-key', id }))
+      }
     }
     if (!upstream.ok || body?.error || !body?.result?.challenge) {
       throw new Error(body?.error?.message || `Circle passkey options failed (HTTP ${upstream.status})`)
@@ -394,7 +396,8 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
       return res.status(403).json({ error: 'Passkey wallet address mismatch' })
     }
     if (agentKey) {
-      const binding = agentBindingStoreModule?.getAgentBinding(agentKey)
+      if (!agentBindingStoreModule) return res.status(503).json({ error: 'agent_binding_store_unavailable' })
+      const binding = agentBindingStoreModule.getAgentBinding(agentKey)
       if (!binding) return res.status(403).json({ error: 'agent_passkey_not_bound' })
       const credentialId = normalizeCredentialId(normalizedCredentialId(credential))
       const allowed = credentialIdsForAgent(agentKey)

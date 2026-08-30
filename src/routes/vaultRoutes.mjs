@@ -145,13 +145,13 @@ vault.post('/approvals/:id/approve', requireAuth, (req, res) => {
   const { txHash, explorerUrl } = req.body || {}
   const a = approveRequest(req.owner, req.params.id, { txHash, explorerUrl })
   if (!a) return res.status(404).json({ error: 'Pending approval not found' })
-  res.json({ approval: a })
+  res.json({ success: true, approval: a })
 })
 
 vault.post('/approvals/:id/reject', requireAuth, (req, res) => {
   const a = rejectRequest(req.owner, req.params.id)
   if (!a) return res.status(404).json({ error: 'Pending approval not found' })
-  res.json({ approval: a })
+  res.json({ success: true, approval: a })
 })
 
 // ── Activity ──
