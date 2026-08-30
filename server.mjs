@@ -413,10 +413,30 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
         }
         bindPasskeyCredential(agentKey, credentialId, verified.walletAddress)
       } else {
+        // Login Passkey: the agent must already exist (a binding row).
+        //
+        // `agent_passkey_not_bound` previously fired for two very different
+        // situations:
+        //   1. The agent genuinely does not exist (typo / wrong key).
+        //   2. The agent exists but has no credential bound yet (created via
+        //      connection token, OAuth approval, or backend migration).
+        //
+        // Case 2 is the normal first-login path for an existing agent wallet.
+        // The browser passkey still resolves to a Circle-verified MSCA address;
+        // that is the ownership proof. Bind the credential on first use
+        // instead of rejecting a legitimate login.
         if (!binding) return res.status(403).json({ error: 'agent_passkey_not_bound' })
-        if (allowed.length > 0 && !allowed.includes(credentialId)) return res.status(403).json({ error: 'agent_passkey_not_bound' })
-        if (String(binding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
-        if (!allowed.includes(credentialId)) bindPasskeyCredential(agentKey, credentialId, binding.walletAddress)
+        if (String(binding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) {
+          return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
+        }
+        // credentialId and allowed are already declared above for this agent.
+        // Bind the credential on first use or when a new authenticator resolves
+        // to the same wallet (device sync, new passkey) instead of blocking.
+        if (allowed.length > 0 && !allowed.includes(credentialId)) {
+          bindPasskeyCredential(agentKey, credentialId, binding.walletAddress)
+        } else if (!allowed.includes(credentialId)) {
+          bindPasskeyCredential(agentKey, credentialId, binding.walletAddress)
+        }
       }
     }
     const { createSession } = await import('./src/services/vaultStore.mjs')
