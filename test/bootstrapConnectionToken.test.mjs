@@ -92,7 +92,7 @@ test('bootstrap connection token creates an owner binding and valid MCP access t
     const ownerToken = vault.createSession(OWNER)
     const result = await request(base, '/api/vault/agents/bootstrap-connection-token', ownerToken, {
       method: 'POST',
-      body: JSON.stringify({ clientName: 'Hermes Bootstrap', ttlDays: 1 }),
+      body: JSON.stringify({ clientName: 'Hermes Bootstrap', ttlDays: 1, walletAddress: WALLET }),
     })
     assert.equal(result.response.status, 200)
     assert.match(result.body.agentKey, new RegExp(`^arcox_conn_[^|]+\\|${OWNER}$`))
@@ -114,6 +114,19 @@ test('bootstrap connection token rejects an owner without an active Agent Wallet
     const result = await request(base, '/api/vault/agents/bootstrap-connection-token', ownerToken, {
       method: 'POST',
       body: JSON.stringify({ clientName: 'Hermes Bootstrap' }),
+    })
+    assert.equal(result.response.status, 400)
+    assert.equal(result.body.error, 'wallet_address_required')
+    assert.equal(session.listAgentBindings(OWNER).length, 0)
+  })
+})
+
+test('bootstrap connection token rejects an owner without an active Agent Wallet session', async () => {
+  await withHttp(async ({ vault, session, base }) => {
+    const ownerToken = vault.createSession(OWNER)
+    const result = await request(base, '/api/vault/agents/bootstrap-connection-token', ownerToken, {
+      method: 'POST',
+      body: JSON.stringify({ clientName: 'Hermes Bootstrap', walletAddress: WALLET }),
     })
     assert.equal(result.response.status, 409)
     assert.equal(result.body.error, 'agent_wallet_session_required')

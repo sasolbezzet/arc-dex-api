@@ -384,13 +384,14 @@ vault.post('/agents/bootstrap-connection-token', requireAuth, async (req, res) =
   try {
     const { getSessionKeyInfo } = await import('../services/vaultStore.mjs')
     // Hermes must be explicitly bound to the wallet created for Hermes. The
-    // optional walletAddress is supplied after the dedicated Passkey ceremony;
-    // falling back to the owner's active session would silently reuse Claude's
-    // wallet and violate the one-agent/one-wallet invariant.
+    // walletAddress is REQUIRED: falling back to the owner's active session
+    // would silently reuse Claude's wallet and violate the one-agent/one-wallet
+    // invariant (agent_wallet_mismatch only fires when walletAddress is sent).
     const requestedWallet = String(req.body?.walletAddress || '').trim().toLowerCase()
-    const session = requestedWallet
-      ? await getSessionKeyInfo(requestedWallet)
-      : await getSessionKeyInfo(req.owner)
+    if (!requestedWallet) {
+      return res.status(400).json({ error: 'wallet_address_required', message: 'Pilih wallet Agent Hermes secara eksplisit sebelum membuat token koneksi.' })
+    }
+    const session = await getSessionKeyInfo(requestedWallet)
     if (!session?.active || !session.walletAddress) {
       return res.status(409).json({ error: 'agent_wallet_session_required', message: 'Aktifkan Agent Wallet Hermes terlebih dahulu.' })
     }

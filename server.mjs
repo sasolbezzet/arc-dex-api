@@ -27,7 +27,7 @@ import vaultRoutes from './src/routes/vaultRoutes.mjs'
 import cardRoutes from './src/routes/cardRoutes.mjs'
 import connectRoutes from './src/routes/connectRoutes.mjs'
 import mscaRoutes from './src/routes/mscaRoutes.mjs'
-import { oauthMetadataHandler, protectedResourceHandler, oauthAuthorizeHandler, siweMessageHandler, siweVerifyHandler, oauthTokenHandler, oauthRegisterHandler, mcpHttpHandler } from './src/services/mcpServer.mjs'
+import { oauthMetadataHandler, protectedResourceHandler, oauthAuthorizeHandler, siweMessageHandler, siweVerifyHandler, passkeyVerifyHandler, oauthTokenHandler, oauthRegisterHandler, mcpHttpHandler } from './src/services/mcpServer.mjs'
 import { estimateUnifiedBalanceX402, getX402Invoice, markUnifiedBalanceSpendSubmitted, processCircleX402Webhook, publicInvoice, reconcileX402Invoice, verifyCircleWebhookSignature } from './src/middleware/x402Middleware.mjs'
 import { paymentLogMatches } from './src/services/invoiceVerify.mjs'
 import { getPolicy } from './src/services/aiRouterStore.mjs'
@@ -720,6 +720,7 @@ app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceHandler)
 app.get('/api/auth/authorize', oauthAuthorizeHandler)
 app.get('/api/auth/siwe-message', siweMessageHandler)
 app.post('/api/auth/siwe-verify', siweVerifyHandler)
+app.post('/api/auth/passkey-verify', passkeyVerifyHandler)
 app.post('/api/auth/token', oauthTokenHandler)
 app.post('/api/auth/register', oauthRegisterHandler)
 app.all('/mcp', mcpHttpHandler)

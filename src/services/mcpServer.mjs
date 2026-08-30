@@ -702,6 +702,67 @@ export async function siweVerifyHandler(req, res) {
   res.json({ redirect: redirectUrl.toString(), code: grant.code, state: state || '' })
 }
 
+// ── Passkey-only OAuth verify + issue auth code (1 signature, no SIWE) ──
+// The passkey/MSCA session token IS the full identity proof: the browser
+// freshly authenticated the selected Agent Wallet via WebAuthn and the token
+// is validated against the exact MSCA + active session. The EOA SIWE step is
+// no longer required for agent connection (the EOA remains in use for manual
+// value transactions only).
+export async function passkeyVerifyHandler(req, res) {
+  const { mscaWalletAddress, mscaSessionToken, clientId, redirectUri, state, codeChallenge, requestId, resource } = req.body || {}
+  if (!mscaWalletAddress || !mscaSessionToken || !clientId || !requestId) return res.status(400).json({ error: 'missing_fields' })
+  if (!redirectUri || !codeChallenge) return res.status(400).json({ error: 'missing_pkce_or_redirect_uri' })
+  if (!validResourceIndicator(resource)) return res.status(400).json({ error: 'invalid_target', error_description: 'resource must identify the ARCOX MCP endpoint' })
+
+  let requestValid
+  try {
+    requestValid = withOAuthStateLock(() => {
+      refreshOAuthClients()
+      const client = oauthClients.get(clientId)
+      const request = oauthRequests.get(requestId)
+      if (!client || !request || request.clientId !== clientId || Date.now() > request.expires) return { error: 'invalid_authorization_request' }
+      if (request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri) || (resource && request.resource !== resource)) return { error: 'authorization_request_mismatch' }
+      return { ok: true }
+    })
+  } catch (error) {
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
+  if (requestValid.error) return res.status(400).json(requestValid)
+
+  // The passkey token proves control of the MSCA. Bind the OAuth identity
+  // (keyed by the MSCA address itself — no EOA needed) to the active session.
+  const binding = await bindMcpIdentityToActiveSession({
+    userId: String(mscaWalletAddress).toLowerCase(),
+    mscaWalletAddress,
+    mscaSessionToken,
+    clientId,
+  })
+  if (!binding.ok) return res.status(403).json({ error: 'session_identity_binding_failed', error_description: binding.error })
+
+  let grant
+  try {
+    grant = withOAuthStateLock(() => {
+      refreshOAuthClients()
+      const client = oauthClients.get(clientId)
+      const request = oauthRequests.get(requestId)
+      if (!client || !request || request.clientId !== clientId || request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri) || Date.now() > request.expires) return { error: 'invalid_authorization_request' }
+      const userId = String(mscaWalletAddress).toLowerCase()
+      const existingCode = findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state, resource: request.resource || resource || MCP_RESOURCE_URL, mscaWalletAddress })
+      const code = existingCode || createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce: '', resource: request.resource || resource || MCP_RESOURCE_URL, mscaWalletAddress })
+      saveOAuthState()
+      return { code }
+    })
+  } catch (error) {
+    return res.status(503).json({ error: 'oauth_state_unavailable', message: error?.message || 'OAuth state store unavailable' })
+  }
+  if (grant.error) return res.status(400).json(grant)
+
+  const redirectUrl = new URL(redirectUri)
+  redirectUrl.searchParams.set('code', grant.code)
+  if (state) redirectUrl.searchParams.set('state', state)
+  res.json({ redirect: redirectUrl.toString(), code: grant.code, state: state || '' })
+}
+
 // ── Token endpoint ──
 export function oauthTokenHandler(req, res) {
   const { grant_type, code, refresh_token, client_id, client_secret, redirect_uri, code_verifier, resource } = req.body || {}

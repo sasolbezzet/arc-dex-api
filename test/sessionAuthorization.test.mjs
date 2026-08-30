@@ -66,7 +66,9 @@ test('manual revoke sets manualRevokePending and reconcile refuses resurrection'
     aliases: {},
   }))
   const previousPath = process.env.SESSION_KEYS_PATH
+  const previousEncryptionKey = process.env.SESSION_KEY_ENCRYPTION_KEY
   process.env.SESSION_KEYS_PATH = path
+  process.env.SESSION_KEY_ENCRYPTION_KEY = 'test-only-session-encryption-key'
   try {
     const { reserveSessionKey, reconcileSessionKeyActivation } = await import('../src/services/sessionKeyService.mjs?auth-test-manual-revoke-' + Date.now())
     const reserved = reserveSessionKey(owner, { walletAddress })
@@ -83,6 +85,8 @@ test('manual revoke sets manualRevokePending and reconcile refuses resurrection'
   } finally {
     if (previousPath === undefined) delete process.env.SESSION_KEYS_PATH
     else process.env.SESSION_KEYS_PATH = previousPath
+    if (previousEncryptionKey === undefined) delete process.env.SESSION_KEY_ENCRYPTION_KEY
+    else process.env.SESSION_KEY_ENCRYPTION_KEY = previousEncryptionKey
     await rm(dir, { recursive: true, force: true })
   }
 })
