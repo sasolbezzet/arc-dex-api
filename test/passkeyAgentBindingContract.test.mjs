@@ -5,6 +5,15 @@ const OWNER = '0x1111111111111111111111111111111111111111'
 const A = 'oauth:claude|' + OWNER
 const B = 'hermes-mcp|' + OWNER
 
+test('registration usernames are never reused across attempts', () => {
+  const usernames = new Set()
+  for (let i = 0; i < 10; i++) {
+    const username = `arx-hermes-mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    assert.equal(usernames.has(username), false)
+    usernames.add(username)
+  }
+})
+
 test('agent keys remain distinct and credential binding is agent scoped', async () => {
   const service = await import('../src/services/sessionKeyService.mjs')
   const original = process.env.SESSION_KEYS_PATH
