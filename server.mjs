@@ -398,14 +398,26 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
     if (agentKey) {
       if (!agentBindingStoreModule) return res.status(503).json({ error: 'agent_binding_store_unavailable' })
       const binding = agentBindingStoreModule.getAgentBinding(agentKey)
-      if (!binding) return res.status(403).json({ error: 'agent_passkey_not_bound' })
       const credentialId = normalizeCredentialId(normalizedCredentialId(credential))
       const allowed = credentialIdsForAgent(agentKey)
-      if (allowed.length > 0 && !allowed.includes(credentialId)) return res.status(403).json({ error: 'agent_passkey_not_bound' })
-      if (String(binding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
-      // First-use binding: the passkey resolved to this agent's bound wallet,
-      // so record the credential for future scoped (allowCredentials) logins.
-      if (!allowed.includes(credentialId)) bindPasskeyCredential(agentKey, credentialId, binding.walletAddress)
+      if (mode === 'Register') {
+        // Registration is the first step for a new agent. Create its binding
+        // only after Circle verifies the passkey and derives the MSCA address.
+        // A pre-existing binding must retain its wallet and cannot be rotated.
+        if (binding && String(binding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) {
+          return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
+        }
+        if (!binding) {
+          const owner = String(agentKey).includes('|') ? String(agentKey).split('|').pop() : verified.walletAddress
+          agentBindingStoreModule.bindAgent(agentKey, owner, verified.walletAddress)
+        }
+        bindPasskeyCredential(agentKey, credentialId, verified.walletAddress)
+      } else {
+        if (!binding) return res.status(403).json({ error: 'agent_passkey_not_bound' })
+        if (allowed.length > 0 && !allowed.includes(credentialId)) return res.status(403).json({ error: 'agent_passkey_not_bound' })
+        if (String(binding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
+        if (!allowed.includes(credentialId)) bindPasskeyCredential(agentKey, credentialId, binding.walletAddress)
+      }
     }
     const { createSession } = await import('./src/services/vaultStore.mjs')
     const token = createSession(verified.walletAddress.toLowerCase())
