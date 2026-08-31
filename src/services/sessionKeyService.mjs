@@ -445,6 +445,9 @@ export function bindAgent(agentKey, ownerAddress, walletAddress) {
   const store = loadStore()
   if (!store.agentBindings || typeof store.agentBindings !== 'object') store.agentBindings = {}
   const previous = store.agentBindings[key]
+  if (previous && String(previous.walletAddress || '').toLowerCase() !== wallet) {
+    throw new Error('agent_wallet_rotation_forbidden')
+  }
   const reusedBy = Object.entries(store.agentBindings).find(([otherKey, binding]) =>
     otherKey !== key && String(binding?.walletAddress || '').toLowerCase() === wallet
   )
@@ -476,6 +479,105 @@ export function getAgentBinding(agentKey) {
   return store.agentBindings?.[normalizeAgentKey(agentKey)] || null
 }
 
+/**
+ * The first OAuth onboarding implementation used `oauth:<clientId>` as a
+ * temporary browser namespace. The durable binding created by the approval
+ * callback is `<clientId>|<walletAddress>`. Keep the migration at the service
+ * boundary so old rows cannot create a second dashboard card.
+ */
+function canonicalOAuthClientId(agentKey) {
+  const key = normalizeAgentKey(agentKey)
+  return key.startsWith('oauth:') ? key.slice('oauth:'.length).split('|')[0] : ''
+}
+
+function canonicalBindingKey(agentKey, ownerAddress) {
+  const rawKey = normalizeAgentKey(agentKey)
+  const clientId = canonicalOAuthClientId(rawKey)
+  return clientId
+    ? `${clientId}|${String(ownerAddress || '').toLowerCase()}`
+    : rawKey
+}
+
+/**
+ * Heal rows written by the pre-canonical OAuth flow. This is deliberately
+ * idempotent and keeps the durable `<clientId>|<owner>` key used by every
+ * management mutation. Legacy `oauth:<clientId>` rows are removed after their
+ * fields are merged into the durable row.
+ */
+function mergeBindingMetadata(previous, current) {
+  return {
+    ...previous,
+    ...current,
+    ownerAddress: current.ownerAddress || previous.ownerAddress,
+    walletAddress: current.walletAddress || previous.walletAddress,
+    boundAt: Math.min(Number(previous.boundAt || Infinity), Number(current.boundAt || Infinity)),
+    lastUsedAt: Math.max(Number(previous.lastUsedAt || 0), Number(current.lastUsedAt || 0)),
+    credentialIds: Array.from(new Set([...(previous.credentialIds || []), ...(current.credentialIds || [])])),
+  }
+}
+
+function migrateLegacyAgentBindings(store) {
+  const bindings = store.agentBindings
+  if (!bindings || typeof bindings !== 'object') return false
+  let changed = false
+  for (const [rawKey, rawBinding] of Object.entries({ ...bindings })) {
+    if (!canonicalOAuthClientId(rawKey)) continue
+    const clientId = canonicalOAuthClientId(rawKey)
+    const wallet = String(rawBinding?.walletAddress || '').toLowerCase()
+    const matchingKey = Object.keys(bindings).find(candidate => {
+      if (candidate === rawKey || !candidate.includes('|')) return false
+      const candidateBinding = bindings[candidate]
+      return normalizeAgentKey(candidate).split('|')[0] === clientId
+        && String(candidateBinding?.walletAddress || '').toLowerCase() === wallet
+    })
+    const canonicalKey = matchingKey || `${clientId}|${String(rawBinding?.ownerAddress || '').toLowerCase()}`
+    if (!canonicalKey || canonicalKey === normalizeAgentKey(rawKey)) continue
+    bindings[canonicalKey] = bindings[canonicalKey]
+      ? mergeBindingMetadata(rawBinding, bindings[canonicalKey])
+      : { ...rawBinding }
+    delete bindings[rawKey]
+    changed = true
+  }
+  return changed
+}
+
+function canonicalBindingRows(rows) {
+  const result = new Map()
+  for (const row of rows) {
+    // One client gets one Agent Wallet. Include the client ID so Claude and
+    // ChatGPT remain separate even if a legacy migration reused one address.
+    const wallet = String(row.walletAddress || '').toLowerCase()
+    const normalized = { ...row, agentKey: canonicalBindingKey(row.agentKey, row.ownerAddress) }
+    const clientId = normalizeAgentKey(normalized.agentKey).split('|')[0]
+    const group = /^0x[0-9a-f]{40}$/.test(wallet)
+      ? `client:${clientId}|wallet:${wallet}`
+      : `key:${normalized.agentKey}`
+    const previous = result.get(group)
+    if (!previous) result.set(group, normalized)
+    else if (String(previous.agentKey).startsWith('oauth:') && !String(normalized.agentKey).startsWith('oauth:')) {
+      result.set(group, mergeBindingMetadata(previous, normalized))
+    } else {
+      result.set(group, mergeBindingMetadata(normalized, previous))
+    }
+  }
+  return [...result.values()]
+}
+
+/** Find the durable binding for an OAuth namespace and verified wallet. */
+export function findAgentBindingByClientAndWallet(agentKey, walletAddress) {
+  const clientId = canonicalOAuthClientId(agentKey) || normalizeAgentKey(agentKey).split('|')[0]
+  const wallet = String(walletAddress || '').toLowerCase()
+  if (!clientId || !wallet) return null
+  const store = loadStore()
+  const entries = Object.entries(store.agentBindings || {})
+    .filter(([key, binding]) => {
+      const candidateClientId = normalizeAgentKey(key).split('|')[0]
+      return candidateClientId === clientId && String(binding?.walletAddress || '').toLowerCase() === wallet
+    })
+  const exact = entries.find(([key]) => key.includes('|')) || entries[0]
+  return exact ? { agentKey: exact[0], ...exact[1] } : null
+}
+
 export function bindAgentCredential(agentKey, credentialId, walletAddress) {
   const key = normalizeAgentKey(agentKey)
   const id = String(credentialId || '').trim()
@@ -493,27 +595,35 @@ export function bindAgentCredential(agentKey, credentialId, walletAddress) {
 export function listAgentBindings(ownerAddress) {
   const owner = normalizeAgentKey(ownerAddress)
   const store = loadStore()
+  const changed = migrateLegacyAgentBindings(store)
+  if (changed) saveStore(store)
   return Object.entries(store.agentBindings || {})
     .filter(([, binding]) => String(binding?.ownerAddress || '').toLowerCase() === owner)
     .map(([agentKey, binding]) => ({ agentKey, ...binding }))
 }
 
 /** List bindings visible to a passkey session identity. The vault session
- * token authenticates the MSCA (passkey login), while bindings are keyed to
- * the owner EOA — so an identity is authoritative when it matches either the
- * binding owner EOA or the bound wallet MSCA (Fase 4/5 flow). */
+ * token authenticates the MSCA, while bindings are keyed to either the owner
+ * EOA or the bound wallet. Legacy OAuth namespace rows are canonicalized here
+ * so the API returns one row per real agent.
+ */
 export function listAgentBindingsForIdentity(identityAddress) {
   const identity = normalizeAgentKey(identityAddress)
   const store = loadStore()
-  return Object.entries(store.agentBindings || {})
+  const changed = migrateLegacyAgentBindings(store)
+  if (changed) saveStore(store)
+  const rows = Object.entries(store.agentBindings || {})
     .filter(([, binding]) =>
       String(binding?.ownerAddress || '').toLowerCase() === identity ||
       String(binding?.walletAddress || '').toLowerCase() === identity)
     .map(([agentKey, binding]) => ({ agentKey, ...binding }))
+  return canonicalBindingRows(rows)
 }
 
 export function getAllAgentBindings() {
   const store = loadStore()
+  const changed = migrateLegacyAgentBindings(store)
+  if (changed) saveStore(store)
   return Object.entries(store.agentBindings || {})
     .map(([agentKey, binding]) => ({ agentKey, ...binding }))
 }

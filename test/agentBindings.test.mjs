@@ -158,3 +158,38 @@ test('listAgentBindings returns only bindings owned by the requested address', a
     assert.equal(listAgentBindings('0x9999999999999999999999999999999999999999').length, 0)
   })
 })
+
+test('legacy OAuth namespace is migrated into one durable binding', async () => {
+  const clientId = 'oauth-client'
+  const legacyKey = `oauth:${clientId}`
+  const durableKey = `${clientId}|${OWNER}`
+  await withSessionStore({
+    agentBindings: {
+      [legacyKey]: { ownerAddress: OWNER, walletAddress: W1, boundAt: 100, lastUsedAt: 200, credentialIds: ['legacy-credential'] },
+      [durableKey]: { ownerAddress: OWNER, walletAddress: W1, boundAt: 150, lastUsedAt: 300, credentialIds: ['durable-credential'] },
+    },
+  }, async ({ listAgentBindingsForIdentity }) => {
+    const visible = listAgentBindingsForIdentity(W1)
+    assert.equal(visible.length, 1)
+    assert.equal(visible[0].agentKey, durableKey)
+    assert.equal(visible[0].walletAddress, W1)
+    assert.deepEqual(visible[0].credentialIds.sort(), ['durable-credential', 'legacy-credential'])
+
+    const raw = await readRawStore()
+    assert.equal(raw.agentBindings[legacyKey], undefined)
+    assert.ok(raw.agentBindings[durableKey])
+  })
+})
+
+test('different OAuth clients remain separate when wallet addresses match', async () => {
+  await withSessionStore({
+    agentBindings: {
+      [`claude|${OWNER}`]: { ownerAddress: OWNER, walletAddress: W1, boundAt: 100 },
+      [`chatgpt|${OWNER}`]: { ownerAddress: OWNER, walletAddress: W1, boundAt: 200 },
+    },
+  }, async ({ listAgentBindingsForIdentity }) => {
+    const visible = listAgentBindingsForIdentity(OWNER)
+    assert.equal(visible.length, 2)
+    assert.deepEqual(visible.map(row => row.agentKey), [`claude|${OWNER}`, `chatgpt|${OWNER}`])
+  })
+})

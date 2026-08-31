@@ -397,21 +397,26 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
     }
     if (agentKey) {
       if (!agentBindingStoreModule) return res.status(503).json({ error: 'agent_binding_store_unavailable' })
+      const namespaceAgent = String(agentKey).trim().toLowerCase()
+      const isTemporaryOAuthNamespace = namespaceAgent.startsWith('oauth:')
       const binding = agentBindingStoreModule.getAgentBinding(agentKey)
       const credentialId = normalizeCredentialId(normalizedCredentialId(credential))
       const allowed = credentialIdsForAgent(agentKey)
       if (mode === 'Register') {
-        // Registration is the first step for a new agent. Create its binding
-        // only after Circle verifies the passkey and derives the MSCA address.
-        // A pre-existing binding must retain its wallet and cannot be rotated.
-        if (binding && String(binding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) {
-          return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
+        // OAuth registration uses a temporary browser namespace. The durable
+        // binding is created by passkey-verify after the OAuth request is
+        // approved; creating it here would produce a second row for the same
+        // wallet (`oauth:<clientId>` plus `<clientId>|<owner>`).
+        if (isTemporaryOAuthNamespace) {
+          const durable = agentBindingStoreModule.findAgentBindingByClientAndWallet(agentKey, verified.walletAddress)
+          if (durable) bindPasskeyCredential(durable.agentKey, credentialId, verified.walletAddress)
+        } else {
+          // Non-OAuth registration is also intentionally not bound here. The
+          // owning connection flow creates its canonical binding only after it
+          // has issued the agent credential (for example Hermes bootstrap).
+          // This keeps passkey wallet namespaces out of the agent list.
+          void binding
         }
-        if (!binding) {
-          const owner = String(agentKey).includes('|') ? String(agentKey).split('|').pop() : verified.walletAddress
-          agentBindingStoreModule.bindAgent(agentKey, owner, verified.walletAddress)
-        }
-        bindPasskeyCredential(agentKey, credentialId, verified.walletAddress)
       } else {
         // Login Passkey: the agent must already exist (a binding row).
         //
@@ -425,17 +430,18 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
         // The browser passkey still resolves to a Circle-verified MSCA address;
         // that is the ownership proof. Bind the credential on first use
         // instead of rejecting a legitimate login.
-        if (!binding) return res.status(403).json({ error: 'agent_passkey_not_bound' })
-        if (String(binding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) {
+        const resolvedBinding = binding || (isTemporaryOAuthNamespace
+          ? agentBindingStoreModule.findAgentBindingByClientAndWallet(agentKey, verified.walletAddress)
+          : null)
+        // The OAuth approval is allowed to finish the durable binding in the
+        // next passkey-verify request. A normal dashboard login still requires
+        // an existing exact binding and can never inherit another agent wallet.
+        if (!resolvedBinding && !isTemporaryOAuthNamespace) return res.status(403).json({ error: 'agent_passkey_not_bound' })
+        if (resolvedBinding && String(resolvedBinding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) {
           return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
         }
-        // credentialId and allowed are already declared above for this agent.
-        // Bind the credential on first use or when a new authenticator resolves
-        // to the same wallet (device sync, new passkey) instead of blocking.
-        if (allowed.length > 0 && !allowed.includes(credentialId)) {
-          bindPasskeyCredential(agentKey, credentialId, binding.walletAddress)
-        } else if (!allowed.includes(credentialId)) {
-          bindPasskeyCredential(agentKey, credentialId, binding.walletAddress)
+        if (resolvedBinding && !resolvedBinding.agentKey.startsWith('oauth:') && !allowed.includes(credentialId)) {
+          bindPasskeyCredential(resolvedBinding.agentKey, credentialId, resolvedBinding.walletAddress)
         }
       }
     }
