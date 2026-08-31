@@ -548,6 +548,65 @@ app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
   }
 })
 
+app.post('/api/agents/quick-connect', apiLimiter, async (req, res) => {
+  try {
+    const { agentKey, clientName, walletAddress } = req.body || {}
+    if (!agentKey || !clientName || !walletAddress) {
+      return res.status(400).json({ error: 'agentKey, clientName, and walletAddress are required' })
+    }
+    const { bindAgent } = await import('./src/services/sessionKeyService.mjs')
+    bindAgent(agentKey, walletAddress, walletAddress)
+    const { createConnectionToken, createSession } = await import('./src/services/vaultStore.mjs')
+    const connection = createConnectionToken(agentKey)
+    const sessionToken = createSession(walletAddress.toLowerCase())
+    res.json({
+      success: true,
+      agentKey,
+      clientName,
+      walletAddress,
+      connectionToken: connection.token,
+      sessionToken,
+      expiresAt: connection.expiresAt
+    })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/agents/status', apiLimiter, async (req, res) => {
+  try {
+    const { getAllAgentBindings, getSessionKey } = await import('./src/services/sessionKeyService.mjs')
+    const bindings = getAllAgentBindings()
+    const agents = bindings.map(b => {
+      const sessionEntry = getSessionKey(b.walletAddress)
+      return {
+        agentKey: b.agentKey,
+        walletAddress: b.walletAddress,
+        credentialsCount: Array.isArray(b.credentialIds) ? b.credentialIds.length : 0,
+        activeSession: sessionEntry?.active === true
+      }
+    })
+    res.json({ success: true, agents })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/session/reactivate', apiLimiter, async (req, res) => {
+  try {
+    const { walletAddress, agentKey } = req.body || {}
+    if (!walletAddress || !agentKey) return res.status(400).json({ error: 'walletAddress and agentKey are required' })
+    const { getSessionKey, getAgentBinding } = await import('./src/services/sessionKeyService.mjs')
+    const binding = getAgentBinding(agentKey)
+    if (!binding || String(binding.walletAddress).toLowerCase() !== String(walletAddress).toLowerCase()) {
+      return res.status(403).json({ reactivated: false, reason: 'agent_wallet_mismatch' })
+    }
+    const entry = getSessionKey(walletAddress)
+    if (!entry || !entry.delegateAddress || !entry.active) {
+      return res.status(404).json({ reactivated: false, reason: 'no_active_delegate_found' })
+    }
+    const { createSession } = await import('./src/services/vaultStore.mjs')
+    const token = createSession(walletAddress.toLowerCase())
+    res.json({ reactivated: true, token, delegateAddress: entry.delegateAddress })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
 app.get('/api/session/status', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { getSessionKeyInfo } = await import('./src/services/vaultStore.mjs')

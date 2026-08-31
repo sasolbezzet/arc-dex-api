@@ -39,6 +39,14 @@ export function createSession(userId) {
   return token
 }
 
+export function createConnectionToken(agentKey) {
+  const token = 'arx_at_' + randomUUID().replace(/-/g, '')
+  const createdAt = Date.now()
+  sessionTokens.set(token, { userId: agentKey, createdAt, expires: createdAt + SESSION_TTL_MS, type: 'connection' })
+  persistSessions(sessionTokens)
+  return { token, expiresAt: createdAt + SESSION_TTL_MS }
+}
+
 export function isRecentSession(token, maxAgeMs = 120000) {
   const session = sessionTokens.get(token)
   if (!session) return false

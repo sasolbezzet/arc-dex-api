@@ -512,6 +512,12 @@ export function listAgentBindingsForIdentity(identityAddress) {
     .map(([agentKey, binding]) => ({ agentKey, ...binding }))
 }
 
+export function getAllAgentBindings() {
+  const store = loadStore()
+  return Object.entries(store.agentBindings || {})
+    .map(([agentKey, binding]) => ({ agentKey, ...binding }))
+}
+
 /** Resolve the canonical EOA owner for an authenticated identity/MSCA pair. */
 export function resolveOwnerAddressForWallet(identityAddress, walletAddress = '') {
   const identity = normalizeAgentKey(identityAddress)
