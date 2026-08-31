@@ -39,6 +39,7 @@ import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleMod
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
 import { startRefundWorker } from './src/services/x402RefundWorker.mjs'
 import { readPaymentInvoice, readTransactionHistory, scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, shadowReadWebhookEvent, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
+import { verifyOwnerToken } from './src/services/authToken.mjs'
 import { claimWebhookEvent, completeWebhookEvent, listAutoMintJobs, readAutoMintJob, claimAutoMintLease, releaseAutoMintLease, supabaseOperationalStatus, upsertAutoMintJob } from './src/services/supabaseOperationalState.mjs'
 
 process.umask(0o077)
@@ -461,20 +462,28 @@ app.post('/api/session/generate-key', apiLimiter, requireAuth, async (req, res) 
     if (!walletAddress || !isAddress(walletAddress) || getAddress(walletAddress).toLowerCase() !== req.owner) {
       return res.status(403).json({ error: 'walletAddress must match the authenticated MSCA' })
     }
+    // A passkey/MSCA session proves the agent wallet, not the owner account.
+    // Require a separately verified EOA session before creating or rebinding a
+    // delegate, so this endpoint cannot attach an MSCA to an env/stale owner.
+    if (!ownerAddress || !ownerSessionToken || !isAddress(ownerAddress)) {
+      return res.status(403).json({ error: 'Verified EOA session is required to bind ownerAddress' })
+    }
     let verifiedOwnerAddress = ''
-    if (ownerAddress) {
-      if (!isAddress(ownerAddress) || !ownerSessionToken) {
-        return res.status(403).json({ error: 'Verified EOA session is required to bind ownerAddress' })
-      }
+    {
       const vault = await import('./src/services/vaultStore.mjs')
-      verifiedOwnerAddress = vault.validateSession(ownerSessionToken) || ''
+      verifiedOwnerAddress = verifyOwnerToken(ownerSessionToken) || vault.validateSession(ownerSessionToken) || ''
       if (verifiedOwnerAddress !== getAddress(ownerAddress).toLowerCase()) {
         return res.status(403).json({ error: 'ownerAddress is not authenticated by the supplied EOA session' })
       }
     }
     const { reserveSessionKey, bindSessionAlias } = await import('./src/services/sessionKeyService.mjs')
     const key = reserveSessionKey(req.owner, { walletAddress })
-    if (verifiedOwnerAddress) bindSessionAlias(req.owner, verifiedOwnerAddress, walletAddress)
+    if (verifiedOwnerAddress) {
+      // The EOA session is a fresh owner proof. Allow it to repair an alias
+      // previously written by the legacy env-based flow, but never allow an
+      // unverified caller to perform this rebind.
+      bindSessionAlias(req.owner, verifiedOwnerAddress, walletAddress, { allowRebind: true })
+    }
     res.json({ success: true, delegateAddress: key.address, walletAddress: key.walletAddress, pendingAuthorization: key.pending })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
@@ -552,35 +561,18 @@ app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
       ...(e.receiptStatus !== undefined ? { receiptStatus: e.receiptStatus } : {}),
     })
   }
+})// Legacy quick-connect accepted an arbitrary wallet and created an owner-less
+// session. Keep the route explicit but closed; all clients must use the
+// authenticated bootstrap/OAuth flows above.
+app.post('/api/agents/quick-connect', apiLimiter, (_req, res) => {
+  res.status(410).json({ error: 'legacy_quick_connect_disabled', message: 'Gunakan flow Agent Wallet + owner wallet yang terverifikasi.' })
 })
 
-app.post('/api/agents/quick-connect', apiLimiter, async (req, res) => {
+app.get('/api/agents/status', apiLimiter, requireAuth, async (req, res) =>
+ {
   try {
-    const { agentKey, clientName, walletAddress } = req.body || {}
-    if (!agentKey || !clientName || !walletAddress) {
-      return res.status(400).json({ error: 'agentKey, clientName, and walletAddress are required' })
-    }
-    const { bindAgent } = await import('./src/services/sessionKeyService.mjs')
-    bindAgent(agentKey, walletAddress, walletAddress)
-    const { createConnectionToken, createSession } = await import('./src/services/vaultStore.mjs')
-    const connection = createConnectionToken(agentKey)
-    const sessionToken = createSession(walletAddress.toLowerCase())
-    res.json({
-      success: true,
-      agentKey,
-      clientName,
-      walletAddress,
-      connectionToken: connection.token,
-      sessionToken,
-      expiresAt: connection.expiresAt
-    })
-  } catch (e) { res.status(500).json({ error: e.message }) }
-})
-
-app.get('/api/agents/status', apiLimiter, async (req, res) => {
-  try {
-    const { getAllAgentBindings, getSessionKey } = await import('./src/services/sessionKeyService.mjs')
-    const bindings = getAllAgentBindings()
+    const { listAgentBindingsForIdentity, getSessionKey } = await import('./src/services/sessionKeyService.mjs')
+    const bindings = listAgentBindingsForIdentity(req.owner)
     const agents = bindings.map(b => {
       const sessionEntry = getSessionKey(b.walletAddress)
       return {
@@ -594,13 +586,13 @@ app.get('/api/agents/status', apiLimiter, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-app.post('/api/session/reactivate', apiLimiter, async (req, res) => {
+app.post('/api/session/reactivate', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { walletAddress, agentKey } = req.body || {}
     if (!walletAddress || !agentKey) return res.status(400).json({ error: 'walletAddress and agentKey are required' })
-    const { getSessionKey, getAgentBinding } = await import('./src/services/sessionKeyService.mjs')
+    const { getSessionKey, getAgentBinding, identityOwnsAgentBinding } = await import('./src/services/sessionKeyService.mjs')
     const binding = getAgentBinding(agentKey)
-    if (!binding || String(binding.walletAddress).toLowerCase() !== String(walletAddress).toLowerCase()) {
+    if (!binding || !identityOwnsAgentBinding(req.owner, binding) || String(binding.walletAddress).toLowerCase() !== String(walletAddress).toLowerCase()) {
       return res.status(403).json({ reactivated: false, reason: 'agent_wallet_mismatch' })
     }
     const entry = getSessionKey(walletAddress)

@@ -137,7 +137,7 @@ function withOAuthStateLock(fn) {
 // ── Persistent OAuth client store ──
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { scheduleOAuthShadowSnapshot } from './supabaseOAuthShadow.mjs'
-import { bindAgent, registerMscaLiveTokenProbe, revokeAgentBinding } from './sessionKeyService.mjs'
+import { bindAgent, findAgentBindingByClientAndWallet, registerMscaLiveTokenProbe, revokeAgentBinding } from './sessionKeyService.mjs'
 import { getLimits } from './vaultStore.mjs'
 
 function loadClients() {
@@ -615,17 +615,26 @@ export async function bindMcpIdentityToActiveSession({ userId, mscaWalletAddress
       return { ok: false, error: 'Selected MSCA does not have an active session key' }
     }
     const { bindSessionAlias, bindAgent } = await import('./sessionKeyService.mjs')
-    // The passkey-backed session token above proves control of this exact
-    // active MSCA. Permit this OAuth flow to replace a stale EOA alias so a
-    // newly selected Agent Wallet can connect without a manual cleanup step.
-    // The ordinary session setup path keeps the strict no-rebind default.
-    const bound = bindSessionAlias(userId, userId, mscaWalletAddress, { allowRebind: true })
-    // Per-agent isolation: key the durable binding by <clientId>|<userId> so
-    // two agents sharing one owner EOA each keep their own Agent Wallet.
-    // The legacy userId alias above stays written for old tokens.
-    let agentBound = null
+    const owner = getAddress(userId).toLowerCase()
+    const wallet = getAddress(mscaWalletAddress).toLowerCase()
     const cid = String(clientId || '').trim()
-    if (cid && !cid.includes('|')) agentBound = bindAgent(`${cid}|${userId}`, userId, mscaWalletAddress)
+    if (cid.includes('|')) return { ok: false, error: 'invalid_client_identity' }
+
+    // Never re-parent a durable client/wallet binding owned by another EOA.
+    // This is the guard that prevents a stale env owner from appearing as the
+    // owner of the current user's passkey wallet.
+    const existing = findAgentBindingByClientAndWallet(cid, wallet)
+    if (existing && String(existing.ownerAddress || '').toLowerCase() !== owner
+      && String(existing.ownerAddress || '').toLowerCase() !== wallet) {
+      return { ok: false, error: 'agent_wallet_belongs_to_another_owner' }
+    }
+
+    // The passkey-backed session token proves control of this exact MSCA, while
+    // `owner` is separately proven by the EOA session/SIWE flow.
+    const bound = bindSessionAlias(owner, owner, wallet, { allowRebind: true })
+    // Per-agent isolation: key the durable binding by <clientId>|<owner> so
+    // two agents sharing one owner EOA each keep their own Agent Wallet.
+    const agentBound = cid ? bindAgent(`${cid}|${owner}`, owner, wallet) : null
     return { ok: true, bound, agentBound }
   } catch (error) {
     return { ok: false, error: error?.message || 'MCP identity binding failed' }
@@ -709,8 +718,22 @@ export async function siweVerifyHandler(req, res) {
 // no longer required for agent connection (the EOA remains in use for manual
 // value transactions only).
 export async function passkeyVerifyHandler(req, res) {
-  const { mscaWalletAddress, mscaSessionToken, clientId, redirectUri, state, codeChallenge, requestId, resource } = req.body || {}
-  if (!mscaWalletAddress || !mscaSessionToken || !clientId || !requestId) return res.status(400).json({ error: 'missing_fields' })
+  const { mscaWalletAddress, mscaSessionToken, ownerAddress, ownerSessionToken, clientId, redirectUri, state, codeChallenge, requestId, resource } = req.body || {}
+  if (!mscaWalletAddress || !mscaSessionToken || !ownerAddress || !ownerSessionToken || !clientId || !requestId) {
+    return res.status(400).json({ error: 'owner_and_agent_sessions_required', error_description: 'Wallet owner dan Agent Wallet harus sama-sama terhubung.' })
+  }
+  let verifiedOwner = ''
+  try {
+    const { validateSession } = await import('./vaultStore.mjs')
+    // Accept either the frontend owner HMAC token or a dedicated owner vault
+    // session, but never an Agent Wallet OAuth/passkey token as owner proof.
+    verifiedOwner = verifyOwnerToken(ownerSessionToken) || validateSession(ownerSessionToken) || ''
+    if (!verifiedOwner || getAddress(verifiedOwner) !== getAddress(ownerAddress)) {
+      return res.status(403).json({ error: 'owner_authentication_required', error_description: 'Hubungkan dan autentikasi wallet utama terlebih dahulu.' })
+    }
+  } catch {
+    return res.status(403).json({ error: 'owner_authentication_required', error_description: 'Sesi wallet utama tidak valid.' })
+  }
   if (!redirectUri || !codeChallenge) return res.status(400).json({ error: 'missing_pkce_or_redirect_uri' })
   if (!validResourceIndicator(resource)) return res.status(400).json({ error: 'invalid_target', error_description: 'resource must identify the ARCOX MCP endpoint' })
 
@@ -729,10 +752,10 @@ export async function passkeyVerifyHandler(req, res) {
   }
   if (requestValid.error) return res.status(400).json(requestValid)
 
-  // The passkey token proves control of the MSCA. Bind the OAuth identity
-  // (keyed by the MSCA address itself — no EOA needed) to the active session.
+  // Both proofs are required. Bind the OAuth identity to the verified owner
+  // EOA; the passkey token only selects/proves the exact Agent Wallet MSCA.
   const binding = await bindMcpIdentityToActiveSession({
-    userId: String(mscaWalletAddress).toLowerCase(),
+    userId: verifiedOwner,
     mscaWalletAddress,
     mscaSessionToken,
     clientId,
@@ -746,7 +769,7 @@ export async function passkeyVerifyHandler(req, res) {
       const client = oauthClients.get(clientId)
       const request = oauthRequests.get(requestId)
       if (!client || !request || request.clientId !== clientId || request.redirectUri !== redirectUri || request.state !== (state || '') || request.codeChallenge !== codeChallenge || !client.redirectUris.includes(redirectUri) || Date.now() > request.expires) return { error: 'invalid_authorization_request' }
-      const userId = String(mscaWalletAddress).toLowerCase()
+      const userId = verifiedOwner
       const existingCode = findExistingAuthCode(clientId, userId, { redirectUri, codeChallenge, state, resource: request.resource || resource || MCP_RESOURCE_URL, mscaWalletAddress })
       const code = existingCode || createAuthCodeUnsafe(clientId, userId, { redirectUri, codeChallenge, state, requestId, challengeNonce: '', resource: request.resource || resource || MCP_RESOURCE_URL, mscaWalletAddress })
       saveOAuthState()
@@ -839,7 +862,7 @@ function extractBearer(req) {
 // ── Backend API helper ──
 const BACKEND_URL = process.env.ARCOX_BACKEND_URL || 'http://localhost:3001'
 
-import { mintOwnerToken } from './authToken.mjs'
+import { mintOwnerToken, verifyOwnerToken } from './authToken.mjs'
 import { markX402ServiceOutcome, publicInvoice } from '../middleware/x402Middleware.mjs'
 import { registerIntelTools } from './mcp/intelTools.mjs'
 import { registerDocsCatalogTools } from './mcp/docsCatalogTools.mjs'

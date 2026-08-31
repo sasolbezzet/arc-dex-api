@@ -1,9 +1,10 @@
 import { Router } from 'express'
 import { listCredentials, addCredential, deduplicateCredentials, revealCredential, deleteCredential, getLimits, setLimits, listApprovals, createApproval, approveRequest, rejectRequest, listActivity, listAgentCardLinks, upsertAgentCardLink, removeAgentCardLink, createChallenge, consumeChallenge, createSession, validateSession, listMcpSessions } from '../services/vaultStore.mjs'
 import { readAgentActivity, readAgentApprovals } from '../services/supabasePersistence.mjs'
-import { listRelatedAddresses, listAgentBindings, listAgentBindingsForIdentity, identityOwnsAgentBinding, resolveOwnerAddressForWallet, revokeAgentBinding, getAgentBinding } from '../services/sessionKeyService.mjs'
+import { listRelatedAddresses, listAgentBindings, listAgentBindingsForIdentity, identityOwnsAgentBinding, resolveOwnerAddressForWallet, revokeAgentBinding, getAgentBinding, agentClientId as agentClientIdFromBinding } from '../services/sessionKeyService.mjs'
 import { getDailySpend } from '../services/agentSpendLedger.mjs'
 import { verifyMessage } from 'viem'
+import { verifyOwnerToken } from '../services/authToken.mjs'
 
 const vault = Router()
 
@@ -16,7 +17,7 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Authentication required', hint: 'POST /api/vault/challenge to start SIWE login' })
   }
   const token = auth.slice(7)
-  const userId = validateSession(token)
+  const userId = validateSession(token) || verifyOwnerToken(token)
   if (!userId) {
     // OAuth/MCP bearer tokens authenticate an agent, not the vault owner. Keep
     // the distinction explicit so owner-only management endpoints do not look
@@ -68,19 +69,11 @@ vault.post('/verify', async (req, res) => {
 
 // ── MCP sessions (connection status) ──
 vault.get('/sessions', requireAuth, async (req, res) => {
-  // Aggregate sessions across the whole user cluster (EOA + MSCA addresses) so
-  // a Claude/ChatGPT MCP connection registered under the SIWE/EOA identity is
-  // visible even when the Plugin page authenticates with the MSCA token.
-  const related = listRelatedAddresses(req.owner)
-  const seen = new Map()
-  for (const addr of related) {
-    for (const s of listMcpSessions(addr)) {
-      const k = `${s.clientId}:${s.agent}`
-      if (!seen.has(k) || seen.get(k).lastActivity < s.lastActivity) seen.set(k, s)
-    }
-  }
-  const merged = [...seen.values()].sort((a, b) => (b.lastActivity || 0) - (a.lastActivity || 0))
-  res.json({ sessions: merged })
+  // Session presence is observability data, not an ownership grant. Read only
+  // the authenticated owner's namespace; traversing aliases here could expose
+  // a foreign owner's Claude/GPT connection after a stale rebind.
+  const sessions = listMcpSessions(req.owner)
+  res.json({ sessions: [...sessions].sort((a, b) => (b.lastActivity || 0) - (a.lastActivity || 0)) })
 })
 
 // ── Credentials ──
@@ -184,31 +177,13 @@ async function resolveClientName(clientId) {
 
 vault.get('/agents', requireAuth, async (req, res) => {
   try {
-    // The passkey session identifies ONE Agent Wallet MSCA, but every agent
-    // keeps its own wallet for good (1 agent = 1 wallet). Aggregate bindings
-    // across the whole owner cluster (EOA + every linked MSCA, expanded
-    // through the matched bindings themselves) so switching the browser
-    // passkey to another wallet — e.g. after connecting Claude/ChatGPT —
-    // never hides the other agents' wallets from this list.
-    const seen = new Map()
-    const queue = listRelatedAddresses(req.owner).map(addr => String(addr).toLowerCase())
-    const visited = new Set()
-    while (queue.length > 0) {
-      const identity = queue.shift()
-      if (!identity || visited.has(identity)) continue
-      visited.add(identity)
-      for (const binding of listAgentBindingsForIdentity(identity)) {
-        if (!seen.has(binding.agentKey)) seen.set(binding.agentKey, binding)
-        // Expand through each matched binding so a stale EOA alias (rewritten
-        // by a later OAuth rebind) can no longer orphan earlier agent wallets.
-        for (const addr of [binding.ownerAddress, binding.walletAddress]) {
-          const next = String(addr || '').toLowerCase()
-          if (next && !visited.has(next)) queue.push(next)
-        }
-      }
-    }
+    // Scope by the authenticated identity only. EOA sessions see rows owned by
+    // that EOA; an MSCA passkey session sees rows for that exact MSCA. Do not
+    // traverse walletFamily/reverse aliases here: those are historical display
+    // metadata and must never grant visibility into another owner's agents.
+    const bindings = listAgentBindingsForIdentity(req.owner)
     const agents = []
-    for (const binding of seen.values()) {
+    for (const binding of bindings) {
       agents.push({
         agentKey: binding.agentKey,
         walletAddress: binding.walletAddress,
@@ -224,10 +199,6 @@ vault.get('/agents', requireAuth, async (req, res) => {
     res.status(500).json({ error: error?.message || 'Failed to list agents' })
   }
 })
-
-function agentClientId(agentKey) {
-  return String(agentKey || '').split('|', 1)[0].trim().toLowerCase()
-}
 
 function activityBelongsToAgent(entry, binding, clientId) {
   const entryOwner = String(entry?.owner || '').toLowerCase()
@@ -255,7 +226,7 @@ vault.get('/agents/:agentKey/activity', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
     }
     const limit = Math.min(Math.max(Number(req.query.limit) || 5, 1), 5)
-    const clientId = agentClientId(agentKey)
+    const clientId = agentClientIdFromBinding(agentKey)
     const local = [
       ...listActivity(binding.ownerAddress, 100),
       ...listActivity(binding.walletAddress, 100),
@@ -470,8 +441,9 @@ vault.delete('/agents/:agentKey', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
     }
     const removed = revokeAgentBinding(agentKey)
-    // Kill the OAuth tokens for this clientId (access + refresh).
-    const clientId = agentKey.split('|')[0]
+    // Kill the OAuth tokens for this clientId (access + refresh), including
+    // legacy `oauth:<clientId>` keys.
+    const clientId = agentClientIdFromBinding(agentKey)
     try {
       const { revokeTokensForClient } = await import('../services/mcpServer.mjs')
       revokeTokensForClient(clientId)

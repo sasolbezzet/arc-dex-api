@@ -44,6 +44,27 @@ async function withSessionStore(users, aliases, fn) {
   }
 }
 
+test('passkey OAuth verification refuses to mint a code without owner-wallet proof', async () => {
+  const { passkeyVerifyHandler } = await import('../src/services/mcpServer.mjs?owner-proof-' + Date.now() + '-' + Math.random())
+  const capture = {}
+  const response = {
+    status(code) { capture.status = code; return this },
+    json(body) { capture.body = body; return this },
+  }
+  await passkeyVerifyHandler({ body: {
+    mscaWalletAddress: MSCA,
+    mscaSessionToken: 'arx_vs_test',
+    clientId: 'client-without-owner-proof',
+    redirectUri: 'https://client.example/callback',
+    state: 'state',
+    codeChallenge: 'challenge',
+    requestId: 'request',
+    resource: 'https://arcoxdex.vercel.app/mcp',
+  } }, response)
+  assert.equal(capture.status, 400)
+  assert.equal(capture.body.error, 'owner_and_agent_sessions_required')
+})
+
 test('MCP wallet balances are bound to the active MSCA and expose four chains', async () => {
   const previousFetch = globalThis.fetch
   const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE

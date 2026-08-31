@@ -427,6 +427,14 @@ function normalizeAgentKey(agentKey) {
   return String(agentKey || '').trim().toLowerCase()
 }
 
+/** Return the stable OAuth/client portion of any legacy or canonical key. */
+export function agentClientId(agentKey) {
+  const key = normalizeAgentKey(agentKey)
+  return key.startsWith('oauth:')
+    ? key.slice('oauth:'.length).split('|')[0]
+    : key.split('|')[0]
+}
+
 function normalizeAddressHex(value, label) {
   const address = String(value || '').trim().toLowerCase()
   if (!/^0x[0-9a-f]{40}$/.test(address)) throw new Error(`${label} must be a valid address`)
@@ -656,24 +664,51 @@ export function identityOwnsAgentBinding(identityAddress, binding) {
     String(binding.walletAddress || '').toLowerCase() === identity
 }
 
-/** Remove exactly one agent binding row. Returns whether a row was removed;
- * aliases and user session records are left untouched. */
+/**
+ * Revoke one logical agent binding. Older releases could leave both
+ * `oauth:<clientId>` and `<clientId>|<owner>` rows for the same wallet; remove
+ * those aliases together so a revoked card cannot reappear on the next read.
+ * A wallet/session is deactivated only when no other agent still references it.
+ */
 export function revokeAgentBinding(agentKey) {
   const key = normalizeAgentKey(agentKey)
   const store = loadStore()
   const bindings = store.agentBindings
   if (!bindings || typeof bindings !== 'object' || !bindings[key]) return false
-  const binding = bindings[key]
-  delete bindings[key]
-  // Revoke only this agent's session key and aliases when they point to the
-  // same wallet; never invalidate another agent sharing the owner identity.
-  if (store.users?.[binding.walletAddress]) {
-    store.users[binding.walletAddress].active = false
-    store.users[binding.walletAddress].revokedAt = Date.now()
-    store.users[binding.walletAddress].revokeReason = 'agent_manual'
+  const target = bindings[key]
+  const clientId = agentClientId(key)
+  const wallet = String(target.walletAddress || '').toLowerCase()
+  const removedKeys = []
+
+  for (const [candidateKey, candidate] of Object.entries(bindings)) {
+    const sameLogicalAgent = candidateKey === key
+      || (clientId
+        && agentClientId(candidateKey) === clientId
+        && String(candidate?.walletAddress || '').toLowerCase() === wallet)
+    if (sameLogicalAgent) {
+      delete bindings[candidateKey]
+      removedKeys.push(candidateKey)
+    }
   }
+
+  const walletStillBound = Object.values(bindings).some(binding =>
+    String(binding?.walletAddress || '').toLowerCase() === wallet)
+  if (!walletStillBound) {
+    const session = store.users?.[wallet]
+    if (session) {
+      session.active = false
+      session.pendingAuthorization = false
+      session.revokedAt = Date.now()
+      session.revokeReason = 'agent_manual'
+    }
+    for (const [owner, boundWallet] of Object.entries(store.aliases || {})) {
+      if (String(boundWallet || '').toLowerCase() === wallet) delete store.aliases[owner]
+    }
+    if (store.walletFamily?.[wallet]) delete store.walletFamily[wallet]
+  }
+
   saveStore(store)
-  return true
+  return removedKeys.length > 0
 }
 
 /** Advance lastUsedAt on one binding without touching any other field.
@@ -1087,47 +1122,21 @@ export function listRelatedAddresses(userId) {
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
   const set = new Set([key])
-  const users = Object.entries(store.users || {})
-  const aliases = Object.entries(store.aliases || {})
-  // Wallet family links: persisted (recorded at bind/rebind time) merged with
-  // links derivable from the current store (agent bindings with a distinct
-  // owner EOA + current alias rows). This keeps earlier agent wallets visible
-  // no matter which wallet of the same account is currently active.
-  const family = new Map()
-  const addFamily = (wallet, root) => {
-    const wk = String(wallet || '').toLowerCase()
-    const rk = String(root || '').toLowerCase()
-    if (!/^0x[0-9a-f]{40}$/.test(wk) || !/^0x[0-9a-f]{40}$/.test(rk) || wk === rk) return
-    if (!family.has(wk)) family.set(wk, rk)
-  }
-  for (const [w, root] of Object.entries(store.walletFamily || {})) addFamily(w, root)
-  for (const [, b] of Object.entries(store.agentBindings || {})) addFamily(b?.walletAddress, b?.ownerAddress)
-  for (const [aliasOwner, wallet] of aliases) addFamily(wallet, aliasOwner)
-  // Forward and reverse alias links (EOA <-> MSCA)
-  const aliasWallet = store.aliases?.[key]
-  if (aliasWallet) set.add(aliasWallet.toLowerCase())
-  // Single-pass transitive closure over owner <-> walletAddress, alias, and
-  // family links.
-  let grew = true
-  while (grew) {
-    grew = false
-    for (const [aliasOwner, wallet] of aliases) {
-      const ownerK = aliasOwner.toLowerCase()
-      const walletK = String(wallet || '').toLowerCase()
-      if (set.has(ownerK) && !set.has(walletK)) { set.add(walletK); grew = true }
-      if (set.has(walletK) && !set.has(ownerK)) { set.add(ownerK); grew = true }
+  const isAddress = /^0x[0-9a-f]{40}$/i.test(key)
+
+  // An authenticated EOA may read its own agent wallets. An authenticated MSCA
+  // may read only that exact wallet. Never walk walletFamily or reverse aliases
+  // from an MSCA: those global graph edges are what exposed foreign-owner
+  // bindings after an env-derived/legacy rebind.
+  if (isAddress) {
+    for (const binding of Object.values(store.agentBindings || {})) {
+      if (String(binding?.ownerAddress || '').toLowerCase() === key) {
+        const wallet = String(binding?.walletAddress || '').toLowerCase()
+        if (/^0x[0-9a-f]{40}$/.test(wallet)) set.add(wallet)
+      }
     }
-    for (const [owner, entry] of users) {
-      if (!entry) continue
-      const ownerK = owner.toLowerCase()
-      const walletK = entry.walletAddress ? String(entry.walletAddress).toLowerCase() : null
-      if (set.has(ownerK) && walletK && !set.has(walletK)) { set.add(walletK); grew = true }
-      if (walletK && set.has(walletK) && !set.has(ownerK)) { set.add(ownerK); grew = true }
-    }
-    for (const [wallet, root] of family) {
-      if (set.has(wallet) && !set.has(root)) { set.add(root); grew = true }
-      if (set.has(root) && !set.has(wallet)) { set.add(wallet); grew = true }
-    }
+    const directWallet = String(store.aliases?.[key] || '').toLowerCase()
+    if (/^0x[0-9a-f]{40}$/.test(directWallet)) set.add(directWallet)
   }
   return [...set]
 }

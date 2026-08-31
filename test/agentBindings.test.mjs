@@ -105,6 +105,25 @@ test('revokeAgentBinding removes exactly one row', async () => {
   })
 })
 
+test('revoke cleans legacy duplicate rows and removes the wallet alias when unused', async () => {
+  await withSessionStore({
+    users: { [W1]: { walletAddress: W1, active: true } },
+    aliases: { [OWNER]: W1, [W1]: W1 },
+    agentBindings: {
+      [`oauth:client-a`]: { ownerAddress: OWNER, walletAddress: W1 },
+      [`client-a|${OWNER}`]: { ownerAddress: OWNER, walletAddress: W1 },
+    },
+  }, async ({ revokeAgentBinding, getAgentBinding, listRelatedAddresses }) => {
+    assert.equal(revokeAgentBinding(`client-a|${OWNER}`), true)
+    assert.equal(getAgentBinding('oauth:client-a'), null)
+    assert.equal(getAgentBinding(`client-a|${OWNER}`), null)
+    assert.deepEqual(listRelatedAddresses(OWNER), [OWNER])
+    const raw = await readRawStore()
+    assert.equal(raw.users[W1].active, false)
+    assert.equal(raw.aliases[OWNER], undefined)
+  })
+})
+
 test('bindAgent fills the legacy user alias so getSessionKey resolves the agent wallet', async () => {
   await withSessionStore({
     users: {

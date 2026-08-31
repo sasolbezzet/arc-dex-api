@@ -172,7 +172,7 @@ test('inactive legacy owner with walletAddress but no explicit alias remains ina
   }
 })
 
-test('listRelatedAddresses clusters EOA and MSCA bidirectionally', async () => {
+test('listRelatedAddresses is owner-scoped and does not reverse-expand an MSCA into foreign owners', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-sk-'))
   const path = join(dir, 'session-keys.json')
   const EOA = '0xe34ff1d2c925ddafb28c95c2396fc49a6f64569e'
@@ -189,8 +189,8 @@ test('listRelatedAddresses clusters EOA and MSCA bidirectionally', async () => {
     const mod = await import('../src/services/sessionKeyService.mjs?c=' + Date.now())
     const fromEoa = mod.listRelatedAddresses(EOA)
     const fromMsca = mod.listRelatedAddresses(MSCA)
-    assert.ok(fromEoa.includes(MSCA), 'EOA cluster includes MSCA')
-    assert.ok(fromMsca.includes(EOA), 'MSCA cluster includes EOA')
+    assert.ok(fromEoa.includes(MSCA), 'EOA cluster includes its directly aliased MSCA')
+    assert.equal(fromMsca.includes(EOA), false, 'MSCA cluster must not expose the owner graph')
   } finally {
     if (prev === undefined) delete process.env.SESSION_KEYS_PATH
     else process.env.SESSION_KEYS_PATH = prev
