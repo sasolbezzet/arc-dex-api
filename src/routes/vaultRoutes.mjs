@@ -429,9 +429,9 @@ vault.post('/agents/:agentKey/connection-token', requireAuth, async (req, res) =
   }
 })
 
-// DELETE /api/vault/agents/:agentKey — revoke exactly one agent binding and
-// kill every OAuth token (access + refresh) issued under that clientId so the
-// agent is truly offline. Owner-only.
+// DELETE /api/vault/agents/:agentKey — revoke or delete exactly one agent
+// binding. Revoke preserves MCP connectivity and disables tool execution;
+// delete removes the dashboard binding. Owner-only.
 vault.delete('/agents/:agentKey', requireAuth, async (req, res) => {
   try {
     const agentKey = String(req.params.agentKey || '')
@@ -442,7 +442,7 @@ vault.delete('/agents/:agentKey', requireAuth, async (req, res) => {
     }
     const action = String(req.body?.action || 'revoke').toLowerCase()
     if (action === 'delete') {
-      const { deleteAgentBinding } = await import('../src/services/sessionKeyService.mjs')
+      const { deleteAgentBinding } = await import('../services/sessionKeyService.mjs')
       deleteAgentBinding(agentKey)
     } else {
       revokeAgentBinding(agentKey)
