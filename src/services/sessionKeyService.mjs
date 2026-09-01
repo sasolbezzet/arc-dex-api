@@ -605,9 +605,9 @@ export function listAgentBindings(ownerAddress) {
   const store = loadStore()
   const changed = migrateLegacyAgentBindings(store)
   if (changed) saveStore(store)
-  return Object.entries(store.agentBindings || {})
+  return canonicalBindingRows(Object.entries(store.agentBindings || {})
     .filter(([, binding]) => String(binding?.ownerAddress || '').toLowerCase() === owner)
-    .map(([agentKey, binding]) => ({ agentKey, ...binding }))
+    .map(([agentKey, binding]) => ({ agentKey, ...binding })))
 }
 
 /** List bindings visible to a passkey session identity. The vault session
