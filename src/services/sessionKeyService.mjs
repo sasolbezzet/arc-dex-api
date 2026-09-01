@@ -670,6 +670,23 @@ export function identityOwnsAgentBinding(identityAddress, binding) {
  * with Login passkey. OAuth/connection tokens are revoked separately by the
  * route; the credentialIds and wallet identity remain available for re-login.
  */
+export function deleteAgentBinding(agentKey) {
+  const key = normalizeAgentKey(agentKey)
+  const store = loadStore()
+  const bindings = store.agentBindings
+  if (!bindings || typeof bindings !== 'object' || !bindings[key]) return false
+  const target = bindings[key]
+  const clientId = agentClientId(key)
+  const wallet = String(target.walletAddress || '').toLowerCase()
+  for (const [candidateKey, candidate] of Object.entries(bindings)) {
+    if (candidateKey === key || (clientId && agentClientId(candidateKey) === clientId && String(candidate?.walletAddress || '').toLowerCase() === wallet)) delete bindings[candidateKey]
+  }
+  const session = store.users?.[wallet]
+  if (session) { session.active = false; session.revokedAt = Date.now(); session.revokeReason = 'agent_deleted' }
+  saveStore(store)
+  return true
+}
+
 export function revokeAgentBinding(agentKey) {
   const key = normalizeAgentKey(agentKey)
   const store = loadStore()

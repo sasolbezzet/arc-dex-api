@@ -440,7 +440,14 @@ vault.delete('/agents/:agentKey', requireAuth, async (req, res) => {
     if (!identityOwnsAgentBinding(req.owner, binding)) {
       return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
     }
-    const removed = revokeAgentBinding(agentKey)
+    const action = String(req.body?.action || 'revoke').toLowerCase()
+    if (action === 'delete') {
+      const { deleteAgentBinding } = await import('../src/services/sessionKeyService.mjs')
+      deleteAgentBinding(agentKey)
+    } else {
+      revokeAgentBinding(agentKey)
+    }
+    const removed = action === 'delete'
     // Kill the OAuth tokens for this clientId (access + refresh), including
     // legacy `oauth:<clientId>` keys.
     const clientId = agentClientIdFromBinding(agentKey)
