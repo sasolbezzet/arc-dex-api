@@ -2166,7 +2166,13 @@ app.post('/api/auth/session', authLimiter, async (req, res) => {
     const normalized = normalizeAddress(address, 'address')
     if (mode === 'siwe') {
       await verifySiweSession({ message: siweMessageText, signature, expectedAddress: normalized })
-      res.json({ success: true, token: createAuthToken(normalized), address: normalized })
+      const token = createAuthToken(normalized)
+      // Keep the owner token available to every owner-gated route, including
+      // the vault/session-key routes that still accept the persisted arx_vs_
+      // session format for backwards compatibility.
+      const { createSession } = await import('./src/services/vaultStore.mjs')
+      const ownerSessionToken = createSession(normalized)
+      res.json({ success: true, token, ownerSessionToken, address: normalized })
     } else {
       const issuedTime = Date.parse(issuedAt)
       if (!issuedAt || !Number.isFinite(issuedTime) || Math.abs(Date.now() - issuedTime) > LOGIN_WINDOW_MS) {
@@ -2175,7 +2181,13 @@ app.post('/api/auth/session', authLimiter, async (req, res) => {
       if (!signature || !/^0x[0-9a-f]+$/i.test(signature)) return res.status(400).json({ error: 'Invalid signature' })
       const ok = await verifyMessage({ address: normalized, message: authMessage(normalized, issuedAt), signature })
       if (!ok) return res.status(401).json({ error: 'Invalid wallet signature' })
-      res.json({ success: true, token: createAuthToken(normalized), address: normalized })
+      const token = createAuthToken(normalized)
+      // Keep the owner token available to every owner-gated route, including
+      // the vault/session-key routes that still accept the persisted arx_vs_
+      // session format for backwards compatibility.
+      const { createSession } = await import('./src/services/vaultStore.mjs')
+      const ownerSessionToken = createSession(normalized)
+      res.json({ success: true, token, ownerSessionToken, address: normalized })
     }
   } catch(e) {
     console.error('[auth]', e.message)
