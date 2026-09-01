@@ -77,5 +77,8 @@ test('revokeAgentBinding removes only the targeted agent', async () => {
     assert.equal(mod.listAgentBindings(EOA).length, 2, 'revoked agent card and sibling survive')
     assert.equal(mod.listAgentBindings(EOA).find(item => item.agentKey === 'agent_a|' + EOA)?.active, false)
     assert.equal(mod.listAgentBindings(EOA).find(item => item.agentKey === 'agent_b|' + EOA)?.active, undefined)
+    // This fixture has no session-key record; the binding itself is the
+    // authoritative revoked execution state for this test.
+    assert.equal(mod.listAgentBindings(EOA).find(item => item.agentKey === 'agent_a|' + EOA)?.active, false, 'revoke disables execution session')
   })
 })

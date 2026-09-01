@@ -2262,6 +2262,16 @@ app.post('/api/wallet', apiLimiter, requireAuth, async (req, res) => {
 app.get('/api/balance/:address', apiLimiter, async (req, res) => {
   try {
     const target = normalizeAddress(req.params.address, 'address')
+    const requestedChain = String(req.query?.chain || 'arc-testnet').trim().toLowerCase()
+    const chainAliases = { arc: 'arc-testnet', 'arc_testnet': 'arc-testnet', base: 'base-sepolia', 'base_sepolia': 'base-sepolia', arbitrum: 'arbitrum-sepolia', 'arbitrum_sepolia': 'arbitrum-sepolia' }
+    const chainKey = chainAliases[requestedChain] || requestedChain
+    if (chainKey !== 'arc-testnet') {
+      const { fetchAllChainBalances } = await import('./src/services/multiChainBalance.mjs')
+      const balances = await fetchAllChainBalances(target)
+      const selected = balances[chainKey]
+      if (!selected) return res.status(400).json({ error: 'Unsupported balance chain' })
+      return res.json(selected)
+    }
     // Batch JSON-RPC (1 request → 4 balanceOf) with fallback on rate limit.
     const data = '0x70a08231' + target.slice(2).toLowerCase().padStart(64, '0')
     const batch = Object.entries(TOKENS).map(([sym, addr], i) => ({
