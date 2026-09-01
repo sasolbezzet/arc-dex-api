@@ -450,7 +450,7 @@ vault.delete('/agents/:agentKey', requireAuth, async (req, res) => {
     } catch (error) {
       console.warn('[vault] token revoke best-effort failed:', error?.message || error)
     }
-    res.json({ ok: true, removed, agentKey })
+    res.json({ ok: true, removed, revoked: removed, agentKey })
   } catch (error) {
     res.status(500).json({ error: error?.message || 'Failed to revoke agent' })
   }

@@ -103,7 +103,7 @@ test('bootstrap connection token creates an owner binding and valid MCP access t
 
     const revoked = await request(base, `/api/vault/agents/${encodeURIComponent(result.body.agentKey)}`, ownerToken, { method: 'DELETE' })
     assert.equal(revoked.response.status, 200)
-    assert.equal(session.getAgentBinding(result.body.agentKey), null)
+    assert.equal(session.getAgentBinding(result.body.agentKey)?.active, false)
     assert.equal(validateAccessToken(result.body.token), null)
   })
 })

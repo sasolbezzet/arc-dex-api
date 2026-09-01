@@ -665,10 +665,10 @@ export function identityOwnsAgentBinding(identityAddress, binding) {
 }
 
 /**
- * Revoke one logical agent binding. Older releases could leave both
- * `oauth:<clientId>` and `<clientId>|<owner>` rows for the same wallet; remove
- * those aliases together so a revoked card cannot reappear on the next read.
- * A wallet/session is deactivated only when no other agent still references it.
+ * Revoke only the active session for one logical agent. Keep the durable
+ * binding so the dashboard can show the wallet and the user can reactivate it
+ * with Login passkey. OAuth/connection tokens are revoked separately by the
+ * route; the credentialIds and wallet identity remain available for re-login.
  */
 export function revokeAgentBinding(agentKey) {
   const key = normalizeAgentKey(agentKey)
@@ -677,38 +677,35 @@ export function revokeAgentBinding(agentKey) {
   if (!bindings || typeof bindings !== 'object' || !bindings[key]) return false
   const target = bindings[key]
   const clientId = agentClientId(key)
+  const matchingKeys = Object.entries(bindings)
+    .filter(([candidateKey, candidate]) => candidateKey === key || (
+      clientId
+      && agentClientId(candidateKey) === clientId
+      && String(candidate?.walletAddress || '').toLowerCase() === String(target.walletAddress || '').toLowerCase()
+    ))
+    .map(([candidateKey]) => candidateKey)
+
+  const now = Date.now()
+  for (const candidateKey of matchingKeys) {
+    const binding = bindings[candidateKey]
+    binding.active = false
+    binding.revokedAt = now
+    binding.revokeReason = 'agent_manual'
+    binding.lastUsedAt = binding.lastUsedAt || now
+  }
+
   const wallet = String(target.walletAddress || '').toLowerCase()
-  const removedKeys = []
-
-  for (const [candidateKey, candidate] of Object.entries(bindings)) {
-    const sameLogicalAgent = candidateKey === key
-      || (clientId
-        && agentClientId(candidateKey) === clientId
-        && String(candidate?.walletAddress || '').toLowerCase() === wallet)
-    if (sameLogicalAgent) {
-      delete bindings[candidateKey]
-      removedKeys.push(candidateKey)
-    }
+  const session = store.users?.[wallet]
+  if (session) {
+    session.active = false
+    session.pendingAuthorization = false
+    session.revokedAt = now
+    session.revokeReason = 'agent_manual'
   }
-
-  const walletStillBound = Object.values(bindings).some(binding =>
-    String(binding?.walletAddress || '').toLowerCase() === wallet)
-  if (!walletStillBound) {
-    const session = store.users?.[wallet]
-    if (session) {
-      session.active = false
-      session.pendingAuthorization = false
-      session.revokedAt = Date.now()
-      session.revokeReason = 'agent_manual'
-    }
-    for (const [owner, boundWallet] of Object.entries(store.aliases || {})) {
-      if (String(boundWallet || '').toLowerCase() === wallet) delete store.aliases[owner]
-    }
-    if (store.walletFamily?.[wallet]) delete store.walletFamily[wallet]
-  }
-
+  // Do not delete aliases, walletFamily, or credential bindings: they are
+  // required to render the retained card and to validate a later passkey login.
   saveStore(store)
-  return removedKeys.length > 0
+  return matchingKeys.length > 0
 }
 
 /** Advance lastUsedAt on one binding without touching any other field.

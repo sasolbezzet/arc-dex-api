@@ -96,11 +96,12 @@ test('revokeAgentBinding removes exactly one row', async () => {
     },
   }, async ({ revokeAgentBinding, getAgentBinding }) => {
     assert.equal(revokeAgentBinding(AGENT_A.toUpperCase()), true, 'agentKey lookup is case-insensitive')
-    assert.equal(getAgentBinding(AGENT_A), null)
+    assert.equal(getAgentBinding(AGENT_A)?.active, false)
     assert.equal(getAgentBinding(AGENT_B)?.walletAddress, W2, 'sibling binding survives')
 
     const raw = await readRawStore()
-    assert.deepEqual(Object.keys(raw.agentBindings), [AGENT_B])
+    assert.deepEqual(Object.keys(raw.agentBindings), [AGENT_A, AGENT_B])
+    assert.equal(raw.agentBindings[AGENT_A].revokeReason, 'agent_manual')
     assert.equal(revokeAgentBinding('unknown-agent'), false, 'revoking an absent binding changes nothing')
   })
 })
@@ -115,12 +116,12 @@ test('revoke cleans legacy duplicate rows and removes the wallet alias when unus
     },
   }, async ({ revokeAgentBinding, getAgentBinding, listRelatedAddresses }) => {
     assert.equal(revokeAgentBinding(`client-a|${OWNER}`), true)
-    assert.equal(getAgentBinding('oauth:client-a'), null)
-    assert.equal(getAgentBinding(`client-a|${OWNER}`), null)
-    assert.deepEqual(listRelatedAddresses(OWNER), [OWNER])
+    assert.equal(getAgentBinding('oauth:client-a')?.active, false)
+    assert.equal(getAgentBinding(`client-a|${OWNER}`)?.active, false)
+    assert.equal(listRelatedAddresses(OWNER).includes(W1), true)
     const raw = await readRawStore()
     assert.equal(raw.users[W1].active, false)
-    assert.equal(raw.aliases[OWNER], undefined)
+    assert.equal(raw.aliases[OWNER], W1)
   })
 })
 
