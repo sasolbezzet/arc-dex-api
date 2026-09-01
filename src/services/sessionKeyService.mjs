@@ -709,6 +709,9 @@ export function revokeAgentBinding(agentKey) {
     binding.revokedAt = now
     binding.revokeReason = 'agent_manual'
     binding.lastUsedAt = binding.lastUsedAt || now
+    // Keep the MCP binding/connection identity intact. Only execution session
+    // authorization is disabled; tool handlers fail closed via canExecuteViaSession.
+    binding.connectionRevoked = false
   }
 
   const wallet = String(target.walletAddress || '').toLowerCase()

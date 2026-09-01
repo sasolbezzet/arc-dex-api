@@ -88,7 +88,7 @@ test('agent bindings reject reusing one wallet for another agent', async () => {
   })
 })
 
-test('revokeAgentBinding removes exactly one row', async () => {
+test('revokeAgentBinding preserves the binding while disabling the session', async () => {
   await withSessionStore({
     agentBindings: {
       [AGENT_A]: { ownerAddress: OWNER, walletAddress: W1, boundAt: 100, lastUsedAt: 100 },

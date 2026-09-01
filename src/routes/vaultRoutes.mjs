@@ -448,16 +448,11 @@ vault.delete('/agents/:agentKey', requireAuth, async (req, res) => {
       revokeAgentBinding(agentKey)
     }
     const removed = action === 'delete'
-    // Kill the OAuth tokens for this clientId (access + refresh), including
-    // legacy `oauth:<clientId>` keys.
-    const clientId = agentClientIdFromBinding(agentKey)
-    try {
-      const { revokeTokensForClient } = await import('../services/mcpServer.mjs')
-      revokeTokensForClient(clientId)
-    } catch (error) {
-      console.warn('[vault] token revoke best-effort failed:', error?.message || error)
-    }
-    res.json({ ok: true, removed, revoked: removed, agentKey })
+    // Revoke only disables execution/session authorization. The MCP connection
+    // and its bearer token remain connected, but every tool call must fail
+    // closed through the inactive session state. Delete is the only destructive
+    // action and removes the dashboard binding.
+    res.json({ ok: true, removed, revoked: !removed, agentKey })
   } catch (error) {
     res.status(500).json({ error: error?.message || 'Failed to revoke agent' })
   }

@@ -47,7 +47,7 @@ async function withEnvPaths(fn) {
   }
 }
 
-test('GET /agents lists bindings and DELETE /agents revokes binding + tokens', async () => {
+test('GET /agents lists bindings and revoke keeps the connection token while disabling execution', async () => {
   await withEnvPaths(async () => {
     const { bindAgent, listAgentBindings } = await import('../src/services/sessionKeyService.mjs?vae1-' + Date.now())
     bindAgent('agent_a|' + EOA, EOA, W1)
