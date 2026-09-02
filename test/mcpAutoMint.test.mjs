@@ -98,7 +98,7 @@ test('inbound Base/Arbitrum bridges use explicit Circle paymaster profiles', asy
   assert.equal(baseParams.maxFeePerGas, 3_000_000_000n)
   assert.equal(baseParams.verificationGasLimit, 270_000n)
   const arbitrumParams = await buildUserOperationParams({ account: {}, calls: [], chainKey: 'arbitrum-sepolia', baseClient: gasPriceClient, feeProfile: resolveMscaBridgeFeeProfile(arbitrumRoute) })
-  assert.equal(arbitrumParams.verificationGasLimit, 125_000n)
+  assert.equal(arbitrumParams.verificationGasLimit, 300_000n)
 })
 
 test('failed source burn before router execution does not block a fresh bridge quote', async () => {

@@ -26,11 +26,21 @@ test('Arbitrum and Ethereum use distinct documented support outcomes', () => {
   assert.ok(!chains.MSCA_SUPPORTED_CHAIN_KEYS.includes('ethereum-sepolia'))
 })
 
-test('Arbitrum fee precheck requires a non-zero priority fee floor', () => {
-  const observed = { maxPriorityFeePerGas: 0n, maxFeePerGas: 0n }
-  const floor = 1_000_000_000n
-  const priority = observed.maxPriorityFeePerGas > floor ? observed.maxPriorityFeePerGas : floor
-  const max = observed.maxFeePerGas > priority ? observed.maxFeePerGas : priority * 2n
-  assert.equal(priority, 1_000_000_000n)
-  assert.ok(max >= priority)
+test('Arbitrum destination verification has enough gas for MSCA validation', async () => {
+  const source = await import('node:fs').then(fs => fs.readFileSync(new URL('../src/services/sessionKeyService.mjs', import.meta.url), 'utf8'))
+  assert.match(source, /'arbitrum-sepolia': 300_000n/)
+})
+
+test('Arbitrum fee precheck requires a non-zero priority fee floor', async () => {
+  const { normalizeUserOperationFees } = await import('../src/services/sessionKeyService.mjs?arb-fees-' + Date.now())
+  const fees = normalizeUserOperationFees({ maxPriorityFeePerGas: 0n, maxFeePerGas: 0n })
+  assert.equal(fees.maxPriorityFeePerGas, 1_000_000_000n)
+  assert.equal(fees.maxFeePerGas, 2_000_000_000n)
+})
+
+test('Arbitrum fee envelope adds headroom above a live max fee', async () => {
+  const { normalizeUserOperationFees } = await import('../src/services/sessionKeyService.mjs?arb-fee-headroom-' + Date.now())
+  const fees = normalizeUserOperationFees({ maxPriorityFeePerGas: 1_000_000_000n, maxFeePerGas: 2_000_000_000n })
+  assert.equal(fees.maxPriorityFeePerGas, 1_000_000_000n)
+  assert.equal(fees.maxFeePerGas, 3_000_000_000n)
 })

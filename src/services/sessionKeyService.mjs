@@ -50,7 +50,9 @@ const BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 const DESTINATION_VERIFICATION_GAS_LIMITS = {
   'arc-testnet': 270_000n,
   'base-sepolia': 270_000n,
-  'arbitrum-sepolia': 125_000n,
+  // Arbitrum's MSCA deployment verification includes the WebAuthn plugin
+  // validation path; 125k is insufficient and causes bundler precheck failure.
+  'arbitrum-sepolia': 300_000n,
 }
 const CIRCLE_GAS_PRICE_LEVELS = ['medium', 'fast', 'slow']
 
@@ -71,6 +73,9 @@ export function normalizeUserOperationFees({ maxFeePerGas = 0n, maxPriorityFeePe
   if (observedPriority < 0n) observedPriority = 0n
   const minimum = parseFeeQuantity(minPriorityFeePerGas) ?? BUNDLER_MIN_PRIORITY_FEE_WEI
   const priority = observedPriority >= minimum ? observedPriority : minimum
+  // Add priority headroom to a live max fee. Arbitrum can change its base fee
+  // between preparation and bundler submission; maxFee must remain above the
+  // current base fee plus priority, not merely equal to priority.
   const max = observedMax >= priority ? observedMax + priority : priority * 2n
   return { maxFeePerGas: max, maxPriorityFeePerGas: priority }
 }
