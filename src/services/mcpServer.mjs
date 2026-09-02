@@ -1147,10 +1147,12 @@ function bridgeConfig(fromChain, toChain) {
 // paymaster-aware fee profile; otherwise Base falls through to the generic
 // UserOperation path and may charge the MSCA's native balance instead.
 export function resolveMscaBridgeFeeProfile(route) {
-  if (route?.toKey === 'Arc_Testnet' && route?.fromKey === 'Base_Sepolia') return 'base-to-arc-source'
-  if (route?.toKey === 'Arc_Testnet' && route?.fromKey === 'Arbitrum_Sepolia') return 'arbitrum-to-arc-source'
-  if (route?.fromKey === 'Arc_Testnet' && route?.toKey === 'Arbitrum_Sepolia') return 'arbitrum-destination'
-  if (route?.fromKey === 'Arc_Testnet') return 'arc-bridge'
+  const from = executionChainKey(route?.fromKey)
+  const to = executionChainKey(route?.toKey)
+  if (to === 'arc-testnet' && from === 'base-sepolia') return 'base-to-arc-source'
+  if (to === 'arc-testnet' && from === 'arbitrum-sepolia') return 'arbitrum-to-arc-source'
+  if (from === 'arc-testnet' && to === 'arbitrum-sepolia') return 'arbitrum-destination'
+  if (from === 'arc-testnet') return 'arc-bridge'
   return undefined
 }
 

@@ -52,7 +52,7 @@ const DESTINATION_VERIFICATION_GAS_LIMITS = {
   'base-sepolia': 270_000n,
   // Arbitrum's MSCA deployment verification includes the WebAuthn plugin
   // validation path; 125k is insufficient and causes bundler precheck failure.
-  'arbitrum-sepolia': 300_000n,
+  'arbitrum-sepolia': 600_000n,
 }
 const CIRCLE_GAS_PRICE_LEVELS = ['medium', 'fast', 'slow']
 

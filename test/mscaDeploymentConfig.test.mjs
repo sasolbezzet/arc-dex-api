@@ -28,7 +28,7 @@ test('Arbitrum and Ethereum use distinct documented support outcomes', () => {
 
 test('Arbitrum destination verification has enough gas for MSCA validation', async () => {
   const source = await import('node:fs').then(fs => fs.readFileSync(new URL('../src/services/sessionKeyService.mjs', import.meta.url), 'utf8'))
-  assert.match(source, /'arbitrum-sepolia': 300_000n/)
+  assert.match(source, /'arbitrum-sepolia': 600_000n/)
 })
 
 test('Arbitrum fee precheck requires a non-zero priority fee floor', async () => {
