@@ -137,7 +137,7 @@ function withOAuthStateLock(fn) {
 // ── Persistent OAuth client store ──
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { scheduleOAuthShadowSnapshot } from './supabaseOAuthShadow.mjs'
-import { bindAgent, findAgentBindingByClientAndWallet, registerMscaLiveTokenProbe, revokeAgentBinding } from './sessionKeyService.mjs'
+import { activateAgentBinding, bindAgent, findAgentBindingByClientAndWallet, getAllAgentBindings, registerMscaLiveTokenProbe, revokeAgentBinding } from './sessionKeyService.mjs'
 import { getLimits } from './vaultStore.mjs'
 
 function loadClients() {
@@ -380,7 +380,12 @@ function ensureConnectionClient(clientName, requestedClientId = '') {
   let cid = String(requestedClientId || '').split('|')[0] || ''
   refreshOAuthClients()
   if (cid && oauthClients.get(cid)) return cid
-  cid = 'arcox_conn_' + randomUUID().slice(0, 12)
+  // Recreate a missing persisted Hermes client under its original ID instead
+  // of silently minting a second `arcox_conn_*` namespace. This keeps token
+  // rotation idempotent after a client-store restore/restart and prevents a
+  // duplicate dashboard card for the same owner + Agent Wallet.
+  if (!/^arcox_conn_[a-z0-9-]{1,40}$/i.test(cid)) cid = ''
+  if (!cid) cid = 'arcox_conn_' + randomUUID().slice(0, 12)
   withOAuthStateLock(() => {
     refreshOAuthClients()
     if (!oauthClients.get(cid)) {
@@ -404,10 +409,15 @@ export function issueBootstrapConnectionToken({ clientName, userId, mscaWalletAd
   if (!/^0x[0-9a-f]{40}$/.test(owner)) throw new Error('userId (owner address) required')
   if (!/^0x[0-9a-f]{40}$/.test(wallet)) throw new Error('mscaWalletAddress required')
 
-  // Bind first, then issue. If token creation fails, remove the new binding so
-  // neither side of the connection can be left in a half-created state.
-  const cid = ensureConnectionClient(clientName || 'MCP Agent')
-  const agentKey = `${cid}|${owner}`
+  // Reuse the existing Hermes connection client for this exact owner/wallet.
+  // A second click after a refresh is token rotation, not a new agent.
+  const existing = getAllAgentBindings()
+    .filter(binding => String(binding.agentKey || '').startsWith('arcox_conn_')
+      && String(binding.ownerAddress || '').toLowerCase() === owner
+      && String(binding.walletAddress || '').toLowerCase() === wallet)
+    .sort((left, right) => Number(left.boundAt || 0) - Number(right.boundAt || 0))[0]
+  const cid = ensureConnectionClient(clientName || 'MCP Agent', existing?.agentKey || '')
+  const agentKey = existing?.agentKey || `${cid}|${owner}`
   const binding = bindAgent(agentKey, owner, wallet)
   try {
     const issued = issueConnectionToken({
@@ -419,7 +429,9 @@ export function issueBootstrapConnectionToken({ clientName, userId, mscaWalletAd
     })
     return { ...issued, agentKey, binding }
   } catch (error) {
-    revokeAgentBinding(agentKey)
+    // Never revoke an already-established binding merely because token rotation
+    // failed. Roll back only a row created by this invocation.
+    if (!existing) revokeAgentBinding(agentKey)
     throw error
   }
 }
@@ -635,6 +647,10 @@ export async function bindMcpIdentityToActiveSession({ userId, mscaWalletAddress
     // Per-agent isolation: key the durable binding by <clientId>|<owner> so
     // two agents sharing one owner EOA each keep their own Agent Wallet.
     const agentBound = cid ? bindAgent(`${cid}|${owner}`, owner, wallet) : null
+    // A passkey login may be reactivating a binding that was intentionally
+    // revoked. Mark it active only after the exact MSCA session above has been
+    // authenticated; this does not create a row or cross wallets.
+    if (agentBound) activateAgentBinding(agentBound.agentKey, wallet)
     return { ok: true, bound, agentBound }
   } catch (error) {
     return { ok: false, error: error?.message || 'MCP identity binding failed' }
@@ -712,28 +728,68 @@ export async function siweVerifyHandler(req, res) {
 }
 
 // ── Passkey-only OAuth verify + issue auth code (1 signature, no SIWE) ──
-// The passkey/MSCA session token IS the full identity proof: the browser
-// freshly authenticated the selected Agent Wallet via WebAuthn and the token
-// is validated against the exact MSCA + active session. The EOA SIWE step is
-// no longer required for agent connection (the EOA remains in use for manual
-// value transactions only).
+// The passkey/MSCA session token is the fresh proof for the selected Agent
+// Wallet. A first-time OAuth binding still needs the owner EOA proof, but an
+// existing durable `<clientId>|<owner>` binding already records which owner
+// approved that wallet. Requiring a second SIWE every time the short-lived
+// session expires defeats the passkey re-login flow and is unnecessary: the
+// passkey proves the same MSCA and the server-side binding proves the owner
+// relationship.
+export async function resolvePasskeyApprovalOwner({ ownerAddress, ownerSessionToken, clientId, mscaWalletAddress } = {}) {
+  const suppliedAddress = String(ownerAddress || '').trim()
+  const suppliedToken = String(ownerSessionToken || '').trim()
+
+  // New bindings and partial/mismatched owner proofs remain fail-closed.
+  if (Boolean(suppliedAddress) !== Boolean(suppliedToken)) {
+    return { ok: false, error: 'owner_authentication_required' }
+  }
+
+  if (suppliedAddress && suppliedToken) {
+    try {
+      const { validateSession } = await import('./vaultStore.mjs')
+      // Accept either the frontend owner HMAC token or a dedicated owner vault
+      // session, but never an Agent Wallet token as owner proof.
+      const verifiedOwner = verifyOwnerToken(suppliedToken) || validateSession(suppliedToken) || ''
+      if (!verifiedOwner || getAddress(verifiedOwner) !== getAddress(suppliedAddress)) {
+        return { ok: false, error: 'owner_authentication_required' }
+      }
+      return { ok: true, ownerAddress: getAddress(verifiedOwner).toLowerCase(), inferred: false }
+    } catch {
+      return { ok: false, error: 'owner_authentication_required' }
+    }
+  }
+
+  // Login of an existing agent may omit owner proof. Match the client and the
+  // passkey-resolved wallet exactly; never infer an owner from a wallet-wide
+  // alias, environment variable, or "latest active" session.
+  try {
+    const { findAgentBindingByClientAndWallet } = await import('./sessionKeyService.mjs')
+    const binding = findAgentBindingByClientAndWallet(clientId, mscaWalletAddress)
+    const owner = String(binding?.ownerAddress || '').toLowerCase()
+    const wallet = String(mscaWalletAddress || '').toLowerCase()
+    // An existing row may be inactive because the user explicitly revoked
+    // only its execution session. That row is still the durable owner binding
+    // and may be reactivated by the freshly verified passkey flow. A deleted
+    // agent has no row and therefore remains rejected here.
+    if (!binding || !/^0x[0-9a-f]{40}$/.test(owner) || owner === wallet) {
+      return { ok: false, error: 'owner_authentication_required' }
+    }
+    return { ok: true, ownerAddress: getAddress(owner).toLowerCase(), inferred: true }
+  } catch {
+    return { ok: false, error: 'owner_authentication_required' }
+  }
+}
+
 export async function passkeyVerifyHandler(req, res) {
   const { mscaWalletAddress, mscaSessionToken, ownerAddress, ownerSessionToken, clientId, redirectUri, state, codeChallenge, requestId, resource } = req.body || {}
-  if (!mscaWalletAddress || !mscaSessionToken || !ownerAddress || !ownerSessionToken || !clientId || !requestId) {
+  if (!mscaWalletAddress || !mscaSessionToken || !clientId || !requestId) {
     return res.status(400).json({ error: 'owner_and_agent_sessions_required', error_description: 'Wallet owner dan Agent Wallet harus sama-sama terhubung.' })
   }
-  let verifiedOwner = ''
-  try {
-    const { validateSession } = await import('./vaultStore.mjs')
-    // Accept either the frontend owner HMAC token or a dedicated owner vault
-    // session, but never an Agent Wallet OAuth/passkey token as owner proof.
-    verifiedOwner = verifyOwnerToken(ownerSessionToken) || validateSession(ownerSessionToken) || ''
-    if (!verifiedOwner || getAddress(verifiedOwner) !== getAddress(ownerAddress)) {
-      return res.status(403).json({ error: 'owner_authentication_required', error_description: 'Hubungkan dan autentikasi wallet utama terlebih dahulu.' })
-    }
-  } catch {
-    return res.status(403).json({ error: 'owner_authentication_required', error_description: 'Sesi wallet utama tidak valid.' })
+  const ownerProof = await resolvePasskeyApprovalOwner({ ownerAddress, ownerSessionToken, clientId, mscaWalletAddress })
+  if (!ownerProof.ok) {
+    return res.status(400).json({ error: 'owner_and_agent_sessions_required', error_description: 'Login passkey hanya dapat melewati SIWE untuk agent yang sudah terikat ke owner ini.' })
   }
+  const verifiedOwner = ownerProof.ownerAddress
   if (!redirectUri || !codeChallenge) return res.status(400).json({ error: 'missing_pkce_or_redirect_uri' })
   if (!validResourceIndicator(resource)) return res.status(400).json({ error: 'invalid_target', error_description: 'resource must identify the ARCOX MCP endpoint' })
 
@@ -752,8 +808,9 @@ export async function passkeyVerifyHandler(req, res) {
   }
   if (requestValid.error) return res.status(400).json(requestValid)
 
-  // Both proofs are required. Bind the OAuth identity to the verified owner
-  // EOA; the passkey token only selects/proves the exact Agent Wallet MSCA.
+  // The passkey token selects/proves the exact Agent Wallet MSCA. The owner is
+  // either freshly verified above (first binding) or recovered from the exact
+  // durable binding (repeat login after session expiry).
   const binding = await bindMcpIdentityToActiveSession({
     userId: verifiedOwner,
     mscaWalletAddress,

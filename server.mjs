@@ -400,7 +400,7 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
       if (!agentBindingStoreModule) return res.status(503).json({ error: 'agent_binding_store_unavailable' })
       const namespaceAgent = String(agentKey).trim().toLowerCase()
       const isTemporaryOAuthNamespace = namespaceAgent.startsWith('oauth:')
-      const binding = agentBindingStoreModule.getAgentBinding(agentKey)
+      const directBinding = agentBindingStoreModule.getAgentBinding(agentKey)
       const credentialId = normalizeCredentialId(normalizedCredentialId(credential))
       const allowed = credentialIdsForAgent(agentKey)
       if (mode === 'Register') {
@@ -409,14 +409,14 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
         // approved; creating it here would produce a second row for the same
         // wallet (`oauth:<clientId>` plus `<clientId>|<owner>`).
         if (isTemporaryOAuthNamespace) {
-          const durable = agentBindingStoreModule.findAgentBindingByClientAndWallet(agentKey, verified.walletAddress)
+          const durable = agentBindingStoreModule.findAgentBindingForAgent(agentKey, verified.walletAddress)
           if (durable) bindPasskeyCredential(durable.agentKey, credentialId, verified.walletAddress)
         } else {
           // Non-OAuth registration is also intentionally not bound here. The
           // owning connection flow creates its canonical binding only after it
           // has issued the agent credential (for example Hermes bootstrap).
           // This keeps passkey wallet namespaces out of the agent list.
-          void binding
+          void directBinding
         }
       } else {
         // Login Passkey: the agent must already exist (a binding row).
@@ -431,17 +431,15 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
         // The browser passkey still resolves to a Circle-verified MSCA address;
         // that is the ownership proof. Bind the credential on first use
         // instead of rejecting a legitimate login.
-        const resolvedBinding = binding || (isTemporaryOAuthNamespace
-          ? agentBindingStoreModule.findAgentBindingByClientAndWallet(agentKey, verified.walletAddress)
-          : null)
+        const resolvedBinding = agentBindingStoreModule.findAgentBindingForAgent(agentKey, verified.walletAddress)
         // The OAuth approval is allowed to finish the durable binding in the
         // next passkey-verify request. A normal dashboard login still requires
         // an existing exact binding and can never inherit another agent wallet.
-        if (!resolvedBinding && !isTemporaryOAuthNamespace) return res.status(403).json({ error: 'agent_passkey_not_bound' })
+        if (!resolvedBinding) return res.status(403).json({ error: 'agent_passkey_not_bound' })
         if (resolvedBinding && String(resolvedBinding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) {
           return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
         }
-        if (resolvedBinding && !resolvedBinding.agentKey.startsWith('oauth:') && !allowed.includes(credentialId)) {
+        if (resolvedBinding && !allowed.includes(credentialId)) {
           bindPasskeyCredential(resolvedBinding.agentKey, credentialId, resolvedBinding.walletAddress)
         }
       }
@@ -458,24 +456,39 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
 // UserOperations on behalf of the agent.
 app.post('/api/session/generate-key', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { walletAddress, ownerAddress, ownerSessionToken } = req.body || {}
+    const { walletAddress, ownerAddress, ownerSessionToken, agentKey } = req.body || {}
     if (!walletAddress || !isAddress(walletAddress) || getAddress(walletAddress).toLowerCase() !== req.owner) {
       return res.status(403).json({ error: 'walletAddress must match the authenticated MSCA' })
     }
-    // A passkey/MSCA session proves the agent wallet, not the owner account.
-    // Require a separately verified EOA session before creating or rebinding a
-    // delegate, so this endpoint cannot attach an MSCA to an env/stale owner.
-    if (!ownerAddress || !ownerSessionToken || !isAddress(ownerAddress)) {
-      return res.status(403).json({ error: 'Verified EOA session is required to bind ownerAddress' })
-    }
+
     let verifiedOwnerAddress = ''
-    {
+    if (ownerAddress || ownerSessionToken) {
+      // New wallet/binding path: an EOA proof is mandatory and must match the
+      // address supplied by the browser. Never accept a stale/env owner here.
+      if (!ownerAddress || !ownerSessionToken || !isAddress(ownerAddress)) {
+        return res.status(403).json({ code: 'owner_session_required', error: 'Verified EOA session is required to bind ownerAddress' })
+      }
       const vault = await import('./src/services/vaultStore.mjs')
       verifiedOwnerAddress = verifyOwnerToken(ownerSessionToken) || vault.validateSession(ownerSessionToken) || ''
       if (verifiedOwnerAddress !== getAddress(ownerAddress).toLowerCase()) {
-        return res.status(403).json({ error: 'ownerAddress is not authenticated by the supplied EOA session' })
+        return res.status(403).json({ code: 'owner_session_required', error: 'ownerAddress is not authenticated by the supplied EOA session' })
+      }
+    } else {
+      // Existing-agent recovery path: a fresh passkey token authenticates the
+      // exact MSCA in req.owner. It may recover/rotate the delegate only when a
+      // durable binding already connects this wallet to an EOA owner. This does
+      // not create a new owner relationship and cannot use an env/stale owner.
+      const { findAgentBindingForAgent } = await import('./src/services/sessionKeyService.mjs')
+      const requestedKey = String(agentKey || '').trim()
+      const existing = requestedKey ? findAgentBindingForAgent(requestedKey, req.owner) : null
+      if (!existing || !/^0x[0-9a-f]{40}$/.test(String(existing.ownerAddress || '').toLowerCase())) {
+        return res.status(403).json({
+          code: 'owner_session_required',
+          error: 'Sesi wallet utama diperlukan untuk membuat atau mengikat Agent Wallet baru.',
+        })
       }
     }
+
     const { reserveSessionKey, bindSessionAlias } = await import('./src/services/sessionKeyService.mjs')
     const key = reserveSessionKey(req.owner, { walletAddress })
     if (verifiedOwnerAddress) {
@@ -485,7 +498,9 @@ app.post('/api/session/generate-key', apiLimiter, requireAuth, async (req, res) 
       bindSessionAlias(req.owner, verifiedOwnerAddress, walletAddress, { allowRebind: true })
     }
     res.json({ success: true, delegateAddress: key.address, walletAddress: key.walletAddress, pendingAuthorization: key.pending })
-  } catch (e) { res.status(500).json({ error: e.message }) }
+  } catch (e) {
+    res.status(500).json({ error: e.message, ...(e?.code ? { code: e.code } : {}) })
+  }
 })
 
 app.post('/api/session/authorization-attempt', apiLimiter, requireAuth, async (req, res) => {
@@ -640,6 +655,34 @@ app.post('/api/session/revoke', apiLimiter, requireAuth, async (req, res) => {
     clearSessionKeyInfo(req.owner)
     res.json({ success: true, active: false })
   } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// Reactivate exactly one durable agent binding after the caller has completed
+// a fresh passkey login and session-key authorization. This route never creates
+// or re-parents a binding; it only flips the matched row back to active when
+// the authenticated MSCA, wallet address, and agent namespace all agree.
+app.post('/api/session/activate-binding', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { walletAddress, agentKey } = req.body || {}
+    if (!walletAddress || !agentKey || !isAddress(walletAddress)) {
+      return res.status(400).json({ error: 'walletAddress and agentKey are required' })
+    }
+    if (getAddress(walletAddress).toLowerCase() !== req.owner) {
+      return res.status(403).json({ error: 'walletAddress must match the authenticated MSCA' })
+    }
+    const { getSessionKey, findAgentBindingForAgent, activateAgentBinding } = await import('./src/services/sessionKeyService.mjs')
+    const session = getSessionKey(req.owner)
+    if (!session?.active || String(session.walletAddress || '').toLowerCase() !== req.owner) {
+      return res.status(409).json({ error: 'agent_session_inactive' })
+    }
+    const binding = findAgentBindingForAgent(agentKey, req.owner)
+    if (!binding) return res.status(404).json({ code: 'agent_binding_not_found', error: 'agent_binding_not_found' })
+    const activated = activateAgentBinding(binding.agentKey, req.owner)
+    if (!activated) return res.status(404).json({ code: 'agent_binding_not_found', error: 'agent_binding_not_found' })
+    res.json({ success: true, agentKey: activated.agentKey, walletAddress: activated.walletAddress, active: true })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
 })
 
 // Verify a passkey-signed delegate authorization on a destination chain.

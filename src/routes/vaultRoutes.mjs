@@ -189,6 +189,12 @@ vault.get('/agents', requireAuth, async (req, res) => {
         walletAddress: binding.walletAddress,
         boundAt: binding.boundAt,
         lastUsedAt: binding.lastUsedAt,
+        // Preserve the durable binding lifecycle in the API response. Without
+        // this field the frontend cannot distinguish a manually revoked agent
+        // from an idle but usable one after refresh.
+        active: binding.active !== false,
+        ...(binding.revokedAt ? { revokedAt: binding.revokedAt } : {}),
+        ...(binding.revokeReason ? { revokeReason: binding.revokeReason } : {}),
         spentToday: getDailySpend(binding.agentKey),
         clientName: await resolveClientName(binding.agentKey.split('|')[0] || ''),
       })

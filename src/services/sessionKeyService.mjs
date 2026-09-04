@@ -461,6 +461,9 @@ export function bindAgent(agentKey, ownerAddress, walletAddress) {
   if (previous && String(previous.walletAddress || '').toLowerCase() !== wallet) {
     throw new Error('agent_wallet_rotation_forbidden')
   }
+  if (previous && String(previous.ownerAddress || '').toLowerCase() !== owner) {
+    throw new Error('agent_binding_owner_mismatch')
+  }
   const reusedBy = Object.entries(store.agentBindings).find(([otherKey, binding]) =>
     otherKey !== key && String(binding?.walletAddress || '').toLowerCase() === wallet
   )
@@ -468,7 +471,11 @@ export function bindAgent(agentKey, ownerAddress, walletAddress) {
   // rows for migration/read compatibility; reject only new cross-agent reuse.
   if (reusedBy && !previous && process.env.ENFORCE_UNIQUE_AGENT_WALLETS === 'true') throw new Error(`wallet_already_bound_to_agent:${reusedBy[0]}`)
   const now = Date.now()
+  // Rebinding the same authenticated agent must not erase credential IDs,
+  // revoke state, or audit metadata. The passkey flow may call bindAgent again
+  // after a session renewal, so this operation is deliberately metadata-safe.
   store.agentBindings[key] = {
+    ...(previous || {}),
     ownerAddress: owner,
     walletAddress: wallet,
     boundAt: previous?.boundAt ?? now,
@@ -578,17 +585,87 @@ function canonicalBindingRows(rows) {
 
 /** Find the durable binding for an OAuth namespace and verified wallet. */
 export function findAgentBindingByClientAndWallet(agentKey, walletAddress) {
-  const clientId = canonicalOAuthClientId(agentKey) || normalizeAgentKey(agentKey).split('|')[0]
+  const clientId = canonicalOAuthClientId(agentKey) || agentClientId(agentKey)
   const wallet = String(walletAddress || '').toLowerCase()
   if (!clientId || !wallet) return null
   const store = loadStore()
   const entries = Object.entries(store.agentBindings || {})
-    .filter(([key, binding]) => {
-      const candidateClientId = normalizeAgentKey(key).split('|')[0]
-      return candidateClientId === clientId && String(binding?.walletAddress || '').toLowerCase() === wallet
-    })
-  const exact = entries.find(([key]) => key.includes('|')) || entries[0]
+    .filter(([key, binding]) => agentClientId(key) === clientId
+      && String(binding?.walletAddress || '').toLowerCase() === wallet)
+  // A passkey proves the wallet, not which EOA owns an ambiguous duplicate.
+  // Refuse that situation rather than selecting the first row and potentially
+  // issuing an OAuth grant for the wrong owner.
+  const owners = new Set(entries
+    .map(([, binding]) => String(binding?.ownerAddress || '').toLowerCase())
+    .filter(value => /^0x[0-9a-f]{40}$/.test(value)))
+  if (owners.size > 1) return null
+  // Prefer the durable `<clientId>|<owner>` row over the old temporary
+  // `oauth:<clientId>` row when both exist. This prevents a second dashboard
+  // card and keeps login attached to the canonical binding.
+  const exact = entries.find(([key]) => key.includes('|') && !key.startsWith('oauth:')) || entries[0]
   return exact ? { agentKey: exact[0], ...exact[1] } : null
+}
+
+/**
+ * Resolve one existing binding for a passkey login namespace and wallet.
+ * OAuth uses the client ID; Hermes uses a stable browser namespace while its
+ * durable connection-token binding is `arcox_conn_*|owner`. Never fall back to
+ * an arbitrary wallet binding when more than one candidate is ambiguous.
+ */
+export function findAgentBindingForAgent(agentKey, walletAddress) {
+  const requested = normalizeAgentKey(agentKey)
+  const wallet = String(walletAddress || '').toLowerCase()
+  if (!requested || !wallet) return null
+  const store = loadStore()
+  const direct = store.agentBindings?.[requested]
+
+  // Hermes is a browser/passkey namespace, not the durable connection-token
+  // key. Prefer its canonical `arcox_conn_*|owner` row even when an old
+  // `hermes-mcp` row remains in the store; otherwise a mismatching legacy row
+  // would return null before the canonical row could be considered.
+  if (requested === 'hermes-mcp') {
+    const canonicalCandidates = Object.entries(store.agentBindings || {})
+      .filter(([key, binding]) => key.startsWith('arcox_conn_')
+        && String(binding?.walletAddress || '').toLowerCase() === wallet)
+    if (canonicalCandidates.length > 0) {
+      const owners = new Set(canonicalCandidates
+        .map(([, binding]) => String(binding?.ownerAddress || '').toLowerCase())
+        .filter(value => /^0x[0-9a-f]{40}$/.test(value)))
+      if (owners.size > 1) return null
+      const preferred = canonicalCandidates.find(([key]) => key.includes('|'))
+      const match = preferred || (canonicalCandidates.length === 1 ? canonicalCandidates[0] : null)
+      return match ? { agentKey: match[0], ...match[1] } : null
+    }
+    // Preserve compatibility for an installation that has only the legacy
+    // direct Hermes row. It is still wallet-checked and cannot inherit a
+    // different Agent Wallet.
+    if (direct && String(direct.walletAddress || '').toLowerCase() === wallet) {
+      return { agentKey: requested, ...direct }
+    }
+    return null
+  }
+
+  // A legacy `oauth:<clientId>` row is only a temporary namespace. Continue
+  // searching so a canonical `<clientId>|<owner>` row wins when both exist.
+  // Non-OAuth direct keys (including a canonical key) remain exact and cannot
+  // inherit a sibling wallet.
+  if (direct && !requested.startsWith('oauth:')) {
+    return String(direct.walletAddress || '').toLowerCase() === wallet
+      ? { agentKey: requested, ...direct }
+      : null
+  }
+
+  const clientId = agentClientId(requested)
+  const candidates = Object.entries(store.agentBindings || {})
+    .filter(([key, binding]) => agentClientId(key) === clientId
+      && String(binding?.walletAddress || '').toLowerCase() === wallet)
+  const owners = new Set(candidates
+    .map(([, binding]) => String(binding?.ownerAddress || '').toLowerCase())
+    .filter(value => /^0x[0-9a-f]{40}$/.test(value)))
+  if (owners.size > 1) return null
+  const preferred = candidates.find(([key]) => key.includes('|') && !key.startsWith('oauth:'))
+  if (preferred) return { agentKey: preferred[0], ...preferred[1] }
+  return candidates.length === 1 ? { agentKey: candidates[0][0], ...candidates[0][1] } : null
 }
 
 export function bindAgentCredential(agentKey, credentialId, walletAddress) {
@@ -602,6 +679,43 @@ export function bindAgentCredential(agentKey, credentialId, walletAddress) {
   binding.credentialIds = Array.from(new Set([...(binding.credentialIds || []), id]))
   saveStore(store)
   return { ...binding }
+}
+
+/** Mark exactly one durable binding active after its MSCA session was
+ * authenticated and activated. This never creates a binding and never crosses
+ * wallets, so a passkey login cannot revive a sibling agent. */
+export function activateAgentBinding(agentKey, walletAddress) {
+  const key = normalizeAgentKey(agentKey)
+  const wallet = String(walletAddress || '').toLowerCase()
+  const store = loadStore()
+  const binding = store.agentBindings?.[key]
+  if (!binding) return null
+  if (wallet && String(binding.walletAddress || '').toLowerCase() !== wallet) throw new Error('agent_wallet_mismatch')
+  binding.active = true
+  binding.lastUsedAt = Date.now()
+  delete binding.revokedAt
+  delete binding.revokeReason
+  delete binding.connectionRevoked
+  delete binding.manualRevokePending
+  saveStore(store)
+  return { agentKey: key, ...binding }
+}
+
+/**
+ * Return the execution state for one agent/wallet pair.
+ * `null` means no durable binding is known (legacy compatibility callers may
+ * still use the wallet-level session checks); `false` is an explicit revoke.
+ */
+export function isAgentBindingActive(agentKey, walletAddress = '') {
+  const requested = normalizeAgentKey(agentKey)
+  const wallet = String(walletAddress || '').toLowerCase()
+  if (!requested) return null
+  const resolved = wallet ? findAgentBindingForAgent(requested, wallet) : null
+  if (resolved) return resolved.active !== false
+  const direct = getAgentBinding(requested)
+  if (!direct) return null
+  if (wallet && String(direct.walletAddress || '').toLowerCase() !== wallet) return false
+  return direct.active !== false
 }
 
 /** List every binding owned by one owner EOA. */
@@ -675,6 +789,27 @@ export function identityOwnsAgentBinding(identityAddress, binding) {
  * with Login passkey. OAuth/connection tokens are revoked separately by the
  * route; the credentialIds and wallet identity remain available for re-login.
  */
+function hasOtherActiveBindingForWallet(bindings, walletAddress, ignoredKeys = []) {
+  const wallet = String(walletAddress || '').toLowerCase()
+  const ignored = new Set(ignoredKeys)
+  if (!wallet) return false
+  return Object.entries(bindings || {}).some(([candidateKey, candidate]) =>
+    !ignored.has(candidateKey)
+      && String(candidate?.walletAddress || '').toLowerCase() === wallet
+      && candidate?.active !== false
+  )
+}
+
+function deactivateSessionIfUnused(store, walletAddress, ignoredBindingKeys, reason, timestamp) {
+  const wallet = String(walletAddress || '').toLowerCase()
+  const session = store.users?.[wallet]
+  if (!session || hasOtherActiveBindingForWallet(store.agentBindings, wallet, ignoredBindingKeys)) return
+  session.active = false
+  session.pendingAuthorization = false
+  session.revokedAt = timestamp
+  session.revokeReason = reason
+}
+
 export function deleteAgentBinding(agentKey) {
   const key = normalizeAgentKey(agentKey)
   const store = loadStore()
@@ -683,11 +818,15 @@ export function deleteAgentBinding(agentKey) {
   const target = bindings[key]
   const clientId = agentClientId(key)
   const wallet = String(target.walletAddress || '').toLowerCase()
-  for (const [candidateKey, candidate] of Object.entries(bindings)) {
-    if (candidateKey === key || (clientId && agentClientId(candidateKey) === clientId && String(candidate?.walletAddress || '').toLowerCase() === wallet)) delete bindings[candidateKey]
-  }
-  const session = store.users?.[wallet]
-  if (session) { session.active = false; session.revokedAt = Date.now(); session.revokeReason = 'agent_deleted' }
+  const removedKeys = Object.entries(bindings)
+    .filter(([candidateKey, candidate]) => candidateKey === key || (
+      clientId
+      && agentClientId(candidateKey) === clientId
+      && String(candidate?.walletAddress || '').toLowerCase() === wallet
+    ))
+    .map(([candidateKey]) => candidateKey)
+  for (const candidateKey of removedKeys) delete bindings[candidateKey]
+  deactivateSessionIfUnused(store, wallet, removedKeys, 'agent_deleted', Date.now())
   saveStore(store)
   return true
 }
@@ -715,18 +854,15 @@ export function revokeAgentBinding(agentKey) {
     binding.revokeReason = 'agent_manual'
     binding.lastUsedAt = binding.lastUsedAt || now
     // Keep the MCP binding/connection identity intact. Only execution session
-    // authorization is disabled; tool handlers fail closed via canExecuteViaSession.
+    // authorization is disabled; the MCP transport remains online and the
+    // createMcpServer tool boundary rejects this exact binding.
     binding.connectionRevoked = false
   }
 
   const wallet = String(target.walletAddress || '').toLowerCase()
-  const session = store.users?.[wallet]
-  if (session) {
-    session.active = false
-    session.pendingAuthorization = false
-    session.revokedAt = now
-    session.revokeReason = 'agent_manual'
-  }
+  // A shared/legacy MSCA must stay usable for a different active agent. The
+  // exact binding guard, not the wallet-level session flag, disables this agent.
+  deactivateSessionIfUnused(store, wallet, matchingKeys, 'agent_manual', now)
   // Do not delete aliases, walletFamily, or credential bindings: they are
   // required to render the retained card and to validate a later passkey login.
   saveStore(store)
@@ -1332,7 +1468,7 @@ export function canExecuteViaSession(userId, amount, chainKey, options = {}) {
   }
   // Record real usage so auto-detect picks the MSCA most recently used.
   try { touchSessionKey(userId) } catch { /* non-fatal */ }
-  const limits = getLimits(userId)
+  const limits = getLimits(options.limitsOwner || userId)
   // Tolerant parse: Claude/agent may pass "1.5 USDC", "$10", or "1e3".
   const parsed = parseHumanAmount(amount)
   if (parsed === null || parsed <= 0) return { ok: false, reason: 'bad_amount', message: `Amount tidak valid: "${amount}". Gunakan angka saja, contoh "1.5".` }
@@ -1640,7 +1776,11 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
     return { status: 'denied', reason: 'msca_unsupported_chain', chain: requestedChain }
   }
   const agentKey = String(options.agentKey || '').trim()
-  const gate = canExecuteViaSession(userId, amount, requestedChain, { agentKey, dailyLimit: options.dailyLimit || options.agentLimit })
+  const gate = canExecuteViaSession(userId, amount, requestedChain, {
+    agentKey,
+    dailyLimit: options.dailyLimit || options.agentLimit,
+    limitsOwner: options.limitsOwner,
+  })
   if (!gate.ok) return { status: 'denied', reason: gate.reason, chain: requestedChain }
 
   const chainKey = requestedChain || gate.entry?.chain || 'arc-testnet'
@@ -1690,7 +1830,7 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
  * by passing prepared calldata from /api/eoa-swap-prepare.
  */
 export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, preparedCalldata, preparedCalls, chainKey, agentKey, dailyLimit }) {
-  const gate = canExecuteViaSession(userId, amountIn, chainKey, { agentKey, dailyLimit })
+  const gate = canExecuteViaSession(userId, amountIn, chainKey, { agentKey, dailyLimit, limitsOwner: arguments?.[0]?.limitsOwner })
   if (!gate.ok) return { status: 'denied', reason: gate.reason }
 
   const chain = chainKey || gate.entry?.chain || 'arc-testnet'

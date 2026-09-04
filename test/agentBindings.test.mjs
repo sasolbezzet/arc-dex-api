@@ -213,3 +213,46 @@ test('different OAuth clients remain separate when wallet addresses match', asyn
     assert.deepEqual(visible.map(row => row.agentKey), [`claude|${OWNER}`, `chatgpt|${OWNER}`])
   })
 })
+
+test('Hermes passkey namespace resolves the canonical connection binding over a legacy row', async () => {
+  const canonicalKey = `arcox_conn_hermes123|${OWNER}`
+  await withSessionStore({
+    agentBindings: {
+      // This stale row was created by the old browser namespace and points at
+      // another wallet. It must not shadow the durable connection binding.
+      'hermes-mcp': { ownerAddress: OWNER, walletAddress: W2, active: true },
+      [canonicalKey]: {
+        ownerAddress: OWNER,
+        walletAddress: W1,
+        active: false,
+        revokedAt: 123,
+        revokeReason: 'agent_manual',
+        credentialIds: ['hermes-credential'],
+      },
+    },
+  }, async ({ findAgentBindingForAgent, activateAgentBinding }) => {
+    const resolved = findAgentBindingForAgent('hermes-mcp', W1)
+    assert.equal(resolved?.agentKey, canonicalKey)
+    assert.equal(resolved?.walletAddress, W1)
+
+    const activated = activateAgentBinding(canonicalKey, W1)
+    assert.equal(activated?.agentKey, canonicalKey)
+    assert.equal(activated?.active, true)
+    assert.deepEqual(activated?.credentialIds, ['hermes-credential'])
+    assert.equal(activated?.revokeReason, undefined)
+    assert.equal(activated?.revokedAt, undefined)
+    assert.equal(findAgentBindingForAgent('hermes-mcp', W2)?.agentKey, 'hermes-mcp')
+  })
+})
+
+test('Hermes passkey resolution fails closed when the same wallet belongs to multiple owners', async () => {
+  const otherOwner = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+  await withSessionStore({
+    agentBindings: {
+      [`arcox_conn_one|${OWNER}`]: { ownerAddress: OWNER, walletAddress: W1 },
+      [`arcox_conn_two|${otherOwner}`]: { ownerAddress: otherOwner, walletAddress: W1 },
+    },
+  }, async ({ findAgentBindingForAgent }) => {
+    assert.equal(findAgentBindingForAgent('hermes-mcp', W1), null)
+  })
+})
