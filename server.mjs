@@ -285,6 +285,48 @@ function bindPasskeyCredential(agentKey, credentialId, walletAddress) {
   agentBindingStoreModule.bindAgentCredential(key, id, walletAddress)
 }
 
+const DEFAULT_PASSKEY_AGENT_KEY = 'dashboard:primary'
+
+function requiresPluginOwnerProof(agentKey) {
+  const key = String(agentKey || '').trim().toLowerCase()
+  return Boolean(key && key !== DEFAULT_PASSKEY_AGENT_KEY)
+}
+
+/**
+ * Validate the connected EOA session supplied by Plugin passkey flows.
+ *
+ * A passkey/session token authenticates an MSCA, not its EOA owner. Accept only
+ * the HMAC owner token or the dedicated owner vault session issued by the
+ * wallet-login flow, and reject partial proofs before Circle/WebAuthn work.
+ */
+async function verifyPluginOwnerProof({ ownerAddress, ownerSessionToken, agentWalletAddress = '' } = {}) {
+  const suppliedAddress = String(ownerAddress || '').trim()
+  const suppliedToken = String(ownerSessionToken || '').trim()
+  if (!suppliedAddress || !suppliedToken || !isAddress(suppliedAddress)) {
+    return { ok: false, error: 'owner_session_required' }
+  }
+
+  let authenticatedAddress = verifyOwnerToken(suppliedToken) || ''
+  if (!authenticatedAddress && suppliedToken.startsWith('arx_vs_')) {
+    try {
+      const { validateSession } = await import('./src/services/vaultStore.mjs')
+      authenticatedAddress = validateSession(suppliedToken) || ''
+    } catch { /* invalid owner session remains rejected */ }
+  }
+
+  try {
+    const expected = getAddress(suppliedAddress).toLowerCase()
+    const actual = getAddress(authenticatedAddress).toLowerCase()
+    if (expected !== actual) return { ok: false, error: 'owner_session_required' }
+    if (agentWalletAddress && actual === getAddress(agentWalletAddress).toLowerCase()) {
+      return { ok: false, error: 'owner_session_required' }
+    }
+    return { ok: true, ownerAddress: actual }
+  } catch {
+    return { ok: false, error: 'owner_session_required' }
+  }
+}
+
 async function verifiedPasskeyWalletAddress({ credential, mode = 'Login', flowId = '' } = {}) {
   const normalizedCredential = normalizeIncomingWebAuthnCredential(credential)
   const clientUrl = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc/w3s/buidl').replace(/\/+$/, '')
@@ -332,8 +374,14 @@ async function verifiedPasskeyWalletAddress({ credential, mode = 'Login', flowId
 
 app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
   try {
-    const { mode = 'Login', username = '', agentKey = '' } = req.body || {}
+    const { mode = 'Login', username = '', agentKey = '', ownerAddress = '', ownerSessionToken = '' } = req.body || {}
     if (mode !== 'Login' && mode !== 'Register') return res.status(400).json({ error: 'Invalid passkey mode' })
+    if (requiresPluginOwnerProof(agentKey)) {
+      const ownerProof = await verifyPluginOwnerProof({ ownerAddress, ownerSessionToken })
+      if (!ownerProof.ok) {
+        return res.status(403).json({ code: 'owner_session_required', error: 'Hubungkan wallet utama terlebih dahulu sebelum memulai passkey Agent Wallet.' })
+      }
+    }
     const clientUrl = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc/w3s/buidl').replace(/\/+$/, '')
     const clientKey = process.env.CIRCLE_CLIENT_KEY || ''
     if (!clientKey) return res.status(503).json({ error: 'Circle Modular credential verification is not configured' })
@@ -383,7 +431,14 @@ app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
 
 app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
   try {
-    const { walletAddress, credential, mode = 'Login', flowId = '', agentKey = '' } = req.body || {}
+    const { walletAddress, credential, mode = 'Login', flowId = '', agentKey = '', ownerAddress = '', ownerSessionToken = '' } = req.body || {}
+    const requiresOwner = requiresPluginOwnerProof(agentKey)
+    const ownerProof = requiresOwner
+      ? await verifyPluginOwnerProof({ ownerAddress, ownerSessionToken, agentWalletAddress: walletAddress })
+      : { ok: true, ownerAddress: '' }
+    if (!ownerProof.ok) {
+      return res.status(403).json({ code: 'owner_session_required', error: 'Hubungkan wallet utama terlebih dahulu sebelum Login passkey Agent Wallet.' })
+    }
     if (walletAddress && !isAddress(walletAddress)) {
       return res.status(400).json({ error: 'walletAddress must be a valid address when supplied' })
     }
@@ -419,27 +474,19 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
           void directBinding
         }
       } else {
-        // Login Passkey: the agent must already exist (a binding row).
-        //
-        // `agent_passkey_not_bound` previously fired for two very different
-        // situations:
-        //   1. The agent genuinely does not exist (typo / wrong key).
-        //   2. The agent exists but has no credential bound yet (created via
-        //      connection token, OAuth approval, or backend migration).
-        //
-        // Case 2 is the normal first-login path for an existing agent wallet.
-        // The browser passkey still resolves to a Circle-verified MSCA address;
-        // that is the ownership proof. Bind the credential on first use
-        // instead of rejecting a legitimate login.
+        // Login Passkey: the agent must already exist (a binding row), and a
+        // Plugin login must also be owned by the currently authenticated EOA.
+        // The Circle-verified MSCA proves the passkey; the durable binding plus
+        // owner proof prevents an owner from selecting another agent wallet.
         const resolvedBinding = agentBindingStoreModule.findAgentBindingForAgent(agentKey, verified.walletAddress)
-        // The OAuth approval is allowed to finish the durable binding in the
-        // next passkey-verify request. A normal dashboard login still requires
-        // an existing exact binding and can never inherit another agent wallet.
         if (!resolvedBinding) return res.status(403).json({ error: 'agent_passkey_not_bound' })
-        if (resolvedBinding && String(resolvedBinding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) {
+        if (String(resolvedBinding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) {
           return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
         }
-        if (resolvedBinding && !allowed.includes(credentialId)) {
+        if (requiresOwner && String(resolvedBinding.ownerAddress || '').toLowerCase() !== ownerProof.ownerAddress) {
+          return res.status(403).json({ code: 'agent_owner_mismatch', error: 'Agent Wallet ini terikat ke owner wallet yang berbeda.' })
+        }
+        if (!allowed.includes(credentialId)) {
           bindPasskeyCredential(resolvedBinding.agentKey, credentialId, resolvedBinding.walletAddress)
         }
       }
@@ -2138,7 +2185,10 @@ app.get('/health', (_, res) => res.json({ ok: true, time: new Date(), version: '
 
 
 app.get('/api/config', (_, res) => {
-  res.json({ kitKey: KIT_KEY || '' })
+  // KIT_KEY is a server-side App Kit credential and must never be exposed to
+  // browser clients. The frontend only uses this endpoint as an API health
+  // check, so return capability metadata rather than the secret itself.
+  res.json({ appKitConfigured: Boolean(KIT_KEY) })
 })
 
 function hashAgentText(text) {

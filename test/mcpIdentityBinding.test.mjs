@@ -257,9 +257,9 @@ test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
       assert.equal(info?.walletAddress, MSCA)
       assert.equal(info?.active, true)
 
-      // The experimental Arc-source CCTP/MSCA path is fail-closed by default.
-      // This exercises the real MCP handler and proves no UserOperation is
-      // attempted while ENABLE_MSCA_CCTP_BRIDGE is absent.
+      // Quote generation is read-only and remains available when execution is
+      // disabled. The execution flag and destination readiness are reported
+      // separately; no UserOperation is attempted by the quote handler.
       const server = createMcpServer(EOA)
       const quote = await server._registeredTools.arcox_quote_bridge.handler({
       fromChain: 'arc-testnet',
@@ -269,8 +269,12 @@ test('MCP resolver maps SIWE EOA to the active Agent Wallet MSCA', async () => {
         source: 'session',
       })
       const quoteResult = JSON.parse(quote.content[0].text)
-      assert.equal(quoteResult.rejected, true)
-      assert.equal(quoteResult.reason, 'msca_bridge_disabled_until_router_validation')
+      assert.equal(quoteResult.preview, true)
+      assert.equal(quoteResult.rejected, undefined)
+      assert.equal(quoteResult.quoteSupported, true)
+      assert.equal(quoteResult.executionReady, false)
+      assert.equal(quoteResult.executionSupported, false)
+      assert.equal(quoteResult.executionReadinessReason, 'msca_bridge_disabled_until_router_validation')
 
       const status = await server._registeredTools.arcox_route_status.handler({
       action: 'bridge',

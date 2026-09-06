@@ -728,53 +728,28 @@ export async function siweVerifyHandler(req, res) {
 }
 
 // ── Passkey-only OAuth verify + issue auth code (1 signature, no SIWE) ──
-// The passkey/MSCA session token is the fresh proof for the selected Agent
-// Wallet. A first-time OAuth binding still needs the owner EOA proof, but an
-// existing durable `<clientId>|<owner>` binding already records which owner
-// approved that wallet. Requiring a second SIWE every time the short-lived
-// session expires defeats the passkey re-login flow and is unnecessary: the
-// passkey proves the same MSCA and the server-side binding proves the owner
-// relationship.
-export async function resolvePasskeyApprovalOwner({ ownerAddress, ownerSessionToken, clientId, mscaWalletAddress } = {}) {
+// The passkey/MSCA session token proves the selected Agent Wallet, while the
+// connected owner-wallet session proves the EOA that is authorizing the MCP
+// binding. Both proofs are mandatory for every Plugin OAuth approval, including
+// re-login of an existing agent; the server never infers ownership from a
+// wallet-wide alias or a "latest active" session.
+export async function resolvePasskeyApprovalOwner({ ownerAddress, ownerSessionToken } = {}) {
   const suppliedAddress = String(ownerAddress || '').trim()
   const suppliedToken = String(ownerSessionToken || '').trim()
 
-  // New bindings and partial/mismatched owner proofs remain fail-closed.
-  if (Boolean(suppliedAddress) !== Boolean(suppliedToken)) {
+  if (!suppliedAddress || !suppliedToken) {
     return { ok: false, error: 'owner_authentication_required' }
   }
 
-  if (suppliedAddress && suppliedToken) {
-    try {
-      const { validateSession } = await import('./vaultStore.mjs')
-      // Accept either the frontend owner HMAC token or a dedicated owner vault
-      // session, but never an Agent Wallet token as owner proof.
-      const verifiedOwner = verifyOwnerToken(suppliedToken) || validateSession(suppliedToken) || ''
-      if (!verifiedOwner || getAddress(verifiedOwner) !== getAddress(suppliedAddress)) {
-        return { ok: false, error: 'owner_authentication_required' }
-      }
-      return { ok: true, ownerAddress: getAddress(verifiedOwner).toLowerCase(), inferred: false }
-    } catch {
-      return { ok: false, error: 'owner_authentication_required' }
-    }
-  }
-
-  // Login of an existing agent may omit owner proof. Match the client and the
-  // passkey-resolved wallet exactly; never infer an owner from a wallet-wide
-  // alias, environment variable, or "latest active" session.
   try {
-    const { findAgentBindingByClientAndWallet } = await import('./sessionKeyService.mjs')
-    const binding = findAgentBindingByClientAndWallet(clientId, mscaWalletAddress)
-    const owner = String(binding?.ownerAddress || '').toLowerCase()
-    const wallet = String(mscaWalletAddress || '').toLowerCase()
-    // An existing row may be inactive because the user explicitly revoked
-    // only its execution session. That row is still the durable owner binding
-    // and may be reactivated by the freshly verified passkey flow. A deleted
-    // agent has no row and therefore remains rejected here.
-    if (!binding || !/^0x[0-9a-f]{40}$/.test(owner) || owner === wallet) {
+    const { validateSession } = await import('./vaultStore.mjs')
+    // Accept either the frontend owner HMAC token or a dedicated owner vault
+    // session, but never an Agent Wallet token as owner proof.
+    const verifiedOwner = verifyOwnerToken(suppliedToken) || validateSession(suppliedToken) || ''
+    if (!verifiedOwner || getAddress(verifiedOwner) !== getAddress(suppliedAddress)) {
       return { ok: false, error: 'owner_authentication_required' }
     }
-    return { ok: true, ownerAddress: getAddress(owner).toLowerCase(), inferred: true }
+    return { ok: true, ownerAddress: getAddress(verifiedOwner).toLowerCase(), inferred: false }
   } catch {
     return { ok: false, error: 'owner_authentication_required' }
   }
@@ -2430,6 +2405,46 @@ function bridgeConfigDisabledReason(route) {
   return destinationMintDisabledReason()
 }
 
+// Quote is read-only: it needs the configured source router/CCTP route, but it
+// must not inherit execution-only gates such as ENABLE_MSCA_CCTP_BRIDGE or
+// destination MSCA deployment/session authorization. Those checks remain in
+// bridgeExecutionReadiness() and arcox_execute_bridge.
+function bridgeQuoteConfigDisabledReason(route) {
+  if (!route?.source?.router) return 'bridge_router_not_configured'
+  if (!route?.source?.usdc || !route?.source?.rpcUrl) return 'source_chain_not_configured'
+  if (!route.destination?.rpcUrl || !route.destination?.messageTransmitter) return 'destination_chain_not_configured'
+  return null
+}
+
+async function bridgeExecutionReadiness({ route, walletAddress, routerValidated = false } = {}) {
+  const disabledReason = bridgeConfigDisabledReason(route)
+  if (disabledReason) {
+    return {
+      ok: false,
+      reason: disabledReason,
+      routerValidated,
+      message: disabledReason === 'msca_bridge_disabled_until_router_validation'
+        ? 'Quote read-only tersedia, tetapi eksekusi bridge masih dinonaktifkan sampai router tervalidasi.'
+        : disabledReason === 'destination_chain_not_configured'
+          ? 'Destination chain belum dikonfigurasi untuk eksekusi bridge.'
+          : 'Bridge belum siap untuk eksekusi.',
+    }
+  }
+  if (!routerValidated) {
+    try {
+      await validateRouterRoute(route)
+    } catch (error) {
+      return { ok: false, reason: 'router_route_validation_failed', routerValidated: false, message: error?.message || 'ArcoxRouter route validation failed' }
+    }
+  }
+  try {
+    const preflight = await destinationMscaPreflight({ route, walletAddress })
+    return { ...preflight, routerValidated: true }
+  } catch (error) {
+    return { ok: false, reason: 'destination_msca_preflight_failed', routerValidated: true, message: error?.message || 'Destination MSCA preflight gagal' }
+  }
+}
+
 function validConfirmationText(value) {
   const text = String(value || '').trim().toLowerCase()
   return text === 'yes' || text === 'ya'
@@ -2844,7 +2859,8 @@ export function createMcpServer(userId, context = {}) {
     const hasUnsupportedSwapToken = action === 'swap' && tokens.some(token => token === 'USYC')
     const knownAction = ['swap', 'send', 'bridge'].includes(action)
     const route = action === 'bridge' ? bridgeConfig(params.fromChain, params.toChain) : null
-    const bridgeIsSupported = action === 'bridge' && ENABLE_MSCA_CCTP_BRIDGE && String(params.token || 'USDC').toUpperCase() === 'USDC' && Boolean(route?.source?.router && route?.destination?.messageTransmitter)
+    const bridgeRouteConfigured = action === 'bridge' && String(params.token || 'USDC').toUpperCase() === 'USDC' && Boolean(route?.source?.router && route?.destination?.messageTransmitter)
+    const bridgeIsSupported = bridgeRouteConfigured && ENABLE_MSCA_CCTP_BRIDGE
     const session = await resolveActiveMsca(userId, boundMscaWalletAddress)
     const disabledReason = action === 'bridge' ? bridgeConfigDisabledReason(route) : null
     let routerValidation = null
@@ -2891,6 +2907,8 @@ export function createMcpServer(userId, context = {}) {
     return { content: [{ type: 'text', text: jsonText({
       supported: mscaSupported,
       executionSupported: mscaSupported,
+      quoteSupported: action === 'bridge' ? bridgeRouteConfigured : undefined,
+      executionEnabled: action === 'bridge' ? ENABLE_MSCA_CCTP_BRIDGE : undefined,
       action: params.action,
       source,
       walletAddress: session?.walletAddress || null,
@@ -2905,7 +2923,9 @@ export function createMcpServer(userId, context = {}) {
       routerValidated: action === 'bridge' ? Boolean(routerValidation?.ok) : undefined,
       routerValidationError: action === 'bridge' && routerValidation?.ok === false ? routerValidation.message : undefined,
       destinationReady: action === 'bridge' ? Boolean(destinationReadiness?.ok) : undefined,
-      note: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Swap stablecoin harus memiliki quote Circle yang live; quote tetap wajib sebelum eksekusi.',
+      note: action === 'bridge'
+        ? 'Bridge quote bersifat read-only dan dapat tersedia sebelum execution flag, deployment, atau delegate authorization siap. Eksekusi tetap fail-closed dan wajib memenuhi executionSupported=true serta previewId/confirmation.'
+        : 'MCP server hanya memakai Agent Wallet (MSCA/session key). Swap stablecoin harus memiliki quote Circle yang live; quote tetap wajib sebelum eksekusi.',
     }) }] }
   })
 
@@ -3048,9 +3068,9 @@ export function createMcpServer(userId, context = {}) {
     if (!route || !route.source?.router || !route.destination?.messageTransmitter || token.toUpperCase() !== 'USDC') {
       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'bridge', fromChain: executionChainKey(params.fromChain), toChain: executionChainKey(params.toChain), reason: 'bridge_route_not_supported_for_msca', message: 'MSCA bridge hanya mendukung route CCTP USDC yang memiliki router source dan MessageTransmitter destination.' }) }] }
     }
-    const disabledReason = bridgeConfigDisabledReason(route)
-    if (disabledReason) {
-      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'bridge', fromChain: executionChainKey(params.fromChain), toChain: executionChainKey(params.toChain), chain: executionChainKey(params.fromChain), walletType: 'MSCA', reason: disabledReason, message: disabledReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi.' : 'Bridge MSCA belum diaktifkan.' }) }] }
+    const quoteConfigReason = bridgeQuoteConfigDisabledReason(route)
+    if (quoteConfigReason) {
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'bridge', fromChain: executionChainKey(params.fromChain), toChain: executionChainKey(params.toChain), chain: executionChainKey(params.fromChain), walletType: 'MSCA', reason: quoteConfigReason, message: quoteConfigReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi untuk quote.' : 'Router atau source chain belum dikonfigurasi untuk quote.' }) }] }
     }
     const { listApprovals } = await import('./vaultStore.mjs')
     let unresolvedSource = hasUnresolvedSourceBridgeIntent(listApprovals(userId), {
@@ -3086,15 +3106,20 @@ export function createMcpServer(userId, context = {}) {
           : 'Bridge intent sumber sebelumnya belum memiliki hasil UserOperation yang pasti. Rekonsiliasi status intent tersebut sebelum meminta quote baru; burn tidak diulang.',
       }) }] }
     }
-    const destinationPreflight = await destinationMscaPreflight({ route, walletAddress: info.walletAddress })
-    if (!destinationPreflight.ok) {
-      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'bridge', fromChain: executionChainKey(params.fromChain), toChain: executionChainKey(params.toChain), chain: executionChainKey(params.fromChain), walletType: 'MSCA', reason: destinationPreflight.reason, message: destinationPreflight.message || 'Destination MSCA belum siap. Deploy MSCA terlebih dahulu; source burn belum dilakukan.' }) }] }
-    }
     try {
       const amount = parseUnits(String(params.amount).trim(), 6)
       if (amount <= 0n) throw new Error('Amount bridge tidak valid')
+      // getRouterFeeQuote validates the deployed router and route before the
+      // read-only quoteFee call. This validation is retained even though the
+      // execution flag and destination MSCA readiness are intentionally bypassed
+      // for quoting.
       const fee = await getRouterFeeQuote(route, amount)
       const cctpFee = await getCctpFeeQuote(route, fee.netAmount)
+      const executionReadiness = await bridgeExecutionReadiness({
+        route,
+        walletAddress: info.walletAddress,
+        routerValidated: true,
+      })
       const quote = createExecutionQuote(userId, 'bridge', {
         fromChain: route.fromKey,
         toChain: route.toKey,
@@ -3124,6 +3149,15 @@ export function createMcpServer(userId, context = {}) {
         walletAddress: info.walletAddress,
         walletType: 'MSCA',
         destinationWallet: info.walletAddress,
+        // A quote is useful even when execution is not yet ready. Keep the
+        // readiness result explicit so an agent cannot mistake preview support
+        // for permission to submit a source burn.
+        quoteSupported: true,
+        executionReady: executionReadiness.ok === true,
+        executionSupported: executionReadiness.ok === true,
+        executionReadinessReason: executionReadiness.reason || null,
+        executionReadinessMessage: executionReadiness.message || null,
+        routerValidated: executionReadiness.routerValidated === true,
         platformFee: formatUnits(fee.fee, 6),
         estimatedReceive: formatUnits(fee.netAmount, 6),
         router: route.source.router,
