@@ -1313,22 +1313,55 @@ export function buildMscaRouterBridgeCalls({ route, amount, mintRecipient, maxFe
   ]
 }
 
-async function verifyBridgeBurn({ burnTxHash, route, walletAddress, amount }) {
+async function readBridgeBurnEvents({ burnTxHash, route, amount } = {}) {
   const client = bridgePublicClient(route.source)
   const receipt = await client.getTransactionReceipt({ hash: burnTxHash })
-  const expectedPayer = getAddress(walletAddress).toLowerCase()
   const expectedAmount = amount === undefined || amount === null ? null : BigInt(amount)
+  const events = []
   for (const log of receipt.logs) {
     if (String(log.address).toLowerCase() !== String(route.source.router).toLowerCase()) continue
     try {
       const decoded = decodeEventLog({ abi: BRIDGE_EVENT_ABI, data: log.data, topics: log.topics })
       const args = decoded.args || {}
-      const payer = getAddress(args.payer).toLowerCase()
-      const recipient = String(args.mintRecipient).toLowerCase()
-      const expectedRecipient = `0x${expectedPayer.slice(2).padStart(64, '0')}`
-      if (payer !== expectedPayer || Number(args.destinationDomain) !== Number(route.destination.domain) || recipient !== expectedRecipient || (expectedAmount !== null && BigInt(args.amount) !== expectedAmount)) continue
-      return { ok: true, receipt, args }
+      if (Number(args.destinationDomain) !== Number(route.destination.domain)) continue
+      if (expectedAmount !== null && BigInt(args.amount) !== expectedAmount) continue
+      events.push({ receipt, args, payer: getAddress(args.payer).toLowerCase() })
     } catch { /* inspect the next router log */ }
+  }
+  return events
+}
+
+// Legacy destination-mint records created before walletAddress was persisted
+// are recoverable without weakening wallet isolation: the source router event
+// contains the actual MSCA payer. A different payer proves that the record
+// belongs to an older wallet in the same owner family.
+export function bridgeIntentBelongsToWallet({ storedWallet = '', provenPayer = '', expectedWallet = '' } = {}) {
+  const stored = String(storedWallet || '').trim().toLowerCase()
+  const payer = String(provenPayer || '').trim().toLowerCase()
+  const expected = String(expectedWallet || '').trim().toLowerCase()
+  if (!expected) return true
+  if (stored) return stored === expected
+  // A legacy record without a stored wallet is only safe to associate after
+  // the source router event proves the payer. Unknown payer stays fail-closed.
+  return Boolean(payer) && payer === expected
+}
+
+async function getBridgeBurnPayer({ burnTxHash, route, amount } = {}) {
+  try {
+    return (await readBridgeBurnEvents({ burnTxHash, route, amount }))[0]?.payer || null
+  } catch {
+    return null
+  }
+}
+
+async function verifyBridgeBurn({ burnTxHash, route, walletAddress, amount }) {
+  const expectedPayer = getAddress(walletAddress).toLowerCase()
+  const expectedRecipient = `0x${expectedPayer.slice(2).padStart(64, '0')}`
+  const events = await readBridgeBurnEvents({ burnTxHash, route, amount })
+  for (const event of events) {
+    const recipient = String(event.args.mintRecipient).toLowerCase()
+    if (event.payer !== expectedPayer || recipient !== expectedRecipient) continue
+    return { ok: true, receipt: event.receipt, args: event.args }
   }
   return { ok: false, reason: 'bridge_burn_proof_mismatch' }
 }
@@ -1765,7 +1798,24 @@ async function destinationMscaPreflight({ route, walletAddress, requireAuthoriza
   return { ok: true }
 }
 
-async function findPendingBridgeMint(userId, burnTxHash, toKey) {
+async function bridgeLegacyApprovalMatchesWallet(approval, details, route, walletAddress) {
+  const expectedWallet = String(walletAddress || '').toLowerCase()
+  const storedWallet = bridgeIntentWalletAddress(approval, details)
+  if (!expectedWallet || storedWallet) return storedWallet === expectedWallet
+  if (!details?.burnTxHash || !route) return true
+  let amount
+  try {
+    const amountText = String(details.amount || approval.amount || '').trim()
+    amount = amountText && amountText !== '0' ? parseUnits(amountText, 6) : undefined
+  } catch { amount = undefined }
+  const payer = await getBridgeBurnPayer({ burnTxHash: details.burnTxHash, route, amount })
+  // Unknown payer remains associated for recovery/blocking; only an explicit
+  // on-chain payer mismatch proves that a legacy record belongs to another
+  // MSCA and may be ignored by the active wallet.
+  return !payer || payer === expectedWallet
+}
+
+async function findPendingBridgeMint(userId, burnTxHash, toKey, walletAddress = '') {
   try {
     const vault = await import('./vaultStore.mjs')
     for (const approval of vault.listApprovals(userId) || []) {
@@ -1774,6 +1824,10 @@ async function findPendingBridgeMint(userId, burnTxHash, toKey) {
       try { details = JSON.parse(approval.details || '{}') } catch { details = null }
       const destinationKey = details?.destinationChainKey || details?.toChain
       if (details?.burnTxHash !== burnTxHash || executionChainKey(destinationKey) !== executionChainKey(toKey)) continue
+      const route = bridgeConfig(details?.fromChain, details?.toChain)
+      if (!await bridgeLegacyApprovalMatchesWallet(approval, details, route, walletAddress)) continue
+      // Explicit wallet bindings are authoritative. For legacy rows, only a
+      // proven different source payer allows a new MSCA to ignore the row.
       // A source-confirmed approval also contains burnTxHash and has no
       // destinationUserOpHash yet. It is the parent intent for mint recovery,
       // not an unknown destination submission. Treating it as the latter
@@ -1828,6 +1882,71 @@ export function classifySourceBridgeBurn(details = {}, approval = {}) {
 // bundler/receipt proved the router burn did not succeed, so no source funds
 // moved and a fresh quote is safe. Any accepted hash, timeout, or hashless
 // record without a proven terminal failure remains fail-closed.
+function bridgeIntentWalletAddress(approval, details = {}) {
+  return String(
+    details.walletAddress
+      || details.sourceWalletAddress
+      || details.sourceMscaWalletAddress
+      || details.sourceWallet
+      || approval?.walletAddress
+      || '',
+  ).trim().toLowerCase()
+}
+
+// Resolve legacy bridge rows before applying the synchronous fail-closed guard.
+// Rows with an explicit wallet are scoped immediately; rows without one are
+// retained unless the on-chain router event proves that their burn payer is a
+// different MSCA. An RPC failure therefore still blocks rather than guessing.
+async function scopeBridgeApprovalsToMsca(approvals, { fromChain, toChain, walletAddress } = {}) {
+  const expectedFrom = String(fromChain || '').toLowerCase()
+  const expectedTo = String(toChain || '').toLowerCase()
+  const expectedWallet = String(walletAddress || '').toLowerCase()
+  const route = bridgeConfig(fromChain, toChain)
+  const scoped = []
+  for (const approval of Array.isArray(approvals) ? approvals : []) {
+    if (approval?.action !== 'bridge') {
+      scoped.push(approval)
+      continue
+    }
+    let details
+    try { details = JSON.parse(approval.details || '{}') } catch { details = null }
+    if (!details || String(details.fromChain || '').toLowerCase() !== expectedFrom || String(details.toChain || '').toLowerCase() !== expectedTo) {
+      scoped.push(approval)
+      continue
+    }
+    const storedWallet = bridgeIntentWalletAddress(approval, details)
+    if (storedWallet || !expectedWallet || !details.burnTxHash || !route) {
+      scoped.push(approval)
+      continue
+    }
+    let amount
+    try {
+      const amountText = String(details.amount || approval.amount || '').trim()
+      amount = amountText && amountText !== '0' ? parseUnits(amountText, 6) : undefined
+    } catch { amount = undefined }
+    const payer = await getBridgeBurnPayer({ burnTxHash: details.burnTxHash, route, amount })
+    if (!payer) {
+      // An RPC/indexing failure is not proof that this legacy intent belongs to
+      // another wallet. Keep it in the guard so the system remains fail-closed.
+      scoped.push(approval)
+      continue
+    }
+    if (bridgeIntentBelongsToWallet({ storedWallet, provenPayer: payer, expectedWallet })) {
+      // Feed the proven legacy payer back into the pure guard as an explicit
+      // binding. Without this annotation a no-wallet legacy row would still be
+      // treated as ambiguous by hasUnresolvedSourceBridgeIntent().
+      scoped.push(storedWallet
+        ? approval
+        : { ...approval, details: jsonText({ ...details, walletAddress: expectedWallet, legacyWalletProof: payer }) })
+      continue
+    }
+    // A proven different payer belongs to another MSCA. It must not block a
+    // bridge from the currently selected wallet, while remaining recoverable
+    // when that older wallet is selected later.
+  }
+  return scoped
+}
+
 export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain, walletAddress } = {}) {
   const pendingPhases = new Set(['source_intent_created', 'source_approval_unknown', 'source_approval_submitted', 'source_approval_confirmed', 'source_submission_unknown', 'source_submitted', 'source_confirmed'])
   const expectedFrom = String(fromChain || '').toLowerCase()
@@ -1847,9 +1966,11 @@ export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain,
     let details
     try { details = JSON.parse(approval.details || '{}') } catch { continue }
     if (String(details?.fromChain || '').toLowerCase() !== expectedFrom || String(details?.toChain || '').toLowerCase() !== expectedTo) continue
-    const storedWallet = String(details?.walletAddress || '').toLowerCase()
+    const storedWallet = bridgeIntentWalletAddress(approval, details)
     // Missing wallet binding is not evidence that the intent belongs to a
-    // different wallet. Fail closed and block the same user's route.
+    // different wallet. The async quote path first tries to prove a legacy
+    // burn's payer from the router event; this pure helper remains fail-closed
+    // when called without that reconciliation step.
     if (expectedWallet && storedWallet && storedWallet !== expectedWallet) continue
     if (details?.burnTxHash && completedBurnHashes.has(String(details.burnTxHash).toLowerCase())) continue
     // A legacy Circle/frontend bridge record can contain a burn hash even after
@@ -2013,7 +2134,7 @@ export function sourceBridgePendingOperation(details = {}) {
   return null
 }
 
-async function findPendingBridgeIntent(userId, burnTxHash, toKey) {
+async function findPendingBridgeIntent(userId, burnTxHash, toKey, walletAddress = '') {
   try {
     const vault = await import('./vaultStore.mjs')
     for (const approval of vault.listApprovals(userId) || []) {
@@ -2021,6 +2142,8 @@ async function findPendingBridgeIntent(userId, burnTxHash, toKey) {
       let details
       try { details = JSON.parse(approval.details || '{}') } catch { details = null }
       const destinationKey = details?.destinationChainKey || details?.toChain
+      const route = bridgeConfig(details?.fromChain, details?.toChain)
+      if (!await bridgeLegacyApprovalMatchesWallet(approval, details, route, walletAddress)) continue
       if (details?.burnTxHash === burnTxHash && executionChainKey(destinationKey) === executionChainKey(toKey) && !details.destinationUserOpHash) {
         return { approval, details, phase: details.settlementPhase || 'intent_created' }
       }
@@ -2176,7 +2299,7 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
       destinationMintLocks.delete(lockKey)
     }
   }
-  const persisted = await findPendingBridgeMint(userId, status.burnTxHash, route.toKey)
+  const persisted = await findPendingBridgeMint(userId, status.burnTxHash, route.toKey, walletAddress)
   if (persisted) {
     if (!persisted.userOpHash) {
       const approvalId = persisted.approval?.id || existingApprovalId || null
@@ -2206,7 +2329,7 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
       await markBridgePendingResolved(userId, persisted, 'error', { userOpHash: persisted.userOpHash, error: live.reason || 'destination UserOperation failed' })
     }
   }
-  const pendingIntent = await findPendingBridgeIntent(userId, status.burnTxHash, route.toKey)
+  const pendingIntent = await findPendingBridgeIntent(userId, status.burnTxHash, route.toKey, walletAddress)
   let approvalId = existingApprovalId || pendingIntent?.approval?.id || null
   if (!allowHashlessRecovery && (pendingIntent?.phase === 'destination_submitted' || pendingIntent?.phase === 'submission_unknown')) {
     destinationMintLocks.set(lockKey, { userId, userOpHash: null, chainKey: destinationKey, approvalId })
@@ -2226,6 +2349,7 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
         fromChain: route.fromKey,
         toChain: route.toKey,
         burnTxHash: status.burnTxHash,
+        walletAddress,
         destinationChainKey: destinationKey,
         settlementPhase: 'intent_created',
       })
@@ -3073,7 +3197,12 @@ export function createMcpServer(userId, context = {}) {
       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'bridge', fromChain: executionChainKey(params.fromChain), toChain: executionChainKey(params.toChain), chain: executionChainKey(params.fromChain), walletType: 'MSCA', reason: quoteConfigReason, message: quoteConfigReason === 'destination_chain_not_configured' ? 'Destination chain belum dikonfigurasi untuk quote.' : 'Router atau source chain belum dikonfigurasi untuk quote.' }) }] }
     }
     const { listApprovals } = await import('./vaultStore.mjs')
-    let unresolvedSource = hasUnresolvedSourceBridgeIntent(listApprovals(userId), {
+    const scopedApprovals = await scopeBridgeApprovalsToMsca(listApprovals(userId), {
+      fromChain: route.fromKey,
+      toChain: route.toKey,
+      walletAddress: info.walletAddress,
+    })
+    let unresolvedSource = hasUnresolvedSourceBridgeIntent(scopedApprovals, {
       fromChain: route.fromKey,
       toChain: route.toKey,
       walletAddress: info.walletAddress,

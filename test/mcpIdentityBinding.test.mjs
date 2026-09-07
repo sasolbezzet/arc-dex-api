@@ -627,6 +627,26 @@ test('unresolved source intent blocks burns but permits approval-only recovery',
   }), null)
 })
 
+test('same-owner MSCA rotation does not inherit a legacy first-wallet bridge intent', async () => {
+  const { bridgeIntentBelongsToWallet } = await import('../src/services/mcpServer.mjs?msca-rotation-' + Date.now() + '-' + Math.random())
+  const oldMsca = '0x4444444444444444444444444444444444444444'
+  const newMsca = '0x5555555555555555555555555555555555555555'
+
+  // The source router event proves the unresolved legacy burn belongs to the
+  // old wallet. The same owner selecting a new MSCA must not be blocked.
+  assert.equal(bridgeIntentBelongsToWallet({ provenPayer: oldMsca, expectedWallet: newMsca }), false)
+  assert.equal(bridgeIntentBelongsToWallet({ provenPayer: oldMsca, expectedWallet: oldMsca }), true)
+
+  // A legacy record with no persisted wallet and no on-chain payer proof stays
+  // fail-closed; the fix must not turn an RPC/indexing failure into permission
+  // to submit a duplicate burn or mint against the wrong MSCA.
+  assert.equal(bridgeIntentBelongsToWallet({ expectedWallet: newMsca }), false)
+
+  // New records use the explicit wallet binding and never depend on the owner.
+  assert.equal(bridgeIntentBelongsToWallet({ storedWallet: oldMsca, expectedWallet: newMsca }), false)
+  assert.equal(bridgeIntentBelongsToWallet({ storedWallet: newMsca, provenPayer: oldMsca, expectedWallet: newMsca }), true)
+})
+
 test('multi-chain balance preserves a structured error for an unavailable chain', async () => {
   const { fetchAllChainBalances } = await import('../src/services/multiChainBalance.mjs?balance-error-' + Date.now())
   const previousFetch = globalThis.fetch
