@@ -48,6 +48,23 @@ function messageFor(recipient, route = ROUTE) {
   return '0x' + header + body
 }
 
+test('legacy bridge payer correlation accepts gross router amount when audit stores net amount', async () => {
+  const { decodeBridgeBurnEvents } = await import('../src/services/mcpServer.mjs?gross-net-bridge-event-' + Date.now() + '-' + Math.random())
+  const router = '0xDf800310443BEB589CEf91A09854203Ea36e43a7'
+  const log = {
+    address: router,
+    topics: [
+      '0xe55b8fc3db9f0d7e3c2c1ded06ca1e49cf23bd55e54a4bea066003ae3dc4b2df',
+      '0x000000000000000000000000871bdc77937869f652dda189080b62a201518bd4',
+      '0x0000000000000000000000000000000000000000000000000000000000000003',
+    ],
+    data: '0x000000000000000000000000871bdc77937869f652dda189080b62a201518bd400000000000000000000000000000000000000000000000000000000000186a0000000000000000000000000000000000000000000000000000000000000012c',
+  }
+  const payerOnly = decodeBridgeBurnEvents({ logs: [log], router, destinationDomain: 3 })
+  assert.equal(payerOnly[0]?.payer, '0x871bdc77937869f652dda189080b62a201518bd4')
+  assert.equal(decodeBridgeBurnEvents({ logs: [log], router, destinationDomain: 3, amount: 99_700n }).length, 1)
+})
+
 test('router validation fails closed on wrong deployment configuration', async () => {
   const { compareRouterRouteConfiguration } = await import('../src/services/mcpServer.mjs?router-validation-' + Date.now() + '-' + Math.random())
   assert.deepEqual(compareRouterRouteConfiguration({

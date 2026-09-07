@@ -1313,22 +1313,38 @@ export function buildMscaRouterBridgeCalls({ route, amount, mintRecipient, maxFe
   ]
 }
 
-async function readBridgeBurnEvents({ burnTxHash, route, amount } = {}) {
-  const client = bridgePublicClient(route.source)
-  const receipt = await client.getTransactionReceipt({ hash: burnTxHash })
+export function decodeBridgeBurnEvents({ logs = [], router, destinationDomain, amount } = {}) {
   const expectedAmount = amount === undefined || amount === null ? null : BigInt(amount)
   const events = []
-  for (const log of receipt.logs) {
-    if (String(log.address).toLowerCase() !== String(route.source.router).toLowerCase()) continue
+  for (const log of Array.isArray(logs) ? logs : []) {
+    if (String(log.address).toLowerCase() !== String(router || '').toLowerCase()) continue
     try {
       const decoded = decodeEventLog({ abi: BRIDGE_EVENT_ABI, data: log.data, topics: log.topics })
       const args = decoded.args || {}
-      if (Number(args.destinationDomain) !== Number(route.destination.domain)) continue
-      if (expectedAmount !== null && BigInt(args.amount) !== expectedAmount) continue
-      events.push({ receipt, args, payer: getAddress(args.payer).toLowerCase() })
+      if (Number(args.destinationDomain) !== Number(destinationDomain)) continue
+      if (expectedAmount !== null) {
+        const grossAmount = BigInt(args.amount)
+        const netAmount = grossAmount - BigInt(args.fee || 0n)
+        // BridgeWithFee logs gross amount, while destination-mint audit rows
+        // may store the post-fee net amount. Accept either representation only
+        // after the transaction/router/domain binding has matched.
+        if (grossAmount !== expectedAmount && netAmount !== expectedAmount) continue
+      }
+      events.push({ args, payer: getAddress(args.payer).toLowerCase() })
     } catch { /* inspect the next router log */ }
   }
   return events
+}
+
+async function readBridgeBurnEvents({ burnTxHash, route, amount } = {}) {
+  const client = bridgePublicClient(route.source)
+  const receipt = await client.getTransactionReceipt({ hash: burnTxHash })
+  return decodeBridgeBurnEvents({
+    logs: receipt.logs,
+    router: route.source.router,
+    destinationDomain: route.destination.domain,
+    amount,
+  }).map(event => ({ ...event, receipt }))
 }
 
 // Legacy destination-mint records created before walletAddress was persisted
@@ -1803,12 +1819,10 @@ async function bridgeLegacyApprovalMatchesWallet(approval, details, route, walle
   const storedWallet = bridgeIntentWalletAddress(approval, details)
   if (!expectedWallet || storedWallet) return storedWallet === expectedWallet
   if (!details?.burnTxHash || !route) return true
-  let amount
-  try {
-    const amountText = String(details.amount || approval.amount || '').trim()
-    amount = amountText && amountText !== '0' ? parseUnits(amountText, 6) : undefined
-  } catch { amount = undefined }
-  const payer = await getBridgeBurnPayer({ burnTxHash: details.burnTxHash, route, amount })
+  // See scopeBridgeApprovalsToMsca: legacy records can store the net amount,
+  // whereas BridgeWithFee logs the gross amount. Correlate payer by the exact
+  // burn transaction and route, not by the human amount field.
+  const payer = await getBridgeBurnPayer({ burnTxHash: details.burnTxHash, route })
   // Unknown payer remains associated for recovery/blocking; only an explicit
   // on-chain payer mismatch proves that a legacy record belongs to another
   // MSCA and may be ignored by the active wallet.
@@ -1919,12 +1933,13 @@ async function scopeBridgeApprovalsToMsca(approvals, { fromChain, toChain, walle
       scoped.push(approval)
       continue
     }
-    let amount
-    try {
-      const amountText = String(details.amount || approval.amount || '').trim()
-      amount = amountText && amountText !== '0' ? parseUnits(amountText, 6) : undefined
-    } catch { amount = undefined }
-    const payer = await getBridgeBurnPayer({ burnTxHash: details.burnTxHash, route, amount })
+    // Do not constrain payer correlation by the human amount stored in the
+    // approval. ArcoxRouter's BridgeWithFee event records the gross amount,
+    // while the approval may store the post-fee net amount. The burn
+    // transaction hash and route already provide the transaction-level binding;
+    // amount validation remains enforced by verifyBridgeBurn before mint recovery.
+    const payer = await getBridgeBurnPayer({ burnTxHash: details.burnTxHash, route })
+
     if (!payer) {
       // An RPC/indexing failure is not proof that this legacy intent belongs to
       // another wallet. Keep it in the guard so the system remains fail-closed.
