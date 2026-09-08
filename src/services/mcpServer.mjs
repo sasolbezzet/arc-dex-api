@@ -1983,11 +1983,15 @@ export function hasUnresolvedSourceBridgeIntent(approvals, { fromChain, toChain,
     if (String(details?.fromChain || '').toLowerCase() !== expectedFrom || String(details?.toChain || '').toLowerCase() !== expectedTo) continue
     const storedWallet = bridgeIntentWalletAddress(approval, details)
     // Missing wallet binding is not evidence that the intent belongs to a
-    // different wallet. The async quote path first tries to prove a legacy
-    // burn's payer from the router event; this pure helper remains fail-closed
-    // when called without that reconciliation step.
+    // different wallet. The async quote path first proves a legacy burn's
+    // payer from the router event; this pure helper remains fail-closed when
+    // called without that reconciliation step.
     if (expectedWallet && storedWallet && storedWallet !== expectedWallet) continue
     if (details?.burnTxHash && completedBurnHashes.has(String(details.burnTxHash).toLowerCase())) continue
+    // A legacy row without a wallet remains fail-closed in this pure helper.
+    // The async quote path may remove it only after proving a different payer
+    // from the exact on-chain burn transaction.
+    if (expectedWallet && !storedWallet) return { approval, details }
     // A legacy Circle/frontend bridge record can contain a burn hash even after
     // destination mint already completed. It remains recoverable by the
     // explicit burn-hash retry tool, but it is not an unresolved source intent
@@ -2147,6 +2151,36 @@ export function sourceBridgePendingOperation(details = {}) {
   if (details.sourceUserOpHash) return { kind: 'burn', hash: details.sourceUserOpHash, phase: 'source_submitted' }
   if (details.sourceApprovalUserOpHash) return { kind: 'approval', hash: details.sourceApprovalUserOpHash, phase: 'source_approval_submitted' }
   return null
+}
+
+async function findBridgeApprovalForMintAudit(userId, burnTxHash, toKey, walletAddress = '') {
+  try {
+    const vault = await import('./vaultStore.mjs')
+    const matches = []
+    for (const approval of vault.listApprovals(userId) || []) {
+      let details
+      try { details = JSON.parse(approval.details || '{}') } catch { details = null }
+      if (details?.burnTxHash !== burnTxHash) continue
+      const destinationKey = details?.destinationMintChainKey || details?.destinationChainKey || details?.toChain
+      if (executionChainKey(destinationKey) !== executionChainKey(toKey)) continue
+      const route = bridgeConfig(details?.fromChain, details?.toChain)
+      if (!await bridgeLegacyApprovalMatchesWallet(approval, details, route, walletAddress)) continue
+      matches.push({ approval, details, phase: details.settlementPhase || 'intent_created' })
+    }
+    // Prefer a non-terminal row so a successful retry heals the original
+    // failed audit record instead of selecting a duplicate success row created
+    // by an older retry implementation. Keep all exact matches for idempotent
+    // cleanup of historical duplicate audit rows.
+    const ordered = matches.sort((left, right) => {
+      const leftTerminal = ['success', 'approved'].includes(left.approval.status) ? 1 : 0
+      const rightTerminal = ['success', 'approved'].includes(right.approval.status) ? 1 : 0
+      return leftTerminal - rightTerminal
+        || Number(left.approval.createdAt || 0) - Number(right.approval.createdAt || 0)
+    })
+    return ordered[0] ? { ...ordered[0], all: ordered } : null
+  } catch {
+    return null
+  }
 }
 
 async function findPendingBridgeIntent(userId, burnTxHash, toKey, walletAddress = '') {
@@ -3796,7 +3830,9 @@ export function createMcpServer(userId, context = {}) {
         message: 'CCTP message tidak terikat ke route/MSCA yang aktif. Retry mint diblokir dan tidak ada transaksi destination yang dikirim.',
       }) }] }
       if (!status.verified) return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, burnTxHash: params.burnTxHash, messageStatus: status.messageStatus || 'pending', message: 'Attestation belum tersedia. Tidak ada transaksi destination yang dikirim.' }) }] }
-      const pendingBridgeIntent = await findPendingBridgeMint(userId, params.burnTxHash, route.toKey)
+      const pendingBridgeIntent = await findPendingBridgeMint(userId, params.burnTxHash, route.toKey, info.walletAddress)
+      const auditBridgeIntent = await findBridgeApprovalForMintAudit(userId, params.burnTxHash, route.toKey, info.walletAddress)
+      const bridgeAuditIntent = pendingBridgeIntent || auditBridgeIntent
       const destinationMint = await destinationMintAlreadyProcessed({ status, route })
       const nonceDecision = destinationNonceDecision(destinationMint)
       if (nonceDecision === 'unavailable') {
@@ -3808,27 +3844,40 @@ export function createMcpServer(userId, context = {}) {
         }) }] }
       }
       if (nonceDecision === 'minted') {
-        if (pendingBridgeIntent) {
-          await markBridgePendingResolved(userId, pendingBridgeIntent, 'success', {
-            ...(pendingBridgeIntent.approval?.txHash ? { txHash: pendingBridgeIntent.approval.txHash } : {}),
-            ...(pendingBridgeIntent.approval?.explorerUrl ? { explorerUrl: pendingBridgeIntent.approval.explorerUrl } : {}),
-            details: jsonText({ ...pendingBridgeIntent.details, settlementStatus: 'success', settlementPhase: 'destination_minted', destinationMintStatus: 'minted' }),
+        if (bridgeAuditIntent) {
+          await markBridgePendingResolved(userId, bridgeAuditIntent, 'success', {
+            ...(bridgeAuditIntent.approval?.txHash ? { txHash: bridgeAuditIntent.approval.txHash } : {}),
+            ...(bridgeAuditIntent.approval?.explorerUrl ? { explorerUrl: bridgeAuditIntent.approval.explorerUrl } : {}),
+            ...(bridgeAuditIntent.approval?.userOpHash ? { userOpHash: bridgeAuditIntent.approval.userOpHash } : {}),
+            details: jsonText({
+              ...bridgeAuditIntent.details,
+              settlementStatus: 'success',
+              settlementPhase: 'destination_minted',
+              destinationMintStatus: 'minted',
+            }),
           })
         }
         return { content: [{ type: 'text', text: jsonText({
           status: 'minted', executed: false, idempotent: true, burnTxHash: params.burnTxHash,
-          walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: null,
-          destinationUserOpHash: null, destinationExplorerUrl: null, safeToRetry: false,
+          walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: bridgeAuditIntent?.details?.mintTxHash || null,
+          destinationUserOpHash: bridgeAuditIntent?.details?.destinationUserOpHash || null, destinationExplorerUrl: bridgeAuditIntent?.approval?.explorerUrl || null, safeToRetry: false,
           error: null, message: 'Destination mint sudah selesai sebelumnya. Tidak mengirim UserOperation ulang.',
         }) }] }
       }
-      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress, userId, approvalId: pendingBridgeIntent?.approval?.id || null, allowHashlessRecovery: true })
-      if (mint.success && pendingBridgeIntent) {
-        await markBridgePendingResolved(userId, pendingBridgeIntent, 'success', {
+      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress, userId, approvalId: bridgeAuditIntent?.approval?.id || null, allowHashlessRecovery: true })
+      if (mint.success && bridgeAuditIntent) {
+        await markBridgePendingResolved(userId, bridgeAuditIntent, 'success', {
           ...(mint.txHash ? { txHash: mint.txHash } : {}),
           ...(mint.explorerUrl ? { explorerUrl: mint.explorerUrl } : {}),
           ...(mint.userOpHash ? { userOpHash: mint.userOpHash } : {}),
-          details: jsonText({ ...pendingBridgeIntent.details, settlementStatus: 'success', settlementPhase: 'destination_minted', destinationMintStatus: 'minted', mintTxHash: mint.txHash || pendingBridgeIntent.details?.mintTxHash || null, destinationUserOpHash: mint.userOpHash || pendingBridgeIntent.details?.destinationUserOpHash || null }),
+          details: jsonText({
+            ...bridgeAuditIntent.details,
+            settlementStatus: 'success',
+            settlementPhase: 'destination_minted',
+            destinationMintStatus: 'minted',
+            mintTxHash: mint.txHash || bridgeAuditIntent.details?.mintTxHash || null,
+            destinationUserOpHash: mint.userOpHash || bridgeAuditIntent.details?.destinationUserOpHash || null,
+          }),
         })
       }
       return { content: [{ type: 'text', text: jsonText({        status: mint.success ? 'minted' : (mint.error === 'destination_mint_in_flight' || mint.error === 'destination_nonce_check_unavailable' ? 'settlement_pending' : 'mint_failed'), executed: mint.success && !mint.idempotent, idempotent: Boolean(mint.idempotent), burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, destinationMintStatus: mint.success ? 'minted' : 'pending', safeToRetry: mint.success ? false : (mint.safeToRetry ?? false), error: mint.success ? null : mint.error, message: mint.success ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya.' : 'Destination receiveMessage berhasil via MSCA UserOperation.') : (mint.error === 'destination_mint_in_flight' ? 'Destination mint UserOperation masih pending. Jangan retry sampai status UserOperation final.' : 'Destination mint belum aman untuk diulang; pastikan status UserOperation dan nonce destination sudah final.') }) }] }

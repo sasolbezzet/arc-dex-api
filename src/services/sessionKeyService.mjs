@@ -50,9 +50,12 @@ const BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 const DESTINATION_VERIFICATION_GAS_LIMITS = {
   'arc-testnet': 270_000n,
   'base-sepolia': 270_000n,
-  // Arbitrum's MSCA deployment verification includes the WebAuthn plugin
-  // validation path; 125k is insufficient and causes bundler precheck failure.
-  'arbitrum-sepolia': 600_000n,
+  // Circle's Arbitrum bundler rejects verification gas whose actual use is
+  // below 40% of the requested limit. This receiveMessage path measured
+  // 55.6k-81.8k in the latest prechecks, so 130k retains execution headroom
+  // while keeping the minimum observed efficiency above 40%; larger limits
+  // (140k, 150k, 200k, and 600k) were rejected before submission.
+  'arbitrum-sepolia': 130_000n,
 }
 const CIRCLE_GAS_PRICE_LEVELS = ['medium', 'fast', 'slow']
 
@@ -1694,6 +1697,26 @@ export async function executeViaSession(userId, calls, options = {}) {
   try {
     userOpHash = await sendUserOperation(modularClient, userOpParams)
   } catch (error) {
+    // Capture raw bundler error before any classification strips the diagnostic
+    // detail. The bundler's response is the only place that tells us whether
+    // the failure was a gas/fee floor, sender reputation, verification gas
+    // efficiency, or a parameter validation issue. The destination bridge path
+    // surfaces this so root-cause analysis does not have to guess.
+    const rawMessage = String(error?.message || error)
+    const rawShortMessage = String(error?.shortMessage || '')
+    const rawCause = error?.cause ? String(error?.cause?.message || error.cause) : ''
+    console.error('[userop-precheck]', JSON.stringify({
+      chainKey,
+      feeProfile: options?.feeProfile,
+      paymasterMode: paymasterMode ?? null,
+      maxFeePerGas: userOpParams?.maxFeePerGas?.toString?.() ?? null,
+      maxPriorityFeePerGas: userOpParams?.maxPriorityFeePerGas?.toString?.() ?? null,
+      verificationGasLimit: userOpParams?.verificationGasLimit?.toString?.() ?? null,
+      callCount: Array.isArray(userOpParams?.calls) ? userOpParams.calls.length : null,
+      rawMessage,
+      rawShortMessage,
+      rawCause,
+    }))
     const precheckReason = classifyUserOperationPrecheckError(error)
     if (precheckReason) {
       return { status: 'error', reason: precheckReason, safeToRetry: true, userOpAccepted: 'no', error: String(error?.message || error) }

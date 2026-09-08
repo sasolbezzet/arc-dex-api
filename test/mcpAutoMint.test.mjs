@@ -98,7 +98,21 @@ test('inbound Base/Arbitrum bridges use explicit Circle paymaster profiles', asy
   assert.equal(baseParams.maxFeePerGas, 3_000_000_000n)
   assert.equal(baseParams.verificationGasLimit, 270_000n)
   const arbitrumParams = await buildUserOperationParams({ account: {}, calls: [], chainKey: 'arbitrum-sepolia', baseClient: gasPriceClient, feeProfile: resolveMscaBridgeFeeProfile(arbitrumRoute) })
-  assert.equal(arbitrumParams.verificationGasLimit, 600_000n)
+  assert.equal(arbitrumParams.verificationGasLimit, 130_000n)
+  const arbitrumDestinationParams = await buildUserOperationParams({ account: {}, calls: [], chainKey: 'arbitrum-sepolia', baseClient: gasPriceClient, feeProfile: 'arbitrum-destination' })
+  // The receiveMessage precheck uses about 56k-82k verification gas. 130k
+  // retains execution headroom while satisfying Circle's 40% efficiency requirement.
+  assert.equal(arbitrumDestinationParams.verificationGasLimit, 130_000n)
+})
+
+test('Arbitrum verification precheck errors are classified as safe destination retries', async () => {
+  const { classifyUserOperationPrecheckError, normalizeUserOperationFees } = await import('../src/services/sessionKeyService.mjs?arb-precheck-' + Date.now() + '-' + Math.random())
+  const error = new Error('Invalid fields set on User Operation. Details: Verification gas limit efficiency too low. Required: 0.4, Actual: 0.13628142857142858')
+  assert.equal(classifyUserOperationPrecheckError(error), 'user_operation_precheck_failed')
+  assert.deepEqual(normalizeUserOperationFees({ maxFeePerGas: 2_000_000_000n, maxPriorityFeePerGas: 1_000_000_000n }), {
+    maxFeePerGas: 3_000_000_000n,
+    maxPriorityFeePerGas: 1_000_000_000n,
+  })
 })
 
 test('failed source burn before router execution does not block a fresh bridge quote', async () => {
