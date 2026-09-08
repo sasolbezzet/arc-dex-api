@@ -107,23 +107,24 @@ async function post(base, path, body) {
   return { response, body: await response.json() }
 }
 
-test('Plugin passkey endpoints reject missing owner proof before Circle is called', async () => {
+test('Existing-agent login options do not require SIWE, while register still does', async () => {
   await withHttp(async ({ base, circleRequests }) => {
-    const options = await post(base, '/api/auth/passkey-options', {
+    const loginOptions = await post(base, '/api/auth/passkey-options', {
       mode: 'Login',
       agentKey: AGENT_KEY,
     })
-    assert.equal(options.response.status, 403)
-    assert.equal(options.body.code, 'owner_session_required')
+    assert.equal(loginOptions.response.status, 200, JSON.stringify(loginOptions.body))
+    assert.equal(loginOptions.body.success, true)
+    assert.equal(loginOptions.body.options.challenge, 'AQ')
 
-    const login = await post(base, '/api/auth/passkey-login', {
-      mode: 'Login',
+    const registerOptions = await post(base, '/api/auth/passkey-options', {
+      mode: 'Register',
       agentKey: AGENT_KEY,
-      credential: {},
+      username: 'test-agent-registration',
     })
-    assert.equal(login.response.status, 403)
-    assert.equal(login.body.code, 'owner_session_required')
-    assert.equal(circleRequests.length, 0)
+    assert.equal(registerOptions.response.status, 403)
+    assert.equal(registerOptions.body.code, 'owner_session_required')
+    assert.equal(circleRequests.length, 1)
   })
 })
 

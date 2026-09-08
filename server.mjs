@@ -376,7 +376,11 @@ app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
   try {
     const { mode = 'Login', username = '', agentKey = '', ownerAddress = '', ownerSessionToken = '' } = req.body || {}
     if (mode !== 'Login' && mode !== 'Register') return res.status(400).json({ error: 'Invalid passkey mode' })
-    if (requiresPluginOwnerProof(agentKey)) {
+    // Existing-agent Login is intentionally passkey-first. The browser has
+    // already performed its silent connected-wallet preflight; owner SIWE is
+    // resolved after WebAuthn by the activation/final OAuth step. Registration
+    // still needs owner proof before creating a new wallet/binding.
+    if (mode === 'Register' || (ownerAddress || ownerSessionToken)) {
       const ownerProof = await verifyPluginOwnerProof({ ownerAddress, ownerSessionToken })
       if (!ownerProof.ok) {
         return res.status(403).json({ code: 'owner_session_required', error: 'Hubungkan wallet utama terlebih dahulu sebelum memulai passkey Agent Wallet.' })
@@ -432,11 +436,12 @@ app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
 app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
   try {
     const { walletAddress, credential, mode = 'Login', flowId = '', agentKey = '', ownerAddress = '', ownerSessionToken = '' } = req.body || {}
-    const requiresOwner = requiresPluginOwnerProof(agentKey)
-    const ownerProof = requiresOwner
+    const requiresOwner = mode === 'Register'
+    const hasOwnerProof = Boolean(ownerAddress || ownerSessionToken)
+    const ownerProof = hasOwnerProof
       ? await verifyPluginOwnerProof({ ownerAddress, ownerSessionToken, agentWalletAddress: walletAddress })
-      : { ok: true, ownerAddress: '' }
-    if (!ownerProof.ok) {
+      : { ok: false, ownerAddress: '' }
+    if (requiresOwner && !ownerProof.ok) {
       return res.status(403).json({ code: 'owner_session_required', error: 'Hubungkan wallet utama terlebih dahulu sebelum Login passkey Agent Wallet.' })
     }
     if (walletAddress && !isAddress(walletAddress)) {
@@ -478,15 +483,25 @@ app.post('/api/auth/passkey-login', apiLimiter, async (req, res) => {
         // Plugin login must also be owned by the currently authenticated EOA.
         // The Circle-verified MSCA proves the passkey; the durable binding plus
         // owner proof prevents an owner from selecting another agent wallet.
-        const resolvedBinding = agentBindingStoreModule.findAgentBindingForAgent(agentKey, verified.walletAddress)
-        if (!resolvedBinding) return res.status(403).json({ error: 'agent_passkey_not_bound' })
-        if (String(resolvedBinding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) {
+        let resolvedBinding = agentBindingStoreModule.findAgentBindingForAgent(agentKey, verified.walletAddress)
+        // Older wallet creations persisted the MSCA session/alias but missed
+        // the per-agent binding row. Allow the passkey ceremony to finish for
+        // that known wallet; the following activation call must supply fresh
+        // owner proof and creates the missing canonical binding. A random/new
+        // MSCA still fails closed here.
+        if (!resolvedBinding && !agentBindingStoreModule.hasSessionKeyRecord(verified.walletAddress)) {
+          return res.status(403).json({ error: 'agent_passkey_not_bound' })
+        }
+        if (hasOwnerProof && !ownerProof.ok) {
+          return res.status(403).json({ code: 'owner_session_required', error: 'Sesi owner wallet tidak valid.' })
+        }
+        if (resolvedBinding && String(resolvedBinding.walletAddress).toLowerCase() !== verified.walletAddress.toLowerCase()) {
           return res.status(403).json({ error: 'agent_passkey_wallet_mismatch' })
         }
-        if (requiresOwner && String(resolvedBinding.ownerAddress || '').toLowerCase() !== ownerProof.ownerAddress) {
+        if (resolvedBinding && hasOwnerProof && String(resolvedBinding.ownerAddress || '').toLowerCase() !== ownerProof.ownerAddress) {
           return res.status(403).json({ code: 'agent_owner_mismatch', error: 'Agent Wallet ini terikat ke owner wallet yang berbeda.' })
         }
-        if (!allowed.includes(credentialId)) {
+        if (resolvedBinding && !allowed.includes(credentialId)) {
           bindPasskeyCredential(resolvedBinding.agentKey, credentialId, resolvedBinding.walletAddress)
         }
       }
@@ -710,20 +725,47 @@ app.post('/api/session/revoke', apiLimiter, requireAuth, async (req, res) => {
 // the authenticated MSCA, wallet address, and agent namespace all agree.
 app.post('/api/session/activate-binding', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { walletAddress, agentKey } = req.body || {}
+    const { walletAddress, agentKey, ownerAddress = '', ownerSessionToken = '', credentialId = '' } = req.body || {}
     if (!walletAddress || !agentKey || !isAddress(walletAddress)) {
       return res.status(400).json({ error: 'walletAddress and agentKey are required' })
     }
     if (getAddress(walletAddress).toLowerCase() !== req.owner) {
       return res.status(403).json({ error: 'walletAddress must match the authenticated MSCA' })
     }
-    const { getSessionKey, findAgentBindingForAgent, activateAgentBinding } = await import('./src/services/sessionKeyService.mjs')
+    const { getSessionKey, findAgentBindingForAgent, activateAgentBinding, ensureAgentBindingForWallet } = await import('./src/services/sessionKeyService.mjs')
     const session = getSessionKey(req.owner)
     if (!session?.active || String(session.walletAddress || '').toLowerCase() !== req.owner) {
       return res.status(409).json({ error: 'agent_session_inactive' })
     }
-    const binding = findAgentBindingForAgent(agentKey, req.owner)
+    let binding = findAgentBindingForAgent(agentKey, req.owner)
+    let verifiedBindingOwner = ''
+    if (ownerAddress || ownerSessionToken) {
+      const ownerProof = await verifyPluginOwnerProof({ ownerAddress, ownerSessionToken, agentWalletAddress: req.owner })
+      if (!ownerProof.ok) return res.status(403).json({ code: 'owner_session_required', error: 'Sesi owner wallet tidak valid.' })
+      verifiedBindingOwner = ownerProof.ownerAddress
+    }
+    if (!binding && verifiedBindingOwner) {
+      try {
+        binding = ensureAgentBindingForWallet(agentKey, verifiedBindingOwner, req.owner, { credentialId })
+      } catch (bindingError) {
+        const message = String(bindingError?.message || '')
+        if (/owner_wallet_relationship_missing|owner_mismatch|rotation_forbidden/i.test(message)) {
+          return res.status(403).json({ code: 'agent_owner_mismatch', error: 'Agent Wallet ini belum terbukti terikat ke owner wallet yang terhubung.' })
+        }
+        throw bindingError
+      }
+    }
     if (!binding) return res.status(404).json({ code: 'agent_binding_not_found', error: 'agent_binding_not_found' })
+    if (verifiedBindingOwner && String(binding.ownerAddress || '').toLowerCase() !== verifiedBindingOwner.toLowerCase()) {
+      return res.status(403).json({ code: 'agent_owner_mismatch', error: 'Agent Wallet ini terikat ke owner wallet yang berbeda.' })
+    }
+    if (credentialId) {
+      const credentialBinding = findAgentBindingForAgent(binding.agentKey, req.owner)
+      if (credentialBinding) {
+        agentBindingStoreModule.bindAgentCredential(binding.agentKey, credentialId, req.owner)
+        binding = { ...binding, credentialIds: Array.from(new Set([...(binding.credentialIds || []), credentialId])) }
+      }
+    }
     const activated = activateAgentBinding(binding.agentKey, req.owner)
     if (!activated) return res.status(404).json({ code: 'agent_binding_not_found', error: 'agent_binding_not_found' })
     res.json({ success: true, agentKey: activated.agentKey, walletAddress: activated.walletAddress, active: true })

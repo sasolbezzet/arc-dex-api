@@ -503,6 +503,68 @@ export function getAgentBinding(agentKey) {
 }
 
 /**
+ * A passkey login may arrive before the old OAuth/agent binding row was
+ * persisted. Keep that recovery limited to a wallet that already has a
+ * server-side session-key record; a random passkey cannot bootstrap an agent
+ * through this compatibility path.
+ */
+export function hasSessionKeyRecord(walletAddress) {
+  const wallet = String(walletAddress || '').trim().toLowerCase()
+  if (!/^0x[0-9a-f]{40}$/.test(wallet)) return false
+  const store = loadStore()
+  return Boolean(store.users?.[wallet]?.walletAddress)
+}
+
+/**
+ * Complete a binding after the passkey and owner proofs have both succeeded.
+ * Existing rows are resolved across legacy/canonical namespaces first. When a
+ * legacy wallet has no row at all, create only the canonical key for the
+ * requested agent; never rotate an existing key to another wallet.
+ */
+function walletOwnerEvidence(store, owner, wallet) {
+  if (String(store.aliases?.[owner] || '').toLowerCase() === wallet) return true
+  if (String(store.walletFamily?.[wallet] || '').toLowerCase() === owner) return true
+  return Object.values(store.agentBindings || {}).some(binding =>
+    String(binding?.ownerAddress || '').toLowerCase() === owner
+      && String(binding?.walletAddress || '').toLowerCase() === wallet
+  )
+}
+
+export function ensureAgentBindingForWallet(agentKey, ownerAddress, walletAddress, { credentialId = '' } = {}) {
+  const requested = normalizeAgentKey(agentKey)
+  const owner = normalizeAddressHex(ownerAddress, 'ownerAddress')
+  const wallet = normalizeAddressHex(walletAddress, 'walletAddress')
+  if (!requested) throw new Error('agentKey required')
+
+  const resolved = findAgentBindingForAgent(requested, wallet)
+  if (resolved) {
+    if (String(resolved.ownerAddress || '').toLowerCase() !== owner) throw new Error('agent_binding_owner_mismatch')
+    if (credentialId) bindAgentCredential(resolved.agentKey, credentialId, wallet)
+    return activateAgentBinding(resolved.agentKey, wallet)
+  }
+
+  const store = loadStore()
+  // Owner proof is necessary but not sufficient: the persisted session/alias
+  // must also show that this EOA has previously created or owned this MSCA.
+  // This prevents a passkey holder from attaching an unrelated legacy wallet
+  // to the currently connected EOA during recovery.
+  if (!walletOwnerEvidence(store, owner, wallet)) throw new Error('agent_owner_wallet_relationship_missing')
+
+  // Generic browser namespaces become stable provider/owner keys. Durable
+  // OAuth client-specific rows continue to resolve through their real clientId.
+  const targetKey = requested.startsWith('oauth:')
+    ? `${agentClientId(requested)}|${owner}`
+    : requested
+  const target = store.agentBindings?.[targetKey]
+  if (target && String(target.walletAddress || '').toLowerCase() !== wallet) {
+    throw new Error('agent_wallet_rotation_forbidden')
+  }
+  const binding = bindAgent(targetKey, owner, wallet)
+  if (credentialId) bindAgentCredential(binding.agentKey, credentialId, wallet)
+  return activateAgentBinding(binding.agentKey, wallet)
+}
+
+/**
  * The first OAuth onboarding implementation used `oauth:<clientId>` as a
  * temporary browser namespace. The durable binding created by the approval
  * callback is `<clientId>|<walletAddress>`. Keep the migration at the service

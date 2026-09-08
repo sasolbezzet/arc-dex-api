@@ -245,6 +245,39 @@ test('Hermes passkey namespace resolves the canonical connection binding over a 
   })
 })
 
+test('legacy wallet with missing agent row can recover one canonical binding for the proven owner', async () => {
+  const legacyAgentKey = 'oauth:client-a'
+  await withSessionStore({
+    users: {
+      [W1]: { walletAddress: W1, delegateAddress: EOA_A, active: true, authorizationUserOpHash: USER_OP_HASH },
+    },
+    aliases: { [OWNER]: W1 },
+    agentBindings: {},
+  }, async ({ ensureAgentBindingForWallet, getAgentBinding, findAgentBindingForAgent }) => {
+    const recovered = ensureAgentBindingForWallet(legacyAgentKey, OWNER, W1, { credentialId: 'recovered-credential' })
+    const canonicalKey = `client-a|${OWNER}`
+    assert.equal(recovered?.agentKey, canonicalKey)
+    assert.equal(recovered?.walletAddress, W1)
+    assert.equal(recovered?.ownerAddress, OWNER)
+    assert.equal(recovered?.active, true)
+    assert.deepEqual(getAgentBinding(canonicalKey)?.credentialIds, ['recovered-credential'])
+    assert.equal(findAgentBindingForAgent(legacyAgentKey, W1)?.agentKey, canonicalKey)
+  })
+})
+
+test('legacy wallet recovery rejects an owner without a persisted wallet relationship', async () => {
+  await withSessionStore({
+    users: { [W1]: { walletAddress: W1, delegateAddress: EOA_A, active: true } },
+    aliases: { [OTHER_OWNER]: W2 },
+    agentBindings: {},
+  }, async ({ ensureAgentBindingForWallet }) => {
+    assert.throws(
+      () => ensureAgentBindingForWallet('oauth:client-a', OWNER, W1),
+      /agent_owner_wallet_relationship_missing/,
+    )
+  })
+})
+
 test('Hermes passkey resolution fails closed when the same wallet belongs to multiple owners', async () => {
   const otherOwner = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
   await withSessionStore({
