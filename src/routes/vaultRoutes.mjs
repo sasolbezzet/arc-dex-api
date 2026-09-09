@@ -5,6 +5,7 @@ import { listRelatedAddresses, listAgentBindings, listAgentBindingsForIdentity, 
 import { getDailySpend } from '../services/agentSpendLedger.mjs'
 import { verifyMessage } from 'viem'
 import { verifyOwnerToken } from '../services/authToken.mjs'
+import { buildAgentReadiness } from '../services/agentReadiness.mjs'
 
 const vault = Router()
 
@@ -223,6 +224,60 @@ function activityBelongsToAgent(entry, binding, clientId) {
 // GET /api/vault/agents/:agentKey/activity — recent activity for exactly one
 // agent. EOA-level events are included only when their audit payload carries
 // this OAuth clientId; MSCA-level events are scoped to the binding's wallet.
+// GET /api/vault/agents/:agentKey/readiness — read-only readiness for exactly
+// one agent. This endpoint is intentionally agent-scoped: it reports MCP token
+// connectivity separately from session-key execution authorization and never
+// changes OAuth/Claude/ChatGPT authentication state.
+vault.get('/agents/:agentKey/readiness', requireAuth, async (req, res) => {
+  try {
+    const agentKey = String(req.params.agentKey || '')
+    const binding = getAgentBinding(agentKey)
+    if (!binding) return res.status(404).json({ error: 'agent_not_found' })
+    if (!identityOwnsAgentBinding(req.owner, binding)) {
+      return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
+    }
+    const canonicalAgentKey = String(binding.agentKey || agentKey).trim().toLowerCase()
+    const clientId = agentClientIdFromBinding(canonicalAgentKey)
+    const ownerAddress = String(binding.ownerAddress || '').toLowerCase()
+    const walletAddress = String(binding.walletAddress || '').toLowerCase()
+    const [{ getAgentTokenStatus }, { listMcpSessions }, { getSessionKey, isSessionAuthorizedForChain }] = await Promise.all([
+      import('../services/mcpServer.mjs'),
+      import('../services/vaultStore.mjs'),
+      import('../services/sessionKeyService.mjs'),
+    ])
+    const token = getAgentTokenStatus({ clientId, ownerAddress, walletAddress })
+    const mcpSession = (listMcpSessions(ownerAddress) || []).find(session => session.clientId === clientId && session.active === true)
+    const session = getSessionKey(walletAddress, { sweep: false })
+    const chainAuthorizationStatus = {
+      'arc-testnet': isSessionAuthorizedForChain(walletAddress, 'arc-testnet') ? 'authorized' : 'failed',
+      'base-sepolia': isSessionAuthorizedForChain(walletAddress, 'base-sepolia') ? 'authorized' : 'failed',
+      'arbitrum-sepolia': isSessionAuthorizedForChain(walletAddress, 'arbitrum-sepolia') ? 'authorized' : 'failed',
+    }
+    const readiness = buildAgentReadiness({
+      agentKey: canonicalAgentKey,
+      clientId,
+      agentType: agentTypeForReadiness(clientId, canonicalAgentKey, await resolveClientName(clientId)),
+      binding,
+      tokenActive: token.active,
+      tokenExpiresAt: token.expiresAt,
+      mcpSessionActive: Boolean(mcpSession),
+      sessionActive: session?.active === true && String(session.walletAddress || '').toLowerCase() === walletAddress,
+      chainAuthorizationStatus,
+    })
+    res.json({ success: true, readiness })
+  } catch (error) {
+    res.status(500).json({ error: error?.message || 'Failed to read agent readiness' })
+  }
+})
+
+function agentTypeForReadiness(clientId, agentKey = '', clientName = '') {
+  const value = `${String(clientId || '')} ${String(agentKey || '')} ${String(clientName || '')}`.toLowerCase()
+  if (value.includes('hermes') || value.includes('arcox_conn_')) return 'hermes'
+  if (value.includes('claude')) return 'claude'
+  if (value.includes('chatgpt') || value.includes('openai') || value.includes('gpt')) return 'chatgpt'
+  return 'custom'
+}
+
 vault.get('/agents/:agentKey/activity', requireAuth, async (req, res) => {
   try {
     const agentKey = String(req.params.agentKey || '')

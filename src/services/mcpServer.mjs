@@ -474,6 +474,32 @@ export function revokeTokensForClient(clientId) {
   return removed
 }
 
+/**
+ * Read-only token observability for the owner dashboard. It deliberately
+ * returns booleans/timestamps only; bearer token values never leave this
+ * module. Matching includes owner and MSCA so one agent cannot appear ready
+ * because a sibling agent has a live token on the same owner.
+ */
+export function getAgentTokenStatus({ clientId, ownerAddress, walletAddress } = {}) {
+  const cid = String(clientId || '').trim()
+  const owner = String(ownerAddress || '').toLowerCase()
+  const wallet = String(walletAddress || '').toLowerCase()
+  if (!cid) return { active: false, expiresAt: null, tokenType: null }
+  refreshAccessTokens()
+  const candidates = [...accessTokens.values()].filter(value =>
+    value?.clientId === cid
+      && (!owner || String(value.userId || '').toLowerCase() === owner)
+      && (!wallet || String(value.mscaWalletAddress || '').toLowerCase() === wallet)
+      && Number(value.expires || 0) > Date.now()
+  )
+  const current = candidates.sort((left, right) => Number(right.expires || 0) - Number(left.expires || 0))[0]
+  return {
+    active: Boolean(current),
+    expiresAt: current?.expires ? new Date(current.expires).toISOString() : null,
+    tokenType: current?.connectionToken === true ? 'connection' : current ? 'oauth' : null,
+  }
+}
+
 // ── Anti-cross-agent revoke probe ──
 // True when any live access OR refresh token is still bound to this MSCA.
 // Registered into sessionKeyService so storeSessionKey refuses to auto-revoke
