@@ -31,7 +31,7 @@ const ARBITRUM_TO_ARC_ROUTE = {
   destination: { domain: 26, requiredFinalityThreshold: 1000, tokenMessenger: TOKEN_MESSENGER, messageTransmitter: MESSAGE_TRANSMITTER, rpcUrl: 'https://example.invalid/arc' },
 }
 
-function messageFor(recipient, route = ROUTE) {
+function messageFor(recipient, route = ROUTE, amount = '0x0f4240') {
   const word = value => String(value).replace(/^0x/i, '').padStart(64, '0')
   const uint32 = value => String(value).replace(/^0x/i, '').padStart(8, '0')
   const finalityThreshold = Number(route.destination.domain) === 26 ? '0x7d0' : '0x3e8'
@@ -42,11 +42,19 @@ function messageFor(recipient, route = ROUTE) {
     word('1'), word(route.source.tokenMessenger), word(route.destination.tokenMessenger), word('0'), uint32(finalityThreshold), uint32(finalityThreshold),
   ].join('')
   const body = [
-    uint32('1'), word(route.source.usdc), word(recipient), word('0x0f4240'),    word(route.source.router), word('0x0a'), word('0x0a'), word('0'),
+    uint32('1'), word(route.source.usdc), word(recipient), word(amount),    word(route.source.router), word('0x0a'), word('0x0a'), word('0'),
 
   ].join('')
   return '0x' + header + body
 }
+
+test('bridge proof keeps both gross and net CCTP amount candidates', async () => {
+  const { bridgeBurnExpectedCctpAmounts } = await import('../src/services/mcpServer.mjs?proof-amount-candidates-' + Date.now() + '-' + Math.random())
+  assert.deepEqual(bridgeBurnExpectedCctpAmounts({ amount: 100000n, fee: 300n }), [99700n, 100000n])
+  assert.deepEqual(bridgeBurnExpectedCctpAmounts({ amount: 99700n, fee: 300n }), [99400n, 99700n])
+  assert.deepEqual(bridgeBurnExpectedCctpAmounts({ amount: 0n, fee: 0n }), [])
+  assert.deepEqual(bridgeBurnExpectedCctpAmounts({ amount: 100n, fee: 101n }), [])
+})
 
 test('legacy bridge payer correlation accepts gross router amount when audit stores net amount', async () => {
   const { decodeBridgeBurnEvents } = await import('../src/services/mcpServer.mjs?gross-net-bridge-event-' + Date.now() + '-' + Math.random())
@@ -63,6 +71,24 @@ test('legacy bridge payer correlation accepts gross router amount when audit sto
   const payerOnly = decodeBridgeBurnEvents({ logs: [log], router, destinationDomain: 3 })
   assert.equal(payerOnly[0]?.payer, '0x871bdc77937869f652dda189080b62a201518bd4')
   assert.equal(decodeBridgeBurnEvents({ logs: [log], router, destinationDomain: 3, amount: 99_700n }).length, 1)
+})
+
+test('CCTP selection accepts the router event gross amount and post-fee amount', async () => {
+  const { selectCctpMessage } = await import('../src/services/mcpServer.mjs?gross-net-cctp-selection-' + Date.now() + '-' + Math.random())
+  const selected = selectCctpMessage([{ message: messageFor(MSCA, ROUTE, '0x26f2'), status: 'complete' }], 26, 6, {
+    route: ROUTE,
+    walletAddress: MSCA,
+    expectedBurnAmount: [9970n, 10000n],
+  })
+  assert.ok(selected.selected)
+  assert.equal(selected.decoded.messageBody.amount, 9970n)
+
+  const rejected = selectCctpMessage([{ message: messageFor(MSCA, ROUTE, '0x26f2'), status: 'complete' }], 26, 6, {
+    route: ROUTE,
+    walletAddress: MSCA,
+    expectedBurnAmount: [9969n, 9999n],
+  })
+  assert.equal(rejected.selected, null)
 })
 
 test('router validation fails closed on wrong deployment configuration', async () => {

@@ -1396,16 +1396,48 @@ async function getBridgeBurnPayer({ burnTxHash, route, amount } = {}) {
   }
 }
 
+export function bridgeBurnExpectedCctpAmounts(args = {}) {
+  const gross = BigInt(args?.amount ?? 0)
+  const fee = BigInt(args?.fee ?? 0)
+  if (gross <= 0n || fee < 0n || fee > gross) return []
+  // The audited router calls depositForBurn(amount - fee), but older deployed
+  // router builds emitted either the gross or net value in BridgeWithFee.amount.
+  // The transaction/router/payer/recipient binding is stronger than that
+  // presentation detail; keep both on-chain-consistent candidates for Iris.
+  return [...new Set([gross - fee, gross].map(value => value.toString()))].map(BigInt)
+}
+
 async function verifyBridgeBurn({ burnTxHash, route, walletAddress, amount }) {
   const expectedPayer = getAddress(walletAddress).toLowerCase()
   const expectedRecipient = `0x${expectedPayer.slice(2).padStart(64, '0')}`
-  const events = await readBridgeBurnEvents({ burnTxHash, route, amount })
+  // Do not filter the receipt by the human quote amount here. BridgeWithFee
+  // deployments have emitted both gross and post-fee values in the event's
+  // `amount` field. The exact transaction hash, router address, destination
+  // domain, MSCA payer, and MSCA recipient are the proof; the event amount is
+  // then used to bind the CCTP message with both valid representations.
+  const events = await readBridgeBurnEvents({ burnTxHash, route })
+  const candidates = events.map(event => ({
+    payer: event.payer,
+    destinationDomain: Number(event.args.destinationDomain),
+    mintRecipient: String(event.args.mintRecipient).toLowerCase(),
+    amount: String(event.args.amount),
+    fee: String(event.args.fee || 0n),
+  }))
   for (const event of events) {
     const recipient = String(event.args.mintRecipient).toLowerCase()
     if (event.payer !== expectedPayer || recipient !== expectedRecipient) continue
-    return { ok: true, receipt: event.receipt, args: event.args }
+    const cctpAmounts = bridgeBurnExpectedCctpAmounts(event.args)
+    const quoteAmount = amount === undefined || amount === null ? null : BigInt(amount)
+    return {
+      ok: true,
+      receipt: event.receipt,
+      args: event.args,
+      cctpAmounts,
+      quoteAmount,
+      quoteAmountMatched: quoteAmount === null || cctpAmounts.includes(quoteAmount),
+    }
   }
-  return { ok: false, reason: 'bridge_burn_proof_mismatch' }
+  return { ok: false, reason: 'bridge_burn_proof_mismatch', candidates }
 }
 
 function hexUint(raw, start, end) {
@@ -1480,16 +1512,18 @@ export function selectCctpMessage(messages, sourceDomain, destinationDomain, bin
   // not the TokenMessenger that receives the forwarded call.
   const expectedMessageSender = binding.route?.source?.router ? getAddress(binding.route.source.router).toLowerCase() : null
   const expectedBurnToken = binding.route?.source?.usdc ? getAddress(binding.route.source.usdc).toLowerCase() : null
-  const expectedAmount = binding.expectedBurnAmount === undefined ? null : BigInt(binding.expectedBurnAmount)
+  const expectedAmounts = binding.expectedBurnAmount === undefined || binding.expectedBurnAmount === null
+    ? null
+    : (Array.isArray(binding.expectedBurnAmount) ? binding.expectedBurnAmount : [binding.expectedBurnAmount]).map(value => BigInt(value))
   const selected = domainCandidates.find(item => {
-    if (!binding.route && !binding.walletAddress && expectedAmount === null) return true
+    if (!binding.route && !binding.walletAddress && expectedAmounts === null) return true
     const body = item.decoded.messageBody
     return item.decoded.sender === expectedSender
       && item.decoded.recipient === expectedRecipient
       && body?.mintRecipient === expectedMintRecipient
       && body?.messageSender === expectedMessageSender
       && body?.burnToken === expectedBurnToken
-      && (expectedAmount === null || body?.amount === expectedAmount)
+      && (expectedAmounts === null || expectedAmounts.some(expectedAmount => body?.amount === expectedAmount))
   })
   // Preserve the first domain-matching decoded message as diagnostics when no
   // candidate binds. This prevents a generic route_unverified response from
@@ -1590,7 +1624,11 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
           mintRecipient: walletAddress ? getAddress(walletAddress).toLowerCase() : null,
           messageSender: route?.source?.router ? getAddress(route.source.router).toLowerCase() : null,
           burnToken: route?.source?.usdc ? getAddress(route.source.usdc).toLowerCase() : null,
-          amount: expectedBurnAmount === undefined ? null : BigInt(expectedBurnAmount).toString(),
+          amount: expectedBurnAmount === undefined || expectedBurnAmount === null
+            ? null
+            : Array.isArray(expectedBurnAmount)
+              ? expectedBurnAmount.map(value => BigInt(value).toString())
+              : BigInt(expectedBurnAmount).toString(),
         },
       }
     }
@@ -1671,11 +1709,14 @@ export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinatio
         messageBody: body,
       }
     }
-    if (expectedBurnAmount !== undefined && (!body.amount || body.amount !== BigInt(expectedBurnAmount))) {
+    const expectedAmounts = expectedBurnAmount === undefined || expectedBurnAmount === null
+      ? null
+      : (Array.isArray(expectedBurnAmount) ? expectedBurnAmount : [expectedBurnAmount]).map(value => BigInt(value))
+    if (expectedAmounts && (!body.amount || !expectedAmounts.some(expectedAmount => body.amount === expectedAmount))) {
       return {
         status: 'rejected', burnTxHash, verified: false,
         reason: 'cctp_message_amount_unverified',
-        expectedBurnAmount: BigInt(expectedBurnAmount).toString(),
+        expectedBurnAmount: expectedAmounts.map(value => value.toString()),
         actualBurnAmount: body?.amount?.toString() || null,
         messageHeader: header,
         messageBody: body,
@@ -2073,7 +2114,7 @@ async function reconcileCompletedBridgeIntent(userId, candidate) {
     destinationDomain: route.destination.domain,
     walletAddress: details.walletAddress,
     route,
-    expectedBurnAmount: BigInt(proof.args.amount) - BigInt(proof.args.fee),
+    expectedBurnAmount: proof.cctpAmounts,
   })
   if (!status?.verified) return false
   const destinationMint = await destinationMintAlreadyProcessed({ status, route })
@@ -2295,7 +2336,7 @@ async function resumePendingBridgeApproval(userId, approval, details, info) {
     destinationDomain: route.destination.domain,
     walletAddress: info.walletAddress,
     route,
-    expectedBurnAmount: BigInt(proof.args.amount) - BigInt(proof.args.fee),
+    expectedBurnAmount: proof.cctpAmounts,
   })
   if (bridgeStatus.status === 'rejected') return { status: 'error', reason: bridgeStatus.reason, burnTxHash }
   if (!bridgeStatus.verified) return { status: 'pending_confirmation', reason: bridgeStatus.reason || 'cctp_message_pending', burnTxHash, messageStatus: bridgeStatus.messageStatus }
@@ -3614,7 +3655,7 @@ export function createMcpServer(userId, context = {}) {
         destinationDomain: route.destination.domain,
         walletAddress: info.walletAddress,
         route,
-        expectedBurnAmount: burnProof.args ? BigInt(burnProof.args.amount) - BigInt(burnProof.args.fee) : undefined,
+        expectedBurnAmount: burnProof.cctpAmounts,
       }, {
         onPending: async () => {
           const queued = await apiPost('/api/auto-mint/register', {
@@ -3774,7 +3815,7 @@ export function createMcpServer(userId, context = {}) {
       destinationDomain: route.destination.domain,
       walletAddress: info.walletAddress,
       route,
-      expectedBurnAmount: BigInt(burnProof.args.amount) - BigInt(burnProof.args.fee),
+      expectedBurnAmount: burnProof.cctpAmounts,
     })
     if (status.status === 'rejected') return { content: [{ type: 'text', text: jsonText({
       ...status,
@@ -3846,7 +3887,7 @@ export function createMcpServer(userId, context = {}) {
         destinationDomain: route.destination.domain,
         walletAddress: info.walletAddress,
         route,
-        expectedBurnAmount: BigInt(proof.args.amount) - BigInt(proof.args.fee),
+        expectedBurnAmount: proof.cctpAmounts,
       })
       if (status.status === 'rejected') return { content: [{ type: 'text', text: jsonText({
         ...status,
