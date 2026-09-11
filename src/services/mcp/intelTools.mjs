@@ -152,8 +152,7 @@ export function registerIntelTools(ctx) {
       ? { ...params, id: normalizeIntelTokenId(params.id) }
       : params
     const path = pathFromParams(normalizedParams)
-    const { getSessionKeyInfo } = await import('../vaultStore.mjs')
-    const sessionInfo = await getSessionKeyInfo(ctx.userId)
+    const sessionInfo = await ctx.resolveMsca()
     const headers = {
       ...(sessionInfo?.active && sessionInfo.walletAddress ? { Authorization: `Bearer ${mintOwnerToken()}`, 'X-Arcox-Owner': sessionInfo.walletAddress } : {}),
       'X-Payment-Id': normalizedParams.paymentId || '',
@@ -579,7 +578,7 @@ export function registerIntelTools(ctx) {
   }, async (params) => {
     if (!params.confirmed) {
       try {
-        const preview = await previewX402Pay(ctx.userId, params.invoiceId)
+        const preview = await previewX402Pay(ctx.userId, params.invoiceId, ctx.boundMscaWalletAddress)
         if (preview.status !== 'preview') {
           return { content: [{ type: 'text', text: jsonText({ ...preview, invoiceId: params.invoiceId }) }] }
         }
@@ -592,7 +591,7 @@ export function registerIntelTools(ctx) {
       return { content: [{ type: 'text', text: jsonText({ status: 'confirmation_required', reason: 'Konfirmasi eksplisit (ya/yes) wajib sebelum bayar x402.' }) }] }
     }
     try {
-      const result = await executeX402Pay(ctx.userId, params.invoiceId)
+      const result = await executeX402Pay(ctx.userId, params.invoiceId, ctx.boundMscaWalletAddress)
       return { content: [{ type: 'text', text: jsonText(result) }] }
     } catch (e) {
       return { content: [{ type: 'text', text: jsonText({ status: 'error', executed: false, error: e?.message || 'x402 payment error' }) }] }

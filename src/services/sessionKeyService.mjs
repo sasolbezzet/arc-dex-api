@@ -1914,8 +1914,8 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
  * treasury. Full AMM routing via MSCA needs the swap router calldata. Upgrade
  * by passing prepared calldata from /api/eoa-swap-prepare.
  */
-export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, preparedCalldata, preparedCalls, chainKey, agentKey, dailyLimit }) {
-  const gate = canExecuteViaSession(userId, amountIn, chainKey, { agentKey, dailyLimit, limitsOwner: arguments?.[0]?.limitsOwner })
+export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, preparedCalldata, preparedCalls, chainKey, agentKey, dailyLimit, limitsOwner }) {
+  const gate = canExecuteViaSession(userId, amountIn, chainKey, { agentKey, dailyLimit, limitsOwner })
   if (!gate.ok) return { status: 'denied', reason: gate.reason }
 
   const chain = chainKey || gate.entry?.chain || 'arc-testnet'
@@ -1930,7 +1930,7 @@ export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, prep
       to: getAddress(call.to),
       data: call.data,
       value: call.value || 0n,
-    })), { paymaster: true, chainKey: chain })
+    })), { paymaster: true, chainKey: chain, limitsOwner })
     if (executed?.status === 'success' && agentKey) {
       recordSpend(agentKey, parseHumanAmount(amountIn) || 0)
     }

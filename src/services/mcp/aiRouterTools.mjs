@@ -21,7 +21,7 @@ export function registerAiRouterTools(ctx) {
     address: z.string().describe('Wallet address (0x...)'),
   }, async (params) => {
     try {
-      const sessionInfo = await (await import('../vaultStore.mjs')).getSessionKeyInfo(ctx.userId)
+      const sessionInfo = await ctx.resolveMsca()
       const r = await fetch(`${backendUrl}/api/intel/report/address/${encodeURIComponent(params.address)}`, { headers: { ...(sessionInfo?.active && sessionInfo.walletAddress ? { Authorization: `Bearer ${mintOwnerToken()}`, 'X-Arcox-Owner': sessionInfo.walletAddress } : {}) } })
       const data = await r.json()
       return { content: [{ type: 'text', text: jsonText({ ...data, safeNextStep: data?.paymentRequired || data?.invoice ? 'Invoice x402 dibuat. Pay via arcox_x402_pay_invoice (tanpa confirmed) untuk preview, lalu retry dengan paymentId.' : 'Report tersedia. Call arcox_intel_execute_wallet_report dengan paymentId jika belum ter-unlock.' }) }] }
@@ -35,7 +35,7 @@ export function registerAiRouterTools(ctx) {
     paymentId: z.string().optional().describe('x402 paymentId if already paid'),
   }, async (params) => {
     try {
-      const sessionInfo = await (await import('../vaultStore.mjs')).getSessionKeyInfo(ctx.userId)
+      const sessionInfo = await ctx.resolveMsca()
       const r = await fetch(`${backendUrl}/api/intel/report/address/${encodeURIComponent(params.address)}`, { headers: { ...(sessionInfo?.active && sessionInfo.walletAddress ? { Authorization: `Bearer ${mintOwnerToken()}`, 'X-Arcox-Owner': sessionInfo.walletAddress } : {}), 'X-Payment-Id': params.paymentId || '' } })
       const data = await r.json()
       if (r.status === 402 || data?.paymentRequired) return { content: [{ type: 'text', text: jsonText({ paymentRequired: true, ...data, safeNextStep: 'Pay via arcox_x402_pay_invoice (tanpa confirmed) untuk preview, lalu retry tool ini dengan paymentId.' }) }] }

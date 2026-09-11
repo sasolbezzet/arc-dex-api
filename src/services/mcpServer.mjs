@@ -2340,7 +2340,7 @@ async function resumePendingBridgeApproval(userId, approval, details, info) {
   })
   if (bridgeStatus.status === 'rejected') return { status: 'error', reason: bridgeStatus.reason, burnTxHash }
   if (!bridgeStatus.verified) return { status: 'pending_confirmation', reason: bridgeStatus.reason || 'cctp_message_pending', burnTxHash, messageStatus: bridgeStatus.messageStatus }
-  const mint = await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress, userId, approvalId: approval.id })
+  const mint = await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress, userId, sessionLookupId: info.walletAddress, approvalId: approval.id })
   if (mint.success) {
     return {
       status: 'success',
@@ -2361,7 +2361,7 @@ async function resumePendingBridgeApproval(userId, approval, details, info) {
   }
 }
 
-async function mintDestinationViaMsca({ status, route, walletAddress, userId, approvalId: existingApprovalId = null, allowHashlessRecovery = false }) {
+async function mintDestinationViaMsca({ status, route, walletAddress, userId, sessionLookupId = '', approvalId: existingApprovalId = null, allowHashlessRecovery = false }) {
   if (!status?.verified || !status.message || !status.attestation) return { success: false, error: 'Attestation belum ready' }
   const destinationKey = {
     Arc_Testnet: 'arc-testnet',
@@ -2400,7 +2400,7 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
       destinationMintLocks.delete(lockKey)
     } else {
       const { getUserOpStatus } = await import('./sessionKeyService.mjs')
-      const live = await getUserOpStatus(existingLock.userId || userId, existingLock.userOpHash, existingLock.chainKey)
+      const live = await getUserOpStatus(existingLock.userId || walletAddress, existingLock.userOpHash, existingLock.chainKey)
       if (live.status === 'success') {
         destinationMintLocks.delete(lockKey)
         return { success: true, txHash: live.txHash, userOpHash: existingLock.userOpHash, explorerUrl: live.explorerUrl }
@@ -2429,7 +2429,7 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
       destinationMintLocks.delete(lockKey)
     } else {
       const { getUserOpStatus } = await import('./sessionKeyService.mjs')
-      const live = await getUserOpStatus(userId, persisted.userOpHash, persisted.chainKey)
+      const live = await getUserOpStatus(walletAddress, persisted.userOpHash, persisted.chainKey)
       if (live.status === 'success') {
         await markBridgePendingResolved(userId, persisted, 'success', { txHash: live.txHash, explorerUrl: live.explorerUrl, userOpHash: persisted.userOpHash })
         return { success: true, txHash: live.txHash, userOpHash: persisted.userOpHash, explorerUrl: live.explorerUrl, idempotent: true }
@@ -2594,14 +2594,20 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, ap
 // MCP server is MSCA-ONLY: only session-key (MSCA) auto-executes. Circle proxy
 // wallet and EOA are explicitly NOT available to remote ChatGPT/Claude, per
 // security policy (remote agents must only use the locked passkey MSCA).
-async function canAutoExecute(userId, source, amount, chainKey) {
+async function canAutoExecute(userId, source, amount, chainKey, sessionLookupId = userId, agentKey = '', dailyLimit = 0) {
   if (source !== 'session') {
     return { ok: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Circle proxy dan EOA tidak diizinkan untuk agent remote.' }
   }
   try {
     const { canExecuteViaSession } = await import('./sessionKeyService.mjs')
-    const gate = canExecuteViaSession(userId, amount, chainKey)
-    return gate
+    // `userId` remains the owner/limits identity; the explicit MSCA is the
+    // signer/session lookup identity for bound MCP tokens. This prevents a
+    // sibling agent's owner alias from selecting the wrong delegate wallet.
+    return canExecuteViaSession(sessionLookupId, amount, chainKey, {
+      agentKey,
+      dailyLimit,
+      limitsOwner: userId,
+    })
   } catch { return { ok: false, reason: 'session_error' } }
 }
 
@@ -2890,14 +2896,35 @@ function invoiceAmountUnits(invoice) {
   return BigInt(whole) * 1_000_000n + BigInt((fraction + '000000').slice(0, 6))
 }
 
-async function unlockX402Resource(userId, invoice) {
+export function resolveMcpSessionLookupId(userId, boundMscaWalletAddress = '') {
+  return String(boundMscaWalletAddress || '').trim() || String(userId || '').trim()
+}
+
+export function x402AgentWalletMismatch(userId, invoice, boundMscaWalletAddress = '') {
+  const expected = String(boundMscaWalletAddress || '').trim().toLowerCase()
+  const invoiceOwner = String(invoice?.ownerWallet || '').trim().toLowerCase()
+  if (expected && invoiceOwner !== expected) {
+    return {
+      status: 'rejected',
+      executed: false,
+      requiresUserConfirmation: false,
+      reason: 'agent_wallet_context_mismatch',
+      payer: expected,
+      invoiceOwner: invoice?.ownerWallet || null,
+      message: 'Invoice x402 bukan milik Agent Wallet MSCA pada koneksi MCP ini.',
+    }
+  }
+  return null
+}
+
+async function unlockX402Resource(userId, invoice, boundMscaWalletAddress = '') {
   const resourcePath = String(invoice.resource || '')
   if (!resourcePath.startsWith('/api/')) return null
   if (!invoice.paymentId) return null
   try {
     const r = await fetch(`${BACKEND_URL}${resourcePath}`, {
       headers: {
-        Authorization: `Bearer ${mintOwnerToken(userId)}`,
+        Authorization: `Bearer ${mintOwnerToken(boundMscaWalletAddress || invoice.ownerWallet || userId)}`,
         'X-Payment-Id': invoice.paymentId,
         ...(invoice.ownerWallet ? { 'X-Arcox-Owner': invoice.ownerWallet } : {}),
       },
@@ -2909,11 +2936,13 @@ async function unlockX402Resource(userId, invoice) {
 }
 
 // Estimate amount + build memo calldata. Preview only — no funds moved.
-async function previewX402Pay(userId, invoiceId) {
+async function previewX402Pay(userId, invoiceId, boundMscaWalletAddress = '') {
   let invoice = await getX402Invoice(invoiceId)
   if (!invoice) throw new Error('x402 invoice not found')
+  const mismatch = x402AgentWalletMismatch(userId, invoice, boundMscaWalletAddress)
+  if (mismatch) return mismatch
   if (invoice.status === 'paid') {
-    const unlocked = await unlockX402Resource(userId, invoice)
+    const unlocked = await unlockX402Resource(userId, invoice, boundMscaWalletAddress)
     return { status: 'paid', invoice, alreadyPaid: true, unlockedResult: unlocked }
   }
   if (invoice.status === 'expired') {
@@ -2921,7 +2950,7 @@ async function previewX402Pay(userId, invoiceId) {
   }
   if (invoice.asset !== 'USDC') throw new Error('Hanya invoice USDC yang didukung x402.')
   const { getSessionKeyInfo } = await import('./vaultStore.mjs')
-  const info = await getSessionKeyInfo(userId)
+  const info = await getSessionKeyInfo(boundMscaWalletAddress || userId)
   if (!info || !info.active) {
     return { status: 'session_required', message: 'Session key MSCA belum aktif. User harus setup Agent Wallet + session key dulu di Plugin page.' }
   }
@@ -2953,23 +2982,25 @@ async function previewX402Pay(userId, invoiceId) {
 }
 
 // Execute a confirmed x402 payment from the MSCA. Moves funds.
-async function executeX402Pay(userId, invoiceId) {
+async function executeX402Pay(userId, invoiceId, boundMscaWalletAddress = '') {
   const invoice = await getX402Invoice(invoiceId)
   if (!invoice) throw new Error('x402 invoice not found')
+  const mismatch = x402AgentWalletMismatch(userId, invoice, boundMscaWalletAddress)
+  if (mismatch) throw Object.assign(new Error(mismatch.message), { code: mismatch.reason, context: mismatch })
   if (invoice.status === 'paid') {
-    const unlocked = await unlockX402Resource(userId, invoice)
+    const unlocked = await unlockX402Resource(userId, invoice, boundMscaWalletAddress)
     return { status: 'paid', invoice, alreadyPaid: true, unlockedResult: unlocked }
   }
   if (invoice.asset !== 'USDC') throw new Error('Hanya invoice USDC yang didukung x402.')
   if (!invoice.recipient || !/^0x[0-9a-fA-F]{40}$/.test(invoice.recipient)) throw new Error('x402 recipient is not configured')
-  const info = await (await import('./vaultStore.mjs')).getSessionKeyInfo(userId)
+  const info = await (await import('./vaultStore.mjs')).getSessionKeyInfo(boundMscaWalletAddress || userId)
   if (!info?.active || info.walletAddress?.toLowerCase() !== String(invoice.ownerWallet || '').toLowerCase()) {
     throw new Error('x402 invoice payer does not match the active MSCA')
   }
   const amountUnits = invoiceAmountUnits(invoice)
 
   const { executeViaSession } = await import('./sessionKeyService.mjs')
-  const result = await executeViaSession(userId, [{
+  const result = await executeViaSession(info.walletAddress, [{
     to: X402_ARC_USDC,
     abi: X402_TRANSFER_ABI,
     functionName: 'transfer',
@@ -2989,7 +3020,7 @@ async function executeX402Pay(userId, invoiceId) {
     await new Promise(res => setTimeout(res, 2000))
   }
   const unlocked = (latest.status === 'paid')
-    ? await unlockX402Resource(userId, latest).catch(() => null)
+    ? await unlockX402Resource(userId, latest, boundMscaWalletAddress).catch(() => null)
     : null
   return {
     status: latest.status === 'paid' ? 'paid' : 'settlement_pending',
@@ -3007,6 +3038,9 @@ async function executeX402Pay(userId, invoiceId) {
 export function createMcpServer(userId, context = {}) {
   const requestAgent = context.agent || resolveAgentForUser(userId)
   const boundMscaWalletAddress = context.boundMscaWalletAddress || ''
+  // A bound MCP token carries an explicit signer identity. Keep owner and signer
+  // separate: owner scopes vault/audit data, while the MSCA scopes UserOps.
+  const sessionLookupId = resolveMcpSessionLookupId(userId, boundMscaWalletAddress)
   // Per-agent identity (Fase 2/3): composite key + optional daily limit from
   // the OAuth clientId so limits/audit are scoped to one agent.
   const clientId = context.clientId || ''
@@ -3236,7 +3270,7 @@ export function createMcpServer(userId, context = {}) {
       walletAddress: activeSession.walletAddress,
     })
     if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
-    const gate = await canAutoExecute(userId, source, params.amountIn)
+    const gate = await canAutoExecute(userId, source, params.amountIn, 'arc-testnet', activeSession.walletAddress, agentKey, dailyLimit)
     if (!gate.ok) {
       return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
     }
@@ -3264,7 +3298,7 @@ export function createMcpServer(userId, context = {}) {
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: preparedResult.reason || 'swap_calldata_unavailable', message }) }] }
       }
       const { swapViaSession } = await import('./sessionKeyService.mjs')
-      const result = await swapViaSession(userId, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: 'arc-testnet', agentKey, dailyLimit })
+      const result = await swapViaSession(activeSession.walletAddress, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: 'arc-testnet', agentKey, dailyLimit, limitsOwner: userId })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: requestAgent, agentClientId: clientId, action: 'swap', amount: params.amountIn, token: params.tokenIn,
@@ -3454,7 +3488,7 @@ export function createMcpServer(userId, context = {}) {
     if (!destinationPreflight.ok) {
       return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: destinationPreflight.reason, message: destinationPreflight.message || 'Destination MSCA belum siap. Tidak ada source burn.' }) }] }
     }
-    const gate = await canAutoExecute(userId, source, params.amount, executionChainKey(params.fromChain))
+    const gate = await canAutoExecute(userId, source, params.amount, executionChainKey(params.fromChain), info.walletAddress, agentKey, dailyLimit)
 
     if (!gate.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, message: gate.message || 'Session key MSCA tidak dapat mengeksekusi bridge.' }) }] }
     try {
@@ -3500,7 +3534,7 @@ export function createMcpServer(userId, context = {}) {
         const storedHash = storedBurnHash || storedApprovalHash
         if (storedHash) {
           const { getUserOpStatus } = await import('./sessionKeyService.mjs')
-          const liveSource = await getUserOpStatus(userId, storedHash, executionChainKey(route.fromKey))
+          const liveSource = await getUserOpStatus(info.walletAddress, storedHash, executionChainKey(route.fromKey))
           if (liveSource.status === 'pending_confirmation') {
             return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, sourceSubmitted: Boolean(storedBurnHash), approvalSubmitted: Boolean(storedApprovalHash), approvalId, userOpHash: storedHash, sourceApprovalUserOpHash: storedApprovalHash || null, sourceUserOpHash: storedBurnHash || null, safeToRetry: false, reason: storedBurnHash ? 'source_user_operation_pending' : 'source_approval_pending', message: 'Source UserOperation masih pending. Jangan mengirim approval atau burn ulang.' }) }] }
           }
@@ -3559,7 +3593,7 @@ export function createMcpServer(userId, context = {}) {
       if (!approvalConfirmed) {
         let approvalResult
         try {
-          approvalResult = await executeViaSession(userId, [approveCall], executionOptions)
+          approvalResult = await executeViaSession(info.walletAddress, [approveCall], executionOptions)
         } catch (submissionError) {
           const submittedApprovalUserOpHash = submissionError?.userOpHash || null
           const submittedApprovalExplorerUrl = submissionError?.explorerUrl || null
@@ -3605,7 +3639,7 @@ export function createMcpServer(userId, context = {}) {
       // bridgeUsdcWithFee sequence exactly.
       let result
       try {
-        result = await executeViaSession(userId, [burnCall], executionOptions)
+        result = await executeViaSession(info.walletAddress, [burnCall], executionOptions)
       } catch (submissionError) {
         // executeViaSession may throw after Circle accepted the operation
         // (for example, receipt indexing failed). Preserve that hash as a
@@ -3698,7 +3732,7 @@ export function createMcpServer(userId, context = {}) {
       }
       let auditPending = false
       const mint = bridgeStatus.verified
-        ? await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress, userId, approvalId }).catch(error => ({ success: false, error: error?.message || 'Destination MSCA mint request failed', detail: String(error?.message || error).slice(0, 500), userOpHash: error?.userOpHash || null, explorerUrl: error?.explorerUrl || null, approvalId, safeToRetry: false }))
+        ? await mintDestinationViaMsca({ status: bridgeStatus, route, walletAddress: info.walletAddress, userId, sessionLookupId: info.walletAddress, approvalId }).catch(error => ({ success: false, error: error?.message || 'Destination MSCA mint request failed', detail: String(error?.message || error).slice(0, 500), userOpHash: error?.userOpHash || null, explorerUrl: error?.explorerUrl || null, approvalId, safeToRetry: false }))
         : { success: false, error: 'Attestation belum ready', approvalId, safeToRetry: false }
       approvalId = mint.approvalId || approvalId
       if (!mint.success && mint.userOpHash && mint.safeToRetry === false) {
@@ -3931,7 +3965,7 @@ export function createMcpServer(userId, context = {}) {
           error: null, message: 'Destination mint sudah selesai sebelumnya. Tidak mengirim UserOperation ulang.',
         }) }] }
       }
-      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress, userId, approvalId: bridgeAuditIntent?.approval?.id || null, allowHashlessRecovery: true })
+      const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress, userId, sessionLookupId: info.walletAddress, approvalId: bridgeAuditIntent?.approval?.id || null, allowHashlessRecovery: true })
       if (mint.success && bridgeAuditIntent) {
         await markBridgePendingResolved(userId, bridgeAuditIntent, 'success', {
           ...(mint.txHash ? { txHash: mint.txHash } : {}),
@@ -4024,7 +4058,7 @@ export function createMcpServer(userId, context = {}) {
     }
     const activeSession = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!activeSession) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }
-    const gate = await canAutoExecute(userId, source, params.amount, fromChain)
+    const gate = await canAutoExecute(userId, source, params.amount, fromChain, activeSession.walletAddress, agentKey, dailyLimit)
     if (!gate.ok) {
       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'rejected', executed: false, action: 'send', walletType: 'MSCA', reason: gate.reason, chain: fromChain, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
     }
@@ -4032,7 +4066,7 @@ export function createMcpServer(userId, context = {}) {
     if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
     try {
       const { sendViaSession } = await import('./sessionKeyService.mjs')
-      const result = await sendViaSession(userId, params.to, params.amount, token, { chainKey: fromChain, agentKey, agentLimit: dailyLimit })
+      const result = await sendViaSession(activeSession.walletAddress, params.to, params.amount, token, { chainKey: fromChain, agentKey, agentLimit: dailyLimit, limitsOwner: userId })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: requestAgent, agentClientId: clientId, action: 'send', amount: params.amount, token,
@@ -4109,7 +4143,7 @@ export function createMcpServer(userId, context = {}) {
   registerTool('arcox_session_status', 'Check if Agent Session Key (MSCA) is active for the user. Returns wallet address, delegate address, and whether session signing is available.', {}, async () => {
     try {
       const { getSessionKeyInfo } = await import('./vaultStore.mjs')
-      const sessionOwner = boundMscaWalletAddress || userId
+      const sessionOwner = sessionLookupId
       const info = await getSessionKeyInfo(sessionOwner)
       // Recording connection time here lets auto-detect choose the MSCA this user
       // most recently connected via Claude/agent — no hardcoded wallet. When OAuth
@@ -4206,7 +4240,7 @@ export function createMcpServer(userId, context = {}) {
     if (approvalOnlySource && a.userOpHash && ['pending_signature', 'pending_confirmation'].includes(a.status)) {
       try {
         const { getUserOpStatus } = await import('./sessionKeyService.mjs')
-        const liveApproval = await getUserOpStatus(userId, pendingSourceOperation.hash, details.sourceChainKey || details.fromChain)
+        const liveApproval = await getUserOpStatus(sessionLookupId, pendingSourceOperation.hash, details.sourceChainKey || details.fromChain)
         if (liveApproval.status === 'success') {
           const nextDetails = { ...details, settlementPhase: 'source_approval_confirmed', settlementStatus: 'pending_confirmation' }
           const { updateApprovalStatus, listApprovals } = await import('./vaultStore.mjs')
@@ -4256,7 +4290,7 @@ export function createMcpServer(userId, context = {}) {
         const trackedChainKey = details?.destinationUserOpHash
           ? details.destinationChainKey
           : (details?.sourceChainKey || details?.fromChain)
-        const liveStatus = await getUserOpStatus(userId, a.userOpHash, trackedChainKey)
+        const liveStatus = await getUserOpStatus(sessionLookupId, a.userOpHash, trackedChainKey)
         const isBridge = a.action === 'bridge' && Boolean(details?.fromChain && details?.toChain)
         let nextStatus = liveStatus.status
         let nextExtra = { txHash: liveStatus.txHash, explorerUrl: liveStatus.explorerUrl, userOpHash: liveStatus.txHash ? a.userOpHash : undefined }
@@ -4266,7 +4300,7 @@ export function createMcpServer(userId, context = {}) {
           const resumed = await resumePendingBridgeApproval(userId, a, {
             ...details,
             burnTxHash: details.burnTxHash || liveStatus.txHash,
-          }, await (await import('./vaultStore.mjs')).getSessionKeyInfo(userId))
+          }, await (await import('./vaultStore.mjs')).getSessionKeyInfo(sessionLookupId))
           if (resumed.status === 'success') {
             nextStatus = 'success'
             nextExtra = {
@@ -4317,11 +4351,16 @@ export function createMcpServer(userId, context = {}) {
     apiPost: (path, body, owner) => apiPost(path, body, owner),
     backendUrl: BACKEND_URL,
     fetch,
-    mintOwnerToken: () => mintOwnerToken(userId),
+    mintOwnerToken: (address = boundMscaWalletAddress || userId) => mintOwnerToken(address),
     getToolHandler: (name) => server._registeredTools?.[name]?.handler,
     userId,
+    boundMscaWalletAddress,
+    sessionLookupId,
     agentKey,
-    markX402ServiceOutcome, previewX402Pay, executeX402Pay, getX402Invoice, publicInvoice,
+    markX402ServiceOutcome,
+    previewX402Pay: (owner, invoiceId) => previewX402Pay(owner, invoiceId, boundMscaWalletAddress),
+    executeX402Pay: (owner, invoiceId) => executeX402Pay(owner, invoiceId, boundMscaWalletAddress),
+    getX402Invoice, publicInvoice,
   }
   registerIntelTools(toolCtx)
   registerDocsCatalogTools(toolCtx)
@@ -4387,7 +4426,7 @@ export async function mcpHttpHandler(req, res) {
   let sessionKeyTouched = false
   try {
     const { touchSessionKey } = await import('./sessionKeyService.mjs')
-    sessionKeyTouched = Boolean(touchSessionKey(auth.userId))
+    sessionKeyTouched = Boolean(touchSessionKey(auth.mscaWalletAddress || auth.userId))
   } catch {
     // A read-only MCP request must still work when no MSCA session is linked.
   }
