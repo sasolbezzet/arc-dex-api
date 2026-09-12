@@ -65,6 +65,26 @@ test('passkey OAuth verification refuses to mint a code without owner-wallet pro
   assert.equal(capture.body.error, 'owner_and_agent_sessions_required')
 })
 
+test('existing OAuth passkey approval can recover its durable owner without a second SIWE proof', async () => {
+  await withSessionStore({}, {}, async () => {
+    const { resolvePasskeyApprovalOwner } = await import('../src/services/mcpServer.mjs?durable-owner-' + Date.now() + '-' + Math.random())
+    const { bindAgent } = await import('../src/services/sessionKeyService.mjs')
+    const binding = bindAgent('client-existing|' + EOA.toLowerCase(), EOA, MSCA)
+    assert.ok(binding)
+    const result = await resolvePasskeyApprovalOwner({ clientId: 'client-existing', mscaWalletAddress: MSCA })
+    assert.deepEqual(result, { ok: true, ownerAddress: EOA.toLowerCase(), inferred: true })
+  })
+})
+
+test('new OAuth passkey approval still requires explicit owner proof', async () => {
+  await withSessionStore({}, {}, async () => {
+    const { resolvePasskeyApprovalOwner } = await import('../src/services/mcpServer.mjs?new-owner-' + Date.now() + '-' + Math.random())
+    const result = await resolvePasskeyApprovalOwner({ clientId: 'client-new', mscaWalletAddress: MSCA })
+    assert.equal(result.ok, false)
+    assert.equal(result.error, 'owner_authentication_required')
+  })
+})
+
 test('MCP wallet balances are bound to the active MSCA and expose four chains', async () => {
   const previousFetch = globalThis.fetch
   const previousBridgeFlag = process.env.ENABLE_MSCA_CCTP_BRIDGE

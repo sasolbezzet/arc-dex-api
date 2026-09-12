@@ -635,6 +635,8 @@ import { createPublicClient, decodeEventLog, defineChain, encodeFunctionData, fa
 
 // Bind the verified SIWE identity to an already-active passkey session only
 // when the browser proves control of that exact MSCA with its vault token.
+// Existing durable client/wallet bindings may recover their owner without a
+// second SIWE ceremony; new bindings still require explicit owner proof.
 // This keeps MCP MSCA-only while allowing Claude/ChatGPT's EOA identity to
 // resolve the Agent Wallet after the user explicitly approves OAuth.
 export async function bindMcpIdentityToActiveSession({ userId, mscaWalletAddress, mscaSessionToken, clientId } = {}) {
@@ -754,31 +756,43 @@ export async function siweVerifyHandler(req, res) {
 }
 
 // ── Passkey-only OAuth verify + issue auth code (1 signature, no SIWE) ──
-// The passkey/MSCA session token proves the selected Agent Wallet, while the
-// connected owner-wallet session proves the EOA that is authorizing the MCP
-// binding. Both proofs are mandatory for every Plugin OAuth approval, including
-// re-login of an existing agent; the server never infers ownership from a
-// wallet-wide alias or a "latest active" session.
-export async function resolvePasskeyApprovalOwner({ ownerAddress, ownerSessionToken } = {}) {
+// The passkey/MSCA session token proves the selected Agent Wallet. A new
+// binding additionally needs the connected owner-wallet session; an existing
+// exact clientId+MSCA binding may recover its durable owner without repeating
+// SIWE. The server never infers ownership from a wallet-wide/latest session.
+export async function resolvePasskeyApprovalOwner({ ownerAddress, ownerSessionToken, clientId = '', mscaWalletAddress = '' } = {}) {
   const suppliedAddress = String(ownerAddress || '').trim()
   const suppliedToken = String(ownerSessionToken || '').trim()
 
-  if (!suppliedAddress || !suppliedToken) {
-    return { ok: false, error: 'owner_authentication_required' }
-  }
-
-  try {
-    const { validateSession } = await import('./vaultStore.mjs')
-    // Accept either the frontend owner HMAC token or a dedicated owner vault
-    // session, but never an Agent Wallet token as owner proof.
-    const verifiedOwner = verifyOwnerToken(suppliedToken) || validateSession(suppliedToken) || ''
-    if (!verifiedOwner || getAddress(verifiedOwner) !== getAddress(suppliedAddress)) {
+  if (suppliedAddress && suppliedToken) {
+    try {
+      const { validateSession } = await import('./vaultStore.mjs')
+      // Accept either the frontend owner HMAC token or a dedicated owner vault
+      // session, but never an Agent Wallet token as owner proof.
+      const verifiedOwner = verifyOwnerToken(suppliedToken) || validateSession(suppliedToken) || ''
+      if (!verifiedOwner || getAddress(verifiedOwner) !== getAddress(suppliedAddress)) {
+        return { ok: false, error: 'owner_authentication_required' }
+      }
+      return { ok: true, ownerAddress: getAddress(verifiedOwner).toLowerCase(), inferred: false }
+    } catch {
       return { ok: false, error: 'owner_authentication_required' }
     }
-    return { ok: true, ownerAddress: getAddress(verifiedOwner).toLowerCase(), inferred: false }
-  } catch {
-    return { ok: false, error: 'owner_authentication_required' }
   }
+
+  // Existing-agent recovery: the fresh passkey token proves the MSCA, and the
+  // exact durable clientId+MSCA binding proves its historical owner. This path
+  // is intentionally narrow: no binding means no inferred owner, so a new
+  // Agent Wallet or first OAuth connection still requires SIWE.
+  if (clientId && mscaWalletAddress) {
+    try {
+      const binding = findAgentBindingByClientAndWallet(String(clientId).trim(), getAddress(mscaWalletAddress).toLowerCase())
+      const owner = String(binding?.ownerAddress || '').toLowerCase()
+      if (/^0x[0-9a-f]{40}$/.test(owner) && owner !== getAddress(mscaWalletAddress).toLowerCase()) {
+        return { ok: true, ownerAddress: owner, inferred: true }
+      }
+    } catch { /* fail closed below */ }
+  }
+  return { ok: false, error: 'owner_authentication_required' }
 }
 
 export async function passkeyVerifyHandler(req, res) {
