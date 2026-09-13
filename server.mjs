@@ -376,11 +376,11 @@ app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
   try {
     const { mode = 'Login', username = '', agentKey = '', ownerAddress = '', ownerSessionToken = '' } = req.body || {}
     if (mode !== 'Login' && mode !== 'Register') return res.status(400).json({ error: 'Invalid passkey mode' })
-    // Existing-agent Login is intentionally passkey-first. The browser has
-    // already performed its silent connected-wallet preflight; owner SIWE is
-    // resolved after WebAuthn by the activation/final OAuth step. Registration
-    // still needs owner proof before creating a new wallet/binding.
-    if (mode === 'Register' || (ownerAddress || ownerSessionToken)) {
+    // Both Login and Register options are safe to issue before SIWE: this
+    // endpoint only creates a single-use WebAuthn challenge and does not bind
+    // an owner or activate a wallet. Register's owner proof is required later
+    // by passkey-login, after navigator.credentials.create() has completed.
+    if (ownerAddress || ownerSessionToken) {
       const ownerProof = await verifyPluginOwnerProof({ ownerAddress, ownerSessionToken })
       if (!ownerProof.ok) {
         return res.status(403).json({ code: 'owner_session_required', error: 'Hubungkan wallet utama terlebih dahulu sebelum memulai passkey Agent Wallet.' })

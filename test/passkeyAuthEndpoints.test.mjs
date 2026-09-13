@@ -107,7 +107,7 @@ async function post(base, path, body) {
   return { response, body: await response.json() }
 }
 
-test('Existing-agent login options do not require SIWE, while register still does', async () => {
+test('Passkey options are issued before SIWE, while registration verification still requires owner proof', async () => {
   await withHttp(async ({ base, circleRequests }) => {
     const loginOptions = await post(base, '/api/auth/passkey-options', {
       mode: 'Login',
@@ -122,9 +122,10 @@ test('Existing-agent login options do not require SIWE, while register still doe
       agentKey: AGENT_KEY,
       username: 'test-agent-registration',
     })
-    assert.equal(registerOptions.response.status, 403)
-    assert.equal(registerOptions.body.code, 'owner_session_required')
-    assert.equal(circleRequests.length, 1)
+    assert.equal(registerOptions.response.status, 200, JSON.stringify(registerOptions.body))
+    assert.equal(registerOptions.body.success, true)
+    assert.ok(registerOptions.body.flowId)
+    assert.equal(circleRequests.length, 2)
   })
 })
 
