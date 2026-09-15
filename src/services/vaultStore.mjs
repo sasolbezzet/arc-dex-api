@@ -470,6 +470,8 @@ export async function getSessionKeyInfo(owner) {
       active: entry.active === true,
       pendingAuthorization: entry.pendingAuthorization === true,
       authorizationUserOpHash: entry.authorizationUserOpHash || '',
+      ...(entry.revokeReason ? { revokeReason: entry.revokeReason } : {}),
+      ...(entry.manualRevokePending ? { manualRevokePending: true } : {}),
       createdAt: entry.createdAt,
       activatedAt: entry.activatedAt,
       lastUsedAt: entry.lastUsedAt,
@@ -478,8 +480,10 @@ export async function getSessionKeyInfo(owner) {
         ? 'active'
         : entry.revokeReason === 'inactivity_24h'
           ? 'inactivity_24h'
-          : entry.revokeReason === 'manual'
+          : ['manual', 'agent_manual'].includes(entry.revokeReason)
             ? 'manual_revoke'
+          : ['agent_deleted', 'clear'].includes(entry.revokeReason)
+            ? 'agent_deleted'
       : entry.lastAuthorizationOutcome === 'failed'
         ? 'authorization_failed'
         : entry.lastAuthorizationOutcome === 'unknown'

@@ -685,6 +685,18 @@ app.post('/api/session/reactivate', apiLimiter, requireAuth, async (req, res) =>
 app.get('/api/session/status', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { getSessionKeyInfo } = await import('./src/services/vaultStore.mjs')
+    const agentKey = String(req.query.agentKey || '').trim()
+    // Binding state is queried for the exact agent namespace. A wallet session
+    // can be active while one agent binding is revoked or cleared; the frontend
+    // must not confuse wallet-level activity with agent-level readiness.
+    let agentBindingFound
+    let agentBindingActive
+    if (agentKey) {
+      const { findAgentBindingForAgent } = await import('./src/services/sessionKeyService.mjs')
+      const candidate = findAgentBindingForAgent(agentKey, req.owner)
+      agentBindingFound = Boolean(candidate)
+      agentBindingActive = candidate ? candidate.active !== false : false
+    }
     // Local store is the execution authority: auth-gating reads never touch
     // the network. This display endpoint additionally merges the Supabase
     // metadata snapshot (Supabase-primary): the local record always wins for
@@ -694,7 +706,17 @@ app.get('/api/session/status', apiLimiter, requireAuth, async (req, res) => {
     const { readSessionMetadata } = await import('./src/services/supabasePersistence.mjs')
     const lookup = String(local?.walletAddress || req.owner).toLowerCase()
     const { metadata, source, mismatch } = await readSessionMetadata(lookup, local)
-    res.json({ success: true, session: metadata || local, metadataSource: source, metadataCompared: Boolean(local), metadataMismatch: Boolean(mismatch) })
+    const session = metadata || local
+    res.json({
+      success: true,
+      session: session ? {
+        ...session,
+        ...(agentKey ? { agentBindingFound, agentBindingActive, agentBindingReason: agentBindingFound ? (agentBindingActive ? 'active' : 'revoked') : 'cleared' } : {}),
+      } : (agentKey ? { agentBindingFound, agentBindingActive, agentBindingReason: agentBindingFound ? (agentBindingActive ? 'active' : 'revoked') : 'cleared' } : session),
+      metadataSource: source,
+      metadataCompared: Boolean(local),
+      metadataMismatch: Boolean(mismatch),
+    })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
