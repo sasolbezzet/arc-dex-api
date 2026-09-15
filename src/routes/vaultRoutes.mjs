@@ -109,7 +109,10 @@ vault.delete('/credentials/:id', requireAuth, (req, res) => {
 
 // ── Limits ──
 vault.get('/limits', requireAuth, (req, res) => {
-  res.json({ limits: getLimits(req.owner) })
+  // Return the authenticated identity so the browser can reject a valid but
+  // stale owner token belonging to a different connected wallet. HTTP 200
+  // alone is not sufficient proof when multiple EOA sessions exist in storage.
+  res.json({ ownerAddress: req.owner, limits: getLimits(req.owner) })
 })
 
 vault.post('/limits', requireAuth, (req, res) => {
@@ -495,8 +498,22 @@ vault.post('/agents/:agentKey/connection-token', requireAuth, async (req, res) =
 // delete removes the dashboard binding. Owner-only.
 vault.delete('/agents/:agentKey', requireAuth, async (req, res) => {
   try {
-    const agentKey = String(req.params.agentKey || '')
-    const binding = getAgentBinding(agentKey)
+    const requestedAgentKey = String(req.params.agentKey || '')
+    let agentKey = requestedAgentKey
+    let binding = getAgentBinding(agentKey)
+    // The dashboard returns canonical OAuth keys, but installations upgraded
+    // from the legacy namespace can still receive a stale `oauth:<clientId>`
+    // row from an older token/cache. Resolve only within the authenticated
+    // owner's visible bindings; never search globally or by client ID alone.
+    if (!binding) {
+      const requestedClientId = agentClientIdFromBinding(requestedAgentKey)
+      const visible = listAgentBindingsForIdentity(req.owner)
+      const match = visible.find(candidate => agentClientIdFromBinding(candidate.agentKey) === requestedClientId)
+      if (match) {
+        agentKey = match.agentKey
+        binding = getAgentBinding(agentKey) || match
+      }
+    }
     if (!binding) return res.status(404).json({ error: 'agent_not_found' })
     if (!identityOwnsAgentBinding(req.owner, binding)) {
       return res.status(403).json({ error: 'forbidden', message: 'Agent milik owner lain' })
