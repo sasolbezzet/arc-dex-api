@@ -573,6 +573,7 @@ export function oauthAuthorizeHandler(req, res) {
       refreshOAuthClients()
       oauthRequests.set(requestId, {
         clientId: client_id,
+        clientName: String(client.clientName || '').slice(0, 80),
         redirectUri: redirect_uri,
         state,
         codeChallenge: code_challenge,
@@ -594,6 +595,7 @@ export function oauthAuthorizeHandler(req, res) {
     redirect_uri,
     state,
     code_challenge,
+    ...(client.clientName ? { agent_name: String(client.clientName).slice(0, 80) } : {}),
     ...(resource ? { resource } : {}),
   })
   res.redirect(302, `${SERVER_URL}/arc-dex/plugin?${params.toString()}`)
@@ -2613,7 +2615,21 @@ async function canAutoExecute(userId, source, amount, chainKey, sessionLookupId 
     return { ok: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Circle proxy dan EOA tidak diizinkan untuk agent remote.' }
   }
   try {
-    const { canExecuteViaSession } = await import('./sessionKeyService.mjs')
+    const { canExecuteViaSession, isAgentBindingActive } = await import('./sessionKeyService.mjs')
+    // A valid bearer token is not an execution grant after the owner revokes
+    // one agent. Check the exact composite clientId|owner binding before the
+    // wallet-level session lookup; otherwise a sibling agent sharing the same
+    // MSCA could continue submitting UserOperations through the revoked card.
+    if (agentKey) {
+      const bindingActive = isAgentBindingActive(agentKey, sessionLookupId)
+      if (bindingActive !== true) {
+        return {
+          ok: false,
+          reason: bindingActive === false ? 'agent_binding_revoked' : 'agent_binding_not_found',
+          message: 'Binding agent ini tidak aktif. Hubungkan ulang agent setelah pemilik mengaktifkannya kembali.',
+        }
+      }
+    }
     // `userId` remains the owner/limits identity; the explicit MSCA is the
     // signer/session lookup identity for bound MCP tokens. This prevents a
     // sibling agent's owner alias from selecting the wrong delegate wallet.
