@@ -47,6 +47,24 @@ journalctl -u arc-dex-api -n 50 --no-pager
 
 Deploy only after review and the staging gates. Roll back the code with a reviewed Git revert, restart the same systemd unit, and keep runtime JSON state unchanged because the agent-binding format is additive.
 
+## Plugin flow regression harnesses
+
+The three Plugin flows that are easy to confuse (Create New Wallet, Relogin
+after Revoke, Login Passkey after Clear) are covered by two real end-to-end
+harnesses. Run them after touching session binding, proof, or clear/revoke
+behaviour — the unit tests alone cannot catch a wiring mistake between them.
+
+```bash
+npm run test:e2e:flows                 # virtual EOA + passkey against the local backend
+npm run test:e2e:ui                    # real Chrome UI: all four Plugin flows
+E2E_BASE_URL=https://arcoxdex.vercel.app npm run test:e2e:flows   # production path
+```
+
+The UI harness drives headless Chrome with a virtual EOA provider and a CDP
+virtual WebAuthn authenticator, and also runs the real MCP OAuth approval
+(DCR + PKCE) for the Grok card. It needs Chrome, network access, and performs
+real `addOwners` UserOperations on Arc testnet, so it stays out of `npm test`.
+
 ## OAuth test-state purge
 
 `node scripts/purge-test-oauth-state.mjs` is dry-run by default and prints only masked token IDs. Review its complete candidate list before any apply. Apply is a separate production data operation requiring `--confirm PURGE` and explicit `--allow-client`/`--allow-token` flags; do not run it from automated tests or a deploy hook.

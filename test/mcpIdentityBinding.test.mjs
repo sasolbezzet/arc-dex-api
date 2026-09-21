@@ -647,6 +647,23 @@ test('unresolved source intent blocks burns but permits approval-only recovery',
   }), null)
 })
 
+test('stale bridge wallet fields are rebound to the proven on-chain payer', async () => {
+  const { rebindBridgeIntentToProvenPayer, bridgeIntentBelongsToWallet } = await import('../src/services/mcpServer.mjs?stale-payer-' + Date.now() + '-' + Math.random())
+  const oldMsca = '0x4444444444444444444444444444444444444444'
+  const activeMsca = '0x5555555555555555555555555555555555555555'
+  const approval = {
+    id: 'stale-bridge',
+    action: 'bridge',
+    details: JSON.stringify({ walletAddress: activeMsca, settlementPhase: 'source_confirmed' }),
+  }
+  const rebound = rebindBridgeIntentToProvenPayer(JSON.parse(JSON.stringify(approval)), JSON.parse(approval.details), oldMsca)
+  const details = JSON.parse(rebound.details)
+  assert.equal(details.walletAddress, oldMsca.toLowerCase())
+  assert.equal(details.legacyWalletProof, oldMsca.toLowerCase())
+  assert.equal(bridgeIntentBelongsToWallet({ storedWallet: details.walletAddress, provenPayer: details.legacyWalletProof, expectedWallet: activeMsca }), false)
+  assert.equal(bridgeIntentBelongsToWallet({ storedWallet: details.walletAddress, provenPayer: details.legacyWalletProof, expectedWallet: oldMsca }), true)
+})
+
 test('same-owner MSCA rotation does not inherit a legacy first-wallet bridge intent', async () => {
   const { bridgeIntentBelongsToWallet } = await import('../src/services/mcpServer.mjs?msca-rotation-' + Date.now() + '-' + Math.random())
   const oldMsca = '0x4444444444444444444444444444444444444444'

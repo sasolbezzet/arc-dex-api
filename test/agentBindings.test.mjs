@@ -289,3 +289,99 @@ test('Hermes passkey resolution fails closed when the same wallet belongs to mul
     assert.equal(findAgentBindingForAgent('hermes-mcp', W1), null)
   })
 })
+
+test('a generic namespace owned by another owner cannot block a new owner wallet', async () => {
+  const legacyOwner = '0xffffffffffffffffffffffffffffffffffffffff'
+  await withSessionStore({
+    users: { [W1]: { walletAddress: W1, delegateAddress: EOA_A, active: true } },
+    aliases: { [OWNER]: W1 },
+    agentBindings: {
+      // Legacy row from a different owner squatting on the shared generic key.
+      'hermes-mcp': { ownerAddress: legacyOwner, walletAddress: '0x9999999999999999999999999999999999999999', active: true },
+    },
+  }, async ({ ensureAgentBindingForWallet, findAgentBindingForAgent }) => {
+    const binding = ensureAgentBindingForWallet('hermes-mcp', OWNER, W1)
+    assert.equal(binding.agentKey, `hermes-mcp|${OWNER}`, 'the new owner gets an owner-scoped durable row')
+    assert.equal(binding.walletAddress, W1)
+
+    const raw = await readRawStore()
+    assert.equal(
+      raw.agentBindings['hermes-mcp'].ownerAddress,
+      legacyOwner,
+      'the other owner legacy row must stay untouched',
+    )
+    assert.equal(findAgentBindingForAgent('hermes-mcp', W1)?.agentKey, `hermes-mcp|${OWNER}`)
+  })
+})
+
+test('the same owner still cannot rotate the generic namespace to a second wallet', async () => {
+  await withSessionStore({
+    users: { [W1]: { walletAddress: W1, delegateAddress: EOA_A, active: true } },
+    aliases: { [OWNER]: W1 },
+    agentBindings: {
+      'hermes-mcp': { ownerAddress: OWNER, walletAddress: W2, active: true },
+    },
+  }, async ({ ensureAgentBindingForWallet }) => {
+    assert.throws(() => ensureAgentBindingForWallet('hermes-mcp', OWNER, W1), /agent_wallet_rotation_forbidden/)
+  })
+})
+
+// ── Hermes stores one logical agent in two namespaces: the durable
+// connection-token row (`arcox_conn_*|owner`) that the dashboard card is built
+// from, and the browser/passkey row (`hermes-mcp`). Clear and Revoke must reach
+// both, otherwise the surviving row keeps rendering the card after the user
+// removed the agent.
+
+const CONN_A = `arcox_conn_abc123|${OWNER}`
+
+test('clear via the Hermes connection row also removes the passkey row', async () => {
+  await withSessionStore({
+    users: { [W1]: { walletAddress: W1, delegateAddress: EOA_A, active: true } },
+    agentBindings: {
+      [CONN_A]: { ownerAddress: OWNER, walletAddress: W1, active: true },
+      'hermes-mcp': { ownerAddress: OWNER, walletAddress: W1, active: true },
+      [`client-x|${OWNER}`]: { ownerAddress: OWNER, walletAddress: W1, active: true },
+      [`arcox_conn_zzz99|${OTHER_OWNER}`]: { ownerAddress: OTHER_OWNER, walletAddress: W2, active: true },
+    },
+  }, async ({ deleteAgentBinding }) => {
+    assert.equal(deleteAgentBinding(CONN_A), true)
+    const raw = await readRawStore()
+    assert.equal(raw.agentBindings[CONN_A], undefined, 'the connection row is gone')
+    assert.equal(raw.agentBindings['hermes-mcp'], undefined, 'the passkey namespace row is gone too')
+    assert.ok(raw.agentBindings[`client-x|${OWNER}`], 'another agent on the same wallet stays')
+    assert.ok(raw.agentBindings[`arcox_conn_zzz99|${OTHER_OWNER}`], "another owner's wallet stays")
+  })
+})
+
+test('clear via the Hermes passkey row also removes the connection row', async () => {
+  await withSessionStore({
+    users: { [W1]: { walletAddress: W1, delegateAddress: EOA_A, active: true } },
+    agentBindings: {
+      [CONN_A]: { ownerAddress: OWNER, walletAddress: W1, active: true },
+      'hermes-mcp': { ownerAddress: OWNER, walletAddress: W1, active: true },
+    },
+  }, async ({ deleteAgentBinding, findAgentBindingForAgent }) => {
+    assert.equal(deleteAgentBinding('hermes-mcp'), true)
+    const raw = await readRawStore()
+    assert.equal(raw.agentBindings[CONN_A], undefined)
+    assert.equal(raw.agentBindings['hermes-mcp'], undefined)
+    assert.equal(findAgentBindingForAgent('hermes-mcp', W1), null, 'no Hermes binding survives a clear')
+  })
+})
+
+test('revoke disables both Hermes namespaces and leaves other agents active', async () => {
+  await withSessionStore({
+    users: { [W1]: { walletAddress: W1, delegateAddress: EOA_A, active: true } },
+    agentBindings: {
+      [CONN_A]: { ownerAddress: OWNER, walletAddress: W1, active: true },
+      'hermes-mcp': { ownerAddress: OWNER, walletAddress: W1, active: true },
+      [`client-x|${OWNER}`]: { ownerAddress: OWNER, walletAddress: W1, active: true },
+    },
+  }, async ({ revokeAgentBinding }) => {
+    assert.equal(revokeAgentBinding(CONN_A), true)
+    const raw = await readRawStore()
+    assert.equal(raw.agentBindings[CONN_A].active, false, 'connection row is revoked')
+    assert.equal(raw.agentBindings['hermes-mcp'].active, false, 'passkey row cannot stay active')
+    assert.notEqual(raw.agentBindings[`client-x|${OWNER}`].active, false, 'another agent keeps working')
+  })
+})

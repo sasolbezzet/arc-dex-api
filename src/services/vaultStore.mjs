@@ -31,10 +31,25 @@ function persistSessions(map) {
 }
 const sessionTokens = loadSessions() // token -> { userId, expires }
 
+/**
+ * Session identities are wallet addresses, and every owner-gated route compares
+ * them against `getAddress(...).toLowerCase()`. A checksummed identity (what
+ * `/api/auth/session` used to store) therefore failed those equality checks and
+ * produced the misleading "ownerAddress is not authenticated by the supplied
+ * EOA session" error while the SIWE proof was perfectly valid. Normalize once,
+ * here, so every consumer sees the same representation. Non-address identities
+ * (agent keys from createConnectionToken) are untouched.
+ */
+export function normalizeSessionIdentity(userId) {
+  const value = String(userId || '').trim()
+  if (!/^0x[0-9a-fA-F]{40}$/.test(value)) return value
+  try { return getAddress(value).toLowerCase() } catch { return value.toLowerCase() }
+}
+
 export function createSession(userId) {
   const token = 'arx_vs_' + randomUUID().replace(/-/g, '')
   const createdAt = Date.now()
-  sessionTokens.set(token, { userId, createdAt, expires: createdAt + SESSION_TTL_MS })
+  sessionTokens.set(token, { userId: normalizeSessionIdentity(userId), createdAt, expires: createdAt + SESSION_TTL_MS })
   persistSessions(sessionTokens)
   return token
 }
@@ -271,25 +286,39 @@ export function deleteCredential(owner, id) {
 }
 
 // ── Limits ──
+/**
+ * Resolve the stored key for an owner, tolerating records written with a
+ * checksummed address before session identities were normalized.
+ */
+function ownerRecordKey(map, owner, fallback) {
+  const key = String(owner || '').toLowerCase()
+  if (map && Object.prototype.hasOwnProperty.call(map, key)) return key
+  const legacyKey = map ? Object.keys(map).find(candidate => String(candidate).toLowerCase() === key) : undefined
+  return legacyKey || fallback
+}
+
+const ownsRecord = (candidate, owner) => String(candidate || '').toLowerCase() === String(owner || '').toLowerCase()
+
 export function getLimits(owner) {
   const v = loadVault()
   const limits = v.limits && typeof v.limits === 'object' ? v.limits : {}
-  return limits[owner] || { maxPerTx: 100, dailyLimit: 500, autoApprove: true, whitelist: [] }
+  return limits[ownerRecordKey(limits, owner, owner)] || { maxPerTx: 100, dailyLimit: 500, autoApprove: true, whitelist: [] }
 }
 
 export function setLimits(owner, limits) {
   const v = loadVault()
   if (!v.limits || typeof v.limits !== 'object') v.limits = {}
-  v.limits[owner] = { ...getLimits(owner), ...limits }
+  const key = ownerRecordKey(v.limits, owner, String(owner || '').toLowerCase())
+  v.limits[key] = { ...getLimits(owner), ...limits }
   saveVault(v)
   logActivity(owner, 'limits_updated', limits)
-  return v.limits[owner]
+  return v.limits[key]
 }
 
 // ── Approvals ──
 export function listApprovals(owner) {
   const v = loadVault()
-  return v.approvals.filter(a => a.owner === owner)
+  return v.approvals.filter(a => ownsRecord(a.owner, owner))
 }
 
 export function createApproval(owner, { agent, agentClientId, action, amount, token, source, to, details, forcePending }) {

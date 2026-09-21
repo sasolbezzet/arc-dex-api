@@ -531,10 +531,18 @@ app.post('/api/session/generate-key', apiLimiter, requireAuth, async (req, res) 
         return res.status(403).json({ code: 'owner_session_required', error: 'Verified EOA session is required to bind ownerAddress' })
       }
       const vault = await import('./src/services/vaultStore.mjs')
-      verifiedOwnerAddress = verifyOwnerToken(ownerSessionToken) || vault.validateSession(ownerSessionToken) || ''
-      if (verifiedOwnerAddress !== getAddress(ownerAddress).toLowerCase()) {
+      // The two proof formats do not share a representation: HMAC owner tokens
+      // carry a lowercase address, while a vault session created by
+      // /api/auth/session stored the checksummed one. Compare them
+      // case-insensitively (or the SIWE proof is rejected even though the user
+      // just signed with the connected wallet).
+      const claimedOwner = String(verifyOwnerToken(ownerSessionToken) || vault.validateSession(ownerSessionToken) || '')
+      const ownerMatches = isAddress(claimedOwner)
+        && getAddress(claimedOwner).toLowerCase() === getAddress(ownerAddress).toLowerCase()
+      if (!ownerMatches) {
         return res.status(403).json({ code: 'owner_session_required', error: 'ownerAddress is not authenticated by the supplied EOA session' })
       }
+      verifiedOwnerAddress = getAddress(ownerAddress).toLowerCase()
     } else {
       // Existing-agent recovery path: a fresh passkey token authenticates the
       // exact MSCA in req.owner. It may recover/rotate the delegate only when a
@@ -771,6 +779,7 @@ app.post('/api/session/activate-binding', apiLimiter, requireAuth, async (req, r
         binding = ensureAgentBindingForWallet(agentKey, verifiedBindingOwner, req.owner, { credentialId })
       } catch (bindingError) {
         const message = String(bindingError?.message || '')
+        console.warn('[activate-binding] rejected:', message, JSON.stringify({ agentKey, owner: verifiedBindingOwner, wallet: req.owner }))
         if (/owner_wallet_relationship_missing|owner_mismatch|rotation_forbidden/i.test(message)) {
           return res.status(403).json({ code: 'agent_owner_mismatch', error: 'Agent Wallet ini belum terbukti terikat ke owner wallet yang terhubung.' })
         }
@@ -1391,12 +1400,17 @@ async function requireAuth(req, res, next) {
     } catch { authAddress = null }
   }
   if (!authAddress) return res.status(401).json({ error: 'Wallet authentication required' })
+  // Owner-scoped routes compare `getAddress(...).toLowerCase() !== req.owner`.
+  // Sessions minted before identities were normalized may still carry a
+  // checksummed address, which made every such comparison fail while the
+  // session itself was valid.
+  const ownerAddress = String(authAddress).toLowerCase()
   const bodyAddress = req.body?.metamaskAddress || req.body?.address
-  if (bodyAddress && (!isAddress(bodyAddress) || getAddress(bodyAddress).toLowerCase() !== authAddress)) {
+  if (bodyAddress && (!isAddress(bodyAddress) || getAddress(bodyAddress).toLowerCase() !== ownerAddress)) {
     return res.status(403).json({ error: 'Authenticated wallet does not match request address' })
   }
-  req.authAddress = authAddress
-  req.owner = authAddress
+  req.authAddress = ownerAddress
+  req.owner = ownerAddress
   next()
 }
 

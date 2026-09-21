@@ -556,10 +556,17 @@ export function ensureAgentBindingForWallet(agentKey, ownerAddress, walletAddres
     ? `${agentClientId(requested)}|${owner}`
     : requested
   const target = store.agentBindings?.[targetKey]
-  if (target && String(target.walletAddress || '').toLowerCase() !== wallet) {
+  const targetOwner = String(target?.ownerAddress || '').toLowerCase()
+  // A generic namespace such as `hermes-mcp` is shared by every owner, so a row
+  // left behind by a different owner must neither block this owner (that made
+  // "Buat Agent Wallet" fail with a bogus owner-mismatch banner) nor be
+  // overwritten. Keep this owner's durable row owner-scoped instead.
+  const foreignGenericRow = Boolean(target) && targetOwner !== owner
+  if (target && !foreignGenericRow && String(target.walletAddress || '').toLowerCase() !== wallet) {
     throw new Error('agent_wallet_rotation_forbidden')
   }
-  const binding = bindAgent(targetKey, owner, wallet)
+  const durableKey = foreignGenericRow ? `${targetKey}|${owner}` : targetKey
+  const binding = bindAgent(durableKey, owner, wallet)
   if (credentialId) bindAgentCredential(binding.agentKey, credentialId, wallet)
   return activateAgentBinding(binding.agentKey, wallet)
 }
@@ -707,6 +714,12 @@ export function findAgentBindingForAgent(agentKey, walletAddress) {
     if (direct && String(direct.walletAddress || '').toLowerCase() === wallet) {
       return { agentKey: requested, ...direct }
     }
+    // When the shared generic key belongs to another owner, this owner's row is
+    // stored owner-scoped. Resolve it by wallet, exactly like the rows above.
+    const ownerScoped = Object.entries(store.agentBindings || {})
+      .find(([key, binding]) => key.startsWith(`${requested}|`)
+        && String(binding?.walletAddress || '').toLowerCase() === wallet)
+    if (ownerScoped) return { agentKey: ownerScoped[0], ...ownerScoped[1] }
     return null
   }
 
@@ -865,6 +878,25 @@ function hasOtherActiveBindingForWallet(bindings, walletAddress, ignoredKeys = [
   )
 }
 
+/**
+ * Drop the reusable authorization proof from an inactive record.
+ *
+ * The stored addOwners hash is only a recovery proof while the on-chain owner
+ * is still valid (the legacy inactivity expiry). Once an agent is revoked or
+ * cleared, keeping it lets a later status read advertise a proof that must
+ * never resurrect the old delegate, and makes the browser reconcile that stale
+ * operation instead of submitting the fresh addOwners the user just approved
+ * with the passkey.
+ */
+function clearAuthorizationProof(entry) {
+  if (!entry) return
+  entry.authorizationUserOpHash = ''
+  entry.authorizationUserOpHashes = {}
+  entry.lastAuthorizationOutcome = undefined
+  entry.lastAuthorizationErrorAt = undefined
+  entry.lastAuthorizationTransactionHash = undefined
+}
+
 function deactivateSessionIfUnused(store, walletAddress, ignoredBindingKeys, reason, timestamp) {
   const wallet = String(walletAddress || '').toLowerCase()
   const session = store.users?.[wallet]
@@ -873,6 +905,32 @@ function deactivateSessionIfUnused(store, walletAddress, ignoredBindingKeys, rea
   session.pendingAuthorization = false
   session.revokedAt = timestamp
   session.revokeReason = reason
+  // Legacy inactivity records keep their proof so the still-valid on-chain
+  // owner can be reconciled. Every other reason is a policy event, so the
+  // proof must not survive it.
+  if (reason !== 'inactivity_24h') clearAuthorizationProof(session)
+}
+
+/**
+ * Hermes keeps two rows for one logical agent: the durable connection-token
+ * namespace (`arcox_conn_*|owner`) that the dashboard card is built from, and
+ * the browser/passkey namespace (`hermes-mcp`). Clear or Revoke must reach
+ * both, otherwise the surviving row keeps rendering the card (and a later
+ * passkey login revives the agent the user just removed).
+ */
+function isHermesNamespace(clientId) {
+  return clientId === 'hermes-mcp' || clientId.startsWith('arcox_conn_')
+}
+
+/** True when both rows describe the same logical agent (same key, client id, or Hermes alias). */
+function matchesAgentBinding(candidateKey, candidateWallet, targetKey, targetWallet) {
+  if (candidateKey === targetKey) return true
+  if (!targetWallet || candidateWallet !== targetWallet) return false
+  const candidateId = agentClientId(candidateKey)
+  const targetId = agentClientId(targetKey)
+  if (!candidateId || !targetId) return false
+  if (candidateId === targetId) return true
+  return isHermesNamespace(candidateId) && isHermesNamespace(targetId)
 }
 
 export function deleteAgentBinding(agentKey) {
@@ -881,13 +939,13 @@ export function deleteAgentBinding(agentKey) {
   const bindings = store.agentBindings
   if (!bindings || typeof bindings !== 'object' || !bindings[key]) return false
   const target = bindings[key]
-  const clientId = agentClientId(key)
   const wallet = String(target.walletAddress || '').toLowerCase()
   const removedKeys = Object.entries(bindings)
-    .filter(([candidateKey, candidate]) => candidateKey === key || (
-      clientId
-      && agentClientId(candidateKey) === clientId
-      && String(candidate?.walletAddress || '').toLowerCase() === wallet
+    .filter(([candidateKey, candidate]) => matchesAgentBinding(
+      candidateKey,
+      String(candidate?.walletAddress || '').toLowerCase(),
+      key,
+      wallet,
     ))
     .map(([candidateKey]) => candidateKey)
   for (const candidateKey of removedKeys) delete bindings[candidateKey]
@@ -902,12 +960,13 @@ export function revokeAgentBinding(agentKey) {
   const bindings = store.agentBindings
   if (!bindings || typeof bindings !== 'object' || !bindings[key]) return false
   const target = bindings[key]
-  const clientId = agentClientId(key)
+  const targetWallet = String(target.walletAddress || '').toLowerCase()
   const matchingKeys = Object.entries(bindings)
-    .filter(([candidateKey, candidate]) => candidateKey === key || (
-      clientId
-      && agentClientId(candidateKey) === clientId
-      && String(candidate?.walletAddress || '').toLowerCase() === String(target.walletAddress || '').toLowerCase()
+    .filter(([candidateKey, candidate]) => matchesAgentBinding(
+      candidateKey,
+      String(candidate?.walletAddress || '').toLowerCase(),
+      key,
+      targetWallet,
     ))
     .map(([candidateKey]) => candidateKey)
 
@@ -1515,6 +1574,7 @@ export function revokeSessionKey(userId) {
   entry.revokedAt = Date.now()
   entry.revokeReason = 'manual'
   entry.pendingAuthorization = false
+  clearAuthorizationProof(entry)
   saveStore(store)
   return entry
 }

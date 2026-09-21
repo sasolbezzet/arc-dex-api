@@ -29,7 +29,9 @@ async function requireAuth(req, res, next) {
     } catch { /* invalid/non-OAuth tokens remain a normal 401 */ }
     return res.status(401).json({ error: 'Session expired or invalid', hint: 'Re-authenticate via /api/vault/challenge' })
   }
-  req.owner = userId
+  // Sessions minted before identities were normalized may still carry a
+  // checksummed address; every owner-scoped lookup compares lowercase.
+  req.owner = String(userId).toLowerCase()
   next()
 }
 

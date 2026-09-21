@@ -21,6 +21,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { webcrypto } from 'node:crypto'
 import { createPublicClient, custom, defineChain, encodeFunctionData, getAddress } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
 import { PublicKey } from 'ox'
 import { toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
 import { toWebAuthnAccount, sendUserOperation, waitForUserOperationReceipt } from 'viem/account-abstraction'
@@ -33,6 +34,9 @@ import { createPasskey, makePasskeyGetFn } from './e2e-webauthn.mjs'
 const BASE = process.env.E2E_BASE_URL || 'http://localhost:3001'
 const STATE_PATH = process.env.MULTICHAIN_STATE_PATH || '/tmp/arcox-e2e-multichain-state.json'
 const CHAIN_KEYS = ['arc-testnet', 'base-sepolia', 'arbitrum-sepolia']
+const TEST_OWNER_KEY = process.env.TEST_EOA_KEY || `0x${'22'.repeat(32)}`
+const testOwner = privateKeyToAccount(TEST_OWNER_KEY)
+const agentKey = process.env.MULTICHAIN_AGENT_KEY || `virtual-multichain|${testOwner.address.toLowerCase()}`
 const CLIENT_URL = process.env.CIRCLE_CLIENT_URL
 const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY
 const PASSKEY_BASE = String(CLIENT_URL).replace(/\/+$/, '')
@@ -131,12 +135,11 @@ const getFn = makePasskeyGetFn({
 })
 const owner = toWebAuthnAccount({ credential, getFn, rpId })
 
-// Mirrors the frontend's circleGasFees(): Arbitrum's bundler precheck rejects a
-// zero priority fee, so fetch Circle's recommended fee envelope (medium) or fall
-// back to a safe 1 gwei priority / 2 gwei max. Other chains leave fees to the
-// paymaster/Gas Station exactly like the browser flow.
+// Mirrors the frontend's circleGasFees(): Circle's bundler requires a 1 gwei
+// minimum priority fee on the MSCA creation chains. Arbitrum additionally uses
+// Circle's live fee recommendation when available.
 async function circleGasFees(chainKey) {
-  if (chainKey !== 'arbitrum-sepolia') return {}
+  const safeFloor = { maxPriorityFeePerGas: 1_000_000_000n, maxFeePerGas: 2_000_000_000n }
   const chain = CHAINS[chainKey]
   try {
     const client = createPublicClient({
@@ -155,16 +158,19 @@ async function circleGasFees(chainKey) {
       }, { key: 'Modular wallets transport', name: 'Modular wallets transport' }),
     })
     const price = await client.request({ method: 'circle_getUserOperationGasPrice', params: [] }).catch(() => null)
-    const level = price?.medium
-    if (level?.maxPriorityFeePerGas && level?.maxFeePerGas) {
-      const maxPriorityFeePerGas = BigInt(level.maxPriorityFeePerGas)
-      const maxFeePerGas = BigInt(level.maxFeePerGas)
-      if (maxPriorityFeePerGas > 0n && maxFeePerGas >= maxPriorityFeePerGas) {
-        return { maxPriorityFeePerGas, maxFeePerGas }
-      }
+    for (const level of [price?.medium, price?.fast, price?.slow]) {
+      if (!level) continue
+      const suggestedPriority = BigInt(level.maxPriorityFeePerGas || 0)
+      const suggestedMax = BigInt(level.maxFeePerGas || 0)
+      if (suggestedPriority <= 0n && suggestedMax <= 0n) continue
+      const maxPriorityFeePerGas = suggestedPriority > safeFloor.maxPriorityFeePerGas
+        ? suggestedPriority
+        : safeFloor.maxPriorityFeePerGas
+      const maxFeePerGas = suggestedMax >= maxPriorityFeePerGas ? suggestedMax : safeFloor.maxFeePerGas
+      return { maxPriorityFeePerGas, maxFeePerGas }
     }
   } catch { /* fall through to the safe floor */ }
-  return { maxPriorityFeePerGas: 1_000_000_000n, maxFeePerGas: 2_000_000_000n }
+  return safeFloor
 }
 
 // ── 2. Derive the deterministic MSCA on each chain (same address) ──
@@ -205,16 +211,27 @@ persist()
 console.log('   ✅ deterministic MSCA identical across all 3 chains:', msca)
 
 // ── 3. Reserve the server-side delegate ──
+// The endpoint authenticates the selected MSCA session and separately requires
+// a proof from the owner EOA. Keep these tokens distinct in the harness just
+// like the browser flow does.
 const token = mintOwnerToken(msca)
-if (!token) throw new Error('Failed to mint owner token (AUTH_SECRET missing?)')
+const ownerSessionToken = mintOwnerToken(testOwner.address)
+if (!token || !ownerSessionToken) throw new Error('Failed to mint virtual owner/MSCA tokens (AUTH_SECRET missing?)')
 if (!state.delegateAddress) {
-  const reserve = await post('/api/session/generate-key', { walletAddress: msca }, token)
+  const reserve = await post('/api/session/generate-key', {
+    walletAddress: msca,
+    ownerAddress: testOwner.address,
+    ownerSessionToken,
+    agentKey,
+  }, token)
   if (reserve.status !== 200 || !reserve.delegateAddress) throw new Error(`generate-key failed: ${reserve.status} ${JSON.stringify(reserve)}`)
   state.delegateAddress = reserve.delegateAddress
   persist()
 }
 const delegate = getAddress(state.delegateAddress)
-console.log('③ delegate (server):', delegate)
+console.log('③ owner (virtual):', testOwner.address)
+console.log('   agentKey        :', agentKey)
+console.log('   delegate (server):', delegate)
 
 // ── 4-6. Per-chain addOwners → record → (Arc: setup / dest: authorize-chain) ──
 const results = {}

@@ -1404,6 +1404,18 @@ export function bridgeIntentBelongsToWallet({ storedWallet = '', provenPayer = '
   return Boolean(payer) && payer === expected
 }
 
+// Rebind a legacy approval to the wallet proven by its exact router event.
+// This is intentionally an in-memory projection used by quote scoping; the
+// durable approval is not mutated until an explicit status/recovery operation.
+export function rebindBridgeIntentToProvenPayer(approval, details, provenPayer) {
+  const payer = String(provenPayer || '').trim().toLowerCase()
+  if (!payer) return approval
+  return {
+    ...approval,
+    details: jsonText({ ...(details || {}), walletAddress: payer, legacyWalletProof: payer }),
+  }
+}
+
 async function getBridgeBurnPayer({ burnTxHash, route, amount } = {}) {
   try {
     return (await readBridgeBurnEvents({ burnTxHash, route, amount }))[0]?.payer || null
@@ -2012,10 +2024,16 @@ async function scopeBridgeApprovalsToMsca(approvals, { fromChain, toChain, walle
       continue
     }
     const storedWallet = bridgeIntentWalletAddress(approval, details)
-    if (storedWallet || !expectedWallet || !details.burnTxHash || !route) {
+    if (!expectedWallet || !details.burnTxHash || !route) {
       scoped.push(approval)
       continue
     }
+    // The exact on-chain router event is authoritative for legacy rows, even
+    // when a persisted walletAddress is stale. This matters after MSCA rotation
+    // or an interrupted migration: trusting the stale field would make the old
+    // burn block the wrong agent forever, while retrying it from the active MSCA
+    // would be unsafe.
+    //
     // Do not constrain payer correlation by the human amount stored in the
     // approval. ArcoxRouter's BridgeWithFee event records the gross amount,
     // while the approval may store the post-fee net amount. The burn
@@ -2024,20 +2042,17 @@ async function scopeBridgeApprovalsToMsca(approvals, { fromChain, toChain, walle
     const payer = await getBridgeBurnPayer({ burnTxHash: details.burnTxHash, route })
 
     if (!payer) {
-      // An RPC/indexing failure is not proof that this legacy intent belongs to
+      // An RPC/indexing failure is not proof that this intent belongs to
       // another wallet. Keep it in the guard so the system remains fail-closed.
       scoped.push(approval)
       continue
     }
-    if (bridgeIntentBelongsToWallet({ storedWallet, provenPayer: payer, expectedWallet })) {
-      // Feed the proven legacy payer back into the pure guard as an explicit
-      // binding. Without this annotation a no-wallet legacy row would still be
-      // treated as ambiguous by hasUnresolvedSourceBridgeIntent().
-      scoped.push(storedWallet
-        ? approval
-        : { ...approval, details: jsonText({ ...details, walletAddress: expectedWallet, legacyWalletProof: payer }) })
-      continue
-    }
+    // Rebind the in-memory legacy row to the proven payer. This preserves
+    // recovery when the old MSCA is selected, while the current MSCA will not
+    // inherit an unrelated unresolved bridge. The durable row is not rewritten
+    // here; only an explicit recovery/status path may mutate it.
+    scoped.push(rebindBridgeIntentToProvenPayer(approval, details, payer))
+    if (bridgeIntentBelongsToWallet({ storedWallet, provenPayer: payer, expectedWallet })) continue
     // A proven different payer belongs to another MSCA. It must not block a
     // bridge from the currently selected wallet, while remaining recoverable
     // when that older wallet is selected later.

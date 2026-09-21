@@ -260,9 +260,19 @@ check('activate-binding creates the agent row WITH owner proof', bind1.status ==
 const status1 = await sessionStatus()
 check('status: binding found and active', status1.session?.agentBindingFound === true && status1.session?.agentBindingActive === true, `found=${status1.session?.agentBindingFound} active=${status1.session?.agentBindingActive}`)
 
+// The dashboard never deletes a bare namespace: it deletes the canonical row
+// the API returned for this wallet (e.g. `arcox_conn_*|owner` for Hermes, whose
+// passkey namespace `hermes-mcp` is shared with other owners). Resolve that key
+// exactly like the card does, otherwise the request is refused as another
+// owner's row.
+const agentRows = await request('GET', '/api/vault/agents', { token: vaultToken })
+const ownRow = (agentRows.agents || []).find(entry => String(entry.walletAddress || '').toLowerCase() === msca.toLowerCase())
+const BINDING_KEY = ownRow?.agentKey || AGENT_KEY
+check('the dashboard exposes exactly one card for this wallet', Boolean(ownRow), `agentKey=${BINDING_KEY}`)
+
 // ── FLOW 2 — Relogin after Revoke (passkey only, no SIWE) ──
 step('④', 'FLOW 2 — Relogin after Revoke (passkey only)')
-const revoked = await request('DELETE', `/api/vault/agents/${encodeURIComponent(AGENT_KEY)}`, { body: { action: 'revoke' }, token: vaultToken })
+const revoked = await request('DELETE', `/api/vault/agents/${encodeURIComponent(BINDING_KEY)}`, { body: { action: 'revoke' }, token: vaultToken })
 check('revoke succeeds', revoked.status === 200 && revoked.ok === true, `${revoked.status} revoked=${revoked.revoked}`)
 
 const statusRevoked = await sessionStatus()
@@ -270,6 +280,11 @@ check(
   'revoke keeps the durable binding (found, inactive)',
   statusRevoked.session?.agentBindingFound === true && statusRevoked.session?.agentBindingActive === false,
   `found=${statusRevoked.session?.agentBindingFound} active=${statusRevoked.session?.agentBindingActive}`,
+)
+check(
+  'revoke drops the stored authorization proof (no stale hash)',
+  !statusRevoked.session?.authorizationUserOpHash,
+  `hash=${statusRevoked.session?.authorizationUserOpHash || '(empty)'}`,
 )
 
 const passkeyOnly = await request('POST', '/api/session/generate-key', {
@@ -292,11 +307,22 @@ check('status: binding active again', status2.session?.agentBindingActive === tr
 
 // ── FLOW 3 — Relogin after Clear (owner proof required) ──
 step('⑤', 'FLOW 3 — Relogin after Clear (owner proof required)')
-const cleared = await request('DELETE', `/api/vault/agents/${encodeURIComponent(AGENT_KEY)}`, { body: { action: 'delete' }, token: vaultToken })
+const cleared = await request('DELETE', `/api/vault/agents/${encodeURIComponent(BINDING_KEY)}`, { body: { action: 'delete' }, token: vaultToken })
 check('clear succeeds', cleared.status === 200 && cleared.ok === true, `${cleared.status} removed=${cleared.removed}`)
 
 const statusCleared = await sessionStatus()
 check('clear removes the binding', statusCleared.session?.agentBindingFound === false, `found=${statusCleared.session?.agentBindingFound} reason=${statusCleared.session?.agentBindingReason}`)
+check(
+  'clear drops the stored authorization proof (no stale hash)',
+  !statusCleared.session?.authorizationUserOpHash,
+  `hash=${statusCleared.session?.authorizationUserOpHash || '(empty)'}`,
+)
+const reconcileAfterClear = await request('POST', '/api/session/reconcile', { token: vaultToken })
+check(
+  'cleared record cannot be resurrected by its old proof',
+  reconcileAfterClear.session?.active !== true,
+  `reason=${reconcileAfterClear.session?.reason || '(none)'}`,
+)
 
 const clearedNoProof = await request('POST', '/api/session/generate-key', {
   body: { walletAddress: msca, agentKey: AGENT_KEY },
