@@ -155,7 +155,7 @@ class CDP {
         // coordinate click can land on the wrong one (Clear hit Revoke).
         const clicked = await this.eval(`(() => {
           const el = (${finderJs})
-          if (!el) return ''
+          if (!el || el.disabled) return ''
           el.scrollIntoView({ block: 'center' })
           const text = (el.textContent || '').trim().slice(0, 40)
           el.click()
@@ -174,7 +174,7 @@ class CDP {
         const x = Math.round(rect.x + rect.width / 2)
         const y = Math.round(rect.y + rect.height / 2)
         const hit = document.elementFromPoint(x, y)
-        const onTarget = Boolean(hit) && (hit === element || element.contains(hit) || hit.contains(element))
+        const onTarget = Boolean(hit) && (hit === element || element.contains(hit) || hit.contains(element)) && element.disabled !== true
         // A modal backdrop means the click is meant to be impossible; retry
         // instead of clicking through it (that hid the token dialog bug).
         const blockedByModal = Boolean(hit && hit.closest && hit.closest('.plugin-modal-backdrop'))
@@ -224,6 +224,13 @@ window.__cardButton = (agent, text) => {
   const card = Array.from(document.querySelectorAll('article.agent-card')).find(node => new RegExp(agent, 'i').test(node.innerText || ''))
   if (!card) return null
   return Array.from(card.querySelectorAll('button')).find(node => (node.textContent || '').includes(text)) || null
+}
+// Card buttons are disabled while any plugin action is running; clicking a
+// disabled button silently does nothing, so wait for an idle card first.
+window.__cardIdle = (agent) => {
+  const card = Array.from(document.querySelectorAll('article.agent-card')).find(node => new RegExp(agent, 'i').test(node.innerText || ''))
+  if (!card) return false
+  return !Array.from(card.querySelectorAll('button')).some(node => node.disabled)
 }
 window.__card = (agent) => {
   const card = Array.from(document.querySelectorAll('article.agent-card')).find(node => new RegExp(agent, 'i').test(node.innerText || ''))
@@ -390,6 +397,10 @@ const cardBadgeWait = (accept) => `(() => {
   return card.badge && ${accept} ? raw : ''
 })()`
 const cardGoneWait = agent => `window.__card(${JSON.stringify(agent)}) === '' ? 'gone' : ''`
+const waitCardIdle = agent => cdp.waitFor(
+  `window.__cardIdle(${JSON.stringify(agent)}) ? 'idle' : ''`,
+  { timeout: 180_000, every: 1000, label: `idle ${agent} card` },
+)
 const cardBadgeWaitFor = (agent, accept) => `(() => {
   const raw = window.__card(${JSON.stringify(agent)})
   if (!raw) return ''
@@ -537,6 +548,7 @@ try {
   // ── FLOW 2 — Revoke → Relogin ──
   step('②', 'FLOW 2 — Revoke, then Relogin with the passkey only…')
   await closeModals(cdp)
+  await waitCardIdle(CARD_AGENT)
   await cdp.clickFound(`window.__cardButton(${JSON.stringify(CARD_AGENT)}, 'Cabut Akses')`, { timeout: 90_000, label: 'revoke button', dom: true })
   await cdp.waitFor(`(() => {
     const backdrop = document.querySelector('.plugin-modal-backdrop')
@@ -549,6 +561,7 @@ try {
   check('revoked card offers "Relogin"', revoked.buttons.some(label => /Relogin/i.test(label)), revoked.buttons.join(' | '))
 
   await closeModals(cdp)
+  await waitCardIdle(CARD_AGENT)
   const signsBefore2 = await readSignCount()
   const passkeysBefore2 = (await readPasskeys()).length
   await cdp.clickFound(`window.__cardButton(${JSON.stringify(CARD_AGENT)}, 'Relogin')`, { timeout: 90_000, label: 'relogin button', dom: true })
@@ -562,6 +575,7 @@ try {
   await closeModals(cdp)
   const signsBefore3 = await readSignCount()
   const passkeysBefore3 = (await readPasskeys()).length
+  await waitCardIdle(CARD_AGENT)
   await cdp.clickFound(`window.__cardButton(${JSON.stringify(CARD_AGENT)}, 'Hapus')`, { timeout: 90_000, label: 'clear button', dom: true })
   await cdp.waitFor(`window.__card(${JSON.stringify(CARD_AGENT)}) === '' ? 'gone' : ''`, { timeout: 180_000, every: 2000, label: 'card removal after clear' })
   check('clear removes the agent card', true, 'card gone from the dashboard')
@@ -610,6 +624,7 @@ try {
 
   // Revoke → Relogin (passkey only) on the OAuth agent card.
   await closeModals(cdp)
+  await waitCardIdle(OAUTH_CARD_AGENT)
   const grokSignsBefore = await readSignCount()
   await cdp.clickFound(`window.__cardButton(${JSON.stringify(OAUTH_CARD_AGENT)}, 'Cabut Akses')`, { timeout: 90_000, label: 'Grok revoke button', dom: true })
   await cdp.waitFor(`(() => {
@@ -620,6 +635,7 @@ try {
   const grokRevoked = await cdp.waitFor(cardBadgeWaitFor(OAUTH_CARD_AGENT, `card.badge === 'Akses dicabut'`), { timeout: 180_000, every: 2000, label: 'Grok revoked badge' }).then(raw => JSON.parse(raw))
   check('Grok card shows "Akses dicabut" after revoke', grokRevoked.badge === 'Akses dicabut', `badge="${grokRevoked.badge}"`)
   await closeModals(cdp)
+  await waitCardIdle(OAUTH_CARD_AGENT)
   await cdp.clickFound(`window.__cardButton(${JSON.stringify(OAUTH_CARD_AGENT)}, 'Relogin')`, { timeout: 90_000, label: 'Grok relogin button', dom: true })
   const grokRecovered = await cdp.waitFor(cardBadgeWaitFor(OAUTH_CARD_AGENT, `card.badge !== 'Akses dicabut'`), { timeout: 480_000, every: 3000, label: 'Grok card active after relogin' }).then(raw => JSON.parse(raw))
   check('Grok relogin needs no new owner SIWE', (await readSignCount()) === grokSignsBefore, `${(await readSignCount()) - grokSignsBefore} signature(s)`)
@@ -627,6 +643,7 @@ try {
 
   // Clear from the dashboard, then re-bind through a brand-new OAuth request.
   await closeModals(cdp)
+  await waitCardIdle(OAUTH_CARD_AGENT)
   await cdp.clickFound(`window.__cardButton(${JSON.stringify(OAUTH_CARD_AGENT)}, 'Hapus')`, { timeout: 90_000, label: 'Grok clear button', dom: true })
   await cdp.waitFor(cardGoneWait(OAUTH_CARD_AGENT), { timeout: 180_000, every: 2000, label: 'Grok card removal after clear' })
   check('Grok clear removes the agent card', true, 'card gone from the dashboard')
