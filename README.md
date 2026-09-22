@@ -1,225 +1,213 @@
 # ARCOX DEX API
 
-Backend retail proxy untuk ARCOX DEX.
+Backend retail + agent untuk ARCOX DEX: quote/swap/bridge/send, ARCOX Pay &
+x402, ARCOX Intel, ARCOX AI Router, dan MCP server remote untuk agent
+(Hermes, Grok, Claude, ChatGPT, Codex).
 
 ## Production
 
-- Web production: https://arcoxdex.vercel.app
-- MCP production: https://arcoxdex.vercel.app/mcp
-- GitHub: https://github.com/sasolbezzet/arc-dex-api
+```text
+Web            : https://arcoxdex.vercel.app
+Public MCP     : https://arcoxdex.vercel.app/mcp
+OpenAI-compat  : https://arcoxdex.vercel.app/v1
+GitHub         : https://github.com/sasolbezzet/arc-dex-api
+```
 
-MCP selalu menggunakan URL web production di atas; alamat VPS hanya dipakai sebagai backend upstream internal dan health check.
+MCP selalu memakai URL web production di atas. Alamat VPS
+(`https://43.134.14.43.nip.io`) hanya backend upstream internal dan jarang
+dipakai langsung; Vercel me-rewrite `/api/*`, `/v1/*`, `/mcp`,
+`/.well-known/*`, dan `/health` ke sana.
+
+## Menjalankan
+
+Service berjalan sebagai unit systemd `arc-dex-api` yang mengikat port 3001
+(nginx di depannya). **Hanya satu proses boleh memegang port 3001** — proses
+ganda adalah penyebab klasik jawaban 4xx "palsu" dari kode lama.
+
+```bash
+sudo systemctl status arc-dex-api
+sudo systemctl restart arc-dex-api        # setelah update kode
+curl -fsS http://127.0.0.1:3001/health    # {"ok":true,...}
+```
+
+Jalankan manual (untuk debugging):
+
+```bash
+cd /home/ubuntu/arc-dex-api
+node --env-file=.env server.mjs           # hentikan service dulu agar port bebas
+```
 
 ## Tanggung Jawab
 
-- Circle proxy wallet lookup dan action.
+- Circle proxy wallet lookup dan action, dan webhook Circle Gateway/Circle Wallets.
 - Quote/swap/send/bridge preparation untuk web UI dan agent.
-- ARCOX Pay invoice/payment request API untuk public USDC payment link di Arc Testnet.
-- Circle Gateway webhook foundation dan dev simulator.
-- Eco route preview untuk future cross-chain stablecoin invoice.
-- x402 middleware untuk premium API endpoint memakai real Arc Testnet USDC invoice.
-- Arc Transaction Memo reconciliation untuk x402 payment dengan chunked `eth_getLogs` (2k block range per request) agar kompatibel dengan RPC Canteen dan fallback publik.
-- Reconcile invoice yang sudah `expired` tetap diproses jika ada bukti pembayaran on-chain (memo transfer atau Gateway record).
-- `wallets-db.json` sebagai mapping owner ke Circle wallet proxy.
-- `tx-history-db.json` sebagai history transaksi web UI dan agent.
-- `invoices-db.json` sebagai invoice/payment request runtime storage.
-- `webhook-events-db.json` sebagai webhook raw event/idempotency storage.
-- Atomic JSON writes dengan `.bak` dan `runtime-backups/` untuk mengurangi risiko corrupt file saat crash.
+- **MCP server remote** (`/mcp`) untuk agent: OAuth 2.1 (DCR + PKCE), token
+  koneksi Hermes, per-agent binding ke Agent Wallet (MSCA).
+- **Session key service** untuk MSCA: generate key, otorisasi delegate
+  on-chain (Arc + Base Sepolia + Arbitrum Sepolia), reconcile, revoke.
+- ARCOX Pay: invoice/payment link USDC publik di Arc Testnet + reconcilasi memo.
+- x402 middleware untuk endpoint berbayar (ARCOX Intel) dengan invoice internal.
+- ARCOX AI Router (OpenAI-compatible) dengan pembayaran dari Unified Balance.
+- Agent cards, agentic jobs (ERC-8004/ERC-8183), dan vault credential.
 
-## Bukan Tanggung Jawab
-
-- Frontend React ada di `/home/ubuntu/arc-dex`.
-- MCP, terminal agent, CLI, router deploy tooling ada di `/home/ubuntu/arcox-mcp`.
-- Jangan simpan private key user browser wallet di API.
-
-## File Runtime Penting
+## Struktur Runtime
 
 ```text
-.env
-wallets-db.json
-tx-history-db.json
-invoices-db.json
-webhook-events-db.json
-runtime-backups/
+.env                  konfigurasi server (jangan commit)
+server.mjs            entry point + routing HTTP (76 route)
+src/services/         mcpServer.mjs, sessionKeyService.mjs, vaultStore.mjs, dll
+src/routes/           route group (aiRouter, arkham, treasury, x402, vault)
+data/                 state runtime JSON (atomic write + .bak)
+docs/                 dokumentasi teknis
+test/                 unit/regresi (node --test)
+scripts/              e2e nyata + diagnosa
 ```
 
-File DB JSON adalah state runtime lokal. Backup sebelum migrasi atau reset server. Untuk production serius, migrasi berikutnya tetap disarankan ke PostgreSQL/SQLite managed migration; atomic JSON backup ini adalah mitigasi VPS testnet.
-
-## VPS Deployment
-
-PM2:
-
-```bash
-cd /home/ubuntu/arc-dex-api
-npm install
-mkdir -p logs runtime-backups
-pm2 start ecosystem.config.cjs
-pm2 save
-```
-
-Restart setelah update:
-
-```bash
-cd /home/ubuntu/arc-dex-api
-git pull
-pm2 restart arc-dex-api
-```
-
-Direct fallback:
-
-```bash
-node --env-file=.env server.mjs
-```
-
-## ARCOX Pay
-
-ARCOX Pay adalah USDC payment request dan invoice layer untuk Arc. Fitur yang disiapkan:
-
-- Payment links dan checkout page.
-- Invoice status/timeline.
-- Circle Gateway webhook foundation.
-- Pay status console di `/pay/status`.
-- Unified Balance / Circle Gateway payment readiness.
-- MCP compatibility.
-- x402 monetization memakai Arc Testnet USDC.
-- ARCOX Intel API: Arkham-backed read-only intelligence endpoints protected by ARCOX x402; Intel tools never execute swaps, bridges, sends, buys, or sells.
-- Future Circle Gateway Nanopayments readiness.
-
-Yang real sekarang: public USDC invoice/payment link di Arc Testnet.
-
-Yang future: production Eco routing penuh, gas-free nanopayments batch settlement, dan privacy/private payment.
-
-ARCOX Intel:
-
-- Backend only: `ARKHAM_API_KEY` belongs in `arc-dex-api` env.
-- Frontend and MCP call `/api/intel/*`; they never call Arkham directly.
-- MCP Intel tools are read-only and support address, entity, token, balances, portfolio, contract, transaction lookup, and search services.
-- x402 payment memakai exact USDC amount, 6 decimals, Arc Transaction Memo, dan on-chain reconciliation.
-- See `docs/arcox-intel.md`.
-
-## ARCOX AI Router
-
-ARCOX AI Router adalah OpenAI-compatible API layer yang dibayar per request dari Unified Balance user melalui Auto Pay. Flow retail:
-
-OpenAI-compatible `tools`, `tool_choice`, and `parallel_tool_calls` are forwarded unchanged to tool-capable upstream providers. When a provider rejects tool calling, the router can fall back to another configured provider without reducing the Hermes tool schema.
+State di `data/` (backup sebelum migrasi/reset):
 
 ```text
-Connect wallet -> Deposit USDC to Unified Balance -> Auto Pay ON -> Create API Key -> Use /v1/chat/completions
+oauth-clients.json    klien OAuth terdaftar (Grok, Claude, ChatGPT, arcox_conn_*)
+oauth-tokens.json     access/refresh token
+oauth-state.json      authorization request + SIWE challenge
+session-keys.json     session key per Agent Wallet (MSCA)
+vault.json            credential, limit, approval, card link
+vault-sessions.json   sesi owner/passkey + metadata session
+vault-activity.json   audit aktivitas agent
+agent-spend.json      pengeluaran harian per agent
 ```
 
-Endpoint:
+Supabase dipakai sebagai persistence shadow/primary (transaksi, invoice,
+aktivitas, metadata session); kegagalan dual-write tidak memblokir permintaan.
+
+## MCP Server
+
+Endpoint publik:
 
 ```text
-GET  /api/ai-router/status?ownerAddress=0x...
-POST /api/ai-router/auto-pay
-POST /api/ai-router/api-keys
-POST /api/ai-router/api-keys/:id/revoke
-POST /api/ai-router/api-keys/:id/rotate
-GET  /api/ai-router/models
-GET  /api/ai-router/usage?ownerAddress=0x...
-GET  /v1/models
-POST /v1/chat/completions
+POST/GET/DELETE /mcp
+GET  /.well-known/oauth-authorization-server[/mcp]
+GET  /.well-known/oauth-protected-resource[/mcp]
+POST /api/auth/register      dynamic client registration (RFC 7591)
+GET  /api/auth/authorize     authorization code + PKCE S256
+POST /api/auth/token         authorization_code / refresh_token
+GET  /api/auth/siwe-message  SIWE challenge untuk approval owner
+POST /api/auth/siwe-verify   verifikasi SIWE + penerbitan authorization code
+POST /api/auth/passkey-*     login/verify passkey di halaman approval
 ```
 
-OpenAI-compatible config:
+Karakteristik yang berlaku sekarang:
+
+- Access token berlaku 24 jam, refresh token 30 hari; keduanya diikat ke
+  `resource = <SERVER_URL>/mcp` dan hanya valid untuk resource itu.
+- **Satu agent = satu `clientId` = satu binding** `<clientId>|<owner>` dengan
+  Agent Wallet, limit harian, card link, dan state revoke sendiri.
+- Agent Hermes-style boleh memakai **connection token** (`arcox_conn_*`) yang
+  dibuat dari halaman Plugin, bukan OAuth penuh.
+- Interoperabilitas transport:
+  - Klien yang hanya menerima `application/json` (mis. runtime Grok, konfigurasi
+    default Hermes) dilayani sebagai JSON, bukan SSE.
+  - Klien yang menerima `text/event-stream` (Claude/ChatGPT) tetap SSE.
+  - Permintaan tanpa `Mcp-Session-Id` (klien stateless) dilayani dengan server
+    sekali pakai, sehingga `tools/list` tetap bisa dijawab.
+  - Field tasks-extension `execution` **tidak** dikirim, karena server tidak
+    mengiklankan capability `tasks` dan klien dengan skema ketat gagal
+    mem-parse seluruh daftar tool jika field asing ikut terkirim.
+- 88 tool tersedia untuk semua agent (`arcox_wallet_balances`,
+  `arcox_quote_bridge`/`arcox_execute_bridge`, `arcox_intel_*`, `arcox_card_*`,
+  `arcox_x402_*`, `arcox_agent_*`, `call_ai_model`, …).
+
+Diagnosa konektor (jawaban untuk "agent sudah terhubung tapi tool tidak
+terbaca"):
+
+```bash
+npm run diag:mcp                      # semua agent
+npm run diag:mcp -- --agent grok      # filter satu agent
+```
+
+Skrip ini mencocokkan klien OAuth + token yang benar-benar terbit, lalu
+melakukan handshake `initialize` → `tools/list` → `tools/call` memakai token
+tersebut, pada mode JSON-only dan SSE.
+
+## Alur Agent Wallet (MSCA)
+
+| Alur | Aturan backend |
+|---|---|
+| Buat Wallet Baru | butuh owner proof (SIWE) + passkey; `generate-key` membuat delegate & `addOwners` di Arc, lalu Base/Arbitrum Sepolia |
+| Relogin setelah Revoke | passkey cukup; delegate dirotasi, binding lama diaktifkan kembali tanpa SIWE |
+| Login Passkey setelah Hapus | passkey + owner proof; binding dibuat ulang |
+
+Session key yang di-revoke atau di-clear tidak menyisakan
+`authorizationUserOpHash` lama, sehingga permintaan berikutnya tidak terjebak
+pada state basi. Detail policy sisi frontend ada di
+`arc-dex/src/services/sessionProofPolicy.ts`.
+
+## ARCOX Pay, x402, Intel, AI Router
+
+- **ARCOX Pay**: payment link/invoice USDC Arc Testnet, status timeline,
+  reconciliation amount unik + Arc Transaction Memo. Lihat `docs/arcox-pay.md`.
+- **x402**: endpoint berbayar mengembalikan `402 Payment Required` dengan
+  invoice internal; setelah dibayar, hasil terbuka. Lihat
+  `docs/x402-monetization.md` dan `docs/mcp-pay-tools.md`.
+- **ARCOX Intel**: endpoint `/api/intel/*` (Arkham-backed, read-only) hanya
+  dapat diakses lewat backend; `ARKHAM_API_KEY` tidak pernah dikirim ke
+  frontend/MCP. Lihat `docs/arcox-intel.md`.
+- **AI Router**: `/v1/chat/completions` + `/v1/models`, key `arx_sk_...`
+  (disimpan sebagai hash), dibayar per request dari Unified Balance melalui
+  Auto Pay. Provider key hanya di env backend.
 
 ```text
 base_url = https://arcoxdex.vercel.app/v1
-api_key = arx_sk_...
-model = arcox/auto
+api_key  = arx_sk_...
+model    = arcox/auto
 ```
 
-Security:
+## Testing
 
-- API key format `arx_sk_...`.
-- Backend stores only SHA-256 hash, never plain API key.
-- Provider API keys stay only in backend env.
-- AI Router charges only at request time through Auto Pay Unified Balance spend.
-- User funds stay in user Unified Balance until each AI request is paid.
-- If Unified Balance is insufficient, `/v1/chat/completions` returns HTTP 402 with “Please deposit more USDC to Unified Balance”.
-- If Auto Pay is not ready, `/v1/chat/completions` returns HTTP 402 with “Enable Auto Pay first”.
-
-Provider env example:
-
-```text
-AI_PROVIDER_1_NAME=NVIDIA
-AI_PROVIDER_1_BASE_URL=https://integrate.api.nvidia.com/v1
-AI_PROVIDER_1_API_KEY=
-AI_PROVIDER_1_MODEL=openai/gpt-oss-120b
-AI_PROVIDER_2_NAME=NVIDIA
-AI_PROVIDER_2_BASE_URL=https://integrate.api.nvidia.com/v1
-AI_PROVIDER_2_API_KEY=
-AI_PROVIDER_2_MODEL=nvidia/nemotron-3-super-120b-a12b
+```bash
+npm test                 # node --check + 315 test unit/regresi
+npm run test:e2e:flows   # 3 alur agent: passkey + EOA virtual, UserOperation NYATA di Arc testnet
+npm run test:e2e:ui      # 4 alur menu Plugin di Chrome nyata (virtual authenticator)
+npm run diag:mcp         # diagnosa konektor/token MCP per agent
 ```
 
-Circle Gateway Nanopayments gas-free belum live. ARCOX memakai response `402 Payment Required`, invoice internal, dan Arc USDC memo payment:
+`test:e2e:ui` dan `test:e2e:flows` butuh Chrome/jaringan dan menulis state uji,
+jadi tidak dijalankan otomatis di `npm test`. Detail operasional:
+`MAINTENANCE.md`.
+
+## Env penting
 
 ```text
-GET /api/nanopayments/capabilities
-```
-
-## Env Tambahan
-
-```text
-ARCOX_PAY_BASE_URL=https://arcoxdex.vercel.app
-ENABLE_DEV_TOOLS=false
-CIRCLE_API_KEY=
-CIRCLE_WEBHOOK_SECRET=
-CIRCLE_ENVIRONMENT=TEST
-CIRCLE_BASE_URL=https://api-sandbox.circle.com
-CIRCLE_ENV=TEST
-ECO_ENVIRONMENT=TEST
-ECO_API_BASE_URL=
-ECO_LIVE_ROUTES=false
-ECO_DAPP_ID=arcox-pay
-ECO_QUOTES_API_URL=https://quotes.eco.com/api/v3/quotes/single
+SERVER_URL=https://arcoxdex.vercel.app     # dipakai untuk issuer OAuth + resource MCP
+AUTH_SECRET=
+ALLOWED_ORIGINS=https://arcoxdex.vercel.app
+SUPABASE_URL= / SUPABASE_SERVICE_KEY=
+CIRCLE_API_KEY= / CIRCLE_CLIENT_KEY_LIVE= / CIRCLE_API_KEY_MAINNET=
+CIRCLE_ENTITY_SECRET=
+KIT_KEY=
+ARKHAM_API_KEY=
 X402_ENABLED=true
-X402_MODE=arc_real_testnet
-X402_ASSET=USDC
-X402_CHAIN_ID=5042002
-X402_USDC_ADDRESS=0x3600000000000000000000000000000000000000
-X402_BASE_AMOUNT=0.005
-X402_PAYMENT_TTL_SECONDS=300
-X402_RECONCILE_LOOKBACK_BLOCKS=8000
-ARC_RPC_URL=https://rpc.testnet.arc.io
-CIRCLE_X402_TREASURY_WALLET_ID=
-CIRCLE_X402_NETWORK=arc-testnet
 ARC_MEMO_CONTRACT=0x5294E9927c3306DcBaDb03fe70b92e01cCede505
 ARCOX_TREASURY_WALLET_ADDRESS=
-ARCOX_SOLANA_TREASURY_ADDRESS=
 AI_ROUTER_DELEGATE_ADDRESS=
-AI_ROUTER_DEFAULT_COST_USDC=0.001
-AI_ROUTER_DEFAULT_MAX_PER_REQUEST_USDC=0.02
-AI_PROVIDER_VALIDATE_MODELS=true
-AI_PROVIDER_1_NAME=
-AI_PROVIDER_1_BASE_URL=
-AI_PROVIDER_1_API_KEY=
-AI_PROVIDER_1_MODEL=
+AI_PROVIDER_1_NAME= / AI_PROVIDER_1_BASE_URL= / AI_PROVIDER_1_API_KEY= / AI_PROVIDER_1_MODEL=
+ENABLE_SERVER_SIGNED_MINT=false
 ```
 
-`ARCOX_TREASURY_WALLET_ADDRESS` adalah penerima tunggal untuk fee backend,
-AI Router, dan x402. Setelah menggantinya, restart proses backend. Router EVM
-yang sudah ter-deploy menyimpan treasury on-chain; owner juga harus memanggil
-`setTreasury(address)` pada setiap router agar fee kontrak mengikuti alamat baru.
+- `ARCOX_TREASURY_WALLET_ADDRESS` adalah penerima tunggal fee backend, AI
+  Router, dan x402. Setelah diganti, restart proses dan panggil
+  `setTreasury(address)` pada router on-chain.
+- Setelah mengubah `.env`, restart unit systemd agar env baru dimuat.
 
-## Testing Singkat
+## Mainnet
 
-1. Start API dan DEX.
-2. Buka `/pay/status`.
-3. Create invoice.
-4. Bayar exact Arc USDC via wallet memo.
-5. Cek invoice status sampai `paid`.
-6. Retry Intel request memakai `X-PAYMENT-ID`.
+- `docs/mainnet-security.md` — checklist keamanan mainnet.
+- `docs/mainnet-x402-readiness.md` — kesiapan x402 di Arc mainnet.
+- Ringkasan prasyarat frontend+backend: `arc-dex/docs/mainnet-readiness.md`.
 
-Catatan teknis:
+## Catatan teknis
 
-- RPC publik `rpc.testnet.arc.io` adalah fallback yang sinkron (RPC resmi sesuai docs.arc.io). Production backend dan local agent dapat memakai RPC Canteen melalui environment lokal (`arc-canteen rpc-url`); jangan commit URL bertoken ke repository.
-- `eth_getLogs` pada RPC Canteen memiliki batas parameter/ukuran respons yang lebih ketat daripada RPC publik. Semua scan Arc memakai chunk konservatif 2,000 block agar tidak gagal `-32602` atau response-size limit.
-- Invoice yang sudah `expired` tetap di-reconcile jika ada bukti pembayaran on-chain (memo atau Gateway). Ini mencegah dana terkunci saat TTL 300 detik berlalu sebelum reconcile sempat berjalan.
-- PM2 membutuhkan `--update-env` setelah mengubah `.env` agar env baru dimuat. Tanpa ini, process restart dengan env lama.
-- Hati-hati zombie process: pastikan tidak ada process lama yang masih mendengarkan di port 3001 sebelum start backend baru.
-# ARCOX API keys
-
-AI Router uses standard `arx_sk_...` bearer keys with the OpenAI-compatible production base URL. Keys are shown once, stored only as hashes, and can be revoked from the connected owner wallet.
-
-Set model prices only in `arc-dex-api/.env` with `AI_ROUTER_MODEL_PRICE_DEFAULT_USDC` and the JSON map `AI_ROUTER_MODEL_PRICES_USDC`. Client-provided prices are ignored. The local proxy supplies an idempotency key so a retried identical request is not charged twice.
+- RPC Arc publik yang sinkron: `rpc.testnet.arc.network`. Jangan pakai node
+  tertinggal — nonce konflik pada x402/swap/bridge/send.
+- Semua scan `eth_getLogs` Arc di-chunk konservatif (2.000–8.000 block).
+- Invoice `expired` tetap di-reconcile bila ada bukti pembayaran on-chain.
+- Jangan simpan private key user atau secret Circle di repo/frontend.

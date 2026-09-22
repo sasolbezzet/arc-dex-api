@@ -47,6 +47,19 @@ journalctl -u arc-dex-api -n 50 --no-pager
 
 Deploy only after review and the staging gates. Roll back the code with a reviewed Git revert, restart the same systemd unit, and keep runtime JSON state unchanged because the agent-binding format is additive.
 
+**Exactly one process may own port 3001.** A manually started `node server.mjs`
+left running alongside the systemd unit keeps the old code alive behind nginx,
+which produces 4xx answers that no longer match the current source (this has
+caused false "reject" reports more than once). Before debugging a rejection,
+confirm both the listening PID and the unit's `MainPID`:
+
+```bash
+ss -ltnp | grep ':3001'
+systemctl show arc-dex-api -p MainPID -p ActiveState
+```
+
+If they differ, stop the manual process and `sudo systemctl restart arc-dex-api`.
+
 ## Plugin flow regression harnesses
 
 The three Plugin flows that are easy to confuse (Create New Wallet, Relogin
@@ -64,6 +77,33 @@ The UI harness drives headless Chrome with a virtual EOA provider and a CDP
 virtual WebAuthn authenticator, and also runs the real MCP OAuth approval
 (DCR + PKCE) for the Grok card. It needs Chrome, network access, and performs
 real `addOwners` UserOperations on Arc testnet, so it stays out of `npm test`.
+
+## MCP connector diagnostics ("agent connected but no tools")
+
+A provider can show a connector as connected while its OAuth exchange never
+completed, so no access token exists and `tools/list` was never successfully
+called. Diagnose from the backend instead of guessing:
+
+```bash
+npm run diag:mcp                    # every registered client
+npm run diag:mcp -- --agent grok    # one provider
+```
+
+The script matches registered OAuth clients with the tokens actually issued,
+prints token expiry and the bound MSCA, then performs a real
+`initialize` → `tools/list` → `tools/call` handshake in JSON-only and SSE modes.
+A client with no active token means the browser approval (passkey → Setujui on
+`/plugin`) never finished; re-connect from the provider and complete that page.
+
+Transport interoperability rules the server must keep:
+
+- A client that only sends `Accept: application/json` must receive JSON, not SSE.
+- Requests without `Mcp-Session-Id` are served statelessly instead of rejected.
+- The tasks-extension field `execution` must not appear in `tools/list` while the
+  server does not advertise the `tasks` capability; strict clients fail to parse
+  the whole list otherwise.
+
+`test/mcpToolListCompat.test.mjs` locks the tool-list shape.
 
 ## OAuth test-state purge
 

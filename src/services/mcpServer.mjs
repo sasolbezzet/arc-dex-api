@@ -4413,6 +4413,17 @@ export function createMcpServer(userId, context = {}) {
   registerArcoxPayTools(toolCtx)
   registerCardTools(toolCtx)
   registerAiRouterTools(toolCtx)
+
+  // ── Client compatibility: drop the tasks-extension field ──
+  // SDK 1.30 stamps `execution: { taskSupport: 'forbidden' }` on every tool
+  // definition even though this server never advertises the `tasks`
+  // capability. Clients that model tools with a strict schema (extra keys
+  // rejected) fail to parse the whole tools/list payload and then report the
+  // connector as connected but with no tools — exactly the symptom reported
+  // for Grok. The field carries no information here, so omit it.
+  for (const tool of Object.values(server._registeredTools || {})) {
+    if (tool && 'execution' in tool) tool.execution = undefined
+  }
   return server
 }
 
@@ -4440,6 +4451,13 @@ export async function mcpHttpHandler(req, res) {
       i -= 2
     }
   }
+  // Remember what the CLIENT actually asked for before normalizing below.
+  // Some clients (Grok's connector runtime, Hermes default config) send
+  // `Accept: application/json` only. Answering those with an SSE frame is
+  // technically allowed but leaves the tool list unparsed on strict clients,
+  // which then report "connected, no tools". JSON mode is used for them.
+  const clientAcceptsSse = acceptTypes.includes('text/event-stream')
+  const jsonOnlyClient = !clientAcceptsSse
   if (!acceptTypes.includes('application/json')) acceptTypes.push('application/json')
   if (!acceptTypes.includes('text/event-stream')) acceptTypes.push('text/event-stream')
   req.rawHeaders.push('accept', acceptTypes.join(', '))
@@ -4484,8 +4502,31 @@ export async function mcpHttpHandler(req, res) {
   // Hermes performs its default POST probe. Keep a stable id only when the
   // client explicitly sent one; initialization gets a fresh id from the SDK.
   const sessionId = req.headers['mcp-session-id'] || undefined
-  
+  const requestMethod = String(req.body?.method || '')
+  const isInitializeRequest = requestMethod === 'initialize'
+  // Stateless fallback: a client that never echoes Mcp-Session-Id (or that
+  // reconnects without one) must still be able to call tools/list and
+  // tools/call. In stateless mode the SDK skips session validation entirely;
+  // the bearer token already carries the verified owner + MSCA context, so
+  // nothing is loosened by answering such a request with a throwaway server.
+  const statelessRequest = !sessionId && !isInitializeRequest && req.method === 'POST'
+
   const boundMscaWalletAddress = auth.mscaWalletAddress || ''
+  if (statelessRequest) {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: jsonOnlyClient,
+    })
+    const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress, clientId: auth.clientId })
+    await server.connect(transport)
+    try {
+      await transport.handleRequest(req, res, req.body)
+    } finally {
+      try { await server.close() } catch { /* already closed */ }
+    }
+    return
+  }
+
   let session = sessionId ? sessions.get(sessionId) : null
   // Claude may reuse an MCP session id after OAuth reconnect/rebinding. Never
   // reuse a server created for a different verified MSCA context; otherwise the
@@ -4498,7 +4539,10 @@ export async function mcpHttpHandler(req, res) {
     session = null
   }
   if (!session) {
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId || randomUUID() })
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => sessionId || randomUUID(),
+      enableJsonResponse: jsonOnlyClient,
+    })
     const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress, clientId: auth.clientId })
     await server.connect(transport)
     session = { transport, server, userId: auth.userId, clientId: auth.clientId, boundMscaWalletAddress, lastActivity: Date.now() }
