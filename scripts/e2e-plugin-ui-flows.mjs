@@ -51,7 +51,12 @@ const short = a => `${String(a).slice(0, 10)}…${String(a).slice(-6)}`
 
 const state = existsSync(STATE_PATH) ? JSON.parse(readFileSync(STATE_PATH, 'utf8')) : {}
 const persist = () => writeFileSync(STATE_PATH, JSON.stringify(state, null, 2))
-const eoaKey = state.eoaKey || `0x${Buffer.from(webcrypto.getRandomValues(new Uint8Array(32))).toString('hex')}`
+// Each run uses a fresh virtual owner by default. Reusing the previous run's
+// EOA would hit `agent_wallet_rotation_forbidden` on the next "Buat Agent
+// Wallet": the agent is already bound to that owner's earlier wallet. Set
+// E2E_UI_REUSE_EOA=1 (plus a state file) only when resuming an interrupted run.
+const reuseEoa = process.env.E2E_UI_REUSE_EOA === '1'
+const eoaKey = (reuseEoa && state.eoaKey) || `0x${Buffer.from(webcrypto.getRandomValues(new Uint8Array(32))).toString('hex')}`
 state.eoaKey = eoaKey
 persist()
 const account = privateKeyToAccount(eoaKey)
@@ -541,6 +546,16 @@ try {
   check('passkey prompt carries the agent name', /hermes/i.test(createEntry.userName) || /hermes/i.test(createEntry.rpName), `user.name="${createEntry.userName}" rp.name="${createEntry.rpName}"`)
   check('passkey prompt carries a unique wallet number', /#\d{2}/.test(createEntry.userName), `user.name="${createEntry.userName}"`)
   check('owner SIWE was requested for the new wallet', (await readSignCount()) > signsBefore1, `${(await readSignCount()) - signsBefore1} signature(s)`)
+
+  // Fail fast with the backend's own message when the agent is already bound to
+  // another wallet: waiting 4 minutes for a card that can never appear hides a
+  // clear 403 behind a timeout.
+  const rejected = await cdp.eval(`JSON.stringify((window.__e2eLogs.read('arx_e2e_api_log') || [])
+    .filter(entry => /activate-binding/.test(entry.url) && Number(entry.status) === 403)
+    .map(entry => String(entry.body || '')))`).then(raw => JSON.parse(raw || '[]'))
+  if (rejected.length) {
+    throw new Error(`activate-binding ditolak backend: ${rejected[rejected.length - 1].slice(0, 300)}`)
+  }
 
   const card1 = await cdp.waitFor(`window.__card(${JSON.stringify(CARD_AGENT)})`, { timeout: 240_000, every: 2000, label: 'Hermes agent card' }).then(raw => JSON.parse(raw))
   check('Hermes agent card appears after creation', Boolean(card1), `badge="${card1.badge}"`)

@@ -103,7 +103,26 @@ Transport interoperability rules the server must keep:
   server does not advertise the `tasks` capability; strict clients fail to parse
   the whole list otherwise.
 
-`test/mcpToolListCompat.test.mjs` locks the tool-list shape.
+`test/mcpToolListCompat.test.mjs` locks the tool-list shape, and
+`test/mcpToolProfile.test.mjs` locks the optional `?profile=lite|core` subsets
+(`full` stays the default; every profile keeps quote+execute pairs together).
+
+## Agent wallet rotation and the UI harness
+
+An agent that already has an Agent Wallet cannot silently switch to a new one.
+`POST /api/session/activate-binding` answers `403
+agent_wallet_rotation_forbidden` with an actionable message; it must never be
+reported as an owner-session problem, because the UI shows the backend text
+directly.
+
+`npm run test:e2e:ui` uses a fresh virtual owner each run. Reusing a previous
+run's EOA makes Flow 1 fail on that guard, so the state file is per-run by
+default; set `E2E_UI_REUSE_EOA=1` with `E2E_UI_STATE_PATH` only when resuming an
+interrupted run. Known limitation: an agent whose wallet was created through the
+OAuth approval page has no passkey credential bound to its `agentKey` yet, so
+the passkey prompt for that agent is discoverable — a second registered passkey
+can be selected and then fails activation. Bind the credential during approval
+before relying on relogin for such agents.
 
 ## OAuth test-state purge
 

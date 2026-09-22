@@ -30,6 +30,51 @@ function jsonText(value) {
 const SERVER_URL = process.env.SERVER_URL || 'https://arcoxdex.vercel.app'
 const MCP_RESOURCE_URL = `${SERVER_URL}/mcp`
 const TOKEN_TTL = 3600 * 24 // 24 hours
+
+// ── Optional tool profiles ──
+// Some MCP clients (and provider connectors) have a small tool budget or a
+// strict schema, so they can ask for a reduced, self-consistent subset through
+// `?profile=lite` on the MCP URL or the `x-arcox-tool-profile` header. The
+// default stays `full` (every tool), and quotes/executes always travel together
+// so a reduced profile can never expose an execute without its quote.
+const TOOL_PROFILES = {
+  lite: [
+    'arcox_wallet_balances', 'arcox_session_status', 'arcox_mcp_info',
+    'arcox_route_status', 'arcox_search_docs',
+    'arcox_quote_swap', 'arcox_execute_swap',
+    'arcox_quote_bridge', 'arcox_execute_bridge', 'arcox_bridge_status',
+    'arcox_quote_send', 'arcox_execute_send',
+    'arcox_get_request',
+  ],
+  core: [
+    'arcox_wallet_balances', 'arcox_transaction_history', 'arcox_session_status',
+    'arcox_mcp_info', 'arcox_route_status', 'arcox_get_request',
+    'arcox_quote_swap', 'arcox_execute_swap',
+    'arcox_quote_bridge', 'arcox_execute_bridge', 'arcox_bridge_status', 'arcox_retry_bridge_mint',
+    'arcox_quote_send', 'arcox_execute_send',
+    'arcox_vault_get_limits', 'arcox_vault_list_credentials',
+    'arcox_search_docs', 'arcox_read_doc', 'arcox_execution_guide', 'arcox_ui_map', 'arcox_action_plan',
+    'arcox_agent_status',
+    'arcox_create_payment_request', 'arcox_get_payment_request', 'arcox_quote_payment_request',
+    'arcox_pay_payment_request', 'arcox_check_payment_status', 'arcox_pay_list_recent_payments',
+    'arcox_x402_pay_invoice', 'arcox_x402_invoice_status',
+    'arcox_intel_get_address', 'arcox_intel_get_token', 'arcox_intel_get_tx', 'arcox_intel_search',
+    'arcox_card_balance', 'arcox_card_list', 'arcox_card_spend', 'arcox_card_transactions',
+    'get_ai_router_status', 'list_ai_models', 'call_ai_model',
+  ],
+}
+
+export function resolveToolProfile(requested) {
+  const name = String(requested || '').trim().toLowerCase()
+  if (!name || name === 'full' || name === 'all') return { name: 'full', tools: null }
+  if (TOOL_PROFILES[name]) return { name, tools: TOOL_PROFILES[name] }
+  console.warn(`[mcp] unknown tool profile "${name}" — falling back to full`)
+  return { name: 'full', tools: null }
+}
+
+export function toolProfileNames() {
+  return ['full', ...Object.keys(TOOL_PROFILES)]
+}
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 // Keep the Streamable HTTP transport alive for the same practical lifetime as
 // the OAuth token. The previous fixed 30-minute timer deleted an otherwise
@@ -3090,6 +3135,7 @@ export function createMcpServer(userId, context = {}) {
   // the OAuth clientId so limits/audit are scoped to one agent.
   const clientId = context.clientId || ''
   const agentKey = clientId && !clientId.includes('|') ? `${clientId}|${userId}` : ''
+  const toolProfile = resolveToolProfile(context.toolProfile)
   // MCP callers carry an OAuth clientId; use the owner's configured limit
   // when the caller did not provide an explicit per-server override.
   const dailyLimit = Number(context.dailyLimit || getLimits(userId)?.dailyLimit || 0) || 0
@@ -4163,6 +4209,9 @@ export function createMcpServer(userId, context = {}) {
           version: '1.1.0',
           url: SERVER_URL,
           userId,
+          tool_profile: toolProfile.name,
+          tool_count: Object.keys(server._registeredTools || {}).length,
+          tool_profiles_available: toolProfileNames(),
           services: ['wallet_balances', 'swap', 'bridge', 'send', 'cards', 'intel', 'x402', 'vault', 'transaction_history', 'route_status', 'session_key', 'get_request'],
           sources: {
             session: 'Agent Session Key (MSCA) — passkey-gated setup, gasless, within limits. SATU-SATUNYA sumber untuk agent remote.',
@@ -4424,6 +4473,17 @@ export function createMcpServer(userId, context = {}) {
   for (const tool of Object.values(server._registeredTools || {})) {
     if (tool && 'execution' in tool) tool.execution = undefined
   }
+
+  // Apply the requested tool profile. Removing the entry from the tool map is
+  // exactly what the SDK's own tool.remove() does, so both tools/list and
+  // tools/call agree: a filtered tool is simply absent.
+  if (toolProfile.tools) {
+    const allowed = new Set(toolProfile.tools)
+    for (const name of Object.keys(server._registeredTools || {})) {
+      if (!allowed.has(name)) delete server._registeredTools[name]
+    }
+  }
+  server.toolProfileName = toolProfile.name
   return server
 }
 
@@ -4502,6 +4562,14 @@ export async function mcpHttpHandler(req, res) {
   // Hermes performs its default POST probe. Keep a stable id only when the
   // client explicitly sent one; initialization gets a fresh id from the SDK.
   const sessionId = req.headers['mcp-session-id'] || undefined
+  // A client may ask for a reduced tool set through the URL (?profile=lite) or a
+  // header; anything unknown falls back to the full tool list.
+  let requestedProfile = ''
+  try {
+    requestedProfile = new URL(req.url, SERVER_URL).searchParams.get('profile')
+      || req.headers['x-arcox-tool-profile'] || ''
+  } catch { /* keep default */ }
+  const toolProfile = resolveToolProfile(requestedProfile).name
   const requestMethod = String(req.body?.method || '')
   const isInitializeRequest = requestMethod === 'initialize'
   // Stateless fallback: a client that never echoes Mcp-Session-Id (or that
@@ -4517,7 +4585,7 @@ export async function mcpHttpHandler(req, res) {
       sessionIdGenerator: undefined,
       enableJsonResponse: jsonOnlyClient,
     })
-    const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress, clientId: auth.clientId })
+    const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress, clientId: auth.clientId, toolProfile })
     await server.connect(transport)
     try {
       await transport.handleRequest(req, res, req.body)
@@ -4533,6 +4601,7 @@ export async function mcpHttpHandler(req, res) {
   // request's fresh OAuth token is silently ignored by the old tool closure.
   if (session && (session.userId !== auth.userId
     || session.clientId !== auth.clientId
+    || (session.toolProfile || 'full') !== toolProfile
     || (session.boundMscaWalletAddress || '') !== boundMscaWalletAddress)) {
     sessions.delete(sessionId)
     try { await session.server?.close?.() } catch { /* already closed */ }
@@ -4543,9 +4612,9 @@ export async function mcpHttpHandler(req, res) {
       sessionIdGenerator: () => sessionId || randomUUID(),
       enableJsonResponse: jsonOnlyClient,
     })
-    const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress, clientId: auth.clientId })
+    const server = createMcpServer(auth.userId, { agent: agentName, boundMscaWalletAddress, clientId: auth.clientId, toolProfile })
     await server.connect(transport)
-    session = { transport, server, userId: auth.userId, clientId: auth.clientId, boundMscaWalletAddress, lastActivity: Date.now() }
+    session = { transport, server, userId: auth.userId, clientId: auth.clientId, toolProfile, boundMscaWalletAddress, lastActivity: Date.now() }
     // The transport may generate its own id during initialize. Register the
     // request alias now and the generated id after initialization below.
     if (sessionId) sessions.set(sessionId, session)

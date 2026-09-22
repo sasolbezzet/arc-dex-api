@@ -115,6 +115,19 @@ Karakteristik yang berlaku sekarang:
 - 88 tool tersedia untuk semua agent (`arcox_wallet_balances`,
   `arcox_quote_bridge`/`arcox_execute_bridge`, `arcox_intel_*`, `arcox_card_*`,
   `arcox_x402_*`, `arcox_agent_*`, `call_ai_model`, …).
+- Klien dengan kuota tool kecil (mis. connector penyedia AI) bisa meminta
+  subset yang konsisten lewat URL atau header; default tetap daftar penuh:
+
+  ```text
+  https://arcoxdex.vercel.app/mcp?profile=lite    # 13 tool transaksi inti
+  https://arcoxdex.vercel.app/mcp?profile=core    # 41 tool
+  x-arcox-tool-profile: core                       # lewat header
+  ```
+
+  Nama profil tak dikenal jatuh kembali ke `full`. Setiap profil selalu memuat
+  pasangan quote + execute agar agent tidak pernah bisa execute tanpa preview;
+  profil aktif terlihat di output `arcox_mcp_info` (`tool_profile`,
+  `tool_count`).
 
 Diagnosa konektor (jawaban untuk "agent sudah terhubung tapi tool tidak
 terbaca"):

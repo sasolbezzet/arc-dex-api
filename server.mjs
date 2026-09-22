@@ -780,7 +780,16 @@ app.post('/api/session/activate-binding', apiLimiter, requireAuth, async (req, r
       } catch (bindingError) {
         const message = String(bindingError?.message || '')
         console.warn('[activate-binding] rejected:', message, JSON.stringify({ agentKey, owner: verifiedBindingOwner, wallet: req.owner }))
-        if (/owner_wallet_relationship_missing|owner_mismatch|rotation_forbidden/i.test(message)) {
+        if (/rotation_forbidden/i.test(message)) {
+          // An agent that already has an Agent Wallet cannot silently switch to a
+          // new one. Report that plainly: the old generic owner-mismatch text made
+          // the UI look like the owner session was unverified.
+          return res.status(403).json({
+            code: 'agent_wallet_rotation_forbidden',
+            error: 'Agent ini sudah memakai Agent Wallet lain. Pakai Login Passkey untuk wallet itu, atau Cabut/Hapus agent dulu sebelum membuat wallet baru.',
+          })
+        }
+        if (/owner_wallet_relationship_missing|owner_mismatch/i.test(message)) {
           return res.status(403).json({ code: 'agent_owner_mismatch', error: 'Agent Wallet ini belum terbukti terikat ke owner wallet yang terhubung.' })
         }
         throw bindingError
