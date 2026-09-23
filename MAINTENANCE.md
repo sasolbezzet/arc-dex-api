@@ -69,9 +69,16 @@ behaviour — the unit tests alone cannot catch a wiring mistake between them.
 
 ```bash
 npm run test:e2e:flows                 # virtual EOA + passkey against the local backend
-npm run test:e2e:ui                    # real Chrome UI: all four Plugin flows
+npm run test:e2e:ui                    # real Chrome UI: all five Plugin flows
+E2E_UI_FLOWS=1,5 npm run test:e2e:ui   # subset: create + stale per-agent token
 E2E_BASE_URL=https://arcoxdex.vercel.app npm run test:e2e:flows   # production path
 ```
+
+Flow 5 covers the stale per-agent session token that produced "Sesi berakhir.
+Masuk kembali dengan passkey." on every card action while the same page had a
+healthy session: it seeds a dead `arx_oauth_vault_token:<clientId>` slot, then
+requires Revoke and Clear to keep working and that rejected slot to be retired.
+It depends on the card Flow 1 creates, hence the `E2E_UI_FLOWS=1,5` form.
 
 The UI harness drives headless Chrome with a virtual EOA provider and a CDP
 virtual WebAuthn authenticator, and also runs the real MCP OAuth approval
@@ -118,11 +125,34 @@ directly.
 `npm run test:e2e:ui` uses a fresh virtual owner each run. Reusing a previous
 run's EOA makes Flow 1 fail on that guard, so the state file is per-run by
 default; set `E2E_UI_REUSE_EOA=1` with `E2E_UI_STATE_PATH` only when resuming an
-interrupted run. Known limitation: an agent whose wallet was created through the
-OAuth approval page has no passkey credential bound to its `agentKey` yet, so
-the passkey prompt for that agent is discoverable — a second registered passkey
-can be selected and then fails activation. Bind the credential during approval
-before relying on relogin for such agents.
+interrupted run.
+
+### Passkey namespace resolution (why the prompt is never discoverable)
+
+The browser only knows a logical namespace for some agents — the OAuth approval
+card sends `oauth:<clientId>`, a provider placeholder sends its bare slug — while
+the durable binding row is `<clientId>|<owner>`. `GET /api/auth/passkey-options`
+resolves that namespace (`listAgentBindingsForNamespace`) and returns
+`allowCredentials` for every install of that agent, so WebAuthn never falls back
+to a discoverable ceremony that would offer every passkey on the device (which
+could authenticate a different Agent Wallet). Revoked rows stay included on
+purpose: Relogin after revoke must still be able to select its own passkey.
+`bindPasskeyCredential` resolves to the same durable row, so a passkey used for
+the first time through a namespace key is bound there and offered on the next
+login. `test/agentNamespaceCredentials.test.mjs` locks this down — cross-agent
+namespaces must stay separate.
+
+### Per-agent vault sessions expire independently (frontend rule)
+
+The dashboard keeps one session per agent client in
+`arx_oauth_vault_token:<clientId>` plus the global `arx_vault_token` family.
+Every card action must retry the next candidate after a `401`/`403 forbidden`
+and then retire the rejected token (`forgetVaultToken`); a fresh passkey Relogin
+also rewrites that agent's own slot. Skipping either half is what made Revoke
+and Clear answer "Sesi berakhir" forever after the 24h session expired, even
+though the passkey had just been re-authenticated.
+`src/services/agentTokenSelection.ts` (+ its test) owns the ordering, retirement
+and retry policy; Flow 5 in the UI harness locks the wiring.
 
 ## OAuth test-state purge
 

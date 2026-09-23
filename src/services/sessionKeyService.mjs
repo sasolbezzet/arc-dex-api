@@ -746,6 +746,36 @@ export function findAgentBindingForAgent(agentKey, walletAddress) {
   return candidates.length === 1 ? { agentKey: candidates[0][0], ...candidates[0][1] } : null
 }
 
+/**
+ * List every durable binding that shares one passkey login namespace.
+ *
+ * The browser only knows a logical namespace for some agents — the OAuth
+ * approval card sends `oauth:<clientId>` and a provider placeholder sends its
+ * bare clientId/slug — while the durable row is `<clientId>|<owner>`. Resolving
+ * the namespace keeps Login Passkey scoped to that agent's own passkeys; without
+ * it WebAuthn runs discoverable and offers every passkey on the device, which
+ * can authenticate the wrong Agent Wallet.
+ *
+ * Revoked rows are included on purpose: Relogin after revoke must still be able
+ * to select the passkey that belongs to this agent.
+ */
+export function listAgentBindingsForNamespace(agentKey) {
+  const requested = normalizeAgentKey(agentKey)
+  if (!requested) return []
+  const store = loadStore()
+  const clientId = agentClientId(requested)
+  const rows = []
+  for (const [key, binding] of Object.entries(store.agentBindings || {})) {
+    const normalizedKey = normalizeAgentKey(key)
+    if (normalizedKey === requested) continue
+    const sameClient = agentClientId(normalizedKey) === clientId
+    const ownerScoped = normalizedKey.startsWith(`${requested}|`)
+    if (!sameClient && !ownerScoped) continue
+    rows.push({ agentKey: normalizedKey, ...binding })
+  }
+  return rows
+}
+
 export function bindAgentCredential(agentKey, credentialId, walletAddress) {
   const key = normalizeAgentKey(agentKey)
   const id = String(credentialId || '').trim()

@@ -154,6 +154,13 @@ Session key yang di-revoke atau di-clear tidak menyisakan
 pada state basi. Detail policy sisi frontend ada di
 `arc-dex/src/services/sessionProofPolicy.ts`.
 
+Tombol passkey selalu menunjuk ke passkey milik agent itu sendiri. Frontend
+mengirim namespace logis (`oauth:<clientId>` atau slug provider) sementara baris
+binding tersimpan sebagai `<clientId>|<owner>`; `GET /api/auth/passkey-options`
+me-resolve namespace tersebut lewat `listAgentBindingsForNamespace` dan mengirim
+`allowCredentials`, sehingga dialog passkey tidak pernah berjalan discoverable
+(yang bisa memilih wallet agent lain).
+
 ## ARCOX Pay, x402, Intel, AI Router
 
 - **ARCOX Pay**: payment link/invoice USDC Arc Testnet, status timeline,

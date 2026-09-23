@@ -255,13 +255,26 @@ function normalizeCredentialId(value) {
   return String(value || '').trim()
 }
 
+const MAX_AGENT_CREDENTIALS = 20
+
 function credentialIdsForAgent(agentKey) {
   const key = String(agentKey || '').trim().toLowerCase()
   if (!key) return []
   try {
-    const { getAgentBinding } = requireAgentBindingStore()
-    const binding = getAgentBinding(key)
-    return Array.isArray(binding?.credentialIds) ? binding.credentialIds.map(normalizeCredentialId).filter(Boolean) : []
+    const { getAgentBinding, listAgentBindingsForNamespace } = requireAgentBindingStore()
+    const ids = new Set((getAgentBinding(key)?.credentialIds || []).map(normalizeCredentialId).filter(Boolean))
+    // The browser only knows the logical passkey namespace for some agents (the
+    // OAuth approval card sends `oauth:<clientId>`), while the durable row is
+    // `<clientId>|<owner>`. Without this fallback WebAuthn runs discoverable and
+    // offers every passkey on the device, so the user can select a passkey that
+    // belongs to a different Agent Wallet. Revoked rows stay included because
+    // Relogin after revoke must offer its own passkey.
+    if (ids.size === 0) {
+      for (const row of listAgentBindingsForNamespace(key)) {
+        for (const id of (row.credentialIds || []).map(normalizeCredentialId)) if (id) ids.add(id)
+      }
+    }
+    return [...ids].slice(0, MAX_AGENT_CREDENTIALS)
   } catch {
     return []
   }
@@ -280,9 +293,21 @@ function bindPasskeyCredential(agentKey, credentialId, walletAddress) {
   const key = String(agentKey || '').trim().toLowerCase()
   const id = normalizeCredentialId(credentialId)
   if (!key || !id) return
-  const binding = agentBindingStoreModule?.getAgentBinding(key)
-  if (!binding) return
-  agentBindingStoreModule.bindAgentCredential(key, id, walletAddress)
+  const store = agentBindingStoreModule
+  if (!store) return
+  // A namespace-only key (OAuth approval card, provider placeholder) still
+  // belongs to a durable `<clientId>|<owner>` row once the passkey has
+  // authenticated a wallet. Bind there so the next login can offer this exact
+  // passkey instead of a discoverable ceremony. A direct row owned by another
+  // wallet is never overwritten.
+  const direct = store.getAgentBinding(key)
+  const directMatchesWallet = direct && (!walletAddress
+    || String(direct.walletAddress || '').toLowerCase() === String(walletAddress).toLowerCase())
+  const target = directMatchesWallet
+    ? key
+    : store.findAgentBindingForAgent(key, walletAddress)?.agentKey
+  if (!target) return
+  store.bindAgentCredential(target, id, walletAddress)
 }
 
 const DEFAULT_PASSKEY_AGENT_KEY = 'dashboard:primary'
