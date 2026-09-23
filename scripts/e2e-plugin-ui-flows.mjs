@@ -45,6 +45,14 @@ const LOGIN_LABEL = 'Login Passkey yang sudah ada'
 const OAUTH_LOGIN_LABEL = 'Login Passkey'
 const CARD_AGENT = 'hermes'
 const OAUTH_CARD_AGENT = 'grok'
+// FLOW 5 — a stale per-agent session token must not block card actions.
+// Run a subset with E2E_UI_FLOWS=1,5 (Flow 5 needs the card Flow 1 creates).
+const FLOWS = new Set(String(process.env.E2E_UI_FLOWS || '1,2,3,4,5').split(',').map(value => value.trim()).filter(Boolean))
+const flowEnabled = (id, label) => {
+  if (FLOWS.has(id)) return true
+  console.log(`   ⏭️  ${label} skipped (E2E_UI_FLOWS=${[...FLOWS].join(',')})`)
+  return false
+}
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const short = a => `${String(a).slice(0, 10)}…${String(a).slice(-6)}`
@@ -302,20 +310,43 @@ const injectSource = `
       Object.defineProperty(credentials, method, {
         configurable: true,
         value: async options => {
+          let allow = null
+          let picked = ''
           try {
             const publicKey = (options && options.publicKey) || {}
             const user = publicKey.user || {}
             const rp = publicKey.rp || {}
+            // Login must be scoped with allowCredentials; without it WebAuthn
+            // runs discoverable and can hand back another agent's passkey.
+            const allowCredentials = publicKey.allowCredentials
+            allow = Array.isArray(allowCredentials)
+              ? allowCredentials.map(entry => String((entry && entry.id) || '').slice(0, 8))
+              : null
             pushLog(LOG_KEYS.passkey, {
               method,
               userName: String(user.name || ''),
               displayName: String(user.displayName || ''),
               rpName: String(rp.name || ''),
               rpId: String(rp.id || ''),
+              allow,
               at: Date.now(),
             })
           } catch {}
-          return original(options)
+          const result = await original(options)
+          try {
+            const rawId = result && result.rawId ? (result.rawId.byteLength || result.rawId.length) : 0
+            picked = rawId
+              ? Array.from(new Uint8Array(result.rawId)).map(byte => byte.toString(16).padStart(2, '0')).join('').slice(0, 8)
+              : ''
+            const entries = readLog(LOG_KEYS.passkey)
+            if (entries.length > 0) {
+              entries[entries.length - 1].returned = picked
+              entries[entries.length - 1].allowed =
+                allow === null ? 'discoverable' : allow.length === 0 ? 'empty' : allow.length
+              try { localStorage.setItem(LOG_KEYS.passkey, JSON.stringify(entries.slice(-500))) } catch {}
+            }
+          } catch {}
+          return result
         },
       })
       credentials['__wrapped_' + method] = true
@@ -377,8 +408,10 @@ async function fail(why) {
   try {
     console.log('   page tail :', (await cdp.bodyText()).slice(-900).replace(/\n+/g, ' | '))
     console.log('   banners   :', await cdp.eval('JSON.stringify(Array.from(document.querySelectorAll(".inline-error, .inline-notice")).map(node => node.innerText.slice(0, 200)))'))
-    const trace = await cdp.eval(`JSON.stringify(window.__e2eLogs.read('arx_e2e_api_log').filter(entry => /session|vault|auth/.test(entry.url)).slice(-12))`)
-    for (const entry of JSON.parse(trace || '[]')) console.log(`   api ${entry.status} ${entry.method} ${String(entry.url).replace(BASE, '')} → ${entry.body}`)
+    // Focus on writes: the dashboard polls vault reads every few seconds, which
+    // would otherwise push the failing auth/session calls out of the window.
+    const trace = await cdp.eval(`JSON.stringify(window.__e2eLogs.read('arx_e2e_api_log').filter(entry => entry.method !== 'GET').slice(-14).map(entry => ({ status: entry.status, method: entry.method, url: entry.url, req: String(entry.reqBody || '').slice(0, 260), body: String(entry.body || '').slice(0, 180) })))`)
+    for (const entry of JSON.parse(trace || '[]')) console.log(`   api ${entry.status} ${entry.method} ${String(entry.url).replace(BASE, '')} ← ${entry.req} → ${entry.body}`)
     console.log('   passkeys  :', await cdp.eval(`JSON.stringify(window.__e2eLogs.read('arx_e2e_passkey_log').slice(-4))`))
     console.log('   last signs:', await cdp.eval(`JSON.stringify(window.__e2eLogs.read('arx_e2e_sign_log').slice(-3).map(entry => entry.preview))`))
     console.log('   unsupported provider methods:', await cdp.eval(`JSON.stringify(Array.from(new Set(window.__e2eLogs.read('arx_e2e_unsupported_log'))))`))
@@ -561,6 +594,9 @@ try {
   check('Hermes agent card appears after creation', Boolean(card1), `badge="${card1.badge}"`)
 
   // ── FLOW 2 — Revoke → Relogin ──
+  if (!flowEnabled('2', 'FLOW 2')) {
+    // nothing to do — Flow 3/5 below still run against the created card
+  } else {
   step('②', 'FLOW 2 — Revoke, then Relogin with the passkey only…')
   await closeModals(cdp)
   await waitCardIdle(CARD_AGENT)
@@ -584,8 +620,12 @@ try {
   check('relogin uses the passkey', (await readPasskeys()).length > passkeysBefore2, `${(await readPasskeys()).length - passkeysBefore2} ceremony(s)`)
   check('relogin needs no new owner SIWE', (await readSignCount()) === signsBefore2, `${(await readSignCount()) - signsBefore2} signature(s)`)
   check('card is active again after relogin', recovered.badge !== 'Akses dicabut', `badge="${recovered.badge}"`)
+  }
 
   // ── FLOW 3 — Clear → Login Passkey ──
+  if (!flowEnabled('3', 'FLOW 3')) {
+    // nothing to do — Flow 5 below still runs against the created card
+  } else {
   step('③', 'FLOW 3 — Clear the agent, then Login Passkey (owner proof path)…')
   await closeModals(cdp)
   const signsBefore3 = await readSignCount()
@@ -610,8 +650,12 @@ try {
     .filter(entry => /\\/api\\/session\\/(generate-key|activate-binding)/.test(entry.url) && String(entry.reqBody || '').includes('ownerSessionToken'))
     .map(entry => entry.url))`).then(raw => JSON.parse(raw || '[]'))
   check('relogin after clear sends the owner proof', ownerProofSent.length > 0, `calls=${ownerProofSent.length} signature(s)=${(await readSignCount()) - signsBefore3}`)
+  }
 
   // ── FLOW 4 — OAuth agent (Grok): create → revoke/relogin → clear/login ──
+  if (!flowEnabled('4', 'FLOW 4')) {
+    // nothing to do — Flow 5 below still runs against the created card
+  } else {
   step('④', 'FLOW 4 — Grok via real OAuth: create a wallet on the approval card…')
   const grokOauth = await startOAuthFlow('Grok')
   await cdp.navigate(grokOauth.pluginUrl)
@@ -670,6 +714,89 @@ try {
   await cdp.clickFound(`window.__bodyButton(${JSON.stringify(OAUTH_LOGIN_LABEL)}, ['.plugin-oauth'])`, { timeout: 90_000, label: 'OAuth login passkey button', dom: true })
   const grokRebound = await cdp.waitFor(cardBadgeWaitFor(OAUTH_CARD_AGENT, `card.badge !== 'Akses dicabut'`), { timeout: 600_000, every: 3000, label: 'Grok card rebound after clear + login passkey' }).then(raw => JSON.parse(raw))
   check('Grok relogin after clear re-binds the agent card', grokRebound.badge !== 'Akses dicabut', `badge="${grokRebound.badge}"`)
+  }
+
+  // ── FLOW 5 — stale per-agent session token ──
+  // Production evidence behind this: a card action kept sending the agent own
+  // 24h-old `arx_oauth_vault_token:<clientId>` slot, the backend answered 401,
+  // and Revoke/Clear reported "Sesi berakhir. Masuk kembali dengan passkey."
+  // even though the same page had a healthy session for `/api/vault/agents`.
+  if (!flowEnabled('5', 'FLOW 5')) {
+    // nothing to do
+  } else {
+  step('⑤', 'FLOW 5 — a stale per-agent token must not block Revoke/Clear…')
+  // The dashboard reads readiness/activity on `/api/vault/agents/<agentKey>/…`,
+  // so the request log is the authoritative source for the EXACT key a card
+  // action will use. The Hermes card of this run is the connection-token agent
+  // (`arcox_conn_*`) owned by this run's freshly generated EOA — OAuth cards use
+  // an `arcox_<uuid>` client id instead.
+  const hermesAgentKey = await cdp.eval(`(() => {
+    const marker = '/api/vault/agents/'
+    const owner = ${JSON.stringify(eoa.toLowerCase())}
+    const keys = window.__e2eLogs.read('arx_e2e_api_log')
+      .map(entry => String(entry.url || ''))
+      .filter(url => url.indexOf(marker) !== -1)
+      .map(url => decodeURIComponent(url.split(marker)[1].split('/')[0]))
+    const unique = [...new Set(keys)]
+    const connectionAgent = unique.find(key => /^arcox_conn_/i.test(key) && key.toLowerCase().indexOf(owner) !== -1)
+    return connectionAgent || unique.find(key => /^arcox_conn_/i.test(key)) || ''
+  })()`).then(value => String(value || ''))
+  const hermesClientId = hermesAgentKey.split('|')[0]
+  // Seed every slot the dashboard may prefer for this agent: the exact
+  // composite key plus its clientId-only form.
+  const staleSlots = [...new Set([hermesClientId, hermesAgentKey].filter(Boolean))]
+    .map(clientId => `arx_oauth_vault_token:${clientId}`)
+  check('Flow 5 can address the Hermes per-agent token slot', staleSlots.length > 0,
+    `agentKey=${hermesAgentKey || '(unknown)'} slots=${staleSlots.join(', ') || '(none)'}`)
+
+  const seedStaleToken = async () => cdp.eval(`(() => {
+    for (const slot of ${JSON.stringify(staleSlots)}) localStorage.setItem(slot, 'arx_vs_deadbeefdeadbeefdeadbeefdeadbeef')
+    return ${JSON.stringify(staleSlots)}.filter(slot => localStorage.getItem(slot)).join(',')
+  })()`).then(value => String(value || ''))
+
+  await closeModals(cdp)
+  await seedStaleToken()
+  // Reload so the dashboard boots in exactly the state a returning user has:
+  // a healthy global session plus an expired per-agent slot.
+  await cdp.navigate(`${BASE}/plugin`)
+  await cdp.waitFor(`Boolean(document.querySelector('.plugin-page'))`, { timeout: 90_000, label: 'plugin page after stale token' })
+  await cdp.waitFor(`window.__card(${JSON.stringify(CARD_AGENT)}) !== '' ? 'card' : ''`, { timeout: 120_000, every: 2000, label: 'Hermes card with stale token' })
+  await sleep(3000)
+
+  await waitCardIdle(CARD_AGENT)
+  await cdp.clickFound(`window.__cardButton(${JSON.stringify(CARD_AGENT)}, 'Cabut Akses')`, { timeout: 90_000, label: 'revoke button with stale token', dom: true })
+  await cdp.waitFor(`(() => {
+    const backdrop = document.querySelector('.plugin-modal-backdrop')
+    return backdrop && /cabut akses/i.test(backdrop.innerText || '') ? 'open' : ''
+  })()`, { timeout: 60_000, every: 700, label: 'revoke dialog with stale token' })
+  await cdp.clickFound(`window.__bodyButton('Ya, cabut akses', ['.plugin-modal'])`, { timeout: 60_000, label: 'revoke confirmation with stale token', dom: true })
+
+  let revokeSurvived = true
+  const staleRevoked = await cdp.waitFor(cardBadgeWait(`card.badge === 'Akses dicabut'`), { timeout: 120_000, every: 2000, label: 'revoked badge with stale token' })
+    .then(raw => JSON.parse(raw))
+    .catch(() => { revokeSurvived = false; return null })
+  const staleRetired = await cdp.eval(`(() => {
+    const left = ${JSON.stringify(staleSlots)}.filter(slot => localStorage.getItem(slot) !== null)
+    return left.length ? 'still-there: ' + left.join(',') : 'retired'
+  })()`).then(value => String(value || ''))
+  const bannerAfterStale = await cdp.eval(`(() => {
+    const node = document.querySelector('.plugin-alert.inline-error')
+    return node ? String(node.innerText || '').trim() : ''
+  })()`).then(value => String(value || ''))
+  check('a stale per-agent token does not abort Revoke', revokeSurvived && staleRevoked?.badge === 'Akses dicabut',
+    `badge="${staleRevoked?.badge || '(unchanged)'}"`)
+  check('no "Sesi berakhir" after the card action', !/Sesi berakhir/i.test(bannerAfterStale), `banner="${bannerAfterStale.slice(0, 80)}"`)
+  check('the rejected per-agent token is retired from localStorage', staleRetired === 'retired', staleRetired)
+
+  // Clear must survive the same stale slot: seed it again and delete the card.
+  await closeModals(cdp)
+  await seedStaleToken()
+  await waitCardIdle(CARD_AGENT)
+  await cdp.clickFound(`window.__cardButton(${JSON.stringify(CARD_AGENT)}, 'Hapus')`, { timeout: 90_000, label: 'clear button with stale token', dom: true })
+  const clearSurvived = await cdp.waitFor(cardGoneWait(CARD_AGENT), { timeout: 180_000, every: 2000, label: 'card removal with stale token' })
+    .then(() => true).catch(() => false)
+  check('a stale per-agent token does not abort Clear', clearSurvived, clearSurvived ? 'card gone from the dashboard' : 'card still present')
+  }
 
   const failed = results.filter(entry => !entry.ok)
   console.log(`\n${failed.length === 0 ? '✅ ALL UI CHECKS PASSED' : `❌ ${failed.length}/${results.length} UI CHECKS FAILED`}`)
