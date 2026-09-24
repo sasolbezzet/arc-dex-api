@@ -733,19 +733,41 @@ try {
   const hermesAgentKey = await cdp.eval(`(() => {
     const marker = '/api/vault/agents/'
     const owner = ${JSON.stringify(eoa.toLowerCase())}
-    const keys = window.__e2eLogs.read('arx_e2e_api_log')
+    // The dashboard's persisted agent store carries the exact canonical key the
+    // card renders, so this is the authoritative source (the request log can be
+    // truncated or evicted between flows).
+    const fromStore = (() => {
+      try {
+        const raw = localStorage.getItem('arx-agents')
+        const parsed = raw ? JSON.parse(raw) : null
+        const list = parsed?.state?.agents || parsed?.agents || []
+        return (Array.isArray(list) ? list : []).map(agent => String(agent?.agentKey || '')).filter(Boolean)
+      } catch { return [] }
+    })()
+    const fromRequests = window.__e2eLogs.read('arx_e2e_api_log')
       .map(entry => String(entry.url || ''))
       .filter(url => url.indexOf(marker) !== -1)
       .map(url => decodeURIComponent(url.split(marker)[1].split('/')[0]))
-    const unique = [...new Set(keys)]
-    const connectionAgent = unique.find(key => /^arcox_conn_/i.test(key) && key.toLowerCase().indexOf(owner) !== -1)
-    return connectionAgent || unique.find(key => /^arcox_conn_/i.test(key)) || ''
+    // The dashboard also keeps one scoped vault slot per agent client, which is
+    // exactly what a card action prefers; either source names the same agent.
+    const fromSlots = Object.keys(localStorage)
+      .filter(key => key.indexOf('arx_oauth_vault_token:') === 0)
+      .map(key => key.slice('arx_oauth_vault_token:'.length))
+    const unique = [...new Set([...fromStore, ...fromRequests, ...fromSlots])]
+    const owned = unique.find(key => /^arcox_conn_/i.test(key) && key.toLowerCase().indexOf(owner) !== -1)
+    const connectionAgent = owned || unique.find(key => /^arcox_conn_/i.test(key))
+    window.__e2eFlow5Debug = { fromStore, fromRequests: fromRequests.slice(-4), fromSlots, picked: connectionAgent || '' }
+    return connectionAgent || ''
   })()`).then(value => String(value || ''))
   const hermesClientId = hermesAgentKey.split('|')[0]
   // Seed every slot the dashboard may prefer for this agent: the exact
   // composite key plus its clientId-only form.
   const staleSlots = [...new Set([hermesClientId, hermesAgentKey].filter(Boolean))]
     .map(clientId => `arx_oauth_vault_token:${clientId}`)
+  if (staleSlots.length === 0) {
+    const debug = await cdp.eval('JSON.stringify(window.__e2eFlow5Debug || {})').then(raw => String(raw || ''))
+    ok(`Flow 5 agent-key sources: ${debug.slice(0, 400)}`)
+  }
   check('Flow 5 can address the Hermes per-agent token slot', staleSlots.length > 0,
     `agentKey=${hermesAgentKey || '(unknown)'} slots=${staleSlots.join(', ') || '(none)'}`)
 

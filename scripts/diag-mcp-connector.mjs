@@ -132,11 +132,43 @@ async function handshake(token, accept, label) {
 
 const jsonOnly = await handshake(pick.newest.token, 'application/json', 'klien JSON-only')
 const sse = await handshake(pick.newest.token, 'application/json, text/event-stream', 'klien SSE (Claude/ChatGPT)')
+const stale = await staleSessionHandshake(pick.newest.token)
+
+// Grok menutup sesinya sendiri (DELETE /mcp) di akhir setiap discovery dan
+// restart backend mengosongkan peta sesi in-memory. Sebelum diperbaiki, request
+// berikutnya yang memakai session id mati itu dibalas `400 Bad Request: Server
+// not initialized`, sehingga agent tampak "terhubung" tetapi tidak bisa membaca
+// tool. Sekarang POST dilayani stateless dan GET/DELETE dijawab 404.
+async function staleSessionHandshake(token) {
+  const dead = '00000000-0000-4000-8000-000000000000'
+  const headers = {
+    'content-type': 'application/json',
+    accept: 'application/json, text/event-stream',
+    authorization: `Bearer ${token}`,
+    'mcp-session-id': dead,
+  }
+  const list = await fetch(`${base}/mcp`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+  })
+  const raw = await list.text()
+  let tools = 0
+  try { tools = JSON.parse(raw.replace(/^event: message\ndata: /, '').trim()).result?.tools?.length || 0 } catch { /* error body */ }
+  console.log(`   klien dgn Mcp-Session-Id mati: HTTP ${list.status} · ${tools} tool`)
+  if (list.status === 200 && tools) {
+    console.log('      ✅ sesi mati (pasca-restart / setelah DELETE /mcp) tetap bisa membaca tool')
+  } else {
+    console.log('      ❌ sesi mati menutup akses tool — agent tampak terhubung tetapi tanpa tool')
+    console.log(`      body: ${raw.slice(0, 160).replace(/\n/g, ' ')}`)
+  }
+  return list.status === 200 ? tools : 0
+}
 
 console.log('\nRingkasan')
 console.log(`  klien tanpa token aktif : ${withoutToken}`)
 console.log(`  tools JSON-only         : ${jsonOnly}`)
 console.log(`  tools SSE               : ${sse}`)
+console.log(`  tools via sesi mati     : ${stale}`)
 if (withoutToken) {
   console.log('\nKesimpulan: ada klien yang sudah terdaftar tetapi belum pernah menukar kode OAuth')
   console.log('menjadi access token. Agent seperti itu akan tampil "terhubung" di sisi penyedia,')

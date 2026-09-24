@@ -109,6 +109,11 @@ Karakteristik yang berlaku sekarang:
   - Klien yang menerima `text/event-stream` (Claude/ChatGPT) tetap SSE.
   - Permintaan tanpa `Mcp-Session-Id` (klien stateless) dilayani dengan server
     sekali pakai, sehingga `tools/list` tetap bisa dijawab.
+  - `Mcp-Session-Id` yang sudah tidak dikenal proses ini (peta sesi in-memory
+    kosong setelah restart, dan Grok menutup sesinya sendiri dengan
+    `DELETE /mcp` di akhir setiap discovery) tetap dilayani untuk POST; GET dan
+    DELETE dijawab `404 Session not found` agar klien melakukan initialize ulang.
+    Tanpa aturan ini agent tampil "terhubung" tetapi tidak bisa membaca tool.
   - Field tasks-extension `execution` **tidak** dikirim, karena server tidak
     mengiklankan capability `tasks` dan klien dengan skema ketat gagal
     mem-parse seluruh daftar tool jika field asing ikut terkirim.
@@ -139,7 +144,9 @@ npm run diag:mcp -- --agent grok      # filter satu agent
 
 Skrip ini mencocokkan klien OAuth + token yang benar-benar terbit, lalu
 melakukan handshake `initialize` → `tools/list` → `tools/call` memakai token
-tersebut, pada mode JSON-only dan SSE.
+tersebut, pada mode JSON-only dan SSE, plus sekali lagi memakai
+`Mcp-Session-Id` yang sudah mati (kondisi yang membuat Grok tampak "terhubung
+tanpa tool").
 
 ## Alur Agent Wallet (MSCA)
 
@@ -188,6 +195,7 @@ npm test                 # node --check + 315 test unit/regresi
 npm run test:e2e:flows   # 3 alur agent: passkey + EOA virtual, UserOperation NYATA di Arc testnet
 npm run test:e2e:ui      # 4 alur menu Plugin di Chrome nyata (virtual authenticator)
 npm run diag:mcp         # diagnosa konektor/token MCP per agent
+npm run probe:mainnet    # pre-flight Arc mainnet (read-only, tanpa transaksi)
 ```
 
 `test:e2e:ui` dan `test:e2e:flows` butuh Chrome/jaringan dan menulis state uji,

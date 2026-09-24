@@ -7,6 +7,7 @@
     "check": "node --check server.mjs && node --check src/routes/aiRouterRoutes.mjs && node --check src/routes/arkhamRoutes.mjs && node --check src/routes/treasuryRoutes.mjs && node --check src/routes/x402Routes.mjs",
     "test": "npm run check && node --test test/*.test.mjs",
     "diag:mcp": "node scripts/diag-mcp-connector.mjs",
+    "probe:mainnet": "node --env-file=.env scripts/probe-arc-mainnet-readiness.mjs",
     "test:e2e:flows": "node --env-file=.env scripts/e2e-three-agent-flows.mjs",
     "test:e2e:ui": "node scripts/e2e-plugin-ui-flows.mjs",
     "test:solana-e2e": "node scripts/test-solana-unified-e2e.mjs",

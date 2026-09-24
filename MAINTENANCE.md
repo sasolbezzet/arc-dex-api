@@ -98,7 +98,8 @@ npm run diag:mcp -- --agent grok    # one provider
 
 The script matches registered OAuth clients with the tokens actually issued,
 prints token expiry and the bound MSCA, then performs a real
-`initialize` → `tools/list` → `tools/call` handshake in JSON-only and SSE modes.
+`initialize` → `tools/list` → `tools/call` handshake in JSON-only and SSE modes,
+and finally repeats `tools/list` with a dead `Mcp-Session-Id`.
 A client with no active token means the browser approval (passkey → Setujui on
 `/plugin`) never finished; re-connect from the provider and complete that page.
 
@@ -106,10 +107,18 @@ Transport interoperability rules the server must keep:
 
 - A client that only sends `Accept: application/json` must receive JSON, not SSE.
 - Requests without `Mcp-Session-Id` are served statelessly instead of rejected.
+- A request that carries a `Mcp-Session-Id` this process does not know must also
+  work. The `sessions` map is in-memory, so it empties on every restart, and
+  Grok's connector manager ends each discovery run with `DELETE /mcp` and then
+  reuses that dead id. Such a POST is served statelessly; GET/DELETE get the
+  protocol's `404` (`-32001 Session not found`) so the client re-initializes.
+  Never let this surface as the SDK's `400 Bad Request: Server not initialized`
+  — providers report that as "terhubung tetapi tanpa tool".
 - The tasks-extension field `execution` must not appear in `tools/list` while the
   server does not advertise the `tasks` capability; strict clients fail to parse
   the whole list otherwise.
 
+`test/mcpUnknownSession.test.mjs` locks the dead-session recovery above,
 `test/mcpToolListCompat.test.mjs` locks the tool-list shape, and
 `test/mcpToolProfile.test.mjs` locks the optional `?profile=lite|core` subsets
 (`full` stays the default; every profile keeps quote+execute pairs together).

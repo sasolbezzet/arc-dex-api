@@ -4,6 +4,30 @@ Checklist untuk memindahkan x402 monetization dari Arc Testnet ke Arc Mainnet.
 Semua item di bawah bersifat persiapan/validasi; tidak ada yang men-deploy ke
 mainnet sampai checklist ini lulus dan konfirmasi eksplisit diberikan.
 
+## Status 24 Sep 2026 (hasil `npm run probe:mainnet`, read-only)
+
+- ✅ Arc mainnet hidup: `eth_chainId = 0x13b2` (5042), blok > 22,5 juta, `https://rpc.mainnet.arc.io`
+- ✅ Semua kontrak pihak Circle sudah ada di mainnet: USDC, EURC, USYC, Memo,
+  ERC-8004 IdentityRegistry, CCTP TokenMessengerV2 + MessageTransmitterV2,
+  Gateway Wallet + Minter
+- ✅ Client Key LIVE: `arc` (0x13b2), `base` (0x2105), `arbitrum` (0xa4b1),
+  EntryPoint v0.7 — jadi MSCA + passkey + bundler mainnet memakai key yang sama
+- ✅ API Key LIVE (`CIRCLE_API_KEY_MAINNET`) diterima: `appId 7e9205d2-…`
+- ❌ **Blocker: Gas Station policy LIVE belum aktif** —
+  `pm_getPaymasterStubData` → `Policy is not activated and cannot be used.`
+  (bukan lagi "policy not found": policy sudah ada, tinggal diaktifkan/dijadikan
+  default untuk environment LIVE di Console — **satu-satunya blocker Console yang
+  tersisa**)
+- ✅ Passkey domain LIVE sudah terdaftar: `rp_getRegistrationOptions` (LIVE) →
+  `rp.name = arcoxdex.vercel.app` + challenge. Catatan probe: `rp_*` dilayani di
+  base path `…/v1/rpc/w3s/buidl` **tanpa** slug chain; menambahkan `/arc`
+  menghasilkan `Method not found`, dan memakai `/v1/rpc` dijawab edge `Lockout`
+- ❌ Kontrak ARCOX (Fee Router, AMM Router, Swap Adapter, dan ERC-8183 Agentic
+  Commerce bila dipakai) masih alamat testnet → wajib deploy ulang ke mainnet
+
+Gunakan `npm run probe:mainnet` untuk mengulang seluruh pemeriksaan di atas
+(read-only, aman, tanpa transaksi) setiap kali konfigurasi Console berubah.
+
 ## Status saat ini (testnet)
 
 - Network: `Arc_Testnet` (chainId `5042002`), USDC `0x3600...`

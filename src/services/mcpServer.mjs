@@ -4572,12 +4572,27 @@ export async function mcpHttpHandler(req, res) {
   const toolProfile = resolveToolProfile(requestedProfile).name
   const requestMethod = String(req.body?.method || '')
   const isInitializeRequest = requestMethod === 'initialize'
+  // Resolve the session BEFORE deciding statelessness. The `sessions` map lives
+  // in memory, so a session id this process has never seen is normal: every
+  // backend restart wipes the map, and Grok's connector manager deliberately
+  // ends each discovery run with `DELETE /mcp`. Its next tools/list or tools/call
+  // then reuses that dead id.
+  let session = sessionId ? sessions.get(sessionId) : null
+  const knownSession = Boolean(session)
   // Stateless fallback: a client that never echoes Mcp-Session-Id (or that
   // reconnects without one) must still be able to call tools/list and
   // tools/call. In stateless mode the SDK skips session validation entirely;
   // the bearer token already carries the verified owner + MSCA context, so
   // nothing is loosened by answering such a request with a throwaway server.
-  const statelessRequest = !sessionId && !isInitializeRequest && req.method === 'POST'
+  const statelessRequest = (!sessionId || !knownSession) && !isInitializeRequest && req.method === 'POST'
+  // An unknown session id must never surface as the SDK's opaque
+  // `400 Bad Request: Server not initialized`, which strict clients (Grok)
+  // report as "terhubung tetapi tanpa tool". POST is served statelessly above;
+  // GET (SSE stream) and DELETE have no session to serve, so the protocol's
+  // 404 tells the client to initialize a new session instead of giving up.
+  if (sessionId && !knownSession && !isInitializeRequest && req.method !== 'POST') {
+    return res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null })
+  }
 
   const boundMscaWalletAddress = auth.mscaWalletAddress || ''
   if (statelessRequest) {
@@ -4595,7 +4610,6 @@ export async function mcpHttpHandler(req, res) {
     return
   }
 
-  let session = sessionId ? sessions.get(sessionId) : null
   // Claude may reuse an MCP session id after OAuth reconnect/rebinding. Never
   // reuse a server created for a different verified MSCA context; otherwise the
   // request's fresh OAuth token is silently ignored by the old tool closure.
