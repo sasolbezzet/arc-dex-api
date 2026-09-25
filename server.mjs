@@ -35,7 +35,7 @@ import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './s
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
 import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus } from './src/services/circleWalletWebhookService.mjs'
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
-import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, IS_ARC_MAINNET, arcCircleApiKey, arcGatewayBaseUrl, arcGatewayChains, arcNetwork } from './src/config/arcNetwork.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, IS_ARC_MAINNET, arcCircleApiKey, arcContractAddress, arcGatewayBaseUrl, arcGatewayChains, arcNetwork } from './src/config/arcNetwork.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
 import { startRefundWorker } from './src/services/x402RefundWorker.mjs'
@@ -1133,9 +1133,18 @@ function swapTokenParam(token) {
   return token
 }
 
-const PLATFORM_FEE_BPS = Number(process.env.ARCOX_ROUTER_FEE_BPS || 30)
+// Fee router on-chain bisa punya bps berbeda per jaringan (mainnet di-deploy 500),
+// jadi nilai mainnet dibaca dari var terpisah dan tidak menimpa testnet.
+const PLATFORM_FEE_BPS = Number(
+  (IS_ARC_MAINNET ? process.env.ARCOX_ROUTER_FEE_BPS_MAINNET : '') ||
+  process.env.ARCOX_ROUTER_FEE_BPS ||
+  process.env.ARCOX_FEE_BPS ||
+  30,
+)
 const platformTreasury = () => requireTreasuryAddress()
-const ARC_APPKIT_ADAPTER = '0xBBD70b01a1CAbc96d5b7b129Ae1AAabdf50dd40b'
+// Alamat adapter tidak boleh hardcode testnet: mainnet membaca `*_MAINNET` dan
+// mengembalikan string kosong kalau belum di-deploy (fail-closed).
+const ARC_APPKIT_ADAPTER = arcContractAddress('ARCOX_SWAP_ADAPTER') || ''
 const STABLECOIN_SERVICE_BASE_URL = 'https://api.circle.com'
 
 // cirBTC AMM Router — on-chain fallback when Circle API doesn't support cirBTC

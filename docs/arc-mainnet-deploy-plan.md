@@ -14,7 +14,7 @@ Snapshot terverifikasi (`npm run mainnet:sources` + `npm run mainnet:plan` di
 
 | Kontrak | Alamat testnet | Bentuk on-chain | Status mainnet |
 | --- | --- | --- | --- |
-| ARCOX Fee Router | `0xDf80…43a7` | `ArcoxRouter` langsung (solc 0.8.35) | belum di-deploy |
+| ARCOX Fee Router | `0xDf80…43a7` | `ArcoxRouter` langsung (solc 0.8.35) | **Arc ✓, Base ✓** (25 Sep 2026); Arbitrum tertahan dana gas |
 | AMM Router | `0x9f24…6124` | `ArcoxCirBTCRouterV2` langsung (solc 0.8.24) | belum di-deploy |
 | AMM Pool USDC-cirBTC | `0xd4af…dc2d` | `ArcoxBTCPool` (solc 0.8.24) | belum di-deploy |
 | AMM Pool EURC-cirBTC | `0xcca9…6bfa2` | `ArcoxBTCPool` (solc 0.8.24) | belum di-deploy |
@@ -57,24 +57,55 @@ Arc memakai USDC sebagai gas.
 - [ ] Simpan sebagai `ARCOX_MAINNET_DEPLOYER_PRIVATE_KEY` di `.env` VPS.
 - [ ] Catat alamat deployer di `MAINTENANCE.md` (tanpa key).
 
-### 3.2 ARCOX Fee Router (`ArcoxRouter.sol`)
+### 3.2 ARCOX Fee Router (`ArcoxRouter.sol`) — SUDAH DIJALANKAN
 
-Sumber: `arcox-mcp/packages/contracts-evm/ArcoxRouter.sol`, script compile/deploy
-`arcox-mcp/packages/runtime/scripts/{compile-router,deploy-router}.mjs`.
+Script mainnet khusus ada di `arcox-mcp/packages/runtime/scripts/` (jangan pakai
+`deploy-router.mjs` yang hardcode TokenMessenger testnet):
 
-Script deploy saat ini hardcode `TOKEN_MESSENGER` **testnet** dan `chains` map
-testnet-only. Sebelum dipakai untuk mainnet:
+| Langkah | Perintah |
+| --- | --- |
+| Cek saldo deployer | `npm run mainnet:balances -- --key-file <file>:<VAR>` |
+| Dry-run rencana | `npm run mainnet:fee-router:deploy -- --key-file … --treasury … --fee-bps 500 --chains arc,base` |
+| Kirim | tambahkan `--broadcast` |
+| Aktifkan domain tujuan | `npm run mainnet:fee-router:domains -- --key-file … --chains arc,base --broadcast` |
+| Verifikasi state + bytecode | `npm run mainnet:fee-router:verify` |
+| Verifikasi source publik | `npm run mainnet:fee-router:verify-sources` |
 
-- [ ] Tambah entri chain `Arc_Mainnet` (id `5042`, `domain 26`,
-      `usdc 0x3600…0000`, `rpc https://rpc.mainnet.arc.io`).
-- [ ] `TOKEN_MESSENGER` → mainnet `0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d`.
-- [ ] Output deployment jangan menimpa `deployments/arcox-router.testnet.json`
-      (pakai file `-mainnet.json`).
-- [ ] Constructor: `[initialOwner, initialTreasury, usdc_, tokenMessenger_, localDomain_=26, feeBps_=ARCOX_ROUTER_FEE_BPS]`
-      (argumen lengkap ada di `mainnet-sources/manifest.json`).
-- [ ] Setelah deploy, `setSupportedDestinationDomain(domain, true)` hanya untuk
-      domain tujuan yang benar-benar dipakai (jangan meniru daftar testnet).
-- [ ] Verifikasi bytecode + source di `https://explorer.arc.io`.
+Hasil 25 Sep 2026 — owner/deployer `0xE34FF1D2…4569e` (key `EOA_PRIVATE_KEY` di
+`~/.arcox/agent.env`), treasury `0x5d16E8Ef…DF40F`, `feeBps` **500** (5%):
+
+| Chain | Alamat Fee Router | Domain aktif | Deploy tx |
+| --- | --- | --- | --- |
+| Arc Mainnet (5042) | `0x9Fd14A94bDbEFf73EDB22853cc77416B65E2A0c0` | 6 (Base) | `0x97f717a8…a5b11` |
+| Base Mainnet (8453) | `0xD858f073FA09834b1d64C165afC2757F1DF2f019` | 26 (Arc) | `0x0411ca0c…af523` |
+| Arbitrum One (42161) | — | — | **tertahan**: saldo deployer `0.0000001 ETH`, butuh ≈`0.00007 ETH` |
+
+Verifikasi yang sudah lulus: state on-chain (owner, treasury, feeBps, `usdc`,
+`tokenMessenger` mainnet CCTP v2, `localDomain`, `supportedTokens`,
+`quoteFee(1 USDC)` = 0.05), bytecode on-chain cocok dengan hasil kompilasi ulang
+sumber (immutable di-mask), dan **source terverifikasi Sourcify `exact_match`**
+(creation + runtime) untuk kedua chain. Explorer Arc Mainnet memblokir API dari
+server (Cloudflare), jadi Sourcify dipakai sebagai jalur verifikasi otomatis.
+
+> ⚠️ **JANGAN DIPAKAI** — dua alamat ini hasil percobaan pertama yang salah dan
+> sengaja dibiarkan tercatat: Arc `0xb9Fb801A5D1491E70A886800982CB80cdf98A174`,
+> Base `0xc31F668B17A8A923d661F2fc16A89Cd0BD14a39b`. Keduanya ter-deploy dengan
+> immutables **testnet** (feeBps 30, TokenMessenger testnet, di Base bahkan USDC
+> Arc) akibat `creation_bytecode` dari ArcScan sudah menyertakan constructor args
+testnet di ekornya. Detail audit: `packages/runtime/deployments/fee-router-mainnet.REJECTED-20260925-bad-constructor-args.json`.
+> Deploy berikutnya wajib lewat skrip mainnet yang mengompilasi ulang sumber
+> dengan solc lokal sebagai sumber kebenaran bytecode.
+
+Catatan operasional:
+
+- Aktifkan domain tujuan **hanya untuk chain yang router-nya sudah ada**. Kalau
+  Arbitrum belum di-deploy, domain 3 sengaja belum diset di Arc/Base.
+- `setSupportedDestinationDomain` pernah revert out-of-gas dengan limit default
+  (22.026 gas), jadi skrip sekarang selalu memakai limit eksplisit 120.000 gas.
+- `Arbitrum` belum di-deploy: kirim ≈0.0002 ETH ke `0xE34FF1D2…4569e`, lalu
+  jalankan ulang `mainnet:fee-router:deploy --chains arbitrum --broadcast` dan
+  `mainnet:fee-router:domains --chains arc,base,arbitrum --broadcast` (agar
+  domain 3 ikut aktif di Arc + Base).
 
 ### 3.3 AMM Router, Swap Adapter, ERC-8183
 
@@ -118,7 +149,11 @@ Langkah:
 ARC_NETWORK=mainnet
 
 # kontrak ARCOX mainnet — hanya dari *_MAINNET
-ARCOX_FEE_ROUTER_ADDRESS_MAINNET=
+ARCOX_FEE_ROUTER_ADDRESS_MAINNET=0x9Fd14A94bDbEFf73EDB22853cc77416B65E2A0c0
+ARCOX_ROUTER_FEE_BPS_MAINNET=500
+# Router per chain (dibaca backend/frontend di luar resolver Arc)
+ARCOX_BASE_FEE_ROUTER_ADDRESS=0xD858f073FA09834b1d64C165afC2757F1DF2f019
+ARCOX_ARBITRUM_FEE_ROUTER_ADDRESS=          # menunggu dana gas Arbitrum
 ARCOX_AMM_ROUTER_MAINNET=
 ARCOX_SWAP_ADAPTER_MAINNET=
 ARCOX_ERC8183_ADDRESS_MAINNET=

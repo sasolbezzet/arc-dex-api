@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { randomUUID } from 'crypto'
 import { solanaTreasuryAddress, treasuryAddress } from '../config/treasury.mjs'
 import { scheduleTreasuryFinancialEvent } from '../services/supabasePersistence.mjs'
-import { ARC_CHAIN_ID, ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_NETWORK_LABEL, IS_ARC_MAINNET, arcContractAddress } from '../config/arcNetwork.mjs'
 
 const router = Router()
 const ledger = globalThis.__arcoxTreasuryLedger || { deposits: [], spends: [], settlements: [] }
@@ -19,11 +19,17 @@ function cfg() {
     treasuryWallet: treasuryAddress(),
     solanaTreasuryWallet: solanaTreasuryAddress(),
     destinationWallet: process.env.DESTINATION_WALLET_ADDRESS || '',
-    feeRouter: process.env.ARCOX_FEE_ROUTER_ADDRESS || '',
+    // Mainnet hanya membaca `*_MAINNET`; testnet tetap memakai var lama.
+    feeRouter: arcContractAddress('ARCOX_FEE_ROUTER_ADDRESS') || '',
     feeRecipient: process.env.ARCOX_FEE_RECIPIENT || '',
-    feeBps: Math.min(Number(process.env.ARCOX_ROUTER_FEE_BPS || process.env.ARCOX_FEE_BPS || 30), 1_000),
+    feeBps: Math.min(Number(
+      (IS_ARC_MAINNET ? process.env.ARCOX_ROUTER_FEE_BPS_MAINNET : '') ||
+      process.env.ARCOX_ROUTER_FEE_BPS ||
+      process.env.ARCOX_FEE_BPS ||
+      30,
+    ), 1_000),
     maxFeeBps: 1_000,
-    label: 'real testnet - Unified Balance is a USDC routing layer, not a third wallet.',
+    label: `${ARC_NETWORK_LABEL} - Unified Balance is a USDC routing layer, not a third wallet.`,
   }
 }
 
