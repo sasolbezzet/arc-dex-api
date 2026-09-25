@@ -9,17 +9,28 @@ domain LIVE, Gateway mainnet `gateway-api.circle.com` dengan nama chain `Arc`).
 
 ## 1. Yang belum ada di mainnet
 
-| Kontrak | Alamat testnet (referensi) | Status mainnet |
-| --- | --- | --- |
-| ARCOX Fee Router (`ArcoxRouter.sol`) | `0xDf800310443BEB589CEf91A09854203Ea36e43a7` | belum di-deploy |
-| AMM Router | `0x9f2443691bddd8343590c68e2a2cdec5fd0b6124` | belum di-deploy |
-| Swap Adapter | `0xBBD70b01a1CAbc96d5b7b129Ae1AAabdf50dd40b` | belum di-deploy |
-| ERC-8183 Agentic Commerce | `0x0747EEf0706327138c69792bF28Cd525089e4583` | belum di-deploy |
-| Treasury mainnet | — | belum dibuat |
+Snapshot terverifikasi (`npm run mainnet:sources` + `npm run mainnet:plan` di
+`arcox-mcp`), status on-chain dicek read-only pada 25 Sep 2026:
+
+| Kontrak | Alamat testnet | Bentuk on-chain | Status mainnet |
+| --- | --- | --- | --- |
+| ARCOX Fee Router | `0xDf80…43a7` | `ArcoxRouter` langsung (solc 0.8.35) | belum di-deploy |
+| AMM Router | `0x9f24…6124` | `ArcoxCirBTCRouterV2` langsung (solc 0.8.24) | belum di-deploy |
+| AMM Pool USDC-cirBTC | `0xd4af…dc2d` | `ArcoxBTCPool` (solc 0.8.24) | belum di-deploy |
+| AMM Pool EURC-cirBTC | `0xcca9…6bfa2` | `ArcoxBTCPool` (solc 0.8.24) | belum di-deploy |
+| Swap Adapter | `0xBBD7…d40b` | **TransparentUpgradeableProxy** → impl `Adapter` `0xb4d0…c2d4`, admin `0x6a73…8b7a` (solc 0.8.28) | belum di-deploy |
+| ERC-8183 Agentic Commerce | `0x0747…e4583` | **ERC1967Proxy** → impl `AgenticCommerce` `0xa316…351a` (solc 0.8.28, optimizer OFF, evm cancun) | belum di-deploy |
+| Treasury mainnet | — | — | belum dibuat |
 
 Kontrak pihak Circle (USDC, EURC, USYC, Memo, ERC-8004, CCTP, Gateway) **sudah
 live** dan tidak perlu di-deploy; alamatnya sudah ada di
 `src/config/arcNetwork.mjs` (`MAINNET`).
+
+Hal penting: Swap Adapter dan ERC-8183 adalah **proxy**, jadi deploy mainnet perlu
+implementation + proxy (untuk Swap Adapter plus keputusan ProxyAdmin). Konstruktor
+proxy Swap Adapter di testnet menyebut logic `0xCeA69a03…8751`, padahal slot
+implementasi saat ini `0xb4d0…c2d4` — artinya adapter pernah di-upgrade. Yang harus
+ditiru di mainnet adalah implementasi **terkini**, bukan alamat logic lama itu.
 
 ## 2. Aturan yang tidak boleh dilanggar
 
@@ -59,21 +70,37 @@ testnet-only. Sebelum dipakai untuk mainnet:
 - [ ] `TOKEN_MESSENGER` → mainnet `0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d`.
 - [ ] Output deployment jangan menimpa `deployments/arcox-router.testnet.json`
       (pakai file `-mainnet.json`).
-- [ ] Constructor: `[owner, treasury, usdc, tokenMessenger, domain=26, feeBps=ARCOX_ROUTER_FEE_BPS]`.
+- [ ] Constructor: `[initialOwner, initialTreasury, usdc_, tokenMessenger_, localDomain_=26, feeBps_=ARCOX_ROUTER_FEE_BPS]`
+      (argumen lengkap ada di `mainnet-sources/manifest.json`).
 - [ ] Setelah deploy, `setSupportedDestinationDomain(domain, true)` hanya untuk
       domain tujuan yang benar-benar dipakai (jangan meniru daftar testnet).
 - [ ] Verifikasi bytecode + source di `https://explorer.arc.io`.
 
 ### 3.3 AMM Router, Swap Adapter, ERC-8183
 
-Sumber ketiga kontrak ini **tidak ada** di `arc-dex` maupun `arcox-mcp`
-(hanya alamat hasil deploy testnet yang tercatat). Sebelum menjadwalkan deploy:
+Sumber ketiga kontrak ini tidak ada di repo, **tetapi semuanya terverifikasi di
+ArcScan**, jadi source-nya sudah disalin ke
+`arcox-mcp/packages/runtime/mainnet-sources/` lewat `npm run mainnet:sources`
+(read-only). Nama kontrak, compiler, dan constructor args aslinya tercatat di
+`mainnet-sources/manifest.json`.
 
-- [ ] Temukan repo/artefak sumber (legacy `arcox-agent/archive/arc-dex-agent-legacy/contracts/`
-      atau arsip lain) dan konfirmasi bytecode-nya cocok dengan alamat testnet.
-- [ ] Kalau sumber tidak ditemukan: jangan deploy alamat tiruan — jalankan
-      fitur terkait sebagai "belum tersedia di mainnet" (fail-closed) dan
-      dokumentasikan sebagai pekerjaan lanjutan.
+- AMM Router = `ArcoxCirBTCRouterV2`, args `[_treasury, _usdc, _eurc, _cirbtc]`.
+- Pool = `ArcoxBTCPool`, args `[_token0, _token1]` (USDC-cirBTC dan EURC-cirBTC).
+- Swap Adapter = `Adapter` (impl) di belakang `TransparentUpgradeableProxy`.
+- ERC-8183 = `AgenticCommerce` (impl) di belakang `ERC1967Proxy`.
+
+Langkah:
+
+- [ ] Jalankan `npm run mainnet:plan` di `arcox-mcp` untuk cetakan rencana +
+      pemeriksaan prasyarat (read-only; tidak ada broadcast).
+- [ ] Selesaikan blocker yang dicetak: treasury mainnet, deployer key terpisah,
+      alamat cirBTC mainnet, keputusan ProxyAdmin Swap Adapter, dan init data
+      proxy (USDC + operator) — jangan menyalin init data testnet mentah.
+- [ ] **AMM cirBTC terhalang**: token cirBTC mainnet belum terverifikasi, jadi
+      `ArcoxCirBTCRouterV2` + dua pool cirBTC tidak bisa di-deploy dulu. Jalur
+      swap cirBTC di mainnet harus tetap fail-closed.
+- [ ] Seeding likuiditas pool cirBTC setelah deploy adalah langkah operasional
+      terpisah (bukan bagian dari script).
 - [ ] `ArcoxApiPass.sol` (API pass) juga perlu keputusan: dipakai atau tidak.
 
 ### 3.4 Treasury mainnet
@@ -112,6 +139,9 @@ AI_ROUTER_DELEGATE_PRIVATE_KEY_MAINNET=
 # x402
 X402_MODE=arc_mainnet
 ```
+
+Catatan: `mainnet-sources/` dan `mainnet:plan` adalah bagian dari release ini;
+keduanya read-only.
 
 `ARC_RPC_URL`, `CANTEEN_RPC_URL`, dan `ARC_RPC_DRPC` **diabaikan** saat mainnet:
 RPC diambil dari `ARC_MAINNET_RPC_URL` bila diset, kalau tidak dari
