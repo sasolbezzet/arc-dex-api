@@ -124,16 +124,26 @@ Rencana deploy siap di `arcox-mcp/packages/runtime/scripts/deploy-swap-adapter-m
   mendelegatecall `initialize` ke logic; delegatecall ke alamat tanpa kode selalu
   revert), jadi script memakai limit tetap 1,2 juta gas.
 
-Kebutuhan dana (gas impl ≈3,94 juta + proxy ≈0,95 juta):
+Keputusan operator (tercatat di `arcox-mcp/packages/runtime/deployments/swap-adapter-mainnet.json`):
 
-| Chain | Perkiraan biaya | Saldo sekarang | Kurang |
-| --- | --- | --- | --- |
-| Arc | ≈0,098 USDC | 0,0513 USDC | ≈0,047 USDC |
-| Base | ≈0,0000293 ETH | 0,0000115 ETH | ≈0,000018 ETH |
-| Arbitrum | ≈0,0000978 ETH | 0,0000051 ETH | ≈0,000093 ETH |
+| Peran | Alamat |
+| --- | --- |
+| `owner` adapter | `0x5d16E8Ef186d6D0d984f9A50C7ddb16C106DF40F` |
+| Pemilik ProxyAdmin (hak upgrade) | `0x5d16E8Ef186d6D0d984f9A50C7ddb16C106DF40F` |
+| Signer EIP-712 (threshold 1) | `0xE34FF1D2C925DDafB28C95C2396fC49A6f64569e` |
 
-Keputusan operator yang ditunggu: `owner` adapter, `signer` EIP-712 (+ threshold),
-dan pemilik ProxyAdmin (satu-satunya yang bisa upgrade proxy).
+> Owner + ProxyAdmin dipegang alamat treasury operator, sedangkan key signer ada di
+> VPS. Konsekuensinya: eksekusi swap bisa jalan, tetapi penambahan signer dan
+> upgrade proxy hanya bisa dilakukan oleh pemegang key `0x5d16E8Ef…`.
+
+Kebutuhan dana (gas impl ≈3,94 juta + proxy ≈0,95 juta) — preflight berhenti di
+sini, belum ada transaksi adapter yang dikirim:
+
+| Chain | Perkiraan biaya | Saldo sekarang | Kurang | Saran kirim |
+| --- | --- | --- | --- | --- |
+| Arc | ≈0,098 USDC | 0,0513 USDC | ≈0,047 USDC | 1 USDC |
+| Base | ≈0,0000293 ETH | 0,0000115 ETH | ≈0,000018 ETH | 0,0005 ETH |
+| Arbitrum | ≈0,0000978 ETH | 0,0000051 ETH | ≈0,000093 ETH | 0,001 ETH |
 
 ### 3.4 AMM Router, ERC-8183
 
