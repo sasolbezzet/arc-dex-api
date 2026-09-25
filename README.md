@@ -191,7 +191,7 @@ model    = arcox/auto
 ## Testing
 
 ```bash
-npm test                 # node --check + 315 test unit/regresi
+npm test                 # node --check + 340 test unit/regresi
 npm run test:e2e:flows   # 3 alur agent: passkey + EOA virtual, UserOperation NYATA di Arc testnet
 npm run test:e2e:ui      # 4 alur menu Plugin di Chrome nyata (virtual authenticator)
 npm run diag:mcp         # diagnosa konektor/token MCP per agent
@@ -202,14 +202,20 @@ npm run probe:mainnet    # pre-flight Arc mainnet (read-only, tanpa transaksi)
 jadi tidak dijalankan otomatis di `npm test`. Detail operasional:
 `MAINTENANCE.md`.
 
+`npm test` mencakup `test/arcNetwork.test.mjs` yang menjaga kontrak registry:
+default testnet, saklar `ARC_NETWORK=mainnet` (chain 5042, transport `arc`),
+resolusi kontrak `*_MAINNET` tanpa fallback testnet, serta pemilihan kunci LIVE.
+
 ## Env penting
 
 ```text
+ARC_NETWORK=                               # kosong = testnet; `mainnet` = Arc mainnet (5042)
 SERVER_URL=https://arcoxdex.vercel.app     # dipakai untuk issuer OAuth + resource MCP
 AUTH_SECRET=
 ALLOWED_ORIGINS=https://arcoxdex.vercel.app
 SUPABASE_URL= / SUPABASE_SERVICE_KEY=
-CIRCLE_API_KEY= / CIRCLE_CLIENT_KEY_LIVE= / CIRCLE_API_KEY_MAINNET=
+CIRCLE_API_KEY= / CIRCLE_CLIENT_KEY=                       # testnet
+CIRCLE_API_KEY_MAINNET= / CIRCLE_CLIENT_KEY_LIVE=          # wajib saat ARC_NETWORK=mainnet
 CIRCLE_ENTITY_SECRET=
 KIT_KEY=
 ARKHAM_API_KEY=
@@ -225,11 +231,20 @@ ENABLE_SERVER_SIGNED_MINT=false
   Router, dan x402. Setelah diganti, restart proses dan panggil
   `setTreasury(address)` pada router on-chain.
 - Setelah mengubah `.env`, restart unit systemd agar env baru dimuat.
+- `ARC_NETWORK` (atau `ARC_CHAIN_ID=5042`) memindahkan seluruh backend ke Arc
+  mainnet. Registry `src/config/arcNetwork.mjs` menurunkan chain id, RPC,
+  explorer, token, dan kontrak Circle; RPC testnet/Canteen serta kunci sandbox
+  diabaikan di mainnet. Kontrak ARCOX mainnet hanya dibaca dari env `*_MAINNET`
+  (tanpa fallback testnet) sehingga fitur gagal-tertutup bila belum di-deploy.
+  Detail: `MAINTENANCE.md` dan `docs/arc-mainnet-deploy-plan.md`.
 
 ## Mainnet
 
+Probe read-only terakhir: **19 lulus / 0 blocker** (`npm run probe:mainnet`).
+
+- `docs/mainnet-x402-readiness.md` — kesiapan x402 di Arc mainnet (status + checklist).
+- `docs/arc-mainnet-deploy-plan.md` — rencana deploy kontrak ARCOX + treasury mainnet.
 - `docs/mainnet-security.md` — checklist keamanan mainnet.
-- `docs/mainnet-x402-readiness.md` — kesiapan x402 di Arc mainnet.
 - Ringkasan prasyarat frontend+backend: `arc-dex/docs/mainnet-readiness.md`.
 
 ## Catatan teknis

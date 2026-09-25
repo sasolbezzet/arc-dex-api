@@ -1,14 +1,17 @@
 import { createPublicClient, defineChain, fallback, http, isAddress, parseAbi } from 'viem'
 import { resolveArcRpc } from '../config/arcRpc.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_NAME, ARC_CCTP_DOMAIN, ARC_GATEWAY_CHAIN_NAME, ARC_GATEWAY_KEY, ARC_GATEWAY_NETWORK_LABEL, ARC_GATEWAY_WALLET, ARC_USDC_ADDRESS, arcGatewayBaseUrl } from '../config/arcNetwork.mjs'
 
-const GATEWAY_WALLET = '0x0077777d7EBA4688BDeF3E311b846F25870A19B9'
-const GATEWAY_INFO_URL = 'https://gateway-api-testnet.circle.com/v1/info'
+// Gateway Wallet berbeda per jaringan (testnet vs mainnet) → ambil dari registry.
+const GATEWAY_WALLET = ARC_GATEWAY_WALLET
 const STATUS_ABI = parseAbi([
   'function isAuthorizedForBalance(address token, address depositor, address delegate) view returns (bool)',
 ])
 
 const CHAINS = {
-  Arc_Testnet: chainConfig(5042002, 'Arc Testnet', 'USDC', 26, 'ARC', 'Testnet', '0x3600000000000000000000000000000000000000', 'ARC_RPC_URL', resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })),
+  // Kunci peta = vokabulari internal (Arc_Testnet/Arc); `gatewayChain` = nama
+  // chain di API Gateway ("Arc") yang dipakai saat mencocokkan /v1/info.
+  [ARC_GATEWAY_KEY]: chainConfig(ARC_CHAIN_ID, ARC_CHAIN_NAME, 'USDC', ARC_CCTP_DOMAIN, ARC_GATEWAY_CHAIN_NAME, ARC_GATEWAY_NETWORK_LABEL, ARC_USDC_ADDRESS, 'ARC_RPC_URL', resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })),
   Ethereum_Sepolia: chainConfig(11155111, 'Ethereum Sepolia', 'ETH', 0, 'Ethereum', 'Sepolia', '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', 'ETHEREUM_SEPOLIA_RPC', 'https://ethereum-sepolia-rpc.publicnode.com'),
   Base_Sepolia: chainConfig(84532, 'Base Sepolia', 'ETH', 6, 'Base', 'Sepolia', '0x036CbD53842c5426634e7929541eC2318f3dCF7e', 'BASE_SEPOLIA_RPC', 'https://sepolia.base.org'),
   Arbitrum_Sepolia: chainConfig(421614, 'Arbitrum Sepolia', 'ETH', 3, 'Arbitrum', 'Sepolia', '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d', 'ARBITRUM_SEPOLIA_RPC', ['https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com']),
@@ -74,7 +77,7 @@ async function gatewayInfo() {
   if (gatewayInfoCache && Date.now() - gatewayInfoCachedAt < 15_000) return gatewayInfoCache
   if (gatewayInfoInFlight) return gatewayInfoInFlight
   gatewayInfoInFlight = (async () => {
-    const response = await fetch(GATEWAY_INFO_URL, { signal: AbortSignal.timeout(8_000) })
+    const response = await fetch(`${arcGatewayBaseUrl()}/v1/info`, { signal: AbortSignal.timeout(8_000) })
     if (!response.ok) throw new Error(`Gateway info HTTP ${response.status}`)
     const data = await response.json()
     if (!Array.isArray(data?.domains)) throw new Error('Invalid Gateway info response')

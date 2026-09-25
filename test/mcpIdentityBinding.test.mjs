@@ -5,6 +5,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { decodeFunctionData } from 'viem'
 
+// MSCA bridge routes are fail-closed when the ARCOX router address is missing
+// (mainnet never falls back to a testnet address). Declare the testnet router
+// explicitly so the bridge route assertions below describe a configured instance.
+process.env.ARCOX_FEE_ROUTER_ADDRESS ||= '0xDf800310443BEB589CEf91A09854203Ea36e43a7'
+
 const EOA = '0x1111111111111111111111111111111111111111'
 const MSCA = '0x2222222222222222222222222222222222222222'
 const OTHER = '0x3333333333333333333333333333333333333333'

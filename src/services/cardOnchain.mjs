@@ -1,7 +1,7 @@
 // ARC on-chain helpers for the Card Simulator.
 //
-// Balance: reads the real USDC balance of the Agent Wallet MSCA on Arc Testnet
-// (contract 0x3600...0000).
+// Balance: reads the real USDC balance of the Agent Wallet MSCA on the active
+// Arc network (USDC contract 0x3600...0000 on both testnet and mainnet).
 // Transfers: executes a USDC `transfer` userOperation from the MSCA through the
 // existing session-key + paymaster path (same as arcox_pay), so a card spend
 // truly *debits* the wallet's on-chain USDC balance. The destination is the
@@ -10,14 +10,15 @@
 
 import { createPublicClient, defineChain, getAddress, http, parseUnits } from 'viem'
 import { resolveArcRpc } from '../config/arcRpc.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, arcTokenAddress } from '../config/arcNetwork.mjs'
 
-const ARC_TESTNET_CHAIN = defineChain({
-  id: 5042002, name: 'Arc Testnet',
+const ARC_CHAIN = defineChain({
+  id: ARC_CHAIN_ID, name: ARC_CHAIN_NAME,
   nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 6 },
   rpcUrls: { default: { http: [] } },
 })
 
-export const ARC_USDC_TOKEN = '0x3600000000000000000000000000000000000000'
+export const ARC_USDC_TOKEN = arcTokenAddress('USDC')
 
 export function cardMerchantWallet() {
   const explicit = String(process.env.CARDS_MERCHANT_WALLET || '').trim()
@@ -35,7 +36,7 @@ export async function readArcUsdcBalance(walletAddress) {
   if (fake) return parseUnits(fake, 6)
   const rpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
   const client = createPublicClient({
-    chain: { ...ARC_TESTNET_CHAIN, rpcUrls: { default: { http: [rpc] } } },
+    chain: { ...ARC_CHAIN, rpcUrls: { default: { http: [rpc] } } },
     transport: http(rpc),
   })
   return client.readContract({
@@ -55,7 +56,7 @@ export function usdcUnitsToHuman(units) {
 export async function executeArcTransfer(walletAddress, { to, amountUnits } = {}) {
   const fake = String(process.env.CARDS_FAKE_TRANSFER || '').trim()
   if (fake === 'true') {
-    return { status: 'success', txHash: '0xfake'.padEnd(66, 'f'), explorerUrl: 'https://testnet.arcscan.app/tx/fake' }
+    return { status: 'success', txHash: '0xfake'.padEnd(66, 'f'), explorerUrl: `${ARC_EXPLORER_URL}/tx/fake` }
   }
   const { executeViaSession } = await import('./sessionKeyService.mjs')
   const result = await executeViaSession(walletAddress, [{
@@ -64,7 +65,7 @@ export async function executeArcTransfer(walletAddress, { to, amountUnits } = {}
       inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }],
     functionName: 'transfer',
     args: [getAddress(to), parseUnits(usdcUnitsToHuman(amountUnits), 6)],
-  }], { paymaster: true, chainKey: 'arc-testnet', feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+  }], { paymaster: true, chainKey: ARC_CHAIN_KEY, feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
   if (result.status !== 'success') {
     return { status: 'error', reason: result.reason || 'transfer failed', error: result.error, txHash: result.txHash }
   }

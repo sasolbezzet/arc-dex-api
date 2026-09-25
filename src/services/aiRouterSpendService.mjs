@@ -6,18 +6,13 @@ import { Keypair } from '@solana/web3.js'
 import { privateKeyToAccount } from 'viem/accounts'
 import bs58 from 'bs58'
 import { solanaTreasuryAddress, treasuryAddress } from '../config/treasury.mjs'
+import { ARC_GATEWAY_KEY, arcGatewayBaseUrl, arcGatewayChains } from '../config/arcNetwork.mjs'
 
 let kit
 let adapter
 let solanaAdapter
-const GATEWAY_API = 'https://gateway-api-testnet.circle.com'
-const GATEWAY_CHAINS = [
-  { chain: 'Arc_Testnet', domain: 26 },
-  { chain: 'Base_Sepolia', domain: 6 },
-  { chain: 'Ethereum_Sepolia', domain: 0 },
-  { chain: 'Arbitrum_Sepolia', domain: 3 },
-  { chain: 'Solana_Devnet', domain: 5 },
-]
+// Chain Gateway mengikuti jaringan aktif (mainnet: hanya Arc yang terverifikasi).
+const GATEWAY_CHAINS = arcGatewayChains().map(({ chain, domain }) => ({ chain, domain }))
 
 function getKit() {
   if (!kit) kit = new AppKit()
@@ -116,10 +111,10 @@ export async function estimateDelegatedAiSpend({ sourceAccount, solanaSourceAcco
   const cfg = delegateConfig()
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!cfg.recipient) throw new Error('ARCOX treasury recipient is not configured')
-  return estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourceAccount, amount, sourceChains, destinationChain: 'Arc_Testnet', recipient: cfg.recipient })
+  return estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourceAccount, amount, sourceChains, destinationChain: ARC_GATEWAY_KEY, recipient: cfg.recipient })
 }
 
-export async function estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourceAccount = '', amount, sourceChains = [], destinationChain = 'Arc_Testnet', recipient }) {
+export async function estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourceAccount = '', amount, sourceChains = [], destinationChain = ARC_GATEWAY_KEY, recipient }) {
   const cfg = delegateConfig()
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!/^0x[a-fA-F0-9]{40}$/.test(String(sourceAccount || ''))) throw new Error('Invalid Unified Balance owner')
@@ -127,7 +122,7 @@ export async function estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourc
   if (!GATEWAY_CHAINS.some(item => item.chain === destinationChain)) throw new Error('Unsupported Unified Balance destination chain')
   const receiveUnits = usdcUnits(amount)
   const balances = await delegatedBalances(sourceAccount, solanaSourceAccount)
-  const allowed = new Set(sourceChains.length ? sourceChains : ['Arc_Testnet'])
+  const allowed = new Set(sourceChains.length ? sourceChains : [ARC_GATEWAY_KEY])
   const candidates = GATEWAY_CHAINS
     .filter(item => allowed.has(item.chain) && (balances.get(item.domain) || 0n) > 0n)
     .sort((left, right) => sourcePriority(left.chain, destinationChain) - sourcePriority(right.chain, destinationChain))
@@ -150,10 +145,10 @@ export async function spendDelegatedAiPayment({ sourceAccount, solanaSourceAccou
   const cfg = delegateConfig()
   if (!cfg.enabled || !cfg.delegateAddress) throw new Error('Enable Auto Pay first')
   if (!cfg.recipient) throw new Error('ARCOX treasury recipient is not configured')
-  return spendDelegatedUnifiedBalance({ sourceAccount, solanaSourceAccount, amount, estimate: preparedEstimate, sourceChains, destinationChain: 'Arc_Testnet', recipient: cfg.recipient })
+  return spendDelegatedUnifiedBalance({ sourceAccount, solanaSourceAccount, amount, estimate: preparedEstimate, sourceChains, destinationChain: ARC_GATEWAY_KEY, recipient: cfg.recipient })
 }
 
-export async function spendDelegatedUnifiedBalance({ sourceAccount, solanaSourceAccount = '', amount, estimate: preparedEstimate, sourceChains = [], destinationChain = 'Arc_Testnet', recipient, maxTotalDebit }) {
+export async function spendDelegatedUnifiedBalance({ sourceAccount, solanaSourceAccount = '', amount, estimate: preparedEstimate, sourceChains = [], destinationChain = ARC_GATEWAY_KEY, recipient, maxTotalDebit }) {
   let estimate = preparedEstimate || await estimateDelegatedUnifiedSpend({ sourceAccount, solanaSourceAccount, amount, sourceChains, destinationChain, recipient })
   if (maxTotalDebit && usdcUnits(estimate.totalDebit || estimate.spendAmount || amount) > usdcUnits(maxTotalDebit)) {
     throw new Error('Unified Balance fee changed above the approved preview. Estimate again before spending.')
@@ -233,7 +228,7 @@ async function delegatedBalances(sourceAccount, solanaSourceAccount = '') {
 }
 
 async function delegatedAllocations(sourceAccount, solanaSourceAccount, amount, sourceChains, knownBalances) {
-  const allowed = new Set(sourceChains.length ? sourceChains : ['Arc_Testnet'])
+  const allowed = new Set(sourceChains.length ? sourceChains : [ARC_GATEWAY_KEY])
   const balances = knownBalances || await delegatedBalances(sourceAccount, solanaSourceAccount)
   let remaining = usdcUnits(amount)
   const allocations = []
@@ -264,7 +259,7 @@ function delegatedSources(sourceAccount, solanaSourceAccount, allocations) {
   return sources
 }
 
-function sourcePriority(chain, destinationChain = 'Arc_Testnet') {
+function sourcePriority(chain, destinationChain = ARC_GATEWAY_KEY) {
   if (chain === destinationChain) return 0
   return ({ Base_Sepolia: 1, Arbitrum_Sepolia: 2, Ethereum_Sepolia: 3, Solana_Devnet: 4, Arc_Testnet: 5 })[chain] ?? 9
 }
@@ -274,7 +269,7 @@ async function gatewayRequest(path, body) {
   let lastError
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const response = await fetch(`${GATEWAY_API}${path}`, {
+      const response = await fetch(`${arcGatewayBaseUrl()}${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'User-Agent': 'arcox-ai-router/1.0' },
         body: JSON.stringify(body),

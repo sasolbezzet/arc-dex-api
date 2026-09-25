@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { randomUUID } from 'crypto'
 import { solanaTreasuryAddress, treasuryAddress } from '../config/treasury.mjs'
 import { scheduleTreasuryFinancialEvent } from '../services/supabasePersistence.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
 
 const router = Router()
 const ledger = globalThis.__arcoxTreasuryLedger || { deposits: [], spends: [], settlements: [] }
@@ -11,8 +12,8 @@ function cfg() {
   return {
     mode: process.env.TREASURY_MODE || 'unified_balance',
     unifiedBalance: String(process.env.ENABLE_UNIFIED_BALANCE || 'true').toLowerCase() === 'true',
-    network: 'arc-testnet',
-    chainId: Number(process.env.ARC_CHAIN_ID || 5042002),
+    network: ARC_CHAIN_KEY,
+    chainId: Number(ARC_CHAIN_ID),
     asset: 'USDC',
     decimals: 6,
     treasuryWallet: treasuryAddress(),
@@ -71,7 +72,7 @@ router.post('/simulate-settlement', requireDevTools, (req, res) => {
   ledger.settlements.push(rec)
   scheduleTreasuryFinancialEvent({
     id: rec.id, eventType: 'settlement_intent', owner: rec.owner || rec.ownerAddress || '',
-    amount: rec.amount, token: rec.asset || rec.token || 'USDC', chain: rec.chain || 'arc-testnet',
+    amount: rec.amount, token: rec.asset || rec.token || 'USDC', chain: rec.chain || ARC_CHAIN_KEY,
     status: rec.status, txHash: rec.txHash || '', createdAt: rec.createdAt,
     metadata: { source: 'treasury.simulate-settlement', request: rec },
   })
@@ -83,7 +84,7 @@ router.post('/unified-balance/deposit', requireDevTools, (req, res) => {
   ledger.deposits.push(rec)
   scheduleTreasuryFinancialEvent({
     id: rec.id, eventType: 'unified_balance_deposit_intent', owner: rec.owner || rec.ownerAddress || '',
-    amount: rec.amount, token: rec.asset || rec.token || 'USDC', chain: rec.chain || 'arc-testnet',
+    amount: rec.amount, token: rec.asset || rec.token || 'USDC', chain: rec.chain || ARC_CHAIN_KEY,
     status: rec.status, txHash: rec.txHash || '', createdAt: rec.createdAt,
     metadata: { source: 'treasury.unified-balance.deposit', request: rec },
   })
@@ -116,7 +117,7 @@ router.post('/unified-balance/spend', requireDevTools, (req, res) => {
   ledger.spends.push(rec)
   scheduleTreasuryFinancialEvent({
     id: rec.id, eventType: 'unified_balance_spend_intent', owner: rec.owner || rec.ownerAddress || '',
-    amount: rec.amount, token: rec.asset || rec.token || 'USDC', chain: rec.chain || rec.destinationChain || 'arc-testnet',
+    amount: rec.amount, token: rec.asset || rec.token || 'USDC', chain: rec.chain || rec.destinationChain || ARC_CHAIN_KEY,
     status: rec.status, txHash: rec.txHash || '', createdAt: rec.createdAt,
     metadata: { source: 'treasury.unified-balance.spend', request: rec },
   })

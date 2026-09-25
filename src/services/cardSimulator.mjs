@@ -24,6 +24,7 @@ import {
   scheduleCardTransactionUpsert,
 } from './supabasePersistence.mjs'
 import { logActivity } from './vaultStore.mjs'
+import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
 
 export const CARD_CONFIG = Object.freeze({
   mode: 'hybrid', // 'hybrid' = balance syncs from MSCA on-chain USDC ; 'simulated' via env CARDS_SYNC_ONCHAIN=false
@@ -31,11 +32,11 @@ export const CARD_CONFIG = Object.freeze({
   network: 'visa',
   scheme: 'simulated',
   asset: 'USDC',
-  chain: 'arc-testnet',
+  chain: ARC_CHAIN_KEY,
   bint: '4485', // test BIN for Visa
   maxCardsPerOwner: Number(process.env.CARDS_MAX_PER_OWNER || 10),
   defaultBalance: String(process.env.CARDS_DEFAULT_BALANCE_USDC || '100'),
-  note: 'Spend debits real USDC from the Agent Wallet MSCA on Arc Testnet (session-key path). Balance mirrors the MSCA on-chain USDC balance.',
+  note: 'Spend debits real USDC from the Agent Wallet MSCA on the active Arc network (session-key path). Balance mirrors the MSCA on-chain USDC balance.',
 })
 
 export const MERCHANTS = [

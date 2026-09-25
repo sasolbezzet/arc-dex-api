@@ -35,6 +35,7 @@ import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './s
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
 import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus } from './src/services/circleWalletWebhookService.mjs'
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, IS_ARC_MAINNET, arcCircleApiKey, arcGatewayBaseUrl, arcGatewayChains, arcNetwork } from './src/config/arcNetwork.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
 import { startRefundWorker } from './src/services/x402RefundWorker.mjs'
@@ -600,7 +601,7 @@ app.post('/api/session/generate-key', apiLimiter, requireAuth, async (req, res) 
 
 app.post('/api/session/authorization-attempt', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = 'arc-testnet' } = req.body || {}
+    const { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = ARC_CHAIN_KEY } = req.body || {}
     if (!walletAddress || !delegateAddress || !isAddress(walletAddress) || !isAddress(delegateAddress)) {
       return res.status(400).json({ error: 'Valid walletAddress and delegateAddress required' })
     }
@@ -610,7 +611,7 @@ app.post('/api/session/authorization-attempt', apiLimiter, requireAuth, async (r
     const { getSessionKey, getAuthorizationUserOperationOutcome, recordSessionAuthorizationAttempt } = await import('./src/services/sessionKeyService.mjs')
     const current = getSessionKey(walletAddress)
     const previousAuthorizationUserOpHash = current?.authorizationUserOpHashes?.[chainKey]
-      || (chainKey === (current?.chain || 'arc-testnet') ? current?.authorizationUserOpHash : '')
+      || (chainKey === (current?.chain || ARC_CHAIN_KEY) ? current?.authorizationUserOpHash : '')
     const replacingDifferentHash = Boolean(previousAuthorizationUserOpHash && String(previousAuthorizationUserOpHash).toLowerCase() !== String(authorizationUserOpHash).toLowerCase())
     let previousOutcome = 'unknown'
     if (replacingDifferentHash) {
@@ -649,7 +650,7 @@ app.post('/api/session/setup', apiLimiter, requireAuth, async (req, res) => {
       walletAddress,
       delegateAddress,
       authorizationUserOpHash,
-      chainKey: 'arc-testnet',
+      chainKey: ARC_CHAIN_KEY,
     })
     const entry = activateReservedSessionKey(req.owner, {
       walletAddress,
@@ -941,7 +942,7 @@ app.post('/api/pending-txs/:txId/submit', apiLimiter, requireAuth, async (req, r
     const { createPublicClient, defineChain } = await import('viem')
     const CLIENT_URL = process.env.CIRCLE_CLIENT_URL
     const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY
-    const chainKey = tx.chainKey || 'arc-testnet'
+    const chainKey = tx.chainKey || ARC_CHAIN_KEY
     const { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } = await import('./src/services/chains.mjs')
     const chain = CHAINS[chainKey]
     if (!chain) return res.status(400).json({ error: 'unknown_chain', chain: chainKey })
@@ -1004,7 +1005,7 @@ const DRPC_KEY = process.env.DRPC_KEY || ''
 // never hardcode its token in source. Public Arc and dRPC remain fallbacks.
 const ARC_RPC_URLS = arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
 const ARC_RPC_PRIMARY = ARC_RPC_URLS[0]
-const ARC_RPC_DRPC = 'https://arc-testnet.drpc.org'
+const ARC_RPC_DRPC = arcNetwork().drpcRpc || ARC_RPC_PRIMARY
 /** Fetch wrapper — adds Bearer auth header for dRPC when DRPC_KEY is set and
  *  retries on 429/5xx with exponential backoff to survive rate limits. */
 async function drpcFetch(url, opts = {}) {
@@ -1035,12 +1036,25 @@ async function drpcFetch(url, opts = {}) {
   throw lastError
 }
 const arcTestnet = defineChain({
-  id: 5042002,
-  name: 'Arc Testnet',
+  id: ARC_CHAIN_ID,
+  name: ARC_CHAIN_NAME,
   nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
   rpcUrls: { default: { http: ARC_RPC_URLS } },
-  blockExplorers: { default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' } },
+  blockExplorers: { default: { name: 'ArcScan', url: ARC_EXPLORER_URL } },
 })
+
+// SDK Circle (App Kit / Bridge Kit / Stablecoin Service) pada versi terpasang
+// hanya mengenal Arc testnet: `SwapChain.Arc_Testnet`, `BridgeKitChains.ArcTestnet`,
+// dan nama chain "Arc_Testnet". Saat `ARC_NETWORK=mainnet` aktif jalur ini harus
+// gagal dengan pesan jelas — bukan diam-diam menyasar testnet.
+function assertArcSdkPath(feature) {
+  if (!IS_ARC_MAINNET) return
+  throw Object.assign(new Error(`${feature} belum tersedia untuk Arc mainnet: SDK Circle yang terpasang hanya mendukung Arc Testnet.`), { status: 503 })
+}
+function arcSwapChain() { assertArcSdkPath('Swap via App Kit'); return SwapChain.Arc_Testnet }
+function arcBridgeChain() { assertArcSdkPath('Bridge via Bridge Kit'); return BridgeKitChains.ArcTestnet }
+function arcKitSwapChainName() { assertArcSdkPath('Swap Stablecoin Service'); return 'Arc_Testnet' }
+if (IS_ARC_MAINNET) console.log('[network] Arc mainnet aktif (chain 5042). Jalur swap/bridge SDK Circle dinonaktifkan sampai SDK mainnet tersedia.')
 // Save original fetch before override — needed by fetchWithRetry
 const _originalFetch = globalThis.fetch
 
@@ -1224,7 +1238,7 @@ const CCTP = {
     usdc: '0x3600000000000000000000000000000000000000',
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
     messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
-    explorer: 'https://testnet.arcscan.app/tx/',
+    explorer: `${ARC_EXPLORER_URL}/tx/`,
     chain: arcTestnet,
   },
   Ethereum_Sepolia: {
@@ -1290,11 +1304,11 @@ const RETRY_CFG = {
 }
 
 const circleClient = initiateDeveloperControlledWalletsClient({
-  apiKey: process.env.CIRCLE_API_KEY,
+  apiKey: arcCircleApiKey(),
   entitySecret: process.env.CIRCLE_ENTITY_SECRET,
 })
 const circleAdapter = createCircleWalletsAdapter({
-  apiKey: process.env.CIRCLE_API_KEY,
+  apiKey: arcCircleApiKey(),
   entitySecret: process.env.CIRCLE_ENTITY_SECRET,
 })
 const kit = new AppKit()
@@ -1368,7 +1382,7 @@ async function verifySiweSession({ message, signature, expectedAddress }) {
   if (siwe.statement !== 'Only sign this message on the official ARCOX DEX website.') {
     throw new Error('Invalid SIWE statement')
   }
-  if (String(siwe.chainId) !== '5042002') {
+  if (String(siwe.chainId) !== String(ARC_CHAIN_ID)) {
     throw new Error('Invalid chain ID')
   }
   if (!siwe.nonce) {
@@ -1548,9 +1562,9 @@ function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount, customFee
   if (tokenIn === tokenOut) throw new Error('Token swap harus berbeda')
   return {
     tokenInAddress: TOKENS[tokenIn],
-    tokenInChain: 'Arc_Testnet',
+    tokenInChain: arcKitSwapChainName(),
     tokenOutAddress: TOKENS[tokenOut],
-    tokenOutChain: 'Arc_Testnet',
+    tokenOutChain: arcKitSwapChainName(),
     fromAddress: owner,
     toAddress: owner,
     amount: decimalToUnits(amount, TOKEN_DECIMALS[tokenIn]).toString(),
@@ -1834,9 +1848,9 @@ function normalizeInvoiceToken(value) {
 }
 
 function normalizeInvoiceNetwork(value) {
-  const network = String(value || 'arc-testnet').toLowerCase()
-  if (network !== 'arc-testnet') throw new Error('Unsupported network')
-  return 'arc-testnet'
+  const network = String(value || ARC_CHAIN_KEY).toLowerCase()
+  if (network !== ARC_CHAIN_KEY) throw new Error('Unsupported network')
+  return ARC_CHAIN_KEY
 }
 
 function invoiceIsExpired(invoice) {
@@ -2467,10 +2481,10 @@ app.post('/api/wallet', apiLimiter, requireAuth, async (req, res) => {
 app.get('/api/balance/:address', apiLimiter, async (req, res) => {
   try {
     const target = normalizeAddress(req.params.address, 'address')
-    const requestedChain = String(req.query?.chain || 'arc-testnet').trim().toLowerCase()
-    const chainAliases = { arc: 'arc-testnet', 'arc_testnet': 'arc-testnet', base: 'base-sepolia', 'base_sepolia': 'base-sepolia', arbitrum: 'arbitrum-sepolia', 'arbitrum_sepolia': 'arbitrum-sepolia' }
+    const requestedChain = String(req.query?.chain || ARC_CHAIN_KEY).trim().toLowerCase()
+    const chainAliases = { arc: ARC_CHAIN_KEY, 'arc_testnet': ARC_CHAIN_KEY, base: 'base-sepolia', 'base_sepolia': 'base-sepolia', arbitrum: 'arbitrum-sepolia', 'arbitrum_sepolia': 'arbitrum-sepolia' }
     const chainKey = chainAliases[requestedChain] || requestedChain
-    if (chainKey !== 'arc-testnet') {
+    if (chainKey !== ARC_CHAIN_KEY) {
       const { fetchAllChainBalances } = await import('./src/services/multiChainBalance.mjs')
       const balances = await fetchAllChainBalances(target)
       const selected = balances[chainKey]
@@ -2528,14 +2542,8 @@ app.get('/api/balance/:address', apiLimiter, async (req, res) => {
   }
 })
 
-const GATEWAY_TESTNET_API = 'https://gateway-api-testnet.circle.com'
-const GATEWAY_TESTNET_CHAINS = [
-  { domain: 26, chain: 'Arc_Testnet', ecosystem: 'evm' },
-  { domain: 6, chain: 'Base_Sepolia', ecosystem: 'evm' },
-  { domain: 0, chain: 'Ethereum_Sepolia', ecosystem: 'evm' },
-  { domain: 3, chain: 'Arbitrum_Sepolia', ecosystem: 'evm' },
-  { domain: 5, chain: 'Solana_Devnet', ecosystem: 'solana' },
-]
+// Chain + base URL Circle Gateway mengikuti jaringan aktif (mainnet: hanya Arc).
+const GATEWAY_TESTNET_CHAINS = arcGatewayChains()
 
 const GATEWAY_PROXY_PATH = /^\/v1\/(?:info|balances|deposits|estimate|transfer(?:\/[0-9a-f-]{1,80})?)(?:\?.*)?$/i
 
@@ -2547,7 +2555,7 @@ app.all('/api/unified-balance/gateway-proxy', apiLimiter, requireAuth, async (re
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), Number(process.env.GATEWAY_PROXY_TIMEOUT_MS || 40_000))
     try {
-      const response = await fetch(`${GATEWAY_TESTNET_API}${path}`, {
+      const response = await fetch(`${arcGatewayBaseUrl()}${path}`, {
         method: req.method,
         signal: controller.signal,
         headers: { 'Content-Type': 'application/json', 'User-Agent': 'arcox-api/2.0' },
@@ -2642,7 +2650,7 @@ function delegatedUnifiedRequest(req) {
   const amount = String(req.body?.amount || '').trim()
   if (!/^\d+(\.\d{1,6})?$/.test(amount) || Number(amount) <= 0) throw Object.assign(new Error('Valid USDC amount is required'), { status: 400 })
   const purpose = String(req.body?.purpose || '')
-  const destinationChain = String(req.body?.destinationChain || 'Arc_Testnet')
+  const destinationChain = String(req.body?.destinationChain || ARC_GATEWAY_KEY)
   const supported = new Set(GATEWAY_TESTNET_CHAINS.filter(item => item.ecosystem === 'evm').map(item => item.chain))
   if (!supported.has(destinationChain)) throw Object.assign(new Error('Unsupported Unified Balance destination chain'), { status: 400 })
   const policy = getPolicy(owner)
@@ -2659,7 +2667,7 @@ function delegatedUnifiedRequest(req) {
   if (invoice.ownerWallet && invoice.ownerWallet !== owner.toLowerCase()) throw Object.assign(new Error('Invoice owner does not match authenticated wallet'), { status: 403 })
   if (!['payment_required', 'estimate_ready', 'awaiting_signature', 'spend_submitted', 'settlement_pending', 'pending'].includes(invoice.status)) throw Object.assign(new Error(`Invoice cannot be paid in status ${invoice.status}`), { status: 409 })
   if (invoice.uniqueAmount !== amount) throw Object.assign(new Error('Invoice amount mismatch'), { status: 400 })
-  if (destinationChain !== 'Arc_Testnet') throw Object.assign(new Error('x402 must settle on Arc Testnet'), { status: 400 })
+  if (destinationChain !== ARC_GATEWAY_KEY) throw Object.assign(new Error(`x402 must settle on ${ARC_CHAIN_NAME}`), { status: 400 })
   return { sourceAccount: owner, solanaSourceAccount: policy.solanaOwnerAddress || '', amount, sourceChains, destinationChain, recipient: invoice.recipient, invoice, maxTotalDebit: optionalUsdc(req.body?.maxTotalDebit) }
 }
 
@@ -2692,7 +2700,7 @@ async function gatewayBalanceRequest(path, body) {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), Number(process.env.GATEWAY_BALANCE_TIMEOUT_MS || 7_000))
     try {
-      const response = await fetch(`${GATEWAY_TESTNET_API}${path}`, {
+      const response = await fetch(`${arcGatewayBaseUrl()}${path}`, {
         method: 'POST',
         signal: controller.signal,
         headers: { 'Content-Type': 'application/json', 'User-Agent': 'arcox-api/2.0' },
@@ -2975,7 +2983,7 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
     try {
       const wallet = await getOrCreateWallet(owner)
       const estimate = await estimateCircleSwapRoute({
-        from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
+        from: { adapter: circleAdapter, chain: arcSwapChain(), address: wallet.address },
         tokenIn,
         tokenOut,
         amountIn: platformFee.netAmount,
@@ -3027,7 +3035,7 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
     const platformFee = splitPlatformFee(safeAmount, tokenIn)
     const wallet = await getOrCreateWallet(owner)
     const params = {
-      from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
+      from: { adapter: circleAdapter, chain: arcSwapChain(), address: wallet.address },
       tokenIn: swapTokenParam(tokenIn),
       tokenOut: swapTokenParam(tokenOut),
       amountIn: platformFee.netAmount,
@@ -3058,7 +3066,7 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
     if (platformFee.feeUnits > 0n) {
       try {
         feeResult = await kit.send({
-          from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
+          from: { adapter: circleAdapter, chain: arcSwapChain(), address: wallet.address },
           to: treasury,
           amount: platformFee.feeAmount,
           token: SEND_TOKEN_MAP[tokenIn] || TOKENS[tokenIn] || tokenIn,
@@ -3103,7 +3111,7 @@ app.post('/api/prepare-bridge', apiLimiter, requireAuth, async (req, res) => {
     if (!TOKENS[bridgeToken]) return res.status(400).json({ error: 'Unsupported token: ' + bridgeToken })
     const wallet = await getOrCreateWallet(owner)
     const result = await kit.send({
-      from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
+      from: { adapter: circleAdapter, chain: arcSwapChain(), address: wallet.address },
       to: owner, amount: safeAmount, token: bridgeToken,
     })
     res.json({ success: true, txHash: result.txHash, explorerUrl: result.explorerUrl })
@@ -3514,7 +3522,7 @@ app.post('/api/send-estimate', apiLimiter, requireAuth, async (req, res) => {
     const wallet = await getOrCreateWallet(owner)
     const platformFee = splitPlatformFee(safeAmount, token)
     const params = {
-      from: { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address },
+      from: { adapter: circleAdapter, chain: arcSwapChain(), address: wallet.address },
       to: destination,
       amount: platformFee.netAmount,
       token: resolvedToken,
@@ -3553,7 +3561,7 @@ app.post('/api/send', apiLimiter, requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'EOA send harus ditandatangani langsung dari wallet browser.' })
     }
     const wallet = await getOrCreateWallet(owner)
-    const fromCtx = { adapter: circleAdapter, chain: SwapChain.Arc_Testnet, address: wallet.address }
+    const fromCtx = { adapter: circleAdapter, chain: arcSwapChain(), address: wallet.address }
     const platformFee = splitPlatformFee(safeAmount, token)
     const treasury = normalizeAddress(platformTreasury(), 'ARCOX_TREASURY_WALLET_ADDRESS')
     let feeResult = null
@@ -3585,8 +3593,10 @@ app.post('/api/send', apiLimiter, requireAuth, async (req, res) => {
 // browser signature. Only valid for source='circle'. EOA bridges must still be
 // signed in the browser (burn tx) — this endpoint rejects source='eoa'.
 // Chain names use the CCTP config keys (Arc_Testnet, Base_Sepolia, ...).
+// Kunci mengikuti vokabulari CCTP/BridgeKit yang dipakai frontend (Arc_Testnet).
+// Jalur ini testnet-only; `arcBridgeChain()` gagal jelas di mainnet.
 const BRIDGE_CHAIN_DEF = {
-  Arc_Testnet: BridgeKitChains.ArcTestnet,
+  Arc_Testnet: arcBridgeChain(),
   Ethereum_Sepolia: BridgeKitChains.EthereumSepolia,
   Base_Sepolia: BridgeKitChains.BaseSepolia,
   Arbitrum_Sepolia: BridgeKitChains.ArbitrumSepolia,
@@ -3970,7 +3980,7 @@ app.post('/api/eco/route-preview', apiLimiter, withX402PaymentRequired(async (re
   enabled: String(process.env.X402_ENABLED || 'false').toLowerCase() === 'true',
   price: '0.01',
   token: process.env.X402_DEFAULT_TOKEN || 'USDC',
-  network: process.env.X402_DEFAULT_NETWORK || 'arc-testnet',
+  network: process.env.X402_DEFAULT_NETWORK || ARC_CHAIN_KEY,
   recipient: process.env.X402_FEE_WALLET || '',
   resource: '/api/eco/route-preview',
 }))
@@ -3979,7 +3989,7 @@ app.post('/api/eco/route-preview', apiLimiter, withX402PaymentRequired(async (re
 app.get('/api/history/:address', async (req, res) => {
   try {
     const target = normalizeAddress(req.params.address, 'address')
-    const r = await fetch(`https://testnet.arcscan.app/api/v2/addresses/${target}/transactions?filter=to%7Cfrom&limit=10`)
+    const r = await fetch(`${ARC_EXPLORER_URL}/api/v2/addresses/${target}/transactions?filter=to%7Cfrom&limit=10`)
     const data = await r.json()
     const txs = (data.items || []).slice(0, 10).map(tx => ({ hash: tx.hash, method: tx.method || 'transfer', from: tx.from?.hash, to: tx.to?.hash, timestamp: tx.timestamp, status: tx.status }))
     res.json({ txs })

@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js'
 import { createHash, randomUUID } from 'node:crypto'
+import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
 
 // Production defaults to the safe canary when server-only Supabase credentials
 // exist. Set SUPABASE_PERSISTENCE_MODE=off for an explicit rollback.
@@ -369,7 +370,7 @@ function paymentInvoiceFromSupabase(row) {
     merchantAddress: String(row?.merchant_address || metadata.merchantAddress || '').toLowerCase(),
     amount: String(row?.amount || metadata.amount || ''),
     token: String(row?.token || metadata.token || 'USDC'),
-    network: String(row?.network || metadata.network || 'arc-testnet'),
+    network: String(row?.network || metadata.network || ARC_CHAIN_KEY),
     memo: String(row?.memo || metadata.memo || ''),
     status: String(row?.status || metadata.status || 'unpaid'),
     paymentUrl: String(row?.payment_url || metadata.paymentUrl || ''),
@@ -438,7 +439,7 @@ export function schedulePaymentInvoiceUpsert(invoice) {
     merchant_address: String(invoice.merchantAddress).toLowerCase(),
     amount: String(invoice.amount || '0'),
     token: String(invoice.token || 'USDC'),
-    network: String(invoice.network || 'arc-testnet'),
+    network: String(invoice.network || ARC_CHAIN_KEY),
     memo: String(invoice.memo || ''),
     status: String(invoice.status || 'unpaid'),
     payment_url: String(invoice.paymentUrl || ''),
@@ -741,7 +742,7 @@ export function buildSessionMetadataPayloads(data) {
       wallet_address: walletAddress,
       owner_addresses: ownerAddresses,
       delegate_address: String(entry.delegateAddress || '').toLowerCase(),
-      chain: String(entry.chain || 'arc-testnet'),
+      chain: String(entry.chain || ARC_CHAIN_KEY),
       active: Boolean(entry.active),
       pending_authorization: Boolean(entry.pendingAuthorization),
       manual_revoke_pending: Boolean(entry.manualRevokePending),
@@ -801,7 +802,7 @@ function sessionMetadataFromSupabase(row) {
     walletAddress: String(row?.wallet_address || '').toLowerCase(),
     ownerAddresses: Array.isArray(row?.owner_addresses) ? [...new Set(row.owner_addresses.map(value => String(value).toLowerCase()))].sort() : [],
     delegateAddress: String(row?.delegate_address || '').toLowerCase(),
-    chain: String(row?.chain || 'arc-testnet'),
+    chain: String(row?.chain || ARC_CHAIN_KEY),
     active: Boolean(row?.active),
     pendingAuthorization: Boolean(row?.pending_authorization ?? row?.pendingAuthorization),
     manualRevokePending: Boolean(row?.manual_revoke_pending ?? row?.manualRevokePending),

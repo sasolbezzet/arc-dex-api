@@ -3,6 +3,7 @@ import { privateKeyToAccount } from 'viem/accounts'
 import { atomicWriteJsonFile, readJsonFile } from './jsonFileStore.mjs'
 import { treasuryAddress as configuredTreasuryAddress } from '../config/treasury.mjs'
 import { scheduleAiUsageUpsert } from './supabasePersistence.mjs'
+import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
 
 const DB_FILE = process.env.AI_ROUTER_DB || './ai-router-db.json'
 const state = globalThis.__arcoxAiRouterStore || load()
@@ -353,7 +354,7 @@ export function createPaymentIntent({ ownerAddress, agentId = '', amount, reques
     agentId: /^\d+$/.test(String(agentId || '')) ? String(agentId) : '',
     amount: normalizeUsdc(amount),
     asset: 'USDC',
-    network: 'arc-testnet',
+    network: ARC_CHAIN_KEY,
     status: 'created',
     paymentStatus: 'created',
     paymentMethod: 'delegated_unified_balance',

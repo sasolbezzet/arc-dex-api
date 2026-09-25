@@ -6,6 +6,7 @@ import { getDailySpend } from '../services/agentSpendLedger.mjs'
 import { verifyMessage } from 'viem'
 import { verifyOwnerToken } from '../services/authToken.mjs'
 import { buildAgentReadiness } from '../services/agentReadiness.mjs'
+import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
 
 const vault = Router()
 
@@ -254,7 +255,7 @@ vault.get('/agents/:agentKey/readiness', requireAuth, async (req, res) => {
     const mcpSession = (listMcpSessions(ownerAddress) || []).find(session => session.clientId === clientId && session.active === true)
     const session = getSessionKey(walletAddress, { sweep: false })
     const chainAuthorizationStatus = {
-      'arc-testnet': isSessionAuthorizedForChain(walletAddress, 'arc-testnet') ? 'authorized' : 'failed',
+      [ARC_CHAIN_KEY]: isSessionAuthorizedForChain(walletAddress, ARC_CHAIN_KEY) ? 'authorized' : 'failed',
       'base-sepolia': isSessionAuthorizedForChain(walletAddress, 'base-sepolia') ? 'authorized' : 'failed',
       'arbitrum-sepolia': isSessionAuthorizedForChain(walletAddress, 'arbitrum-sepolia') ? 'authorized' : 'failed',
     }

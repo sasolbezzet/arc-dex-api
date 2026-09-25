@@ -143,6 +143,32 @@ async function checkLiveApiKey() {
   }
 }
 
+// Penamaan chain Circle (Gateway/Unified Balance) untuk mainnet tidak boleh
+// ditebak: nama itu dipakai untuk mencocokkan domain di /v1/info. Probe ini
+// mencari namanya, bukan mengasumsikan.
+async function checkGatewayMainnetNaming() {
+  console.log('\n── Gateway / Unified Balance mainnet (penamaan chain Circle)')
+  const candidates = [
+    process.env.CIRCLE_GATEWAY_BASE_URL,
+    'https://gateway-api.circle.com',
+    'https://gateway-api-testnet.circle.com',
+  ].filter(Boolean)
+  for (const base of [...new Set(candidates)]) {
+    try {
+      const res = await fetch(`${base}/v1/info`)
+      if (!res.ok) continue
+      const payload = await res.json().catch(() => ({}))
+      const domains = payload?.domains || payload?.data?.domains || []
+      const arc = domains.find(item => /arc/i.test(String(item.chain || '')))
+      if (!arc) continue
+      const network = /testnet/i.test(base) ? 'testnet' : 'mainnet'
+      record(true, `Gateway ${network} terjangkau — ${base}`, `domain Arc = "${arc.chain}" (domain ${arc.domain})`)
+      return
+    } catch { /* coba kandidat berikutnya */ }
+  }
+  record(null, 'Gateway /v1/info tidak terjangkau dari sini', 'bukan blocker; verifikasi penamaan chain Arc manual di Console Gateway')
+}
+
 async function checkPasskeyDomain() {
   console.log('\n── Passkey domain environment LIVE')
   const key = process.env.CIRCLE_CLIENT_KEY_LIVE || ''
@@ -167,6 +193,7 @@ await checkContracts()
 await checkLiveClientKey()
 await checkLiveApiKey()
 await checkPasskeyDomain()
+await checkGatewayMainnetNaming()
 
 const blockers = results.filter(r => r.ok === false && !/ARCOX|belum di-deploy/.test(r.label))
 const notes = results.filter(r => r.ok === null)

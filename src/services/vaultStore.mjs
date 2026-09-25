@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto'
 import { mkdirSync, rmSync, statSync } from 'fs'
 import { dirname } from 'path'
 import { scheduleAgentActivityUpsert, scheduleApprovalUpsert } from './supabasePersistence.mjs'
+import { ARC_CHAIN_ID } from '../config/arcNetwork.mjs'
 
 function vaultPath() { return process.env.VAULT_PATH || './data/vault.json' }
 function activityPath() { return process.env.VAULT_ACTIVITY_PATH || './data/vault-activity.json' }
@@ -86,7 +87,7 @@ const challenges = new Map() // nonce -> { address, message, expires }
 export function createChallenge(address) {
   const nonce = randomUUID().slice(0, 8)
   const domain = 'arcoxdex.vercel.app'
-  const message = `${domain} wants you to sign in with your Ethereum account:\n${address}\n\nAuthorize ARCOX Vault Access\n\nURI: https://arcoxdex.vercel.app\nVersion: 1\nChain ID: 5042002\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`
+  const message = `${domain} wants you to sign in with your Ethereum account:\n${address}\n\nAuthorize ARCOX Vault Access\n\nURI: https://arcoxdex.vercel.app\nVersion: 1\nChain ID: ${ARC_CHAIN_ID}\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`
   challenges.set(nonce, { address: address.toLowerCase(), message, expires: Date.now() + 300000 })
   return { nonce, message }
 }

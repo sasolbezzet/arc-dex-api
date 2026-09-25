@@ -32,6 +32,7 @@ import { submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { getGatewayDelegateStatus } from '../services/gatewayDelegateService.mjs'
 import { fetchUnifiedBalanceSummary } from '../services/gatewayBalanceService.mjs'
 import { readAiUsage } from '../services/supabasePersistence.mjs'
+import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
 
 const router = Router()
 const aiResponseCache = new Map()
@@ -669,7 +670,7 @@ function paymentRequired(res, message, detail) {
     payment: {
       method: 'unified_balance',
       asset: 'USDC',
-      network: 'arc-testnet',
+      network: ARC_CHAIN_KEY,
       action: 'Deposit USDC to Unified Balance and enable Auto Pay.',
     },
   })

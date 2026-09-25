@@ -659,7 +659,7 @@ export function siweMessageHandler(req, res) {
       const request = oauthRequests.get(request_id)
       if (!client || !request || request.clientId !== client_id || Date.now() > request.expires) return { error: 'invalid_authorization_request' }
       const nonce = randomUUID().slice(0, 8)
-      const message = `${CANONICAL_SERVER_HOST} wants you to sign in with your Ethereum account:\n${address}\n\nAuthorize ARCOX MCP Server\n\nURI: ${SERVER_URL}\nVersion: 1\nChain ID: 5042002\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`
+      const message = `${CANONICAL_SERVER_HOST} wants you to sign in with your Ethereum account:\n${address}\n\nAuthorize ARCOX MCP Server\n\nURI: ${SERVER_URL}\nVersion: 1\nChain ID: ${ARC_CHAIN_ID}\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`
       siweChallenges.set(nonce, {
         address: String(address).toLowerCase(),
         clientId: client_id,
@@ -992,6 +992,7 @@ import { registerAiRouterTools } from './mcp/aiRouterTools.mjs'
 import { fetchAllChainBalances } from './multiChainBalance.mjs'
 import { CHAINS } from './chains.mjs'
 import { arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_SDK_CHAIN_NAME, ARC_USDC_ADDRESS, arcCircleContract, arcContractAddress } from '../config/arcNetwork.mjs'
 
 // The MCP userId is the SIWE-verified EOA used only as the tenant/auth identity.
 // On-chain reads, quotes, and execution must use the explicitly mapped Agent
@@ -1036,7 +1037,7 @@ export async function resolveActiveMsca(userId, boundMscaWalletAddress = '') {
 async function isDeployedSmartAccount(address) {
   const { createPublicClient, http, defineChain } = await import('viem')
   const arcRpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
-  const client = createPublicClient({ chain: defineChain({ id: 5042002, name: 'Arc Testnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [arcRpc] } } }), transport: http(arcRpc) })
+  const client = createPublicClient({ chain: defineChain({ id: ARC_CHAIN_ID, name: ARC_CHAIN_NAME, nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [arcRpc] } } }), transport: http(arcRpc) })
   const code = await client.getBytecode({ address }).catch(() => undefined)
   return Boolean(code && code !== '0x')
 }
@@ -1073,7 +1074,7 @@ async function apiPost(path, body, ownerAddress) {
 // ── Auto-execute helper (Circle-source, server-signed) ──
 // Map MCP chain slugs → backend CCTP keys.
 const CHAIN_SLUG_TO_KEY = {
-  'arc-testnet': 'Arc_Testnet', 'arc': 'Arc_Testnet', 'arc_testnet': 'Arc_Testnet',
+  [ARC_CHAIN_KEY]: ARC_SDK_CHAIN_NAME, 'arc': ARC_SDK_CHAIN_NAME, 'arc_testnet': ARC_SDK_CHAIN_NAME,
   'ethereum-sepolia': 'Ethereum_Sepolia', 'eth-sepolia': 'Ethereum_Sepolia', 'ethereum_sepolia': 'Ethereum_Sepolia',
   'base-sepolia': 'Base_Sepolia', 'base_sepolia': 'Base_Sepolia',
   'arbitrum-sepolia': 'Arbitrum_Sepolia', 'arbitrum_sepolia': 'Arbitrum_Sepolia',
@@ -1089,8 +1090,8 @@ function executionChainKey(slug) {
   if (!slug) return undefined
   const s = String(slug).toLowerCase().trim()
   const aliases = {
-    arc: 'arc-testnet',
-    arc_testnet: 'arc-testnet',
+    arc: ARC_CHAIN_KEY,
+    arc_testnet: ARC_CHAIN_KEY,
     'eth-sepolia': 'ethereum-sepolia',
     ethereum_sepolia: 'ethereum-sepolia',
     base_sepolia: 'base-sepolia',
@@ -1104,17 +1105,19 @@ function executionChainKey(slug) {
 // router sees the MSCA as msg.sender inside the UserOperation; the user's EOA
 // remains only the MCP tenant/auth identity.
 const BRIDGE_CCTP = {
-  Arc_Testnet: {
-    chainId: 5042002,
+  // Kunci mengikuti nama chain SDK Circle; alamat token/CCTP/explorer mengikuti
+  // jaringan aktif dari registry supaya mainnet tidak pernah memakai kontrak testnet.
+  [ARC_SDK_CHAIN_NAME]: {
+    chainId: ARC_CHAIN_ID,
     domain: 26,
-    usdc: '0x3600000000000000000000000000000000000000',
-    tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
-    messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
+    usdc: ARC_USDC_ADDRESS,
+    tokenMessenger: arcCircleContract('tokenMessenger'),
+    messageTransmitter: arcCircleContract('messageTransmitter'),
     // Frontend uses CCTP V2 fast finality for all EVM routes.
     requiredFinalityThreshold: 1000,
     rpcUrl: resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' }),
-    explorer: 'https://testnet.arcscan.app/tx/',
-    router: process.env.ARCOX_FEE_ROUTER_ADDRESS || '0xDf800310443BEB589CEf91A09854203Ea36e43a7',
+    explorer: `${ARC_EXPLORER_URL}/tx/`,
+    router: arcContractAddress('ARCOX_FEE_ROUTER_ADDRESS'),
   },
   Ethereum_Sepolia: { chainId: 11155111, domain: 0, requiredFinalityThreshold: 1000, explorer: 'https://sepolia.etherscan.io/tx/' },
   Base_Sepolia: {
@@ -1268,17 +1271,17 @@ function bridgeConfig(fromChain, toChain) {
 export function resolveMscaBridgeFeeProfile(route) {
   const from = executionChainKey(route?.fromKey)
   const to = executionChainKey(route?.toKey)
-  if (to === 'arc-testnet' && from === 'base-sepolia') return 'base-to-arc-source'
-  if (to === 'arc-testnet' && from === 'arbitrum-sepolia') return 'arbitrum-to-arc-source'
-  if (from === 'arc-testnet' && to === 'arbitrum-sepolia') return 'arbitrum-destination'
-  if (from === 'arc-testnet') return 'arc-bridge'
+  if (to === ARC_CHAIN_KEY && from === 'base-sepolia') return 'base-to-arc-source'
+  if (to === ARC_CHAIN_KEY && from === 'arbitrum-sepolia') return 'arbitrum-to-arc-source'
+  if (from === ARC_CHAIN_KEY && to === 'arbitrum-sepolia') return 'arbitrum-destination'
+  if (from === ARC_CHAIN_KEY) return 'arc-bridge'
   return undefined
 }
 
 function bridgeRpcUrls(chainConfig) {
   const key = String(chainConfig?.name || '').toLowerCase()
   const chainId = Number(chainConfig?.chainId)
-  const configured = key === 'arc_testnet' || chainId === 5042002
+  const configured = key === ARC_SDK_CHAIN_NAME.toLowerCase() || chainId === ARC_CHAIN_ID
     ? arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
     : key === 'base_sepolia' || chainId === 84532
       ? [process.env.BASE_SEPOLIA_RPC_URL, 'https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com']
@@ -1295,7 +1298,7 @@ function bridgePublicClient(chainConfig) {
   const chain = defineChain({
     id: chainConfig.chainId,
     name: chainConfig.name,
-    nativeCurrency: { name: chainConfig.name === 'Arc_Testnet' ? 'USDC' : 'ETH', symbol: chainConfig.name === 'Arc_Testnet' ? 'USDC' : 'ETH', decimals: 18 },
+    nativeCurrency: { name: chainConfig.name === ARC_SDK_CHAIN_NAME ? 'USDC' : 'ETH', symbol: chainConfig.name === ARC_SDK_CHAIN_NAME ? 'USDC' : 'ETH', decimals: 18 },
     rpcUrls: { default: { http: rpcUrls } },
   })
   const transports = rpcUrls.map(url => http(url, {
@@ -1882,7 +1885,7 @@ export async function destinationMintAlreadyProcessed({ status, route, client: i
   if (!nonce || !rpcUrl || !messageTransmitter) return { checked: false, processed: false, nonce, reason: 'destination_nonce_check_unavailable' }
   try {
     const destinationInfo = {
-      Arc_Testnet: { id: 5042002 },
+      [ARC_SDK_CHAIN_NAME]: { id: ARC_CHAIN_ID },
       Base_Sepolia: { id: 84532 },
       Arbitrum_Sepolia: { id: 421614 },
     }[route.toKey]
@@ -1904,7 +1907,7 @@ export async function destinationMintAlreadyProcessed({ status, route, client: i
 
 async function destinationMscaPreflight({ route, walletAddress, requireAuthorization = true }) {
   const destinationInfo = {
-    Arc_Testnet: { id: 5042002, chainKey: 'arc-testnet' },
+    [ARC_SDK_CHAIN_NAME]: { id: ARC_CHAIN_ID, chainKey: ARC_CHAIN_KEY },
     Base_Sepolia: { id: 84532, chainKey: 'base-sepolia' },
     Arbitrum_Sepolia: { id: 421614, chainKey: 'arbitrum-sepolia' },
   }[route?.toKey]
@@ -1913,7 +1916,7 @@ async function destinationMscaPreflight({ route, walletAddress, requireAuthoriza
   const { createPublicClient } = await import('viem')
   const rpcUrls = [...new Set([
     route.destination.rpcUrl,
-    ...(route.toKey === 'Arc_Testnet' ? arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' }) : []),
+    ...(route.toKey === ARC_SDK_CHAIN_NAME ? arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' }) : []),
     ...(route.toKey === 'Base_Sepolia' ? [process.env.BASE_SEPOLIA_RPC_URL, 'https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com'] : []),
     ...(route.toKey === 'Arbitrum_Sepolia' ? [process.env.ARB_SEPOLIA_RPC_URL, 'https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com'] : []),
   ].filter(Boolean))]
@@ -2440,7 +2443,7 @@ async function resumePendingBridgeApproval(userId, approval, details, info) {
 async function mintDestinationViaMsca({ status, route, walletAddress, userId, sessionLookupId = '', approvalId: existingApprovalId = null, allowHashlessRecovery = false }) {
   if (!status?.verified || !status.message || !status.attestation) return { success: false, error: 'Attestation belum ready' }
   const destinationKey = {
-    Arc_Testnet: 'arc-testnet',
+    [ARC_SDK_CHAIN_NAME]: ARC_CHAIN_KEY,
     Base_Sepolia: 'base-sepolia',
     Arbitrum_Sepolia: 'arbitrum-sepolia',
   }[route.toKey]
@@ -2563,7 +2566,7 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, se
       to: route.destination.messageTransmitter,
       value: 0n,
       data: encodeFunctionData({ abi: RECEIVE_MESSAGE_ABI, functionName: 'receiveMessage', args: [status.message, status.attestation] }),
-    }], { paymaster: true, chainKey: destinationKey, feeProfile: destinationKey === 'arbitrum-sepolia' ? 'arbitrum-destination' : destinationKey === 'arc-testnet' ? 'arc-destination' : 'base-destination', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+    }], { paymaster: true, chainKey: destinationKey, feeProfile: destinationKey === 'arbitrum-sepolia' ? 'arbitrum-destination' : destinationKey === ARC_CHAIN_KEY ? 'arc-destination' : 'base-destination', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
     if (result.status === 'pending_confirmation') {
       const details = {
         fromChain: route.fromKey,
@@ -2820,7 +2823,9 @@ const SWAP_TOKEN_ADDRESS = {
   cirBTC: '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF',
 }
 const SWAP_TOKEN_DECIMALS = { USDC: 6, EURC: 6, cirBTC: 8 }
-const ARCOX_AMM_ROUTER = process.env.ARCOX_AMM_ROUTER || '0x9f2443691bddd8343590c68e2a2cdec5fd0b6124'
+// Alamat kontrak ARCOX hanya dari env: mainnet wajib `ARCOX_AMM_ROUTER_MAINNET`,
+// jadi swap MSCA gagal-tertutup kalau router mainnet belum di-deploy.
+const ARCOX_AMM_ROUTER = arcContractAddress('ARCOX_AMM_ROUTER')
 const ARCOX_AMM_POOL = process.env.ARCOX_AMM_POOL || '0xd4aF8e12903A4c6bD60BbC353fb97ffC9Cc2Dc2D'
 const AMM_POOL_SWAP_ABI = [{ type: 'function', name: 'swap', stateMutability: 'nonpayable', inputs: [
   { name: 'tokenIn', type: 'address' }, { name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' },
@@ -2868,8 +2873,8 @@ function computeMinAmountOut(amountOutDecimal, decimals) {
 }
 
 export function buildPreparedSwapCalls(prepared, expected = {}) {
-  const allowedAdapter = String(process.env.ARCOX_SWAP_ADAPTER || '').toLowerCase()
-  const allowedAmmRouter = String(process.env.ARCOX_AMM_ROUTER || '').toLowerCase()
+  const allowedAdapter = String(arcContractAddress('ARCOX_SWAP_ADAPTER') || '').toLowerCase()
+  const allowedAmmRouter = String(arcContractAddress('ARCOX_AMM_ROUTER') || '').toLowerCase()
   if (expected.tokenIn && String(prepared?.tokenIn || '').toUpperCase() !== String(expected.tokenIn).toUpperCase()) return { calls: null, reason: 'quote_token_in_mismatch' }
   if (expected.tokenOut && String(prepared?.tokenOut || '').toUpperCase() !== String(expected.tokenOut).toUpperCase()) return { calls: null, reason: 'quote_token_out_mismatch' }
 
@@ -3095,7 +3100,7 @@ async function executeX402Pay(userId, invoiceId, boundMscaWalletAddress = '') {
     abi: X402_TRANSFER_ABI,
     functionName: 'transfer',
     args: [getAddress(invoice.recipient), amountUnits],
-  }], { paymaster: true, chainKey: 'arc-testnet', feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+  }], { paymaster: true, chainKey: ARC_CHAIN_KEY, feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
 
   if (result.status !== 'success') {
     return { status: result.status, executed: false, error: result.reason || 'x402 payment via MSCA gagal', userOpHash: result.userOpHash }
@@ -3174,11 +3179,11 @@ export function createMcpServer(userId, context = {}) {
         chains,
         // Backward-compatible Arc summary for older Claude/GPT prompts. The
         // canonical multi-chain data lives under chains[chainKey].
-        USDC: chains['arc-testnet']?.USDC ?? null,
-        EURC: chains['arc-testnet']?.EURC ?? null,
-        USYC: chains['arc-testnet']?.USYC ?? null,
-        cirBTC: chains['arc-testnet']?.cirBTC ?? null,
-        supportedChains: ['arc-testnet', 'ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia'],
+        USDC: chains[ARC_CHAIN_KEY]?.USDC ?? null,
+        EURC: chains[ARC_CHAIN_KEY]?.EURC ?? null,
+        USYC: chains[ARC_CHAIN_KEY]?.USYC ?? null,
+        cirBTC: chains[ARC_CHAIN_KEY]?.cirBTC ?? null,
+        supportedChains: [ARC_CHAIN_KEY, 'ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia'],
         balancePolicy: {
           native: 'eth_getBalance dari MSCA; Arc native USDC memakai 18 decimals untuk gas',
           erc20: 'balanceOf(MSCA) memakai address kontrak resmi per chain; Arc ERC-20 USDC memakai 6 decimals',
@@ -3278,7 +3283,7 @@ export function createMcpServer(userId, context = {}) {
       source,
       walletAddress: session?.walletAddress || null,
       walletType: session ? 'MSCA' : null,
-      chains: { 'arc-testnet': 5042002, 'ethereum-sepolia': 11155111, 'base-sepolia': 84532, 'arbitrum-sepolia': 421614, 'solana-devnet': 'solana' },
+      chains: { [ARC_CHAIN_KEY]: ARC_CHAIN_ID, 'ethereum-sepolia': 11155111, 'base-sepolia': 84532, 'arbitrum-sepolia': 421614, 'solana-devnet': 'solana' },
       tokens: ['USDC', 'EURC', 'cirBTC'],
       sources: ['session'],
       reason,
@@ -3304,7 +3309,7 @@ export function createMcpServer(userId, context = {}) {
   }, async (params) => {
     const src = params.source || 'session'
     if (src !== 'session') {
-      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', reason: 'msca_only', source: src, chain: 'arc-testnet', walletType: null, message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote swap hanya untuk source=session.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', reason: 'msca_only', source: src, chain: ARC_CHAIN_KEY, walletType: null, message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote swap hanya untuk source=session.' }) }] }
     }
     const session = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!session) {
@@ -3312,13 +3317,13 @@ export function createMcpServer(userId, context = {}) {
     }
     const quoteData = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: session.walletAddress }, session.walletAddress)
     if (quoteData?.available !== true) {
-      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', chain: 'arc-testnet', ...quoteData, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', chain: ARC_CHAIN_KEY, ...quoteData, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
     }
     // Prepare immutable calldata at preview time. Execution must use this exact
     // payload, not re-quote later with potentially different routing/slippage.
     const prepared = await apiPost('/api/eoa-swap-prepare', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: session.walletAddress }, session.walletAddress)
     if (prepared?.success === false || prepared?.available === false || typeof prepared !== 'object' || !prepared) {
-      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', chain: 'arc-testnet', ...prepared, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', chain: ARC_CHAIN_KEY, ...prepared, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
     }
     const quote = createExecutionQuote(userId, 'swap', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, walletAddress: session.walletAddress, quote: quoteData, prepared })
     return { content: [{ type: 'text', text: jsonText({
@@ -3326,9 +3331,9 @@ export function createMcpServer(userId, context = {}) {
       schemaVersion: 1,
       preview: true,
       action: 'swap',
-      chain: 'arc-testnet',
-      fromChain: 'arc-testnet',
-      toChain: 'arc-testnet',
+      chain: ARC_CHAIN_KEY,
+      fromChain: ARC_CHAIN_KEY,
+      toChain: ARC_CHAIN_KEY,
       previewId: quote.previewId,
       expiresAt: new Date(quote.expires).toISOString(),
       source: 'session',
@@ -3361,7 +3366,7 @@ export function createMcpServer(userId, context = {}) {
       walletAddress: activeSession.walletAddress,
     })
     if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
-    const gate = await canAutoExecute(userId, source, params.amountIn, 'arc-testnet', activeSession.walletAddress, agentKey, dailyLimit)
+    const gate = await canAutoExecute(userId, source, params.amountIn, ARC_CHAIN_KEY, activeSession.walletAddress, agentKey, dailyLimit)
     if (!gate.ok) {
       return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
     }
@@ -3389,7 +3394,7 @@ export function createMcpServer(userId, context = {}) {
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: preparedResult.reason || 'swap_calldata_unavailable', message }) }] }
       }
       const { swapViaSession } = await import('./sessionKeyService.mjs')
-      const result = await swapViaSession(activeSession.walletAddress, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: 'arc-testnet', agentKey, dailyLimit, limitsOwner: userId })
+      const result = await swapViaSession(activeSession.walletAddress, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: ARC_CHAIN_KEY, agentKey, dailyLimit, limitsOwner: userId })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: requestAgent, agentClientId: clientId, action: 'swap', amount: params.amountIn, token: params.tokenIn,

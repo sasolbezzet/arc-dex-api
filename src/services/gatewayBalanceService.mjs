@@ -3,15 +3,13 @@
 // a placeholder string. The route-level formatting in server.mjs stays as-is;
 // this service is self-contained so it can be imported from routes/services
 // without pulling in the Express entrypoint.
-const GATEWAY_TESTNET_API = 'https://gateway-api-testnet.circle.com'
+import { arcGatewayBaseUrl, arcGatewayChains } from '../config/arcNetwork.mjs'
 
-export const GATEWAY_TESTNET_CHAINS = [
-  { domain: 26, chain: 'Arc_Testnet', ecosystem: 'evm' },
-  { domain: 6, chain: 'Base_Sepolia', ecosystem: 'evm' },
-  { domain: 0, chain: 'Ethereum_Sepolia', ecosystem: 'evm' },
-  { domain: 3, chain: 'Arbitrum_Sepolia', ecosystem: 'evm' },
-  { domain: 5, chain: 'Solana_Devnet', ecosystem: 'solana' },
-]
+/** Chain Gateway untuk jaringan aktif (testnet: 5 devnet chain; mainnet: Arc). */
+export const GATEWAY_CHAINS = arcGatewayChains()
+// Nama lama tetap diekspor supaya pemanggil lama tidak pecah; isinya mengikuti
+// jaringan aktif, bukan selalu testnet.
+export const GATEWAY_TESTNET_CHAINS = GATEWAY_CHAINS
 
 function balanceUsdcUnits(value) {
   const normalized = String(value || '0').trim()
@@ -40,7 +38,7 @@ async function gatewayBalanceRequest(path, body) {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), Number(process.env.GATEWAY_BALANCE_TIMEOUT_MS || 7_000))
     try {
-      const response = await fetch(`${GATEWAY_TESTNET_API}${path}`, {
+      const response = await fetch(`${arcGatewayBaseUrl()}${path}`, {
         method: 'POST',
         signal: controller.signal,
         headers: { 'Content-Type': 'application/json', 'User-Agent': 'arcox-api/2.0' },
@@ -82,15 +80,15 @@ export async function fetchUnifiedBalanceSummary({ address, solanaAddress = '' }
       solana = ''
     }
   }
-  const depositorByDomain = new Map(GATEWAY_TESTNET_CHAINS.map(({ domain, ecosystem }) => [domain, ecosystem === 'solana' ? solana : evm]))
-  const sources = GATEWAY_TESTNET_CHAINS
+  const depositorByDomain = new Map(GATEWAY_CHAINS.map(({ domain, ecosystem }) => [domain, ecosystem === 'solana' ? solana : evm]))
+  const sources = GATEWAY_CHAINS
     .map(({ domain }) => ({ depositor: depositorByDomain.get(domain), domain }))
     .filter(source => Boolean(source.depositor))
   if (!sources.length) return null
   const requestBody = { token: 'USDC', sources }
   const confirmed = await gatewayBalanceRequest('/v1/balances', requestBody)
   const confirmedByDomain = new Map((confirmed?.balances || []).map(item => [Number(item.domain), String(item.balance || '0')]))
-  const chains = GATEWAY_TESTNET_CHAINS
+  const chains = GATEWAY_CHAINS
     .filter(({ domain }) => Boolean(depositorByDomain.get(domain)))
     .map(({ domain, chain }) => ({
       chain,

@@ -27,6 +27,7 @@ import { encrypt, decrypt } from './crypto.mjs'
 import { readJsonFile, atomicWriteJsonFile } from './jsonFileStore.mjs'
 import { getLimits } from './vaultStore.mjs'
 import { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } from './chains.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, IS_ARC_MAINNET, arcCircleClientKey } from '../config/arcNetwork.mjs'
 import { scheduleSessionMetadataSnapshot } from './supabasePersistence.mjs'
 import { recordSpend, wouldExceedDailyLimit } from './agentSpendLedger.mjs'
 
@@ -45,10 +46,12 @@ const ADD_OWNERS_ABI = [{
 }]
 
 const CLIENT_URL = process.env.CIRCLE_CLIENT_URL || ''
-const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY || ''
+// Mainnet memakai Client Key LIVE; testnet memakai Client Key sandbox.
+const CLIENT_KEY = arcCircleClientKey()
+const CLIENT_KEY_ENV = IS_ARC_MAINNET ? 'CIRCLE_CLIENT_KEY_LIVE' : 'CIRCLE_CLIENT_KEY'
 const BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 const DESTINATION_VERIFICATION_GAS_LIMITS = {
-  'arc-testnet': 270_000n,
+  [ARC_CHAIN_KEY]: 270_000n,
   'base-sepolia': 270_000n,
   // Circle's Arbitrum bundler rejects verification gas whose actual use is
   // below 40% of the requested limit. This receiveMessage path measured
@@ -122,7 +125,7 @@ function buildViemChain(chainKey) {
 function circleModularHttpTransport(chainKey) {
   const chain = CHAINS[chainKey]
   if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
-  if (!CLIENT_URL || !CLIENT_KEY) throw new Error('CIRCLE_CLIENT_URL and CIRCLE_CLIENT_KEY must be set')
+  if (!CLIENT_URL || !CLIENT_KEY) throw new Error(`CIRCLE_CLIENT_URL and ${CLIENT_KEY_ENV} must be set`)
   const url = `${String(CLIENT_URL).replace(/\/+$/, '')}/${chain.transportSlug}`
   return http(url, {
     timeout: 12_000,
@@ -182,7 +185,7 @@ export function classifyCircleModularError(error) {
 }
 
 function circleModularConfigurationError(error) {
-  const wrapped = new Error('Circle Modular Client Key invalid/expired or domain belum terdaftar di Circle Console; gunakan CIRCLE_CLIENT_KEY (Client Key), bukan CIRCLE_API_KEY.', { cause: error })
+  const wrapped = new Error(`Circle Modular Client Key invalid/expired or domain belum terdaftar di Circle Console; gunakan ${CLIENT_KEY_ENV} (Client Key), bukan CIRCLE_API_KEY.`, { cause: error })
   wrapped.code = 'circle_modular_client_key_invalid'
   return wrapped
 }
@@ -258,20 +261,20 @@ export function getSessionKey(userId, { sweep = true } = {}) {
 /** Resolve the authorization proof for exactly one chain. Legacy fallback is
  * allowed only on the session's original chain; a destination chain must have
  * its own recorded UserOperation hash. */
-export function resolveAuthorizationUserOpHash(entry, chainKey = 'arc-testnet') {
+export function resolveAuthorizationUserOpHash(entry, chainKey = ARC_CHAIN_KEY) {
   if (!entry) return ''
   const key = String(chainKey)
   // `authorizationUserOpHash` is the legacy Arc authorization field. It must
   // never be reused as proof for Base/Arbitrum destination authorization,
   // even when an old record happens to have `chain` set to that destination.
-  if (key === 'arc-testnet') {
+  if (key === ARC_CHAIN_KEY) {
     return String(entry.authorizationUserOpHashes?.[key] || entry.authorizationUserOpHash || '')
   }
   return String(entry.authorizationUserOpHashes?.[key] || '')
 }
 
 /** Return whether the active delegate was explicitly authorized on a chain. */
-export function isSessionAuthorizedForChain(userId, chainKey = 'arc-testnet') {
+export function isSessionAuthorizedForChain(userId, chainKey = ARC_CHAIN_KEY) {
   if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(String(chainKey))) return false
   const entry = getSessionKey(userId)
   if (!entry?.active) return false
@@ -310,7 +313,7 @@ export function generateSessionKey() {
  * it on-chain. The private key never returns to the browser; it is encrypted
  * at rest and remains inactive until activateReservedSessionKey is called.
  */
-export function reserveSessionKey(userId, { walletAddress, chain = 'arc-testnet' } = {}) {
+export function reserveSessionKey(userId, { walletAddress, chain = ARC_CHAIN_KEY } = {}) {
   const store = loadStore()
   const wallet = getAddress(walletAddress)
   const key = wallet.toLowerCase()
@@ -1073,7 +1076,7 @@ function withSessionStoreLock(fn) {
   }
 }
 
-export function recordSessionAuthorizationAttempt(userId, { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = 'arc-testnet', previousAuthorizationUserOpHash, previousOutcome = 'unknown' } = {}) {
+export function recordSessionAuthorizationAttempt(userId, { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = ARC_CHAIN_KEY, previousAuthorizationUserOpHash, previousOutcome = 'unknown' } = {}) {
   return withSessionStoreLock(() => {
     const store = loadStore()
     const wallet = getAddress(walletAddress)
@@ -1083,7 +1086,7 @@ export function recordSessionAuthorizationAttempt(userId, { walletAddress, deleg
   const entry = store.users[wallet.toLowerCase()]
   if (!entry?.pendingAuthorization && !entry?.active) throw new Error('No active automation signer reservation')
   if (getAddress(entry.delegateAddress) !== delegate) throw new Error('Automation signer mismatch')
-  if (String(chainKey) !== 'arc-testnet' && !entry.authorizationUserOpHashes?.[String(chainKey)]) {
+  if (String(chainKey) !== ARC_CHAIN_KEY && !entry.authorizationUserOpHashes?.[String(chainKey)]) {
     // Destination-chain attempts require their own explicit reservation state;
     // an Arc legacy proof must never make Base/Arbitrum appear authorized.
     if (!entry.pendingAuthorization && !entry.active) throw new Error(`No reservation for authorization chain: ${chainKey}`)
@@ -1103,7 +1106,7 @@ export function recordSessionAuthorizationAttempt(userId, { walletAddress, deleg
     // The legacy field is reserved for the original Arc authorization only.
     // Destination-chain proofs must remain in the per-chain map and must never
     // become eligible through the legacy lookup path.
-    if (chainKey === 'arc-testnet') entry.authorizationUserOpHash = authorizationUserOpHash
+    if (chainKey === ARC_CHAIN_KEY) entry.authorizationUserOpHash = authorizationUserOpHash
     delete entry.lastAuthorizationOutcome
     delete entry.lastAuthorizationErrorAt
     delete entry.lastAuthorizationTransactionHash
@@ -1142,7 +1145,7 @@ export function validateAuthorizationUserOperation({ walletAddress, delegateAddr
   return { ok: true, walletAddress: wallet, delegateAddress: delegate, userOpHash: authorizationUserOpHash }
 }
 
-export async function getAuthorizationUserOperationOutcome(userOpHash, chainKey = 'arc-testnet') {
+export async function getAuthorizationUserOperationOutcome(userOpHash, chainKey = ARC_CHAIN_KEY) {
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(userOpHash || ''))) return 'unknown'
   const chain = CHAINS[chainKey]
   if (!chain || !CLIENT_URL || !CLIENT_KEY) return 'unknown'
@@ -1174,7 +1177,7 @@ export async function getAuthorizationUserOperationOutcome(userOpHash, chainKey 
  * UserOperation history is bounded in Circle's indexer, but the address mapping
  * is the durable signal needed to avoid submitting duplicate addOwners calls.
  */
-export async function getDelegateOwnerMapping(walletAddress, delegateAddress, chainKey = 'arc-testnet') {
+export async function getDelegateOwnerMapping(walletAddress, delegateAddress, chainKey = ARC_CHAIN_KEY) {
   const wallet = getAddress(walletAddress)
   const delegate = getAddress(delegateAddress)
   const chain = CHAINS[chainKey]
@@ -1205,7 +1208,7 @@ function authorizationUserOperationError(receipt, message = 'MSCA authorization 
   return error
 }
 
-export async function verifySessionAuthorization(userId, { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = 'arc-testnet' } = {}) {
+export async function verifySessionAuthorization(userId, { walletAddress, delegateAddress, authorizationUserOpHash, chainKey = ARC_CHAIN_KEY } = {}) {
   const wallet = getAddress(walletAddress)
   const delegate = getAddress(delegateAddress)
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(authorizationUserOpHash || ''))) throw new Error('authorizationUserOpHash required')
@@ -1296,7 +1299,7 @@ export async function reconcileSessionKeyActivation(userId) {
   // silently reactivating the old delegate on the strength of its history.
   if (entry.manualRevokePending) return { active: false, reason: 'authorization_proof_missing' }
 
-  const chainKey = entry.chain || 'arc-testnet'
+  const chainKey = entry.chain || ARC_CHAIN_KEY
   const hash = resolveAuthorizationUserOpHash(entry, chainKey)
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(hash || ''))) return { active: false, reason: 'authorization_proof_missing' }
   const chain = CHAINS[chainKey]
@@ -1413,7 +1416,7 @@ export function activateReservedSessionKey(userId, { walletAddress, delegateAddr
   // Session setup is the original Arc authorization flow. Keep the legacy
   // field Arc-only; Base/Arbitrum authorization is recorded separately by
   // recordSessionChainAuthorization and never activates the signer here.
-  const authorizationChain = 'arc-testnet'
+  const authorizationChain = ARC_CHAIN_KEY
   entry.authorizationUserOpHashes = { ...(entry.authorizationUserOpHashes || {}), [authorizationChain]: authorizationUserOpHash }
   entry.authorizationUserOpHash = authorizationUserOpHash
   entry.activatedAt = Date.now()
@@ -1478,7 +1481,7 @@ export function touchSessionKey(userId) {
 /**
  * Store session key for a user (called after frontend passkey setup + mapping).
  * delegatePrivateKey is encrypted at rest using SESSION_KEY_ENCRYPTION_KEY.
- * @param options.chain — chain key (e.g., 'arc-testnet', 'ethereum-sepolia')
+ * @param options.chain — chain key jaringan aktif (ARC_CHAIN_KEY) atau 'ethereum-sepolia'
  */
 // ── MSCA live-token probe (anti-cross-agent revoke) ──
 // mcpServer.mjs registers this probe so storeSessionKey can ask whether any
@@ -1499,7 +1502,7 @@ function mscaHasLiveToken(walletAddress) {
   }
 }
 
-export function storeSessionKey(userId, { walletAddress, delegateAddress, delegatePrivateKey, chain = 'arc-testnet', ownerAddress }) {
+export function storeSessionKey(userId, { walletAddress, delegateAddress, delegatePrivateKey, chain = ARC_CHAIN_KEY, ownerAddress }) {
   const store = loadStore()
   const key = String(userId || '').toLowerCase()
   // One active session key per identity. If a DIFFERENT MSCA is already active
@@ -1673,7 +1676,7 @@ function amountToUnits(value, decimals) {
   }
 }
 
-function delegateWalletClient(privateKey, chainKey = 'arc-testnet') {
+function delegateWalletClient(privateKey, chainKey = ARC_CHAIN_KEY) {
   const account = privateKeyToAccount(privateKey)
   const chain = buildViemChain(chainKey)
   return createWalletClient({ account, chain, transport: http(CHAINS[chainKey].rpcUrl) })
@@ -1683,8 +1686,8 @@ function delegateWalletClient(privateKey, chainKey = 'arc-testnet') {
  * Build a Circle Smart Account client using the delegate EOA as owner.
  * This lets the delegate sign UserOperations for the MSCA.
  */
-async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainKey = 'arc-testnet') {
-  if (!CLIENT_URL || !CLIENT_KEY) throw new Error('CIRCLE_CLIENT_URL and CIRCLE_CLIENT_KEY must be set')
+async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainKey = ARC_CHAIN_KEY) {
+  if (!CLIENT_URL || !CLIENT_KEY) throw new Error(`CIRCLE_CLIENT_URL and ${CLIENT_KEY_ENV} must be set`)
   const chain = CHAINS[chainKey]
   if (!chain) throw new Error(`Unknown chain: ${chainKey}`)
   if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) throw new Error(`MSCA unsupported on ${chain.name}; use a supported Circle wallet product instead`)
@@ -1769,7 +1772,7 @@ export function paymasterWithFeeOverrides(client, fees) {
 export function resolveSessionPaymasterMode({ chainKey, feeProfile, requested = false } = {}) {
   if (requested !== true) return 'disabled'
   const profile = String(feeProfile || '')
-  const arcSourceBridge = chainKey === 'arc-testnet' && ['arc-bridge', 'arbitrum-destination'].includes(profile)
+  const arcSourceBridge = chainKey === ARC_CHAIN_KEY && ['arc-bridge', 'arbitrum-destination'].includes(profile)
   if (arcSourceBridge) return 'native'
   const circleGasStation = ['arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source', 'arc-pay'].includes(profile) || chainKey === 'arbitrum-sepolia'
   return circleGasStation ? 'circle-gas-station' : 'default'
@@ -1807,7 +1810,7 @@ export async function executeViaSession(userId, calls, options = {}) {
   // Record usage for auto-detect. Caller already validated amount — no re-check here.
   try { touchSessionKey(userId) } catch { /* non-fatal */ }
 
-  const chainKey = options.chainKey || entry.chain || 'arc-testnet'
+  const chainKey = options.chainKey || entry.chain || ARC_CHAIN_KEY
   const chain = CHAINS[chainKey]
   if (!chain) throw new Error(`Session not available: unknown_chain (${chainKey})`)
   if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(chainKey)) throw new Error(`Session not available: msca_unsupported_chain (${chainKey})`)
@@ -1958,7 +1961,7 @@ export async function sendViaSession(userId, to, amount, token = 'USDC', options
   })
   if (!gate.ok) return { status: 'denied', reason: gate.reason, chain: requestedChain }
 
-  const chainKey = requestedChain || gate.entry?.chain || 'arc-testnet'
+  const chainKey = requestedChain || gate.entry?.chain || ARC_CHAIN_KEY
   const chain = CHAINS[chainKey]
   if (!chain) return { status: 'denied', reason: 'unknown_chain', chain: chainKey }
   if (!isSessionAuthorizedForChain(userId, chainKey)) {
@@ -2008,7 +2011,7 @@ export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, prep
   const gate = canExecuteViaSession(userId, amountIn, chainKey, { agentKey, dailyLimit, limitsOwner })
   if (!gate.ok) return { status: 'denied', reason: gate.reason }
 
-  const chain = chainKey || gate.entry?.chain || 'arc-testnet'
+  const chain = chainKey || gate.entry?.chain || ARC_CHAIN_KEY
 
   const calls = Array.isArray(preparedCalls)
     ? preparedCalls
@@ -2036,7 +2039,7 @@ export async function swapViaSession(userId, { tokenIn, tokenOut, amountIn, prep
  * Get the status of a previously submitted UserOperation.
  */
 export function resolveUserOpChainKey(entry, requestedChainKey) {
-  const chainKey = requestedChainKey || entry?.chain || 'arc-testnet'
+  const chainKey = requestedChainKey || entry?.chain || ARC_CHAIN_KEY
   return { chainKey, explicit: Boolean(requestedChainKey) }
 }
 

@@ -1,3 +1,5 @@
+import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
+
 /**
  * Agent-scoped readiness is intentionally independent from the OAuth protocol.
  * Hermes uses the connection-token flag while Claude/ChatGPT use OAuth tokens;
@@ -18,7 +20,7 @@ export function buildAgentReadiness({
   chainAuthorizationStatus = {},
 } = {}) {
   const revoked = binding?.active === false
-  const arcAuthorized = chainAuthorizationStatus['arc-testnet'] === 'authorized'
+  const arcAuthorized = chainAuthorizationStatus[ARC_CHAIN_KEY] === 'authorized'
   const destination = Object.fromEntries(DESTINATION_READINESS_CHAINS.map(chain => [
     chain,
     chainAuthorizationStatus[chain] === 'authorized',

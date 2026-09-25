@@ -8,6 +8,7 @@ import { privateKeyToAccount } from 'viem/accounts'
 import { IDENTITY_REGISTRY } from './agentIdentityService.mjs'
 import { ARC_MEMO_CONTRACT } from './arcMemoService.mjs'
 import { resolveArcRpc } from '../config/arcRpc.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL } from '../config/arcNetwork.mjs'
 import { getSessionKey, executeViaSession } from './sessionKeyService.mjs'
 
 export const AGENTIC_COMMERCE = '0x0747EEf0706327138c69792bF28Cd525089e4583'
@@ -179,11 +180,11 @@ export function parseAgentIdFromLogs(logs, owner) {
 function publicClient() {
   const rpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
   const chain = defineChain({
-    id: Number(process.env.ARC_CHAIN_ID || 5042002),
-    name: 'Arc Testnet',
+    id: Number(ARC_CHAIN_ID),
+    name: ARC_CHAIN_NAME,
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
     rpcUrls: { default: { http: [rpc] } },
-    blockExplorers: { default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' } },
+    blockExplorers: { default: { name: 'ArcScan', url: ARC_EXPLORER_URL } },
   })
   return createPublicClient({ chain, transport: http(rpc, { timeout: 12_000, retryCount: 1 }) })
 }
@@ -193,15 +194,15 @@ function publicClient() {
 // the memo sender, so every job mutation is signed by the session delegate
 // EOA — the same key that authorizes the MSCA UserOps. The delegate is
 // auto-funded from the MSCA (native gas + the escrow amount) by the tools.
-export async function signEoaTransaction({ privateKey, to, abi, functionName, args = [], value = 0n, chainKey = 'arc-testnet' }) {
+export async function signEoaTransaction({ privateKey, to, abi, functionName, args = [], value = 0n, chainKey = ARC_CHAIN_KEY }) {
   const account = privateKeyToAccount(privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`)
   const rpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
   const chain = defineChain({
-    id: Number(process.env.ARC_CHAIN_ID || 5042002),
-    name: 'Arc Testnet',
+    id: Number(ARC_CHAIN_ID),
+    name: ARC_CHAIN_NAME,
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
     rpcUrls: { default: { http: [rpc] } },
-    blockExplorers: { default: { name: 'ArcScan', url: 'https://testnet.arcscan.app' } },
+    blockExplorers: { default: { name: 'ArcScan', url: ARC_EXPLORER_URL } },
   })
   const transport = http(rpc, { timeout: 15_000, retryCount: 1 })
   const wallet = createWalletClient({ account, chain, transport })
@@ -220,7 +221,7 @@ export async function signEoaTransaction({ privateKey, to, abi, functionName, ar
     err.receipt = receipt
     throw err
   }
-  return { txHash, explorerUrl: `https://testnet.arcscan.app/tx/${txHash}`, receipt }
+  return { txHash, explorerUrl: `${ARC_EXPLORER_URL}/tx/${txHash}`, receipt }
 }
 
 /** Resolve the active session delegate EOA (private key decrypted from vault) for a wallet. */
@@ -258,7 +259,7 @@ export async function topUpDelegateEoa(walletAddress, { nativeAmount = '0.2', us
     if (mscaBal < shortfall) {
       throw new Error(`Agent Wallet USDC tidak cukup untuk job ini (butuh ${formatUnits(needed, 18)}, tersedia ${formatUnits(mscaBal, 18)}). Top up wallet via bridge/faucet lalu coba lagi.`)
     }
-    const res = await executeViaSession(walletAddress, [{ to: delegateAddress, value: shortfall, data: '0x' }], { paymaster: true, chainKey: 'arc-testnet', feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+    const res = await executeViaSession(walletAddress, [{ to: delegateAddress, value: shortfall, data: '0x' }], { paymaster: true, chainKey: ARC_CHAIN_KEY, feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
     if (res.status !== 'success') throw new Error(`delegate top-up failed: ${res.reason || res.error || 'unknown'}`)
   }
   return { delegateAddress, delegatePrivateKey }
@@ -283,7 +284,7 @@ export async function executeFundViaDelegate(walletAddress, { agentId, jobId, am
     txHash: fund.txHash,
     explorerUrl: fund.explorerUrl,
     delegateAddress: getAddress((await resolveDelegate(walletAddress)).delegateAddress),
-    approveExplorerUrl: `https://testnet.arcscan.app/tx/${approve.txHash}`,
+    approveExplorerUrl: `${ARC_EXPLORER_URL}/tx/${approve.txHash}`,
   }
 }
 
@@ -308,6 +309,6 @@ export async function readAgenticJob(jobId) {
     status: JOB_STATUS[statusIndex] ?? `Status ${statusIndex}`,
     hook: String(job.hook ?? ZERO_ADDRESS),
     contract: AGENTIC_COMMERCE,
-    network: 'arc-testnet',
+    network: ARC_CHAIN_KEY,
   }
 }

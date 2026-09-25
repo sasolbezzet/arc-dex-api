@@ -3,6 +3,7 @@
 // signer. Split out of mcpServer.mjs for maintainability.
 import { createPublicClient, defineChain, formatUnits, getAddress, http, parseUnits } from 'viem'
 import { resolveArcRpc } from '../../config/arcRpc.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME } from '../../config/arcNetwork.mjs'
 
 /**
  * @param {object} ctx
@@ -29,7 +30,7 @@ export function registerArcoxPayTools(ctx) {
     if (invoice.status === 'paid') throw new Error('Invoice already paid.')
     if (invoice.status === 'expired' || invoice.status === 'cancelled' || invoice.status === 'failed') throw new Error(`Invoice status is ${invoice.status}.`)
     if (Date.now() > new Date(invoice.expiresAt).getTime()) throw new Error('Invoice expired.')
-    if (invoice.token !== 'USDC' || invoice.network !== 'arc-testnet') throw new Error('Only USDC invoices on arc-testnet are supported.')
+    if (invoice.token !== 'USDC' || invoice.network !== ARC_CHAIN_KEY) throw new Error(`Only USDC invoices on ${ARC_CHAIN_KEY} are supported.`)
   }
 
   registerTool('arcox_create_payment_request', 'Create an ARCOX Pay USDC invoice/payment request on Arc Testnet.', {
@@ -42,7 +43,7 @@ export function registerArcoxPayTools(ctx) {
   }, async (params) => {
     try {
       const invoice = await apiPost('/api/invoices', {
-        orderId: params.orderId, amount: String(params.amount || ''), token: params.token || 'USDC', network: 'arc-testnet',
+        orderId: params.orderId, amount: String(params.amount || ''), token: params.token || 'USDC', network: ARC_CHAIN_KEY,
         merchantAddress: params.merchantAddress, memo: params.memo, expiresInMinutes: params.expiresInMinutes || 15,
       }, userId)
       if (invoice?.error) return { content: [{ type: 'text', text: jsonText({ error: invoice.error }) }] }
@@ -74,7 +75,7 @@ export function registerArcoxPayTools(ctx) {
       if (invoice?.error) return { content: [{ type: 'text', text: jsonText({ error: invoice.error }) }] }
       assertPayableInvoice(invoice)
       const arcRpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
-      const client = createPublicClient({ chain: defineChain({ id: 5042002, name: 'Arc Testnet', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 6 }, rpcUrls: { default: { http: arcRpc } } }), transport: http(arcRpc) })
+      const client = createPublicClient({ chain: defineChain({ id: ARC_CHAIN_ID, name: ARC_CHAIN_NAME, nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 6 }, rpcUrls: { default: { http: arcRpc } } }), transport: http(arcRpc) })
       const amountUnits = parseUnits(String(invoice.amount), 6)
       const balance = await client.readContract({ address: '0x3600000000000000000000000000000000000000', abi: [{ type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: '', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] }], functionName: 'balanceOf', args: [info.walletAddress] }).catch(() => 0n)
       return { content: [{ type: 'text', text: jsonText({
@@ -120,7 +121,7 @@ export function registerArcoxPayTools(ctx) {
         abi: [{ type: 'function', name: 'transfer', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }],
         functionName: 'transfer',
         args: [getAddress(invoice.merchantAddress), parseUnits(String(invoice.amount), 6)],
-      }], { paymaster: true, chainKey: 'arc-testnet', feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+      }], { paymaster: true, chainKey: ARC_CHAIN_KEY, feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
       if (result.status !== 'success') {
         return { content: [{ type: 'text', text: jsonText({ status: 'error', executed: false, reason: result.reason || 'payment failed', error: result.error, txHash: result.txHash }) }] }
       }

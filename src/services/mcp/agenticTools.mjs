@@ -2,6 +2,7 @@
 // ARC Memo), executed by the Agent Wallet MSCA session key. Ported from the
 // frontend Agentic panel. Split out of mcpServer.mjs for maintainability.
 import { getAddress } from 'viem'
+import { ARC_CHAIN_KEY } from '../../config/arcNetwork.mjs'
 
 /**
  * @param {object} ctx
@@ -69,7 +70,7 @@ export function registerAgenticTools(ctx) {
       if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
       const { registerAgentCall, parseAgentIdFromLogs } = await import('../agenticJobsService.mjs')
       const { executeViaSession } = await import('../sessionKeyService.mjs')
-      const result = await executeViaSession(info.walletAddress, [registerAgentCall(params.metadataUri)], { paymaster: true, chainKey: 'arc-testnet', feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+      const result = await executeViaSession(info.walletAddress, [registerAgentCall(params.metadataUri)], { paymaster: true, chainKey: ARC_CHAIN_KEY, feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
       if (result.status !== 'success') {
         return { content: [{ type: 'text', text: jsonText({ status: result.status, executed: false, reason: result.reason || 'register failed', error: result.error, txHash: result.txHash }) }] }
       }

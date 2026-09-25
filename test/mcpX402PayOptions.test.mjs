@@ -14,7 +14,10 @@ test('x402 session payment uses arc-pay fee profile (bundler floor guard)', () =
   // executeX402Pay must route through the same circle-gas-station envelope as
   // ARCOX Pay; without it Arc bundler can reject the paymaster tip (0.48 gwei
   // floor bug) and every x402 invoice payment becomes non-deterministic.
-  const match = source.match(/functionName: 'transfer',\n\s+args: \[getAddress\(invoice\.recipient\), amountUnits\],\n\s+\}\], \{ paymaster: true, chainKey: 'arc-testnet', feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true \}\)/)
+  // `chainKey` now comes from the network registry (ARC_CHAIN_KEY); the guard
+  // that matters here is the Gas Station envelope: paymaster + arc-pay +
+  // mandatory transaction hash and receipt.
+  const match = source.match(/functionName: 'transfer',\n\s+args: \[getAddress\(invoice\.recipient\), amountUnits\],\n\s+\}\], \{ paymaster: true, chainKey: ARC_CHAIN_KEY, feeProfile: 'arc-pay', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true \}\)/)
   assert.ok(match, 'executeX402Pay must pass feeProfile arc-pay + receipt requirements')
 })
 

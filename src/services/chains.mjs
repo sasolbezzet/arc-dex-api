@@ -1,28 +1,43 @@
 // chains.mjs — Multi-chain configuration for MSCA + balance fetching.
-// Supported: Arc Testnet, Ethereum Sepolia, Arbitrum Sepolia, Base Sepolia.
+//
+// Chain Arc berasal dari registry jaringan aktif (src/config/arcNetwork.mjs):
+// default `arc-testnet`, dan `arc-mainnet` ketika `ARC_NETWORK=mainnet`.
+// Chain Sepolia di bawah tetap ada sebagai chain non-Arc (read-only/tujuan uji);
+// MSCA hanya diizinkan pada chain yang didaftarkan jaringan aktif.
 import { resolveArcRpc } from '../config/arcRpc.mjs'
+import { arcNetwork } from '../config/arcNetwork.mjs'
+
+export {
+  ARC_CHAIN_KEY,
+  ARC_CHAIN_ID,
+  ARC_CHAIN_ID_HEX,
+  ARC_CHAIN_NAME,
+  ARC_EXPLORER_URL,
+  IS_ARC_MAINNET,
+  ARC_NETWORK_ID,
+  arcNetwork,
+  resolveArcChainKey,
+  isArcChainKey,
+} from '../config/arcNetwork.mjs'
+
+const arc = arcNetwork()
 
 // Circle Modular Wallet/MSCA support is narrower than Circle Gas Station support.
 // Ethereum Sepolia can use other Circle wallet products/Gas Station, but it is
 // not an MSCA network and must never enter the passkey/session UserOperation flow.
-export const MSCA_SUPPORTED_CHAIN_KEYS = ['arc-testnet', 'base-sepolia', 'arbitrum-sepolia']
+// Mainnet (scope saat ini) hanya mengizinkan Arc.
+export const MSCA_SUPPORTED_CHAIN_KEYS = [...arc.mscaChainKeys]
 
 export const CHAINS = {
-  'arc-testnet': {
-    id: 5042002,
-    name: 'Arc Testnet',
+  [arc.key]: {
+    id: arc.chainId,
+    name: arc.name,
     shortName: 'ARC',
     rpcUrl: resolveArcRpc(),
-    explorerUrl: 'https://testnet.arcscan.app',
+    explorerUrl: arc.explorerUrl,
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-    transportSlug: 'arcTestnet',
-    tokens: {
-      USDC:  '0x3600000000000000000000000000000000000000',
-      ETH:   null, // native on Arc is USDC
-      EURC:  '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
-      USYC:  '0xe9185F0c5F296Ed1797AaE4238D26CCaBEadb86C',
-      cirBTC: null,
-    },
+    transportSlug: arc.transportSlug,
+    tokens: { ...arc.tokens },
   },
   'ethereum-sepolia': {
     id: 11155111,

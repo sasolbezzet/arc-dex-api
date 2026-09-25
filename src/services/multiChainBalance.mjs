@@ -2,6 +2,7 @@
 // Uses eth_call for ERC-20 balanceOf and eth_getBalance for native.
 
 import { CHAINS, erc20BalanceOfCalldata } from './chains.mjs'
+import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
 
 async function rpcCall(rpcUrl, method, params = []) {
   const res = await fetch(rpcUrl, {
@@ -83,13 +84,13 @@ async function fetchChainBalances(chainKey, walletAddress) {
 
 /**
  * Fetch all balances across all chains for a wallet address.
- * Returns { 'arc-testnet': { USDC: '100', ... }, 'ethereum-sepolia': { ... }, ... }
+ * Returns { '<arc-chain-key>': { USDC: '100', ... }, 'ethereum-sepolia': { ... }, ... }
  */
 export async function fetchAllChainBalances(walletAddress) {
   const results = {}
   // Keep the MCP/dashboard contract explicit and deterministic: exactly the
   // four EVM chains used by the Agent Wallet, not future registry additions.
-  const chains = ['arc-testnet', 'ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia']
+  const chains = [ARC_CHAIN_KEY, 'ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia']
 
   // Fetch in parallel
   const promises = chains.map(async (key) => {

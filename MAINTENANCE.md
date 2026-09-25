@@ -5,6 +5,48 @@
 - Run `npm run maintenance:prune -- --apply` to retain the newest runtime backups per database.
 - Validate changes with `npm test`. Secrets belong only in `.env` and must never be logged or committed.
 
+## Active Arc network (testnet ↔ mainnet)
+
+`src/config/arcNetwork.mjs` is the single source of truth for the active Arc
+network. Everything else (chain id, RPC, explorer, transport slug, tokens,
+Circle contracts, Gateway base URL/chain name, MSCA chain support) is derived
+from it:
+
+```bash
+ARC_NETWORK=mainnet   # atau ARC_CHAIN_ID=5042; default testnet bila kosong
+```
+
+Rules that must stay true when editing network code:
+
+- Never read a mainnet ARCOX contract from a testnet value. `arcContractAddress(name)`
+  only accepts `<NAME>_MAINNET` on mainnet and returns `null` otherwise, so features
+  fail closed with `arcContractMissingMessage()` instead of sending a transaction to a
+  testnet address.
+- Never read a Circle key across environments: `arcCircleApiKey()`/`arcCircleClientKey()`
+  return the LIVE key on mainnet with no sandbox fallback.
+- State is separated by chain key (`arc-testnet` vs `arc-mainnet`); session keys,
+  agent bindings, and invoices never mix between networks.
+- The installed Circle SDK (`@circle-fin/app-kit`, `@circle-fin/bridge-kit`) only
+  supports Arc testnet. On mainnet the swap/bridge paths fail with `503`
+  (`assertArcSdkPath` in `server.mjs` and the AMM/swap guards in `mcpServer.mjs`)
+  rather than silently using testnet. Do not remove those guards to "make it work".
+- Gateway chain naming: the Circle Gateway API calls the Arc chain `Arc` on **both**
+  networks (`/v1/info`); the `network` field (`Testnet`/`Mainnet`) is the
+  discriminator. The internal app/MCP vocabulary stays `Arc_Testnet`/`Arc`
+  (`ARC_GATEWAY_KEY`).
+
+Verify before deploying a network change:
+
+```bash
+npm test                 # 340 unit/regression
+npm run probe:mainnet    # read-only Arc mainnet pre-flight (19 lulus / 0 blocker)
+PORT=3999 node --env-file=.env server.mjs   # boot smoke on a scratch port
+```
+
+Mainnet contract deployment is planned (not executed) in
+`docs/arc-mainnet-deploy-plan.md`; nothing there is broadcast until the operator
+confirms.
+
 ## Per-agent MSCA operations
 
 A single owner identity may have multiple Agent Wallets. Each connection is isolated by `agentKey = <clientId>|<ownerId>`; the OAuth token's `mscaWalletAddress` is the source of truth. Do not use a global owner alias to select an agent wallet.

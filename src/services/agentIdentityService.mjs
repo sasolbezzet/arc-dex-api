@@ -1,7 +1,8 @@
 import { createPublicClient, defineChain, getAddress, http, fallback, isAddress, parseAbiItem } from 'viem'
 import { ARC_RPC_LOG_CHUNK_SIZE, arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, arcCircleContract } from '../config/arcNetwork.mjs'
 
-export const IDENTITY_REGISTRY = '0x8004A818BFB912233c491871b3d84c89A494BD9e'
+export const IDENTITY_REGISTRY = String(process.env.ARC_IDENTITY_REGISTRY || arcCircleContract('identityRegistry') || '0x8004A818BFB912233c491871b3d84c89A494BD9e')
 const TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 indexed tokenId)')
 const cache = new Map()
 
@@ -16,8 +17,8 @@ const ARC_FALLBACK_RPCS = arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RP
 function client() {
   const primaryRpc = resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
   const chain = defineChain({
-    id: Number(process.env.ARC_CHAIN_ID || 5042002),
-    name: 'Arc Testnet',
+    id: Number(ARC_CHAIN_ID),
+    name: ARC_CHAIN_NAME,
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
     rpcUrls: { default: { http: [primaryRpc, ...ARC_FALLBACK_RPCS.filter(u => u !== primaryRpc)] } },
   })
@@ -37,7 +38,7 @@ export async function getAgentIdentity(agentId) {
     rpc.readContract({ address: IDENTITY_REGISTRY, abi: identityAbi, functionName: 'ownerOf', args: [BigInt(id)] }),
     rpc.readContract({ address: IDENTITY_REGISTRY, abi: identityAbi, functionName: 'tokenURI', args: [BigInt(id)] }).catch(() => ''),
   ])
-  return { agentId: id, ownerWallet: getAddress(owner), metadataUri: String(metadataUri || ''), registry: IDENTITY_REGISTRY, network: 'arc-testnet' }
+  return { agentId: id, ownerWallet: getAddress(owner), metadataUri: String(metadataUri || ''), registry: IDENTITY_REGISTRY, network: ARC_CHAIN_KEY }
 }
 
 export async function verifyAgentOwnership(agentId, ownerAddress) {
@@ -75,7 +76,7 @@ export async function listAgentIdentities(ownerAddress, { refresh = false } = {}
 }
 
 async function idsFromArcScan(owner) {
-  const base = String(process.env.ARCSCAN_API_BASE_URL || 'https://testnet.arcscan.app/api/v2').replace(/\/$/, '')
+  const base = String(process.env.ARCSCAN_API_BASE_URL || `${ARC_EXPLORER_URL}/api/v2`).replace(/\/$/, '')
   let url = new URL(`${base}/addresses/${owner}/nft`)
   url.searchParams.set('type', 'ERC-721')
   const ids = []

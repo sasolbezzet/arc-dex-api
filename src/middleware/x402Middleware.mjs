@@ -6,6 +6,7 @@ import { verifyOwnerToken } from '../services/authToken.mjs'
 import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
 import { ARC_RPC_LOG_CHUNK_SIZE, arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_GATEWAY_KEY, ARC_USDC_ADDRESS, arcCircleApiKey, arcCircleContract, arcGatewayBaseUrl } from '../config/arcNetwork.mjs'
 import { readX402Invoice, scheduleWebhookEventUpsert, scheduleX402InvoiceUpsert, shadowReadWebhookEvent } from '../services/supabasePersistence.mjs'
 import { claimWebhookEvent, completeWebhookEvent } from '../services/supabaseOperationalState.mjs'
 
@@ -44,8 +45,8 @@ globalThis.__arcoxX402UnmatchedInboundEvents = unmatchedInboundEvents
 
 let uniqueCounter = globalThis.__arcoxX402UniqueCounter || 0
 const X402_INVOICE_DB = process.env.X402_INVOICE_DB || './x402-invoices-db.json'
-const ARC_USDC = process.env.X402_USDC_ADDRESS || '0x3600000000000000000000000000000000000000'
-const ARC_MEMO_CONTRACT = process.env.ARC_MEMO_CONTRACT || '0x5294E9927c3306DcBaDb03fe70b92e01cCede505'
+const ARC_USDC = process.env.X402_USDC_ADDRESS || ARC_USDC_ADDRESS
+const ARC_MEMO_CONTRACT = process.env.ARC_MEMO_CONTRACT || arcCircleContract('memo')
 const TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from,address indexed to,uint256 value)')
 const MEMO_EVENT = parseAbiItem('event Memo(address indexed sender,address indexed target,bytes32 callDataHash,bytes32 indexed memoId,bytes memo,uint256 memoIndex)')
 const OPEN_STATUSES = new Set(['created', 'payment_required', 'estimate_ready', 'awaiting_signature', 'spend_submitted', 'settlement_pending', 'recovery_required', 'pending'])
@@ -128,8 +129,8 @@ export function x402Config() {
     baseAmount: String(process.env.X402_BASE_AMOUNT || process.env.X402_DEFAULT_PRICE_USDC || '0.005'),
     ttlSeconds: Number(process.env.X402_PAYMENT_TTL_SECONDS || process.env.X402_PAYMENT_EXPIRY_SECONDS || 300),
     asset: process.env.X402_ASSET || 'USDC',
-    network: process.env.CIRCLE_X402_NETWORK || process.env.X402_NETWORK || 'arc-testnet',
-    chainId: Number(process.env.X402_CHAIN_ID || process.env.ARC_CHAIN_ID || 5042002),
+    network: process.env.CIRCLE_X402_NETWORK || process.env.X402_NETWORK || ARC_CHAIN_KEY,
+    chainId: Number(process.env.X402_CHAIN_ID || ARC_CHAIN_ID),
     usdcAddress: ARC_USDC,
     circleEnvironment: process.env.CIRCLE_ENV || 'testnet',
     circleBaseUrl: process.env.CIRCLE_BASE_URL || 'https://api-sandbox.circle.com',
@@ -261,7 +262,7 @@ export function createX402Invoice(input = {}) {
     paymentMethods: paymentMethod === 'unified-balance-gateway' ? ['unified-balance-gateway'] : paymentMethod === 'arc-usdc-memo' ? ['arc-usdc-memo'] : ['arc-usdc-direct'],
     settlementStatus: 'payment_required',
     route: {
-      destination: 'Arc_Testnet',
+      destination: ARC_GATEWAY_KEY,
       asset: 'USDC',
       directArc: true,
       unifiedBalance: true,
@@ -312,7 +313,7 @@ export async function reconcileX402Invoice(id) {
       : null
     if (invoice.paymentMethod === 'arc-usdc-direct' && !/^0x[0-9a-fA-F]{40}$/.test(String(invoice.ownerWallet || ''))) return invoice
     if (invoice.paymentMethod === 'arc-usdc-direct' && normalizeAddress(invoice.usdcAddress) !== normalizeAddress(ARC_USDC)) return invoice
-    if (invoice.paymentMethod === 'arc-usdc-direct' && Number(invoice.chainId) !== 5042002) return invoice
+    if (invoice.paymentMethod === 'arc-usdc-direct' && Number(invoice.chainId) !== ARC_CHAIN_ID) return invoice
     if (gatewayMatch) {
       invoice.status = 'paid'
       invoice.settlementStatus = 'paid'
@@ -377,7 +378,7 @@ export async function reconcileX402Invoice(id) {
       const expectedBaseUnits = invoice.amountBaseUnits || (expectedAmount ? amountToBaseUnits(expectedAmount) : null)
       const expectedPayer = normalizeAddress(invoice.ownerWallet)
       if (normalizeAddress(invoice.usdcAddress) !== normalizeAddress(ARC_USDC)) return invoice
-      if (Number(invoice.chainId) !== 5042002) return invoice
+      if (Number(invoice.chainId) !== ARC_CHAIN_ID) return invoice
       const expectedRecipient = normalizeAddress(invoice.recipient)
       const amountMatches = expectedBaseUnits
         ? logs
@@ -718,8 +719,8 @@ async function circleWebhookPublicKey(keyId) {
   const cached = circleWebhookPublicKeys.get(keyId)
   if (cached && cached.expiresAt > Date.now()) return cached.key
 
-  const apiKey = String(process.env.CIRCLE_API_KEY || '').trim()
-  if (!apiKey) throw new Error('CIRCLE_API_KEY is required for Circle webhook verification')
+  const apiKey = arcCircleApiKey()
+  if (!apiKey) throw new Error('Circle API key is required for Circle webhook verification')
   // Circle v2 Gateway webhook public keys are served from the production
   // notifications API even for TEST subscriptions. Keep the legacy
   // CIRCLE_BASE_URL for other sandbox product calls, but allow an explicit
@@ -867,7 +868,7 @@ export function estimateUnifiedBalanceX402(invoiceId, input = {}) {
     asset: 'USDC',
     amount: invoice.uniqueAmount,
     amountBaseUnits: invoice.amountBaseUnits || amountToBaseUnits(invoice.uniqueAmount),
-    destinationChain: 'Arc_Testnet',
+    destinationChain: ARC_GATEWAY_KEY,
     recipient: invoice.recipient,
     route: input.route || 'Circle Gateway Unified Balance -> Arc Testnet USDC',
     fees: input.fees || [],
@@ -908,7 +909,7 @@ export function markUnifiedBalanceSpendSubmitted(invoiceId, input = {}, options 
 
 async function findFinalizedGatewayTransfer(invoice) {
   if (!invoice.trustedGatewaySpend || !/^[0-9a-f-]{36}$/i.test(String(invoice.transferId || '')) || !/^0x[0-9a-f]{64}$/i.test(String(invoice.spendTxHash || ''))) return null
-  const response = await fetch(`${process.env.CIRCLE_GATEWAY_BASE_URL || 'https://gateway-api-testnet.circle.com'}/v1/transfer/${encodeURIComponent(invoice.transferId)}`, {
+  const response = await fetch(`${arcGatewayBaseUrl()}/v1/transfer/${encodeURIComponent(invoice.transferId)}`, {
     headers: { 'User-Agent': 'arcox-x402-reconciler/1.0' },
     signal: AbortSignal.timeout(Number(process.env.X402_GATEWAY_RECONCILE_TIMEOUT_MS || 8_000)),
   })

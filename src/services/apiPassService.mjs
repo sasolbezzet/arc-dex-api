@@ -1,5 +1,6 @@
 import { createPublicClient, defineChain, getAddress, http, fallback } from 'viem'
 import { arcRpcUrls } from '../config/arcRpc.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_NAME } from '../config/arcNetwork.mjs'
 
 export const API_PASS_ABI = [
   { type: 'function', name: 'ownerOf', stateMutability: 'view', inputs: [{ name: 'tokenId', type: 'uint256' }], outputs: [{ type: 'address' }] },
@@ -10,8 +11,8 @@ export const API_PASS_ABI = [
 
 const ARC_RPC_LIST = arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })
 const chain = defineChain({
-  id: 5042002,
-  name: 'Arc Testnet',
+  id: ARC_CHAIN_ID,
+  name: ARC_CHAIN_NAME,
   nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
   rpcUrls: { default: { http: [...new Set(ARC_RPC_LIST)] } },
 })

@@ -2,6 +2,7 @@ import { createPublicClient, createWalletClient, defineChain, encodeFunctionData
 import { privateKeyToAccount } from 'viem/accounts'
 import { IDENTITY_REGISTRY } from './agentIdentityService.mjs'
 import { resolveArcRpc } from '../config/arcRpc.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_NAME } from '../config/arcNetwork.mjs'
 
 export const ARC_MEMO_CONTRACT = process.env.ARC_MEMO_CONTRACT || '0x5294E9927c3306DcBaDb03fe70b92e01cCede505'
 const memoAbi = [{
@@ -46,7 +47,7 @@ export async function submitAgentMemoProof(input = {}) {
   if (!privateKey) return { status: 'unavailable', reason: 'AI Router delegate signer is not configured' }
   const account = privateKeyToAccount(privateKey)
   const chain = defineChain({
-    id: Number(process.env.ARC_CHAIN_ID || 5042002), name: 'Arc Testnet',
+    id: Number(ARC_CHAIN_ID), name: ARC_CHAIN_NAME,
     nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
     rpcUrls: { default: { http: [resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })] } },
   })

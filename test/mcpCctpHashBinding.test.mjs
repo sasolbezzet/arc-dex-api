@@ -2,6 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { decodeFunctionData } from 'viem'
 
+// MSCA bridge routes are fail-closed when the ARCOX router address is missing
+// (mainnet never falls back to a testnet address). Declare the testnet router
+// explicitly so the capability assertions below describe a configured instance.
+process.env.ARCOX_FEE_ROUTER_ADDRESS ||= '0xDf800310443BEB589CEf91A09854203Ea36e43a7'
+
 const MSCA = '0x2222222222222222222222222222222222222222'
 const TOKEN_MESSENGER = '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA'
 const MESSAGE_TRANSMITTER = '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275'
