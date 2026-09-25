@@ -14,11 +14,11 @@ Snapshot terverifikasi (`npm run mainnet:sources` + `npm run mainnet:plan` di
 
 | Kontrak | Alamat testnet | Bentuk on-chain | Status mainnet |
 | --- | --- | --- | --- |
-| ARCOX Fee Router | `0xDf80…43a7` | `ArcoxRouter` langsung (solc 0.8.35) | **Arc ✓, Base ✓** (25 Sep 2026); Arbitrum tertahan dana gas |
+| ARCOX Fee Router | `0xDf80…43a7` | `ArcoxRouter` langsung (solc 0.8.35) | **Arc ✓, Base ✓, Arbitrum ✓** (25 Sep 2026) |
 | AMM Router | `0x9f24…6124` | `ArcoxCirBTCRouterV2` langsung (solc 0.8.24) | belum di-deploy |
 | AMM Pool USDC-cirBTC | `0xd4af…dc2d` | `ArcoxBTCPool` (solc 0.8.24) | belum di-deploy |
 | AMM Pool EURC-cirBTC | `0xcca9…6bfa2` | `ArcoxBTCPool` (solc 0.8.24) | belum di-deploy |
-| Swap Adapter | `0xBBD7…d40b` | **TransparentUpgradeableProxy** → impl `Adapter` `0xb4d0…c2d4`, admin `0x6a73…8b7a` (solc 0.8.28) | belum di-deploy |
+| Swap Adapter | `0xBBD7…d40b` | **TransparentUpgradeableProxy** → impl `Adapter` `0xb4d0…c2d4`, admin `0x6a73…8b7a` (solc 0.8.28) | belum di-deploy (butuh dana + keputusan owner/signer) |
 | ERC-8183 Agentic Commerce | `0x0747…e4583` | **ERC1967Proxy** → impl `AgenticCommerce` `0xa316…351a` (solc 0.8.28, optimizer OFF, evm cancun) | belum di-deploy |
 | Treasury mainnet | — | — | belum dibuat |
 
@@ -76,9 +76,13 @@ Hasil 25 Sep 2026 — owner/deployer `0xE34FF1D2…4569e` (key `EOA_PRIVATE_KEY`
 
 | Chain | Alamat Fee Router | Domain aktif | Deploy tx |
 | --- | --- | --- | --- |
-| Arc Mainnet (5042) | `0x9Fd14A94bDbEFf73EDB22853cc77416B65E2A0c0` | 6 (Base) | `0x97f717a8…a5b11` |
-| Base Mainnet (8453) | `0xD858f073FA09834b1d64C165afC2757F1DF2f019` | 26 (Arc) | `0x0411ca0c…af523` |
-| Arbitrum One (42161) | — | — | **tertahan**: saldo deployer `0.0000001 ETH`, butuh ≈`0.00007 ETH` |
+| Arc Mainnet (5042) | `0x9Fd14A94bDbEFf73EDB22853cc77416B65E2A0c0` | 6 (Base), 3 (Arbitrum) | `0x97f717a8…a5b11` |
+| Base Mainnet (8453) | `0xD858f073FA09834b1d64C165afC2757F1DF2f019` | 26 (Arc), 3 (Arbitrum) | `0x0411ca0c…af523` |
+| Arbitrum One (42161) | `0xaF15a9fFdDB21A42Aa6175B8130aE69ce41C78F9` | 26 (Arc), 6 (Base) | `0x9ae11d17…7f5cd` |
+
+Ketiga chain memakai `treasury` = `0x5d16E8Ef186d6D0d984f9A50C7ddb16C106DF40F`
+dan `feeBps` = 500 — sudah diverifikasi on-chain, jadi **tidak perlu deploy ulang**
+hanya untuk mengganti treasury.
 
 Verifikasi yang sudah lulus: state on-chain (owner, treasury, feeBps, `usdc`,
 `tokenMessenger` mainnet CCTP v2, `localDomain`, `supportedTokens`,
@@ -107,7 +111,31 @@ Catatan operasional:
   `mainnet:fee-router:domains --chains arc,base,arbitrum --broadcast` (agar
   domain 3 ikut aktif di Arc + Base).
 
-### 3.3 AMM Router, Swap Adapter, ERC-8183
+### 3.3 Swap Adapter — status & yang menghambat
+
+Rencana deploy siap di `arcox-mcp/packages/runtime/scripts/deploy-swap-adapter-mainnet.mjs`
+(dry-run default). Dua hal yang harus diketahui:
+
+- **`Adapter` tidak punya parameter treasury maupun fee.** Yang bisa disetel saat
+  init hanya `initialize(address owner_, address signer_, uint256 signerThreshold_)`.
+  Jadi permintaan "swap adapter pakai alamat treasury" tidak punya padanan di
+  kontrak ini — treasury 5% sudah ditangani Fee Router.
+- Estimasi gas proxy tidak mungkin sebelum implementation ada (konstruktor OZ
+  mendelegatecall `initialize` ke logic; delegatecall ke alamat tanpa kode selalu
+  revert), jadi script memakai limit tetap 1,2 juta gas.
+
+Kebutuhan dana (gas impl ≈3,94 juta + proxy ≈0,95 juta):
+
+| Chain | Perkiraan biaya | Saldo sekarang | Kurang |
+| --- | --- | --- | --- |
+| Arc | ≈0,098 USDC | 0,0513 USDC | ≈0,047 USDC |
+| Base | ≈0,0000293 ETH | 0,0000115 ETH | ≈0,000018 ETH |
+| Arbitrum | ≈0,0000978 ETH | 0,0000051 ETH | ≈0,000093 ETH |
+
+Keputusan operator yang ditunggu: `owner` adapter, `signer` EIP-712 (+ threshold),
+dan pemilik ProxyAdmin (satu-satunya yang bisa upgrade proxy).
+
+### 3.4 AMM Router, ERC-8183
 
 Sumber ketiga kontrak ini tidak ada di repo, **tetapi semuanya terverifikasi di
 ArcScan**, jadi source-nya sudah disalin ke
@@ -134,7 +162,7 @@ Langkah:
       terpisah (bukan bagian dari script).
 - [ ] `ArcoxApiPass.sol` (API pass) juga perlu keputusan: dipakai atau tidak.
 
-### 3.4 Treasury mainnet
+### 3.5 Treasury mainnet
 
 - [ ] Buat wallet treasury mainnet **baru** (bukan testnet).
 - [ ] `ARCOX_TREASURY_WALLET_ADDRESS_MAINNET` → alamat treasury.
