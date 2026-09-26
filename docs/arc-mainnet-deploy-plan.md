@@ -3,14 +3,14 @@
 Dokumen ini adalah **rencana + checklist**. Tidak ada langkah di sini yang boleh
 dijalankan sebagai broadcast sampai operator memberi konfirmasi eksplisit.
 
-Prasyarat read-only sudah hijau: `npm run probe:mainnet` → **19 lulus / 0 blocker**
+Prasyarat read-only sudah hijau: `npm run probe:mainnet` → **22 lulus / 0 blocker**
 (chain 5042, Client Key LIVE, API Key LIVE, Gas Station policy LIVE, passkey
 domain LIVE, Gateway mainnet `gateway-api.circle.com` dengan nama chain `Arc`).
 
 ## 1. Yang belum ada di mainnet
 
 Snapshot terverifikasi (`npm run mainnet:sources` + `npm run mainnet:plan` di
-`arcox-mcp`), status on-chain dicek read-only pada 25 Sep 2026:
+`arcox-mcp`), status on-chain dicek read-only pada 25–26 Sep 2026:
 
 | Kontrak | Alamat testnet | Bentuk on-chain | Status mainnet |
 | --- | --- | --- | --- |
@@ -18,7 +18,7 @@ Snapshot terverifikasi (`npm run mainnet:sources` + `npm run mainnet:plan` di
 | AMM Router | `0x9f24…6124` | `ArcoxCirBTCRouterV2` langsung (solc 0.8.24) | belum di-deploy |
 | AMM Pool USDC-cirBTC | `0xd4af…dc2d` | `ArcoxBTCPool` (solc 0.8.24) | belum di-deploy |
 | AMM Pool EURC-cirBTC | `0xcca9…6bfa2` | `ArcoxBTCPool` (solc 0.8.24) | belum di-deploy |
-| Swap Adapter | `0xBBD7…d40b` | **TransparentUpgradeableProxy** → impl `Adapter` `0xb4d0…c2d4`, admin `0x6a73…8b7a` (solc 0.8.28) | belum di-deploy (butuh dana + keputusan owner/signer) |
+| Swap Adapter | `0xBBD7…d40b` | **TransparentUpgradeableProxy** → impl `Adapter` `0xb4d0…c2d4`, admin `0x6a73…8b7a` (solc 0.8.28) | **Arc ✓** (26 Sep 2026); Base/Arbitrum belum (kurang dana gas) |
 | ERC-8183 Agentic Commerce | `0x0747…e4583` | **ERC1967Proxy** → impl `AgenticCommerce` `0xa316…351a` (solc 0.8.28, optimizer OFF, evm cancun) | belum di-deploy |
 | Treasury mainnet | — | — | belum dibuat |
 
@@ -88,8 +88,15 @@ Verifikasi yang sudah lulus: state on-chain (owner, treasury, feeBps, `usdc`,
 `tokenMessenger` mainnet CCTP v2, `localDomain`, `supportedTokens`,
 `quoteFee(1 USDC)` = 0.05), bytecode on-chain cocok dengan hasil kompilasi ulang
 sumber (immutable di-mask), dan **source terverifikasi Sourcify `exact_match`**
-(creation + runtime) untuk kedua chain. Explorer Arc Mainnet memblokir API dari
-server (Cloudflare), jadi Sourcify dipakai sebagai jalur verifikasi otomatis.
+(creation + runtime) untuk **ketiga chain**. Explorer Arc Mainnet memblokir API
+dari server (Cloudflare), jadi Sourcify dipakai sebagai jalur verifikasi otomatis.
+
+Dicek ulang 26 Sep 2026 (`mainnet:fee-router:verify`): ketiga router masih ada dan
+lulus semua pemeriksaan (kode 4.653 byte di tiap chain, receipt sukses, treasury +
+feeBps sesuai). **Tidak ada yang perlu di-deploy ulang.** Kalau kontrak "tidak
+ditemukan" di explorer, hampir pasti alamat yang dicari alamat testnet —
+`ARCOX_FEE_ROUTER_ADDRESS` di `.env` masih berisi `0xDf800310…` (kode ada di Arc
+**testnet**, kosong di Arc mainnet). Pakai var `*_MAINNET` (bagian 4).
 
 > ⚠️ **JANGAN DIPAKAI** — dua alamat ini hasil percobaan pertama yang salah dan
 > sengaja dibiarkan tercatat: Arc `0xb9Fb801A5D1491E70A886800982CB80cdf98A174`,
@@ -106,10 +113,11 @@ Catatan operasional:
   Arbitrum belum di-deploy, domain 3 sengaja belum diset di Arc/Base.
 - `setSupportedDestinationDomain` pernah revert out-of-gas dengan limit default
   (22.026 gas), jadi skrip sekarang selalu memakai limit eksplisit 120.000 gas.
-- `Arbitrum` belum di-deploy: kirim ≈0.0002 ETH ke `0xE34FF1D2…4569e`, lalu
-  jalankan ulang `mainnet:fee-router:deploy --chains arbitrum --broadcast` dan
-  `mainnet:fee-router:domains --chains arc,base,arbitrum --broadcast` (agar
-  domain 3 ikut aktif di Arc + Base).
+- `Arbitrum` sudah ter-deploy (25 Sep 2026), dan domain 3 sudah aktif di Arc +
+  Base. Untuk chain baru di masa depan: kirim gas ke `0xE34FF1D2…4569e`, lalu
+  `mainnet:fee-router:deploy --chains <chain> --broadcast` diikuti
+  `mainnet:fee-router:domains --chains arc,base,arbitrum --broadcast`, lalu
+  `mainnet:fee-router:verify`.
 
 ### 3.3 Swap Adapter — status & yang menghambat
 
@@ -136,14 +144,36 @@ Keputusan operator (tercatat di `arcox-mcp/packages/runtime/deployments/swap-ada
 > VPS. Konsekuensinya: eksekusi swap bisa jalan, tetapi penambahan signer dan
 > upgrade proxy hanya bisa dilakukan oleh pemegang key `0x5d16E8Ef…`.
 
-Kebutuhan dana (gas impl ≈3,94 juta + proxy ≈0,95 juta) — preflight berhenti di
-sini, belum ada transaksi adapter yang dikirim:
+**Arc sudah ter-deploy 26 Sep 2026** (preflight `CUKUP`, gas impl ≈3,94 juta + proxy
+1,2 juta limit):
 
-| Chain | Perkiraan biaya | Saldo sekarang | Kurang | Saran kirim |
+| Peran | Alamat |
+| --- | --- |
+| Alamat aktif aplikasi (**proxy**) | `0x8bc25dB1feda8Fc5eB20d0117Ff1f965F2F4E29C` |
+| Implementation (`Adapter`) | `0xA6EeE6c972825f7d746673D9a1E25Ca58BD11274` |
+| ProxyAdmin (hak upgrade) | `0x881037816Da1Cd38Ebe1d88250d3ddaEA994a4EA` |
+| Signer EIP-712 (threshold 1) | `0xE34FF1D2C925DDafB28C95C2396fC49A6f64569e` |
+
+Deploy tx: impl `0x624359d08f849eef15cf9613cc2477e02b0275c2f22f6c6b2de35709266ac92b`,
+proxy `0xd46509ed6eb9a6e7601799ed5b942a05b406b0767360e2fcfef1dd46f1a21cf9`.
+
+Verifikasi (`npm run mainnet:swap-adapter:verify -- --chains arc --sourcify`) lulus
+semua: kode proxy 813 byte + impl 17.729 byte, slot EIP-1967 implementation & admin
+benar, `ProxyAdmin.owner()` = `0x5d16E8Ef…`, state lewat proxy (`owner`
+`0x5d16E8Ef…`, threshold 1, signer terdaftar, `paused` false, `pendingOwner` 0x0),
+implementation mentah belum di-`initialize`, bytecode cocok dengan kompilasi ulang
+snapshot (solc 0.8.28 / optimizer 200 / viaIR / paris), dan Sourcify `exact_match`
+untuk impl + proxy.
+
+Base & Arbitrum masih menunggu dana gas:
+
+| Chain | Perkiraan biaya | Saldo terakhir | Kurang | Saran kirim |
 | --- | --- | --- | --- | --- |
-| Arc | ≈0,098 USDC | 0,0513 USDC | ≈0,047 USDC | 1 USDC |
 | Base | ≈0,0000293 ETH | 0,0000115 ETH | ≈0,000018 ETH | 0,0005 ETH |
 | Arbitrum | ≈0,0000978 ETH | 0,0000051 ETH | ≈0,000093 ETH | 0,001 ETH |
+
+Catatan: alamat proxy mainnet di atas **berbeda** dari alamat testnet
+(`0xBBD7…d40b`), jadi env aplikasi harus diarahkan ke `ARCOX_SWAP_ADAPTER_MAINNET`.
 
 ### 3.4 AMM Router, ERC-8183
 
@@ -174,9 +204,10 @@ Langkah:
 
 ### 3.5 Treasury mainnet
 
-- [ ] Buat wallet treasury mainnet **baru** (bukan testnet).
-- [ ] `ARCOX_TREASURY_WALLET_ADDRESS_MAINNET` → alamat treasury.
-- [ ] Deposit USDC sesuai `X402_MIN_TREASURY_USDC` + buffer fee Gateway.
+- [x] Treasury mainnet = alamat fee treasury ARCOX `0x5d16E8Ef186d6D0d984f9A50C7ddb16C106DF40F` (26 Sep 2026), dipakai juga oleh testnet — tidak ada treasury terpisah.
+- [x] `ARCOX_TREASURY_WALLET_ADDRESS_MAINNET` + `ARCOX_TREASURY_WALLET_ADDRESS` = alamat fee treasury; resolver (`src/config/treasury.mjs`) membaca var `_MAINNET` lebih dulu di mainnet.
+- [x] Guard saldo minimum (`X402_MIN_TREASURY_USDC` / `X402_BLOCK_ON_LOW_TREASURY`) dihapus: saldo berapa pun tetap bisa membuat invoice dan refund.
+- [ ] Deposit USDC ke alamat treasury untuk buffer biaya Gateway/CCTP (opsional, tidak lagi memblokir invoice).
 - [ ] `AI_ROUTER_DELEGATE_PRIVATE_KEY_MAINNET` → delegate signer mainnet terpisah.
 - [ ] Verifikasi `/api/x402/treasury-health` → `healthy: true`.
 
@@ -191,9 +222,10 @@ ARCOX_FEE_ROUTER_ADDRESS_MAINNET=0x9Fd14A94bDbEFf73EDB22853cc77416B65E2A0c0
 ARCOX_ROUTER_FEE_BPS_MAINNET=500
 # Router per chain (dibaca backend/frontend di luar resolver Arc)
 ARCOX_BASE_FEE_ROUTER_ADDRESS=0xD858f073FA09834b1d64C165afC2757F1DF2f019
-ARCOX_ARBITRUM_FEE_ROUTER_ADDRESS=          # menunggu dana gas Arbitrum
+ARCOX_ARBITRUM_FEE_ROUTER_ADDRESS=0xaF15a9fFdDB21A42Aa6175B8130aE69ce41C78F9
 ARCOX_AMM_ROUTER_MAINNET=
-ARCOX_SWAP_ADAPTER_MAINNET=
+# Swap Adapter proxy Arc mainnet (impl 0xA6EeE6c9…1274, ProxyAdmin 0x88103781…a4EA)
+ARCOX_SWAP_ADAPTER_MAINNET=0x8bc25dB1feda8Fc5eB20d0117Ff1f965F2F4E29C
 ARCOX_ERC8183_ADDRESS_MAINNET=
 ARCOX_API_PASS_ADDRESS_MAINNET=
 
@@ -223,7 +255,7 @@ RPC diambil dari `ARC_MAINNET_RPC_URL` bila diset, kalau tidak dari
 ## 5. Verifikasi berjenjang (tanpa broadcast dulu)
 
 1. **Statis** — `npm test` (340 tes) hijau; `npm run check` hijau.
-2. **Read-only** — `npm run probe:mainnet` → 19 lulus / 0 blocker.
+2. **Read-only** — `npm run probe:mainnet` → 22 lulus / 0 blocker (probe 26 Sep 2026).
 3. **Konfigurasi** — jalankan satu instance di port uji (`PORT=3999 node --env-file=.env server.mjs`)
    dengan `ARC_NETWORK=mainnet`, lalu cek `/health`, `/api/x402/config`
    (`network: arc-mainnet`, `chainId: 5042`), dan `/api/agents/status`.
@@ -232,6 +264,26 @@ RPC diambil dari `ARC_MAINNET_RPC_URL` bila diset, kalau tidak dari
 5. **Satu pembayaran kecil** — 0.005–0.02 USDC via MSCA (invoice → pay →
    reconcile → unlock data) + jalur refund.
 6. **Baru kemudian** restart unit produksi dengan `ARC_NETWORK=mainnet`.
+
+### 5.1 Status aktivasi env (26 Sep 2026)
+
+- `.env` produksi VPS sudah mainnet: `ARC_NETWORK=mainnet`,
+  `ARCOX_FEE_ROUTER_ADDRESS_MAINNET`, `ARCOX_ROUTER_FEE_BPS_MAINNET=500`,
+  `ARCOX_SWAP_ADAPTER_MAINNET`, `CIRCLE_ENV=live`, `CIRCLE_BASE_URL=https://api.circle.com`,
+  `X402_MODE=arc_mainnet`, `X402_NETWORK=arc-mainnet`, `X402_CHAIN_ID=5042`,
+  `CIRCLE_X402_NETWORK=arc-mainnet`. Backup: `.env.bak-20260926-112802`.
+- `npm run probe:mainnet` → **22 lulus / 0 blocker**. Instance uji (`PORT=3999`) dan
+  produksi (`arc-dex-api.service`) start bersih; `npm test` 340/340 hijau.
+- Bug boot mainnet ditemukan & diperbaiki: `BRIDGE_CHAIN_DEF.Arc_Testnet` memanggil
+  `arcBridgeChain()` saat module load, padahal fungsi itu melempar 503 di mainnet →
+  server crash sebelum listen. Nilainya kini getter lazy (error tetap jelas saat
+  endpoint dipakai).
+- `/api/x402/treasury-health` = `healthy:false` (`totalUsdc 0 < 2`) — fail-closed,
+  sesuai rencana sampai treasury mainnet diisi.
+- Catatan: kode belum membaca `ARCOX_TREASURY_WALLET_ADDRESS_MAINNET` /
+  `AI_ROUTER_DELEGATE_PRIVATE_KEY_MAINNET` (treasury & delegate masih dibaca dari
+  var non-suffixed) — perlu keputusan sebelum x402 mainnet diaktifkan penuh.
+- Rollback: `cp .env.bak-20260926-112802 .env && sudo systemctl restart arc-dex-api`.
 
 ## 6. Rollback
 

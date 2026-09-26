@@ -240,7 +240,7 @@ ENABLE_SERVER_SIGNED_MINT=false
 
 ## Mainnet
 
-Probe read-only terakhir: **19 lulus / 0 blocker** (`npm run probe:mainnet`).
+Probe read-only terakhir: **22 lulus / 0 blocker** (26 Sep 2026, `npm run probe:mainnet`).
 
 - `docs/mainnet-x402-readiness.md` — kesiapan x402 di Arc mainnet (status + checklist).
 - `docs/arc-mainnet-deploy-plan.md` — rencana deploy kontrak ARCOX + treasury mainnet.

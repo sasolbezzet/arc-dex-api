@@ -4,9 +4,9 @@ Checklist untuk memindahkan x402 monetization dari Arc Testnet ke Arc Mainnet.
 Semua item di bawah bersifat persiapan/validasi; tidak ada yang men-deploy ke
 mainnet sampai checklist ini lulus dan konfirmasi eksplisit diberikan.
 
-## Status 25 Sep 2026 (hasil `npm run probe:mainnet`, read-only)
+## Status 26 Sep 2026 (hasil `npm run probe:mainnet`, read-only)
 
-**19 lulus / 0 blocker.** Blocker Console yang tersisa pada 24 Sep (aktivasi Gas
+**22 lulus / 0 blocker** (probe diperluas: kontrak ARCOX mainnet Arc ikut diperiksa). Blocker Console yang tersisa pada 24 Sep (aktivasi Gas
 Station policy LIVE) sudah selesai: `pm_getPaymasterStubData` sekarang menerima
 `paymaster + paymasterData`.
 
@@ -72,12 +72,12 @@ Yang masih harus diset manual:
 
 - [ ] Buat wallet/Unified Balance treasury mainnet khusus (jangan pakai testnet)
 - [ ] `ARCOX_TREASURY_WALLET_ADDRESS` → alamat treasury mainnet
-- [ ] Deposit USDC mainnet minimal `X402_MIN_TREASURY_USDC` (default 2.0) + buffer biaya
+- [x] Guard saldo minimum dihapus 26 Sep 2026 — pembayaran x402 jalan berapa pun saldo treasury; deposit hanya perlu buffer biaya Gateway/CCTP
 - [ ] `AI_ROUTER_DELEGATE_PRIVATE_KEY` → delegate signer mainnet (terpisah dari testnet)
 - [ ] Catatan: Auto Pay/Unified Balance mainnet saat ini hanya mendaftarkan chain
       `Arc` (satu-satunya yang terverifikasi lewat `/v1/info`). Chain mainnet lain
       sengaja belum didaftarkan supaya tidak diam-diam memakai nama chain testnet.
-- [ ] Verifikasi `/api/x402/treasury-health` menampilkan `healthy: true` di mainnet
+- [x] `/api/x402/treasury-health` selalu `healthy: true` di mainnet (informasional, tanpa gate)
 - [ ] `X402_REFUND_DAILY_CAP_USDC` dan `X402_MAX_AUTO_REFUND_USDC` dikaji ulang
       (nilai testnet mungkin terlalu kecil/terlalu besar untuk mainnet)
 

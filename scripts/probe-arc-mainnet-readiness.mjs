@@ -33,12 +33,20 @@ const CIRCLE_CONTRACTS = [
   ['Gateway Minter', '0x2222222d7164433c4C09B0b0D809a9b52C04C205'],
 ]
 
-// Kontrak ARCOX sendiri: saat ini hanya ada di testnet, wajib deploy ulang.
-const ARCOX_CONTRACTS = [
-  ['ARCOX Fee Router', '0xDf800310443BEB589CEf91A09854203Ea36e43a7'],
-  ['ARCOX AMM Router', '0x9f2443691bddd8343590c68e2a2cdec5fd0b6124'],
-  ['ARCOX Swap Adapter', '0xBBD70b01a1CAbc96d5b7b129Ae1AAabdf50dd40b'],
-  ['ERC-8183 Agentic Commerce', '0x0747EEf0706327138c69792bF28Cd525089e4583'],
+// Kontrak ARCOX yang SUDAH di-deploy ke Arc mainnet — harus ada kode di sini.
+// Sumber kebenaran: arcox-mcp/packages/runtime/deployments/*.json.
+// Catatan: alamat testnet (`0xDf800310…`, `0xBBD70b01…`) BUKAN alamat mainnet;
+// mencari alamat itu di Arc mainnet memang tidak akan ketemu.
+const ARCOX_MAINNET_CONTRACTS = [
+  ['ARCOX Fee Router (Arc)', '0x9Fd14A94bDbEFf73EDB22853cc77416B65E2A0c0'],
+  ['ARCOX Swap Adapter proxy (Arc)', '0x8bc25dB1feda8Fc5eB20d0117Ff1f965F2F4E29C'],
+  ['ARCOX Swap Adapter impl (Arc)', '0xA6EeE6c972825f7d746673D9a1E25Ca58BD11274'],
+]
+
+// Masih menunggu deploy ke mainnet (butuh dana gas / keputusan) — informasional.
+const ARCOX_PENDING_CONTRACTS = [
+  ['ARCOX AMM Router (testnet 0x9f24…6124)', '0x9f2443691bddd8343590c68e2a2cdec5fd0b6124'],
+  ['ERC-8183 Agentic Commerce (testnet 0x0747…4583)', '0x0747EEf0706327138c69792bF28Cd525089e4583'],
 ]
 
 const results = []
@@ -87,11 +95,15 @@ async function checkContracts() {
     const size = await codeAt(address)
     record(size > 0, `${label} ada`, `${address}${size ? ` (${size} byte)` : ' — kode kosong'}`)
   }
-  console.log('\n── Kontrak ARCOX (harus di-deploy ulang ke mainnet)')
-  for (const [label, address] of ARCOX_CONTRACTS) {
+  console.log('\n── Kontrak ARCOX mainnet (wajib ada kode)')
+  for (const [label, address] of ARCOX_MAINNET_CONTRACTS) {
     const size = await codeAt(address)
-    // Belum di-deploy = sesuai harapan saat ini; yang penting terlihat jelas.
-    record(null, `${label} ${size > 0 ? 'SUDAH ada' : 'belum di-deploy'}`, `${address} (alamat testnet — mainnet butuh alamat baru)`)
+    record(size > 0, `${label} ada`, `${address}${size ? ` (${size} byte)` : ' — KODE KOSONG, kontrak tidak ditemukan'}`)
+  }
+  console.log('\n── Kontrak ARCOX yang masih menunggu deploy ke mainnet (informasional)')
+  for (const [label, address] of ARCOX_PENDING_CONTRACTS) {
+    const size = await codeAt(address)
+    record(null, `${label} ${size > 0 ? 'SUDAH ada' : 'belum di-deploy'}`, address)
   }
 }
 
@@ -204,9 +216,11 @@ console.log(`  blocker : ${blockers.length}`)
 for (const blocker of blockers) console.log(`    ❌ ${blocker.label}${blocker.detail ? ` — ${blocker.detail}` : ''}`)
 for (const note of notes) console.log(`    • ${note.label}${note.detail ? ` — ${note.detail}` : ''}`)
 if (!blockers.length) {
-  console.log('\nSemua pemeriksaan read-only lolos. Langkah berikutnya: deploy kontrak ARCOX ke Arc mainnet,')
+  console.log('\nSemua pemeriksaan read-only lolos. Langkah berikutnya: isi env `*_MAINNET` (lihat .env.example),')
   console.log('treasury mainnet, lalu uji 1 pembayaran kecil — tetap menunggu konfirmasi operator.')
 }
-console.log('\nCatatan: kontrak ARCOX & treasury mainnet sengaja belum ada; itu pekerjaan berikutnya, bukan kegagalan probe.')
+console.log('\nCatatan: Fee Router Arc/Base/Arbitrum dan Swap Adapter Arc sudah ter-deploy (lihat')
+console.log('arcox-mcp/packages/runtime/deployments/). Swap Adapter Base/Arbitrum, AMM cirBTC, dan ERC-8183')
+console.log('masih menunggu dana gas / keputusan; itu pekerjaan berikutnya, bukan kegagalan probe.')
 
 process.exit(blockers.length ? 1 : 0)

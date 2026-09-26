@@ -514,8 +514,9 @@ export function getX402Stats() {
 }
 
 /**
- * Treasury unified-balance health with a short cache. Fail-open: when the
- * Gateway is unreachable we never block payments, we only report unknown.
+ * Treasury unified-balance health with a short cache. Informational only:
+ * x402 payments are never blocked on a low treasury balance, and when the
+ * Gateway is unreachable we report unknown instead of failing.
  */
 export async function x402TreasuryHealth({ force = false } = {}) {
   const cacheMs = Number(process.env.X402_TREASURY_HEALTH_CACHE_MS || 60_000)
@@ -524,13 +525,11 @@ export async function x402TreasuryHealth({ force = false } = {}) {
     const { readTreasuryUnifiedBalances } = await import('../services/aiRouterSpendService.mjs')
     const balances = await readTreasuryUnifiedBalances()
     const totalUsdc = Number(balances.totalUsdc || 0)
-    const minUsdc = Number(process.env.X402_MIN_TREASURY_USDC || 2.0)
     const value = {
       known: true,
-      healthy: totalUsdc >= minUsdc,
-      degraded: totalUsdc < minUsdc,
+      healthy: true,
+      degraded: false,
       totalUsdc,
-      minUsdc,
       byChain: balances.byChain || {},
       checkedAt: new Date().toISOString(),
     }
@@ -549,17 +548,6 @@ export async function x402TreasuryHealth({ force = false } = {}) {
     treasuryHealthCache.value = value
     return value
   }
-}
-
-/** Block invoice creation when the treasury cannot honor payments. */
-export async function assertX402TreasuryHealthy() {
-  if (String(process.env.X402_TREASURY_CHECK || 'auto') === 'off') return { ok: true }
-  const blockOnLow = String(process.env.X402_BLOCK_ON_LOW_TREASURY || 'true').toLowerCase() === 'true'
-  if (!blockOnLow) return { ok: true }
-  const health = await x402TreasuryHealth()
-  if (health.known === false) return { ok: true, health }
-  if (!health.healthy) return { ok: false, health }
-  return { ok: true, health }
 }
 
 export function publicInvoice(invoice) {
@@ -977,7 +965,7 @@ export function withArcoxX402(handler, config = {}) {
         invoices.set(invoice.invoiceId, invoice)
         invoices.set(invoice.paymentId, invoice)
         persistInvoices()
-        req.arcoxX402 = { mode: 'arc_real_testnet', invoice }
+        req.arcoxX402 = { mode: cfg.mode, invoice }
         return handler(req, res, next)
       }
       if (invoice && normalizeResource(invoice.resource) !== normalizeResource(resource)) {
@@ -1002,10 +990,6 @@ export function withArcoxX402(handler, config = {}) {
       // A direct MSCA invoice must be payer-bound. Legacy memo invoices are not
       // created implicitly for remote MCP requests anymore.
       return res.status(400).json({ error: 'Authenticated MSCA owner is required for x402 resource access' })
-    }
-    const treasury = await assertX402TreasuryHealthy()
-    if (!treasury.ok) {
-      return res.status(503).json({ error: 'x402 treasury balance is too low; payments are temporarily paused', treasury: treasury.health })
     }
     let invoice
     try {

@@ -86,6 +86,56 @@ export const CHAINS = {
       cirBTC: null,
     },
   },
+  // ── Chain mainnet non-Arc ──
+  // Read-only: saldo ERC-20/native + tujuan CCTP. MSCA sengaja TIDAK
+  // didaftarkan di sini — MSCA_SUPPORTED_CHAIN_KEYS tetap diambil dari
+  // registry jaringan aktif (mainnet saat ini hanya Arc). Semua alamat token di
+  // bawah diverifikasi on-chain lewat symbol()/decimals() sebelum dipakai.
+  'ethereum-mainnet': {
+    id: 1,
+    name: 'Ethereum',
+    shortName: 'ETH',
+    rpcUrl: process.env.ETH_MAINNET_RPC_URL || 'https://ethereum-rpc.publicnode.com',
+    explorerUrl: 'https://etherscan.io',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    transportSlug: 'ethereum',
+    tokens: {
+      USDC:   '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+      ETH:    null, // native
+      EURC:   '0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c',
+      cirBTC: null, // belum ada di mainnet
+    },
+  },
+  'base-mainnet': {
+    id: 8453,
+    name: 'Base',
+    shortName: 'BASE',
+    rpcUrl: process.env.BASE_MAINNET_RPC_URL || 'https://mainnet.base.org',
+    explorerUrl: 'https://basescan.org',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    transportSlug: 'base',
+    tokens: {
+      USDC:   '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+      ETH:    null, // native
+      EURC:   '0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42',
+      cirBTC: null,
+    },
+  },
+  'arbitrum-mainnet': {
+    id: 42161,
+    name: 'Arbitrum One',
+    shortName: 'ARB',
+    rpcUrl: process.env.ARB_MAINNET_RPC_URL || 'https://arb1.arbitrum.io/rpc',
+    explorerUrl: 'https://arbiscan.io',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    transportSlug: 'arbitrum',
+    tokens: {
+      USDC:   '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+      ETH:    null, // native
+      EURC:   null, // alamat EURC Arbitrum mainnet belum terverifikasi
+      cirBTC: null,
+    },
+  },
 }
 
 export const CHAIN_LIST = Object.entries(CHAINS).map(([key, c]) => ({

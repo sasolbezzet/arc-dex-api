@@ -1,7 +1,7 @@
 // ARCOX Card MCP tools — list owner-scoped test cards and spend at simulated
 // merchants. MCP execution is restricted to an OAuth-authenticated active MSCA
 // and requires explicit confirmation before a spend. In on-chain card mode,
-// settlement debits testnet USDC from that MSCA through the session key.
+// settlement debits mainnet USDC from that MSCA through the session key.
 
 import { getOwnerBalance, listCards, listCardTransactions, refundCardTransaction, spendWithCard } from '../cardSimulator.mjs'
 import { readCardRecords } from '../supabasePersistence.mjs'
@@ -109,7 +109,7 @@ export function registerCardTools(ctx) {
     }
   })
 
-  registerTool('arcox_card_spend', 'Authorize and settle a purchase with a test card at a simulated merchant. In on-chain mode this moves real testnet USDC from the Agent Wallet MSCA (session-key path). Requires explicit user confirmation.', {
+  registerTool('arcox_card_spend', 'Authorize and settle a purchase with a test card at a simulated merchant. In on-chain mode this moves real mainnet USDC from the Agent Wallet MSCA (session-key path). Requires explicit user confirmation.', {
     cardId: z.string().describe('Card id'),
     merchantId: z.string().describe('Merchant id from arcox_card_list_merchants'),
     amount: z.string().describe('Amount in USDC'),

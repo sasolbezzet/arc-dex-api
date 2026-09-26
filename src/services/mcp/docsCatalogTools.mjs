@@ -15,10 +15,10 @@ export function registerDocsCatalogTools(ctx) {
   const { registerTool, jsonText, mscaRequiredResult, z, resolveMsca, apiGet } = ctx
 
   const arcoxPages = [
-    { id: 'swap', title: 'Swap', purpose: 'Swap retail tokens on Arc Testnet from Agent Wallet (MSCA).', userInputs: ['tokenIn', 'tokenOut', 'amountIn'], actions: ['arcox_quote_swap', 'arcox_execute_swap'] },
-    { id: 'bridge', title: 'Bridge', purpose: 'Bridge USDC across Arc/Base/Arbitrum Sepolia via verified ArcoxRouter + CCTP.', userInputs: ['fromChain', 'toChain', 'token', 'amount'], actions: ['arcox_quote_bridge', 'arcox_execute_bridge', 'arcox_bridge_status', 'arcox_retry_bridge_mint'] },
+    { id: 'swap', title: 'Swap', purpose: 'Swap retail tokens on Arc Mainnet from Agent Wallet (MSCA).', userInputs: ['tokenIn', 'tokenOut', 'amountIn'], actions: ['arcox_quote_swap', 'arcox_execute_swap'] },
+    { id: 'bridge', title: 'Bridge', purpose: 'Bridge USDC across Arc/Base/Arbitrum via verified ArcoxRouter + CCTP.', userInputs: ['fromChain', 'toChain', 'token', 'amount'], actions: ['arcox_quote_bridge', 'arcox_execute_bridge', 'arcox_bridge_status', 'arcox_retry_bridge_mint'] },
     { id: 'send', title: 'Send', purpose: 'Send supported tokens to another address from the Agent Wallet.', userInputs: ['recipient', 'token', 'amount'], actions: ['arcox_quote_send', 'arcox_execute_send'] },
-    { id: 'pay', title: 'ARCOX Pay', purpose: 'Create and pay USDC invoice/payment requests on Arc Testnet.', userInputs: ['amount', 'merchantAddress'], actions: ['arcox_create_payment_request', 'arcox_quote_payment_request', 'arcox_pay_payment_request', 'arcox_check_payment_status'] },
+    { id: 'pay', title: 'ARCOX Pay', purpose: 'Create and pay USDC invoice/payment requests on Arc Mainnet.', userInputs: ['amount', 'merchantAddress'], actions: ['arcox_create_payment_request', 'arcox_quote_payment_request', 'arcox_pay_payment_request', 'arcox_check_payment_status'] },
     { id: 'intel', title: 'Intel', purpose: 'Read-only Arkham address/entity/token/portfolio intelligence through ARCOX API (x402 paid). No swap, bridge, send, buy, or sell execution.', userInputs: ['address/entity/token'], actions: ['arcox_intel_search', 'arcox_intel_get_address', 'arcox_intel_get_entity', 'arcox_intel_get_token', 'arcox_intel_get_balances', 'arcox_intel_get_portfolio', 'arcox_intel_get_portfolio_series', 'arcox_intel_get_flows', 'arcox_intel_get_history', 'arcox_intel_get_volume', 'arcox_intel_get_counterparties', 'arcox_intel_get_transfers', 'arcox_intel_get_global_transfers', 'arcox_intel_get_swaps', 'arcox_intel_get_risk', 'arcox_intel_get_loans', 'arcox_intel_get_network', 'arcox_intel_get_market', 'arcox_intel_get_solana_subaccounts', 'arcox_intel_get_hypercore', 'arcox_intel_get_polymarket', 'arcox_x402_pay_invoice'] },
     { id: 'ai_router', title: 'AI Router', purpose: 'Manage API keys, list models, call models, and inspect usage.', userInputs: ['prompt'], actions: ['get_ai_router_status', 'create_ai_api_key', 'list_ai_models', 'call_ai_model', 'get_usage_logs'] },
   ]
@@ -30,10 +30,12 @@ export function registerDocsCatalogTools(ctx) {
     { id: 'intel', page: 'intel', intentExamples: ['analyze address 0x...', 'check token btc', 'show wallet balances', 'show token holders'], requiredSlots: ['address/entity/token'], safeExecution: 'x402_paid_read' },
   ]
   const arcoxChainSupport = {
-    Arc_Testnet: { bridge: true, router: '0xDf800310443BEB589CEf91A09854203Ea36e43a7', circleWallet: true, aliases: ['arc', 'arc testnet'] },
-    Ethereum_Sepolia: { bridge: true, router: '0x53aB114FeE64b177B8D6066056DfD03Ea38D0ef1', circleWallet: false, aliases: ['ethereum', 'eth sepolia'] },
-    Base_Sepolia: { bridge: true, router: '0x9425cC5b3C8B9e0FCb35beBdE737B4365A614Acc', circleWallet: false, aliases: ['base', 'base sepolia'] },
-    Arbitrum_Sepolia: { bridge: true, router: '0x5dCAA895dDc7350cF0f9eb69E69536a4548b0cA7', circleWallet: false, aliases: ['arbitrum', 'arb sepolia'] },
+    Arc: { bridge: true, router: '0x9Fd14A94bDbEFf73EDB22853cc77416B65E2A0c0', circleWallet: true, aliases: ['arc', 'arc mainnet'] },
+    // Ethereum mainnet belum punya Fee Router ARCOX (alamat lama tidak punya
+    // kode on-chain), jadi bridge USDC lewat CCTP langsung.
+    Ethereum: { bridge: true, router: null, circleWallet: false, aliases: ['ethereum', 'ethereum mainnet'] },
+    Base: { bridge: true, router: '0xD858f073FA09834b1d64C165afC2757F1DF2f019', circleWallet: false, aliases: ['base', 'base mainnet'] },
+    Arbitrum: { bridge: true, router: '0xaF15a9fFdDB21A42Aa6175B8130aE69ce41C78F9', circleWallet: false, aliases: ['arbitrum', 'arbitrum mainnet'] },
   }
   const arcoxRetailRules = [
     'Always quote before swap, bridge, send, or invoice payment.',
@@ -42,8 +44,8 @@ export function registerDocsCatalogTools(ctx) {
     'Agent may prepare plans, but user-owned funds require explicit confirmation.',
   ]
   const arcoxDocsCatalog = [
-    { id: 'overview', title: 'ARCOX Overview', tags: ['dex', 'arc', 'wallet'], body: 'ARCOX DEX is a retail Arc Testnet app for swap, bridge, send, ARCOX Pay invoices, and agent workflows. Value-moving actions must quote before execution.' },
-    { id: 'pay', title: 'ARCOX Pay', tags: ['pay', 'invoice', 'usdc'], body: 'ARCOX Pay creates public USDC invoice/payment links on Arc Testnet. Invoice payment requires preview and confirmation.' },
+    { id: 'overview', title: 'ARCOX Overview', tags: ['dex', 'arc', 'wallet'], body: 'ARCOX DEX is a retail Arc Mainnet app for swap, bridge, send, ARCOX Pay invoices, and agent workflows. Value-moving actions must quote before execution.' },
+    { id: 'pay', title: 'ARCOX Pay', tags: ['pay', 'invoice', 'usdc'], body: 'ARCOX Pay creates public USDC invoice/payment links on Arc Mainnet. Invoice payment requires preview and confirmation.' },
     { id: 'bridge-retry', title: 'Bridge Retry', tags: ['bridge', 'retry', 'cctp'], body: 'CCTP bridge has approve, burn, attestation, and mint stages. If burn succeeded but mint is pending, retry mint instead of repeating the burn.' },
     { id: 'mcp-safety', title: 'MCP Safety Rules', tags: ['mcp', 'agent', 'safety'], body: 'Agents must call quote tools first, show preview, receive explicit confirmation, then execute with previewId and confirmationText.' },
     { id: 'intel-x402', title: 'Intel x402', tags: ['intel', 'x402', 'arkham'], body: 'ARCOX Intel is x402 paid: unpaid requests return an invoice; pay via arcox_x402_pay_invoice then retry with paymentId.' },
@@ -79,13 +81,13 @@ export function registerDocsCatalogTools(ctx) {
         { name: 'bridge', description: 'Quote and execute supported USDC CCTP bridge routes; attestation-ready destinations mint automatically or via arcox_retry_bridge_mint.' },
         { name: 'send', description: 'Quote and send supported Arc tokens from the Agent Wallet.' },
         { name: 'arcox_pay', description: 'Create/quote/pay/check ARCOX Pay invoice workflows.' },
-        { name: 'intel_x402', description: 'Read-only ARCOX Intel via Arkham API with Arc Testnet USDC x402 payment, including address/entity/token, market, transfer, HyperCore, and Polymarket analytics.' },
+        { name: 'intel_x402', description: 'Read-only ARCOX Intel via Arkham API with Arc Mainnet USDC x402 payment, including address/entity/token, market, transfer, HyperCore, and Polymarket analytics.' },
         { name: 'ai_router', description: 'Check AI Router status, create/revoke API keys, list models, call models, and inspect usage.' },
         { name: 'agentic_jobs', description: 'List/create/complete Agentic Economy jobs through the AI Router API.' },
       ],
       examplePrompts: [
         'show all wallet balances', 'quote bridge 1 usdc from arc to base', 'check auto mint worker status for 0xBURN_TX',
-        'send 1 eurc from agent wallet to 0x...', 'retry bridge 0xBURN_TX from arbitrum sepolia to arc', 'quote swap 1 eurc to usdc',
+        'send 1 eurc from agent wallet to 0x...', 'retry bridge 0xBURN_TX from arbitrum mainnet to arc', 'quote swap 1 eurc to usdc',
         'create payment request 10 usdc to 0x...', 'check x402 invoice arcox_x402_...', 'list ai router models', 'call ai router model with prompt ...',
       ],
     }) }] }
@@ -101,13 +103,13 @@ export function registerDocsCatalogTools(ctx) {
         { name: 'bridge', description: 'Quote and execute supported USDC CCTP bridge routes; attestation-ready destinations mint automatically or via arcox_retry_bridge_mint.' },
         { name: 'send', description: 'Quote and send supported Arc tokens from the Agent Wallet.' },
         { name: 'arcox_pay', description: 'Create/quote/pay/check ARCOX Pay invoice workflows.' },
-        { name: 'intel_x402', description: 'Read-only ARCOX Intel via Arkham API with Arc Testnet USDC x402 payment, including address/entity/token, market, transfer, HyperCore, and Polymarket analytics.' },
+        { name: 'intel_x402', description: 'Read-only ARCOX Intel via Arkham API with Arc Mainnet USDC x402 payment, including address/entity/token, market, transfer, HyperCore, and Polymarket analytics.' },
         { name: 'ai_router', description: 'Check AI Router status, create/revoke API keys, list models, call models, and inspect usage.' },
         { name: 'agentic_jobs', description: 'List/create Agentic Economy jobs through the AI Router API.' },
       ],
       examplePrompts: [
         'show all wallet balances', 'quote bridge 1 usdc from arc to base', 'check auto mint worker status for 0xBURN_TX',
-        'send 1 eurc from agent wallet to 0x...', 'retry bridge 0xBURN_TX from arbitrum sepolia to arc', 'quote swap 1 eurc to usdc',
+        'send 1 eurc from agent wallet to 0x...', 'retry bridge 0xBURN_TX from arbitrum mainnet to arc', 'quote swap 1 eurc to usdc',
         'create payment request 10 usdc to 0x...', 'check x402 invoice arcox_x402_...', 'list ai router models', 'call ai router model with prompt ...',
       ],
     }) }],

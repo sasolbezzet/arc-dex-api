@@ -3604,8 +3604,10 @@ app.post('/api/send', apiLimiter, requireAuth, async (req, res) => {
 // Chain names use the CCTP config keys (Arc_Testnet, Base_Sepolia, ...).
 // Kunci mengikuti vokabulari CCTP/BridgeKit yang dipakai frontend (Arc_Testnet).
 // Jalur ini testnet-only; `arcBridgeChain()` gagal jelas di mainnet.
+// Getter dipakai supaya panggilan itu tidak dievaluasi saat module load
+// (di mainnet ia melempar 503 dan akan menjatuhkan server sebelum listen).
 const BRIDGE_CHAIN_DEF = {
-  Arc_Testnet: arcBridgeChain(),
+  get Arc_Testnet() { return arcBridgeChain() },
   Ethereum_Sepolia: BridgeKitChains.EthereumSepolia,
   Base_Sepolia: BridgeKitChains.BaseSepolia,
   Arbitrum_Sepolia: BridgeKitChains.ArbitrumSepolia,

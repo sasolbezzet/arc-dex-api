@@ -1,6 +1,5 @@
 import { Router } from 'express'
 import {
-  assertX402TreasuryHealthy,
   createX402Invoice,
   estimateUnifiedBalanceX402,
   getX402Invoice,
@@ -45,8 +44,6 @@ async function createInvoiceForOwner(req, res, body) {
   if (!authOwner) return res.status(401).json({ error: 'Active authenticated MSCA session required' })
   if (body.ownerWallet && String(body.ownerWallet).toLowerCase() !== authOwner.walletAddress) return res.status(403).json({ error: 'ownerWallet must match authenticated MSCA' })
   if (body.agentId && !await verifyAgentOwnership(body.agentId, authOwner.walletAddress)) return res.status(403).json({ error: 'Agent identity mismatch' })
-  const treasury = await assertX402TreasuryHealthy()
-  if (!treasury.ok) return res.status(503).json({ error: 'x402 treasury balance is too low; payments are temporarily paused', treasury: treasury.health })
   let invoice
   try {
     invoice = createX402Invoice({
@@ -210,8 +207,9 @@ function publicConfig() {
       maxAutoRefundUsdc: Number(process.env.X402_MAX_AUTO_REFUND_USDC || 1.0),
     },
     treasury: {
-      minUsdc: Number(process.env.X402_MIN_TREASURY_USDC || 2.0),
-      blockOnLow: String(process.env.X402_BLOCK_ON_LOW_TREASURY || 'true').toLowerCase() === 'true',
+      // Balance guard is removed: any treasury balance is accepted, so invoice
+      // creation is never blocked on a low Unified Balance.
+      blockOnLow: false,
     },
   }
 }

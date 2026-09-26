@@ -990,7 +990,7 @@ import { registerArcoxPayTools } from './mcp/arcoxPayTools.mjs'
 import { registerCardTools } from './mcp/cardTools.mjs'
 import { registerAiRouterTools } from './mcp/aiRouterTools.mjs'
 import { fetchAllChainBalances } from './multiChainBalance.mjs'
-import { CHAINS } from './chains.mjs'
+import { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } from './chains.mjs'
 import { arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
 import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_SDK_CHAIN_NAME, ARC_USDC_ADDRESS, arcCircleContract, arcContractAddress } from '../config/arcNetwork.mjs'
 
@@ -4099,8 +4099,12 @@ export function createMcpServer(userId, context = {}) {
     if (src !== 'session') {
       return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote send hanya untuk source=session.' }) }] }
     }
-    if (!CHAINS[fromChain]) {
-      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'unsupported_chain', fromChain: params.fromChain, supportedChains: Object.keys(CHAINS), message: 'fromChain wajib berupa chain yang didukung; tidak ada fallback ke Arc.' }) }] }
+    // Quote send hanya untuk Agent Wallet (MSCA) dan session key hanya ada di
+    // chain MSCA yang didukung jaringan aktif, jadi guard-nya memakai
+    // MSCA_SUPPORTED_CHAIN_KEYS — bukan seluruh registry saldo CHAINS (yang
+    // kini juga memuat chain mainnet read-only).
+    if (!CHAINS[fromChain] || !MSCA_SUPPORTED_CHAIN_KEYS.includes(fromChain)) {
+      return { content: [{ type: 'text', text: jsonText({ preview: false, rejected: true, reason: 'unsupported_chain', fromChain: params.fromChain, supportedChains: MSCA_SUPPORTED_CHAIN_KEYS, message: 'fromChain wajib berupa chain MSCA yang didukung; tidak ada fallback ke Arc.' }) }] }
     }
     const chain = CHAINS[fromChain]
     if (!chain.tokens[token] && token !== chain.nativeCurrency.symbol) {
@@ -4149,8 +4153,8 @@ export function createMcpServer(userId, context = {}) {
     if (source !== 'session') {
       return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
     }
-    if (!CHAINS[fromChain]) {
-      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'rejected', executed: false, action: 'send', chain: fromChain, walletType: 'MSCA', reason: 'unsupported_chain', fromChain: params.fromChain, supportedChains: Object.keys(CHAINS), message: 'fromChain wajib berupa chain yang didukung; tidak ada fallback ke Arc.' }) }] }
+    if (!CHAINS[fromChain] || !MSCA_SUPPORTED_CHAIN_KEYS.includes(fromChain)) {
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'rejected', executed: false, action: 'send', chain: fromChain, walletType: 'MSCA', reason: 'unsupported_chain', fromChain: params.fromChain, supportedChains: MSCA_SUPPORTED_CHAIN_KEYS, message: 'fromChain wajib berupa chain MSCA yang didukung; tidak ada fallback ke Arc.' }) }] }
     }
     const activeSession = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!activeSession) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, ...mscaRequiredResult() }) }] }

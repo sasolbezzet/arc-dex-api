@@ -113,7 +113,7 @@ Anti-abuse per owner:
 Analytics + treasury:
 
 - `GET /api/x402/stats` (owner-gated) — revenue, invoices by status, per-service usage, provider errors, refund pipeline state.
-- `GET /api/x402/treasury-health` — treasury Unified Balance across chains vs `X402_MIN_TREASURY_USDC`; when degraded and `X402_BLOCK_ON_LOW_TREASURY=true`, new invoice creation returns 503 until the balance recovers. `monitor.sh` alerts on the same endpoint.
+- `GET /api/x402/treasury-health` — treasury Unified Balance across chains (informational). The low-balance guard was removed: invoice creation never returns 503 for a low balance, and `healthy` stays `true` even at zero; `monitor.sh` only alerts when the Gateway itself is unreachable (`known: false`).
 - `GET /api/x402/openapi.json` — OpenAPI 3.0 document for the whole x402 + Intel surface.
 
 Client SDK:

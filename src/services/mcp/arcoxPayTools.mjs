@@ -33,7 +33,7 @@ export function registerArcoxPayTools(ctx) {
     if (invoice.token !== 'USDC' || invoice.network !== ARC_CHAIN_KEY) throw new Error(`Only USDC invoices on ${ARC_CHAIN_KEY} are supported.`)
   }
 
-  registerTool('arcox_create_payment_request', 'Create an ARCOX Pay USDC invoice/payment request on Arc Testnet.', {
+  registerTool('arcox_create_payment_request', 'Create an ARCOX Pay USDC invoice/payment request on Arc Mainnet.', {
     amount: z.string().describe('Amount in human readable USDC'),
     merchantAddress: z.string().describe('Merchant wallet address that receives the payment'),
     token: z.string().optional().describe('Token symbol. Default USDC'),
