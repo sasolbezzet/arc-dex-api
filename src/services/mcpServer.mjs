@@ -992,7 +992,7 @@ import { registerAiRouterTools } from './mcp/aiRouterTools.mjs'
 import { fetchAllChainBalances } from './multiChainBalance.mjs'
 import { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } from './chains.mjs'
 import { arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
-import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_SDK_CHAIN_NAME, ARC_USDC_ADDRESS, arcCircleContract, arcContractAddress } from '../config/arcNetwork.mjs'
+import { ARC_BALANCE_CHAIN_KEYS, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_EXTERNAL_CHAIN_KEYS, ARC_SDK_CHAIN_NAME, ARC_USDC_ADDRESS, IS_ARC_MAINNET, arcCircleContract, arcContractAddress, arcIrisBaseUrl, arcTokenAddress } from '../config/arcNetwork.mjs'
 
 // The MCP userId is the SIWE-verified EOA used only as the tenant/auth identity.
 // On-chain reads, quotes, and execution must use the explicitly mapped Agent
@@ -1079,6 +1079,13 @@ const CHAIN_SLUG_TO_KEY = {
   'base-sepolia': 'Base_Sepolia', 'base_sepolia': 'Base_Sepolia',
   'arbitrum-sepolia': 'Arbitrum_Sepolia', 'arbitrum_sepolia': 'Arbitrum_Sepolia',
   'hyperevm-testnet': 'HyperEVM_Testnet', 'hyperevm_testnet': 'HyperEVM_Testnet',
+  // Slug chain mainnet (dipakai MCP/console saat ARC_NETWORK=mainnet).
+  'arc-mainnet': ARC_SDK_CHAIN_NAME, 'arc_mainnet': ARC_SDK_CHAIN_NAME,
+  'ethereum-mainnet': 'Ethereum', 'eth-mainnet': 'Ethereum', 'ethereum_mainnet': 'Ethereum',
+  'base-mainnet': 'Base', 'base_mainnet': 'Base',
+  'arbitrum-mainnet': 'Arbitrum', 'arbitrum_mainnet': 'Arbitrum',
+  'hyperevm-mainnet': 'HyperEVM', 'hyperevm_mainnet': 'HyperEVM',
+  'solana-mainnet': 'Solana', 'solana_mainnet': 'Solana',
 }
 function chainKey(slug) {
   if (!slug) return undefined
@@ -1092,10 +1099,15 @@ function executionChainKey(slug) {
   const aliases = {
     arc: ARC_CHAIN_KEY,
     arc_testnet: ARC_CHAIN_KEY,
+    arc_mainnet: ARC_CHAIN_KEY,
     'eth-sepolia': 'ethereum-sepolia',
     ethereum_sepolia: 'ethereum-sepolia',
     base_sepolia: 'base-sepolia',
     arbitrum_sepolia: 'arbitrum-sepolia',
+    'ethereum-mainnet': 'ethereum-mainnet',
+    eth_mainnet: 'ethereum-mainnet',
+    base_mainnet: 'base-mainnet',
+    arbitrum_mainnet: 'arbitrum-mainnet',
   }
   return aliases[s] || s
 }
@@ -1119,33 +1131,86 @@ const BRIDGE_CCTP = {
     explorer: `${ARC_EXPLORER_URL}/tx/`,
     router: arcContractAddress('ARCOX_FEE_ROUTER_ADDRESS'),
   },
-  Ethereum_Sepolia: { chainId: 11155111, domain: 0, requiredFinalityThreshold: 1000, explorer: 'https://sepolia.etherscan.io/tx/' },
-  Base_Sepolia: {
-    chainId: 84532,
-    domain: 6,
-    explorer: 'https://sepolia.basescan.org/tx/',
-    rpcUrl: process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org',
-    usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
-    tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
-    messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
-    requiredFinalityThreshold: 1000,
-    // Frontend's verified Base Sepolia ArcoxRouter.
-    router: process.env.ARCOX_BASE_FEE_ROUTER_ADDRESS || '0x9425cC5b3C8B9e0FCb35beBdE737B4365A614Acc',
-  },
-  Arbitrum_Sepolia: {
-    chainId: 421614,
-    domain: 3,
-    requiredFinalityThreshold: 1000,
-    explorer: 'https://sepolia.arbiscan.io/tx/',
-    rpcUrl: process.env.ARB_SEPOLIA_RPC_URL || 'https://sepolia-rollup.arbitrum.io/rpc',
-    usdc: '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d',
-    tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
-    messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
-    requiredFinalityThreshold: 1000,
-    // Frontend's verified Arbitrum Sepolia ArcoxRouter.
-    router: process.env.ARCOX_ARBITRUM_FEE_ROUTER_ADDRESS || '0x5dCAA895dDc7350cF0f9eb69E69536a4548b0cA7',
-  },
-  HyperEVM_Testnet: { domain: 19, requiredFinalityThreshold: 1000, explorer: 'https://app.hyperliquid-testnet.xyz/explorer/tx/' },
+  ...(IS_ARC_MAINNET
+    ? {
+      // ── Destinasi/sumber mainnet ──
+      // CCTP v2 mainnet memakai TokenMessengerV2/MessageTransmitterV2 di alamat
+      // deterministik yang sama di seluruh EVM (diverifikasi on-chain). Router
+      // ARCOX hanya dipasang kalau alamatnya memang di-deploy di chain itu,
+      // jadi rute dari chain tanpa router gagal-tertutup.
+      Ethereum: {
+        chainId: 1,
+        domain: 0,
+        requiredFinalityThreshold: 1000,
+        explorer: 'https://etherscan.io/tx/',
+        rpcUrl: process.env.ETH_MAINNET_RPC_URL || 'https://ethereum-rpc.publicnode.com',
+        usdc: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+        tokenMessenger: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
+        messageTransmitter: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
+        // Fee Router ARCOX belum di-deploy di Ethereum mainnet (tanpa kode).
+      },
+      Base: {
+        chainId: 8453,
+        domain: 6,
+        requiredFinalityThreshold: 1000,
+        explorer: 'https://basescan.org/tx/',
+        rpcUrl: process.env.BASE_MAINNET_RPC_URL || 'https://mainnet.base.org',
+        usdc: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+        tokenMessenger: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
+        messageTransmitter: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
+        router: arcContractAddress('ARCOX_BASE_FEE_ROUTER_ADDRESS'),
+      },
+      Arbitrum: {
+        chainId: 42161,
+        domain: 3,
+        requiredFinalityThreshold: 1000,
+        explorer: 'https://arbiscan.io/tx/',
+        rpcUrl: process.env.ARB_MAINNET_RPC_URL || 'https://arb1.arbitrum.io/rpc',
+        usdc: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+        tokenMessenger: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
+        messageTransmitter: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
+        router: arcContractAddress('ARCOX_ARBITRUM_FEE_ROUTER_ADDRESS'),
+      },
+      HyperEVM: {
+        chainId: 999,
+        domain: 19,
+        requiredFinalityThreshold: 1000,
+        explorer: 'https://hyperevmscan.io/tx/',
+        rpcUrl: process.env.HYPEREVM_MAINNET_RPC_URL || 'https://rpc.hyperliquid.xyz/evm',
+        usdc: '0xb88339CB7199b77E23DB6E890353E22632Ba630f',
+        tokenMessenger: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
+        messageTransmitter: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
+      },
+    }
+    : {
+      Ethereum_Sepolia: { chainId: 11155111, domain: 0, requiredFinalityThreshold: 1000, explorer: 'https://sepolia.etherscan.io/tx/' },
+      Base_Sepolia: {
+        chainId: 84532,
+        domain: 6,
+        explorer: 'https://sepolia.basescan.org/tx/',
+        rpcUrl: process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org',
+        usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+        tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
+        messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
+        requiredFinalityThreshold: 1000,
+        // Frontend's verified Base Sepolia ArcoxRouter.
+        router: process.env.ARCOX_BASE_FEE_ROUTER_ADDRESS || '0x9425cC5b3C8B9e0FCb35beBdE737B4365A614Acc',
+      },
+      Arbitrum_Sepolia: {
+        chainId: 421614,
+        domain: 3,
+        requiredFinalityThreshold: 1000,
+        explorer: 'https://sepolia.arbiscan.io/tx/',
+        rpcUrl: process.env.ARB_SEPOLIA_RPC_URL || 'https://sepolia-rollup.arbitrum.io/rpc',
+        usdc: '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d',
+        tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
+        messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
+        requiredFinalityThreshold: 1000,
+        // Frontend's verified Arbitrum Sepolia ArcoxRouter.
+        router: process.env.ARCOX_ARBITRUM_FEE_ROUTER_ADDRESS || '0x5dCAA895dDc7350cF0f9eb69E69536a4548b0cA7',
+      },
+      HyperEVM_Testnet: { domain: 19, requiredFinalityThreshold: 1000, explorer: 'https://app.hyperliquid-testnet.xyz/explorer/tx/' },
+    }),
 }
 // The route is explicit opt-in so a deployment cannot start moving funds just
 // because code was updated. Enable it only after the router and destination
@@ -1155,7 +1220,9 @@ const BRIDGE_ZERO_BYTES32 = `0x${'0'.repeat(64)}`
 // CCTP Fast Transfer fees are route- and amount-dependent. Circle explicitly
 // says not to hardcode them: query Iris immediately before the burn and add a
 // small buffer so a fee change cannot degrade the message or revert the burn.
-const CCTP_FEE_API_BASE_URL = String(process.env.CCTP_FEE_API_BASE_URL || 'https://iris-api-sandbox.circle.com').replace(/\/+$/, '')
+// Iris mengikuti jaringan aktif: mainnet selalu `https://iris-api.circle.com`
+// (override sandbox/testnet diabaikan di mainnet oleh arcIrisBaseUrl).
+const CCTP_FEE_API_BASE_URL = arcIrisBaseUrl()
 const CCTP_FEE_BUFFER_BPS = Number(process.env.CCTP_FEE_BUFFER_BPS || '2000')
 // The pure calldata builder defaults to zero; production quote/execute always
 // supplies the fresh Circle-derived value explicitly. There is no production
@@ -1274,6 +1341,11 @@ export function resolveMscaBridgeFeeProfile(route) {
   if (to === ARC_CHAIN_KEY && from === 'base-sepolia') return 'base-to-arc-source'
   if (to === ARC_CHAIN_KEY && from === 'arbitrum-sepolia') return 'arbitrum-to-arc-source'
   if (from === ARC_CHAIN_KEY && to === 'arbitrum-sepolia') return 'arbitrum-destination'
+  // Mainnet: Base/Arbitrum mainnet tetap memakai profil paymaster yang sama
+  // supaya approval + burn memakai sponsor gas yang konsisten.
+  if (to === ARC_CHAIN_KEY && from === 'base-mainnet') return 'base-to-arc-source'
+  if (to === ARC_CHAIN_KEY && from === 'arbitrum-mainnet') return 'arbitrum-to-arc-source'
+  if (from === ARC_CHAIN_KEY && to === 'arbitrum-mainnet') return 'arbitrum-destination'
   if (from === ARC_CHAIN_KEY) return 'arc-bridge'
   return undefined
 }
@@ -1663,7 +1735,7 @@ export async function waitForCctpBridgeStatus(args, options = {}) {
 }
 
 export async function getCctpBridgeStatus({ burnTxHash, sourceDomain, destinationDomain, walletAddress, route, expectedBurnAmount }) {
-  const url = `https://iris-api-sandbox.circle.com/v2/messages/${sourceDomain}?transactionHash=${encodeURIComponent(burnTxHash)}`
+  const url = `${arcIrisBaseUrl()}/v2/messages/${sourceDomain}?transactionHash=${encodeURIComponent(burnTxHash)}`
   try {
     const response = await fetch(url, { headers: { Accept: 'application/json' } })
     if (!response.ok) return { status: 'pending', burnTxHash, verified: false, reason: 'cctp_message_pending' }
@@ -1910,6 +1982,8 @@ async function destinationMscaPreflight({ route, walletAddress, requireAuthoriza
     [ARC_SDK_CHAIN_NAME]: { id: ARC_CHAIN_ID, chainKey: ARC_CHAIN_KEY },
     Base_Sepolia: { id: 84532, chainKey: 'base-sepolia' },
     Arbitrum_Sepolia: { id: 421614, chainKey: 'arbitrum-sepolia' },
+    Base: { id: 8453, chainKey: 'base-mainnet' },
+    Arbitrum: { id: 42161, chainKey: 'arbitrum-mainnet' },
   }[route?.toKey]
   if (!destinationInfo) return { ok: false, reason: 'destination_msca_route_not_supported', message: 'Destination MSCA UserOperation belum mendukung chain tujuan ini.' }
   if (!route?.destination?.rpcUrl || !route.destination.messageTransmitter) return { ok: false, reason: 'destination_chain_not_configured' }
@@ -1919,6 +1993,8 @@ async function destinationMscaPreflight({ route, walletAddress, requireAuthoriza
     ...(route.toKey === ARC_SDK_CHAIN_NAME ? arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' }) : []),
     ...(route.toKey === 'Base_Sepolia' ? [process.env.BASE_SEPOLIA_RPC_URL, 'https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com'] : []),
     ...(route.toKey === 'Arbitrum_Sepolia' ? [process.env.ARB_SEPOLIA_RPC_URL, 'https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com'] : []),
+    ...(route.toKey === 'Base' ? [process.env.BASE_MAINNET_RPC_URL, 'https://mainnet.base.org'] : []),
+    ...(route.toKey === 'Arbitrum' ? [process.env.ARB_MAINNET_RPC_URL, 'https://arb1.arbitrum.io/rpc'] : []),
   ].filter(Boolean))]
   let code
   let sawSuccessfulRpcRead = false
@@ -2446,6 +2522,8 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, se
     [ARC_SDK_CHAIN_NAME]: ARC_CHAIN_KEY,
     Base_Sepolia: 'base-sepolia',
     Arbitrum_Sepolia: 'arbitrum-sepolia',
+    Base: 'base-mainnet',
+    Arbitrum: 'arbitrum-mainnet',
   }[route.toKey]
   if (!destinationKey) return { success: false, error: 'destination_msca_route_not_supported' }
   const alreadyProcessed = await destinationMintAlreadyProcessed({ status, route })
@@ -2566,7 +2644,7 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, se
       to: route.destination.messageTransmitter,
       value: 0n,
       data: encodeFunctionData({ abi: RECEIVE_MESSAGE_ABI, functionName: 'receiveMessage', args: [status.message, status.attestation] }),
-    }], { paymaster: true, chainKey: destinationKey, feeProfile: destinationKey === 'arbitrum-sepolia' ? 'arbitrum-destination' : destinationKey === ARC_CHAIN_KEY ? 'arc-destination' : 'base-destination', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
+    }], { paymaster: true, chainKey: destinationKey, feeProfile: ['arbitrum-sepolia', 'arbitrum-mainnet'].includes(destinationKey) ? 'arbitrum-destination' : destinationKey === ARC_CHAIN_KEY ? 'arc-destination' : 'base-destination', requireTransactionHash: true, requireSuccessfulTransactionReceipt: true })
     if (result.status === 'pending_confirmation') {
       const details = {
         fromChain: route.fromKey,
@@ -2813,15 +2891,20 @@ const X402_ARC_USDC = process.env.X402_USDC_ADDRESS || '0x3600000000000000000000
 const X402_TRANSFER_ABI = [{ type: 'function', name: 'transfer', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
 const X402_APPROVE_ABI = [{ type: 'function', name: 'approve', stateMutability: 'nonpayable', inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
 
-// Arc Testnet swap token registry + on-chain AMM route (USDC↔cirBTC).
-// The deployed router's swapWithFee implementation double-pulls from the
-// caller. Execution therefore targets the router's registered pool directly;
-// the pool pulls once from the MSCA and sends output back to it.
-const SWAP_TOKEN_ADDRESS = {
-  USDC: '0x3600000000000000000000000000000000000000',
-  EURC: '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
-  cirBTC: '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF',
-}
+// Swap token registry mengikuti jaringan aktif (bukan konstanta testnet).
+// cirBTC belum ada di Arc mainnet, jadi entrinya hilang di mainnet dan swap
+// cirBTC gagal-tertutup. Execution menargetkan pool router yang terdaftar:
+// router's swapWithFee double-pull dari caller, pool menarik sekali dari MSCA.
+// cirBTC hanya ada di Arc Testnet (registry mengembalikan null), jadi entri
+// cirBTC dipertahankan khusus testnet dan hilang di mainnet.
+const CIRBTC_TESTNET = '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF'
+const SWAP_TOKEN_ADDRESS = Object.fromEntries(
+  [
+    ['USDC', arcTokenAddress('USDC')],
+    ['EURC', arcTokenAddress('EURC')],
+    ['cirBTC', IS_ARC_MAINNET ? null : CIRBTC_TESTNET],
+  ].filter(([, address]) => Boolean(address)),
+)
 const SWAP_TOKEN_DECIMALS = { USDC: 6, EURC: 6, cirBTC: 8 }
 // Alamat kontrak ARCOX hanya dari env: mainnet wajib `ARCOX_AMM_ROUTER_MAINNET`,
 // jadi swap MSCA gagal-tertutup kalau router mainnet belum di-deploy.
@@ -3183,7 +3266,7 @@ export function createMcpServer(userId, context = {}) {
         EURC: chains[ARC_CHAIN_KEY]?.EURC ?? null,
         USYC: chains[ARC_CHAIN_KEY]?.USYC ?? null,
         cirBTC: chains[ARC_CHAIN_KEY]?.cirBTC ?? null,
-        supportedChains: [ARC_CHAIN_KEY, 'ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia'],
+        supportedChains: [ARC_CHAIN_KEY, ...ARC_EXTERNAL_CHAIN_KEYS],
         balancePolicy: {
           native: 'eth_getBalance dari MSCA; Arc native USDC memakai 18 decimals untuk gas',
           erc20: 'balanceOf(MSCA) memakai address kontrak resmi per chain; Arc ERC-20 USDC memakai 6 decimals',
@@ -3283,7 +3366,7 @@ export function createMcpServer(userId, context = {}) {
       source,
       walletAddress: session?.walletAddress || null,
       walletType: session ? 'MSCA' : null,
-      chains: { [ARC_CHAIN_KEY]: ARC_CHAIN_ID, 'ethereum-sepolia': 11155111, 'base-sepolia': 84532, 'arbitrum-sepolia': 421614, 'solana-devnet': 'solana' },
+      chains: { ...Object.fromEntries(ARC_BALANCE_CHAIN_KEYS.map(key => [key, CHAINS[key]?.id ?? null])), [IS_ARC_MAINNET ? 'solana-mainnet' : 'solana-devnet']: 'solana' },
       tokens: ['USDC', 'EURC', 'cirBTC'],
       sources: ['session'],
       reason,
@@ -3419,7 +3502,7 @@ export function createMcpServer(userId, context = {}) {
   // ── BRIDGE TOOLS (route → quote → confirm → execute) ──
 
   registerTool('arcox_quote_bridge', 'Get a bridge quote preview. Show preview to user, wait for confirmation, then call arcox_execute_bridge', {
-    fromChain: z.string().describe('Source chain (arc-testnet, base-sepolia, arbitrum-sepolia)'),
+    fromChain: z.string().describe(`Source chain (${ARC_CHAIN_KEY}, ${ARC_EXTERNAL_CHAIN_KEYS.join(', ')})`),
     toChain: z.string().describe('Destination chain'),
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol. Default USDC'),
@@ -3918,7 +4001,7 @@ export function createMcpServer(userId, context = {}) {
   })
 
   registerTool('arcox_bridge_status', 'Check attestation and destination mint status for an MSCA bridge burn transaction.', {
-    burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Source-chain burn transaction hash'),     fromChain: z.string().describe('Original source chain (arc-testnet or base-sepolia)'),
+    burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Source-chain burn transaction hash'),     fromChain: z.string().describe(`Original source chain (${ARC_CHAIN_KEY}, ${ARC_EXTERNAL_CHAIN_KEYS.filter(key => /^(base|arbitrum)/.test(key)).join(', ')})`),
     toChain: z.string().describe('Destination chain used by the original quote'),
   }, async (params) => {
     if (!ENABLE_MSCA_CCTP_BRIDGE) {
@@ -3926,7 +4009,7 @@ export function createMcpServer(userId, context = {}) {
     }
     const info = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!info) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
-    const route = bridgeConfig(params.fromChain, params.toChain || 'ethereum-sepolia')
+    const route = bridgeConfig(params.fromChain, params.toChain || (IS_ARC_MAINNET ? 'ethereum-mainnet' : 'ethereum-sepolia'))
     if (!route || !route.source?.router || !route.destination?.messageTransmitter) {
       return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, status: 'rejected', reason: 'bridge_route_not_supported_for_msca', message: 'Status bridge MSCA hanya tersedia untuk route CCTP yang memiliki router source dan MessageTransmitter destination.' }) }] }
     }
@@ -3994,7 +4077,7 @@ export function createMcpServer(userId, context = {}) {
   })
 
   registerTool('arcox_retry_bridge_mint', 'Retry destination receiveMessage for a confirmed MSCA bridge burn. This never burns again; it only polls attestation and mints the already-bound MSCA recipient.', {
-    burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Previously confirmed Arc router bridge transaction hash'),     fromChain: z.string().describe('Original source chain (arc-testnet or base-sepolia)'),
+    burnTxHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/).describe('Previously confirmed Arc router bridge transaction hash'),     fromChain: z.string().describe(`Original source chain (${ARC_CHAIN_KEY}, ${ARC_EXTERNAL_CHAIN_KEYS.filter(key => /^(base|arbitrum)/.test(key)).join(', ')})`),
     toChain: z.string().describe('Original destination chain'),
     confirmed: z.boolean().describe('Must be true to retry destination mint'),
     confirmationText: z.string().describe('Must be exactly yes or ya'),
@@ -4090,7 +4173,7 @@ export function createMcpServer(userId, context = {}) {
     to: z.string().describe('Recipient address'),
     amount: z.string().describe('Amount in human readable'),
     token: z.string().optional().describe('Token symbol. Default USDC'),
-    fromChain: z.string().describe('Source chain (for example arc-testnet or base-sepolia). Required.'),
+    fromChain: z.string().describe(`Source chain (${ARC_CHAIN_KEY}, ${ARC_EXTERNAL_CHAIN_KEYS.join(', ')}). Required.`),
     source: z.string().optional().describe('session (MSCA Agent Wallet)'),
   }, async (params) => {
     const token = String(params.token || 'USDC').toUpperCase()

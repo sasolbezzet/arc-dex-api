@@ -6,7 +6,7 @@ import { verifyOwnerToken } from '../services/authToken.mjs'
 import { buildAgentMemo, submitAgentMemoProof } from '../services/arcMemoService.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
 import { ARC_RPC_LOG_CHUNK_SIZE, arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
-import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_GATEWAY_KEY, ARC_USDC_ADDRESS, arcCircleApiKey, arcCircleContract, arcGatewayBaseUrl } from '../config/arcNetwork.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_GATEWAY_KEY, ARC_USDC_ADDRESS, arcCircleApiKey, arcCircleBaseUrl, arcCircleContract, arcGatewayBaseUrl } from '../config/arcNetwork.mjs'
 import { readX402Invoice, scheduleWebhookEventUpsert, scheduleX402InvoiceUpsert, shadowReadWebhookEvent } from '../services/supabasePersistence.mjs'
 import { claimWebhookEvent, completeWebhookEvent } from '../services/supabaseOperationalState.mjs'
 
@@ -133,7 +133,7 @@ export function x402Config() {
     chainId: Number(process.env.X402_CHAIN_ID || ARC_CHAIN_ID),
     usdcAddress: ARC_USDC,
     circleEnvironment: process.env.CIRCLE_ENV || 'testnet',
-    circleBaseUrl: process.env.CIRCLE_BASE_URL || 'https://api-sandbox.circle.com',
+    circleBaseUrl: arcCircleBaseUrl(),
     circleTreasuryWalletId: process.env.CIRCLE_X402_TREASURY_WALLET_ID || '',
     circleTreasuryAddress: treasuryAddress(),
     memoContract: ARC_MEMO_CONTRACT,
@@ -858,7 +858,7 @@ export function estimateUnifiedBalanceX402(invoiceId, input = {}) {
     amountBaseUnits: invoice.amountBaseUnits || amountToBaseUnits(invoice.uniqueAmount),
     destinationChain: ARC_GATEWAY_KEY,
     recipient: invoice.recipient,
-    route: input.route || 'Circle Gateway Unified Balance -> Arc Testnet USDC',
+    route: input.route || `Circle Gateway Unified Balance -> ${ARC_GATEWAY_KEY} USDC`,
     fees: input.fees || [],
     delegateStatus: input.delegateStatus || 'must_be_ready_before_spend',
     settlement: 'not_paid_until_onchain_transfer_or_gateway_webhook',

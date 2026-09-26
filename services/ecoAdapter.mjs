@@ -1,4 +1,8 @@
-const DEFAULT_DESTINATION_CHAIN = 'arc-testnet'
+import { ARC_CHAIN_KEY } from '../src/config/arcNetwork.mjs'
+
+// Rute Eco default menyasar chain Arc yang sedang aktif (`arc-mainnet` di
+// mainnet, `arc-testnet` di testnet).
+const DEFAULT_DESTINATION_CHAIN = ARC_CHAIN_KEY
 const DEFAULT_TOKEN = 'USDC'
 const ECO_QUOTES_API = process.env.ECO_QUOTES_API_URL || 'https://quotes.eco.com/api/v3/quotes/single'
 const ECO_DAPP_ID = process.env.ECO_DAPP_ID || 'arcox-pay'

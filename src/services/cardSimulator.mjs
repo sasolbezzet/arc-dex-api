@@ -24,7 +24,7 @@ import {
   scheduleCardTransactionUpsert,
 } from './supabasePersistence.mjs'
 import { logActivity } from './vaultStore.mjs'
-import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
+import { ARC_CHAIN_KEY, ARC_CHAIN_NAME } from '../config/arcNetwork.mjs'
 
 export const CARD_CONFIG = Object.freeze({
   mode: 'hybrid', // 'hybrid' = balance syncs from MSCA on-chain USDC ; 'simulated' via env CARDS_SYNC_ONCHAIN=false
@@ -272,7 +272,7 @@ export function listMerchants() {
 
 export function fundTestBalance(owner, amountUsdc) {
   if (onchainModeEnabled()) {
-    const error = new Error('Balance is on-chain linked to the MSCA wallet; deposit USDC on Arc Testnet to the MSCA address to fund the card. Virtual top-up is disabled in on-chain mode.')
+    const error = new Error(`Balance is on-chain linked to the MSCA wallet; deposit USDC on ${ARC_CHAIN_NAME} to the MSCA address to fund the card. Virtual top-up is disabled in on-chain mode.`)
     error.statusCode = 400
     throw error
   }

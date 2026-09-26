@@ -4,7 +4,7 @@ import { validateSession, createApproval, listApprovals, updateApprovalStatus } 
 import { getSessionKeyInfo } from '../services/vaultStore.mjs'
 import { sendViaSession } from '../services/sessionKeyService.mjs'
 import { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } from '../services/chains.mjs'
-import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
+import { ARC_CHAIN_KEY, resolveMscaChainKey } from '../config/arcNetwork.mjs'
 
 const router = Router()
 const QUOTE_TTL_MS = 5 * 60 * 1000
@@ -30,8 +30,7 @@ async function requireMsca(req, res, next) {
 
 function normalizeChain(value) {
   const key = String(value || ARC_CHAIN_KEY).trim().toLowerCase()
-  const aliases = { arc: ARC_CHAIN_KEY, arc_testnet: ARC_CHAIN_KEY, base: 'base-sepolia', base_sepolia: 'base-sepolia', arbitrum: 'arbitrum-sepolia', arbitrum_sepolia: 'arbitrum-sepolia' }
-  return aliases[key] || key
+  return resolveMscaChainKey(key)
 }
 
 function amountUnits(amount, token) {

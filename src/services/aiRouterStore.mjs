@@ -4,6 +4,7 @@ import { atomicWriteJsonFile, readJsonFile } from './jsonFileStore.mjs'
 import { treasuryAddress as configuredTreasuryAddress } from '../config/treasury.mjs'
 import { scheduleAiUsageUpsert } from './supabasePersistence.mjs'
 import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
+import { UNIFIED_BALANCE_CHAIN_NAMES } from './gatewayDelegateService.mjs'
 
 const DB_FILE = process.env.AI_ROUTER_DB || './ai-router-db.json'
 const state = globalThis.__arcoxAiRouterStore || load()
@@ -297,7 +298,8 @@ export function getPolicy(ownerAddress) {
   }
   if (current.enabled && current.delegateAddress?.toLowerCase() === owner) {
     current.delegateStatus = 'ready'
-    current.delegateChains = ['Arc_Testnet', 'Base_Sepolia', 'Ethereum_Sepolia', 'Arbitrum_Sepolia'].map(chain => ({ chain, status: 'ready' }))
+    // Chain Unified Balance mengikuti jaringan aktif (mainnet: Arc saja).
+    current.delegateChains = UNIFIED_BALANCE_CHAIN_NAMES.filter(name => name !== 'Solana_Devnet').map(chain => ({ chain, status: 'ready' }))
   }
   current.delegateStatus = current.delegateStatus || 'not_configured'
   if (current.delegateStatus === 'none') current.delegateStatus = 'not_configured'
@@ -332,7 +334,7 @@ export function setPolicy(ownerAddress, input = {}) {
 }
 
 function normalizeDelegateChains(value) {
-  const supported = new Set(['Arc_Testnet', 'Base_Sepolia', 'Ethereum_Sepolia', 'Arbitrum_Sepolia', 'Solana_Devnet'])
+  const supported = new Set(UNIFIED_BALANCE_CHAIN_NAMES)
   if (!Array.isArray(value)) return []
   return value
     .filter(item => supported.has(String(item?.chain || '')))

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 // fresh module instance (cache-busting query), and runs all assertions inside
 // the applied-env window before restoring the previous values.
 
-const ENV_NAMES = ['ARC_NETWORK', 'ARC_CHAIN_ID', 'CIRCLE_GATEWAY_BASE_URL', 'CIRCLE_API_KEY', 'CIRCLE_API_KEY_MAINNET', 'CIRCLE_CLIENT_KEY', 'CIRCLE_CLIENT_KEY_LIVE', 'ARCOX_FEE_ROUTER_ADDRESS', 'ARCOX_FEE_ROUTER_ADDRESS_MAINNET']
+const ENV_NAMES = ['ARC_NETWORK', 'ARC_CHAIN_ID', 'CIRCLE_GATEWAY_BASE_URL', 'CIRCLE_API_KEY', 'CIRCLE_API_KEY_MAINNET', 'CIRCLE_CLIENT_KEY', 'CIRCLE_CLIENT_KEY_LIVE', 'ARCOX_FEE_ROUTER_ADDRESS', 'ARCOX_FEE_ROUTER_ADDRESS_MAINNET', 'CIRCLE_IRIS_BASE_URL', 'CCTP_FEE_API_BASE_URL', 'ARC_CIRCLE_WALLET_BLOCKCHAIN', 'SOLANA_DEVNET_RPC', 'SOLANA_MAINNET_RPC']
 
 async function withRegistry(env, fn) {
   const previous = new Map(ENV_NAMES.map(name => [name, process.env[name]]))
@@ -167,5 +167,77 @@ test('MSCA chain support is Arc-only on mainnet', async () => {
   })
   await withRegistry({ ARC_NETWORK: 'mainnet' }, (arc) => {
     assert.deepEqual(arc.arcNetwork().mscaChainKeys, ['arc-mainnet'])
+  })
+})
+
+test('Iris base URL never falls back to the sandbox on mainnet', async () => {
+  await withRegistry({}, (arc) => {
+    assert.equal(arc.arcIrisBaseUrl(), 'https://iris-api-sandbox.circle.com')
+    assert.equal(arc.arcIrisBaseUrl({ CCTP_FEE_API_BASE_URL: 'https://iris.example.test' }), 'https://iris.example.test')
+  })
+  await withRegistry({ ARC_NETWORK: 'mainnet' }, (arc) => {
+    assert.equal(arc.arcIrisBaseUrl(), 'https://iris-api.circle.com')
+    // Override produksi tetap dipakai, tapi sandbox tidak pernah menang.
+    assert.equal(arc.arcIrisBaseUrl({ CIRCLE_IRIS_BASE_URL: 'https://iris.internal' }), 'https://iris.internal')
+    assert.equal(arc.arcIrisBaseUrl({ CCTP_FEE_API_BASE_URL: 'https://iris-api-sandbox.circle.com' }), 'https://iris-api.circle.com')
+  })
+})
+
+test('CCTP chain registry follows the active network (mainnet names are not testnet names)', async () => {
+  await withRegistry({}, (arc) => {
+    assert.deepEqual(arc.arcCctpDomains(), { Arc_Testnet: 26, Ethereum_Sepolia: 0, Base_Sepolia: 6, Arbitrum_Sepolia: 3, HyperEVM_Testnet: 19 })
+    assert.equal(arc.arcCctpChain('Arc_Testnet').tokenMessenger, '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA')
+    assert.equal(arc.arcCctpChain('Arc_Testnet').explorer, 'https://testnet.arcscan.app/tx/')
+    // Nama chain mainnet tidak pernah ada di registry testnet.
+    assert.equal(arc.arcCctpChain('Arc'), null)
+    assert.equal(arc.arcCctpChain('Base'), null)
+  })
+  await withRegistry({ ARC_NETWORK: 'mainnet' }, (arc) => {
+    assert.deepEqual(arc.arcCctpDomains(), { Arc: 26, Ethereum: 0, Base: 6, Arbitrum: 3, HyperEVM: 19 })
+    // CCTP v2 mainnet memakai alamat deterministik yang sama di seluruh EVM.
+    for (const name of ['Arc', 'Ethereum', 'Base', 'Arbitrum', 'HyperEVM']) {
+      assert.equal(arc.arcCctpChain(name).tokenMessenger, '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d')
+      assert.equal(arc.arcCctpChain(name).messageTransmitter, '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64')
+    }
+    assert.equal(arc.arcCctpChain('Arc').chainId, 5042)
+    assert.equal(arc.arcCctpChain('Base_Sepolia'), null)
+    assert.equal(arc.arcCctpChain('Arc').explorer, 'https://explorer.arc.io/tx/')
+  })
+})
+
+test('Solana CCTP and Circle wallet blockchain follow the active network', async () => {
+  await withRegistry({}, (arc) => {
+    const solana = arc.arcSolanaCctp({ SOLANA_DEVNET_RPC: 'https://solana.devnet.example' })
+    assert.equal(solana.domain, 5)
+    assert.equal(solana.rpc, 'https://solana.devnet.example')
+    assert.equal(solana.usdcMint, '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU')
+    assert.equal(arc.arcCircleWalletBlockchain(), 'ARC-TESTNET')
+  })
+  await withRegistry({ ARC_NETWORK: 'mainnet' }, (arc) => {
+    const solana = arc.arcSolanaCctp()
+    assert.equal(solana.domain, 5)
+    assert.equal(solana.rpc, 'https://api.mainnet-beta.solana.com')
+    assert.equal(solana.usdcMint, 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v')
+    assert.equal(arc.arcCircleWalletBlockchain(), 'ARC')
+    assert.equal(arc.arcCircleWalletBlockchain({ ARC_CIRCLE_WALLET_BLOCKCHAIN: 'ARC-MAINNET' }), 'ARC-MAINNET')
+  })
+})
+
+test('balance/readiness chain keys and MSCA aliases follow the active network', async () => {
+  await withRegistry({}, (arc) => {
+    assert.deepEqual(arc.ARC_EXTERNAL_CHAIN_KEYS, ['ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia'])
+    assert.deepEqual(arc.ARC_BALANCE_CHAIN_KEYS, ['arc-testnet', 'ethereum-sepolia', 'base-sepolia', 'arbitrum-sepolia'])
+    assert.equal(arc.resolveMscaChainKey('base'), 'base-sepolia')
+    assert.equal(arc.resolveMscaChainKey('base_sepolia'), 'base-sepolia')
+    assert.equal(arc.resolveMscaChainKey('arbitrum'), 'arbitrum-sepolia')
+  })
+  await withRegistry({ ARC_NETWORK: 'mainnet' }, (arc) => {
+    assert.deepEqual(arc.ARC_EXTERNAL_CHAIN_KEYS, ['ethereum-mainnet', 'base-mainnet', 'arbitrum-mainnet'])
+    assert.deepEqual(arc.ARC_BALANCE_CHAIN_KEYS, ['arc-mainnet', 'ethereum-mainnet', 'base-mainnet', 'arbitrum-mainnet'])
+    assert.equal(arc.resolveMscaChainKey('base'), 'base-mainnet')
+    assert.equal(arc.resolveMscaChainKey('base_sepolia'), 'base-mainnet')
+    assert.equal(arc.resolveMscaChainKey('arbitrum'), 'arbitrum-mainnet')
+    assert.equal(arc.resolveMscaChainKey('arc'), 'arc-mainnet')
+    assert.equal(arc.resolveMscaChainKey('arc-testnet'), 'arc-mainnet')
   })
 })

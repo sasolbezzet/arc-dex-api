@@ -1,4 +1,4 @@
-import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
+import { ARC_CHAIN_KEY, ARC_EXTERNAL_CHAIN_KEYS } from '../config/arcNetwork.mjs'
 
 /**
  * Agent-scoped readiness is intentionally independent from the OAuth protocol.
@@ -6,7 +6,10 @@ import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
  * both can be represented here without changing their authentication flow.
  */
 
-export const DESTINATION_READINESS_CHAINS = ['base-sepolia', 'arbitrum-sepolia']
+// Chain tujuan inbound bridge (Base/Arbitrum → Arc) yang diperiksa
+// kesiapannya, mengikuti jaringan aktif: testnet `base-sepolia`/
+// `arbitrum-sepolia`, mainnet `base-mainnet`/`arbitrum-mainnet`.
+export const DESTINATION_READINESS_CHAINS = ARC_EXTERNAL_CHAIN_KEYS.filter(key => /^(base|arbitrum)/.test(key))
 
 export function buildAgentReadiness({
   agentKey = '',

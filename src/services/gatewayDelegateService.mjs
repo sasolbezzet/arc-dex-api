@@ -1,6 +1,6 @@
 import { createPublicClient, defineChain, fallback, http, isAddress, parseAbi } from 'viem'
 import { resolveArcRpc } from '../config/arcRpc.mjs'
-import { ARC_CHAIN_ID, ARC_CHAIN_NAME, ARC_CCTP_DOMAIN, ARC_GATEWAY_CHAIN_NAME, ARC_GATEWAY_KEY, ARC_GATEWAY_NETWORK_LABEL, ARC_GATEWAY_WALLET, ARC_USDC_ADDRESS, arcGatewayBaseUrl } from '../config/arcNetwork.mjs'
+import { ARC_CHAIN_ID, ARC_CHAIN_NAME, ARC_CCTP_DOMAIN, ARC_GATEWAY_CHAIN_NAME, ARC_GATEWAY_KEY, ARC_GATEWAY_NETWORK_LABEL, ARC_GATEWAY_WALLET, ARC_USDC_ADDRESS, IS_ARC_MAINNET, arcGatewayBaseUrl } from '../config/arcNetwork.mjs'
 
 // Gateway Wallet berbeda per jaringan (testnet vs mainnet) → ambil dari registry.
 const GATEWAY_WALLET = ARC_GATEWAY_WALLET
@@ -8,13 +8,34 @@ const STATUS_ABI = parseAbi([
   'function isAuthorizedForBalance(address token, address depositor, address delegate) view returns (bool)',
 ])
 
-const CHAINS = {
-  // Kunci peta = vokabulari internal (Arc_Testnet/Arc); `gatewayChain` = nama
-  // chain di API Gateway ("Arc") yang dipakai saat mencocokkan /v1/info.
-  [ARC_GATEWAY_KEY]: chainConfig(ARC_CHAIN_ID, ARC_CHAIN_NAME, 'USDC', ARC_CCTP_DOMAIN, ARC_GATEWAY_CHAIN_NAME, ARC_GATEWAY_NETWORK_LABEL, ARC_USDC_ADDRESS, 'ARC_RPC_URL', resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' })),
-  Ethereum_Sepolia: chainConfig(11155111, 'Ethereum Sepolia', 'ETH', 0, 'Ethereum', 'Sepolia', '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', 'ETHEREUM_SEPOLIA_RPC', 'https://ethereum-sepolia-rpc.publicnode.com'),
-  Base_Sepolia: chainConfig(84532, 'Base Sepolia', 'ETH', 6, 'Base', 'Sepolia', '0x036CbD53842c5426634e7929541eC2318f3dCF7e', 'BASE_SEPOLIA_RPC', 'https://sepolia.base.org'),
-  Arbitrum_Sepolia: chainConfig(421614, 'Arbitrum Sepolia', 'ETH', 3, 'Arbitrum', 'Sepolia', '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d', 'ARBITRUM_SEPOLIA_RPC', ['https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com']),
+// Kunci peta = vokabulari internal (Arc_Testnet/Arc); `gatewayChain` = nama
+// chain di API Gateway ("Arc") yang dipakai saat mencocokkan /v1/info.
+const ARC_GATEWAY_CHAIN_ENTRY = chainConfig(ARC_CHAIN_ID, ARC_CHAIN_NAME, 'USDC', ARC_CCTP_DOMAIN, ARC_GATEWAY_CHAIN_NAME, ARC_GATEWAY_NETWORK_LABEL, ARC_USDC_ADDRESS, 'ARC_RPC_URL', resolveArcRpc({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' }))
+
+// Unified Balance / Auto Pay mengikuti chain yang sudah diverifikasi lewat
+// GET /v1/info untuk jaringan aktif. Mainnet saat ini hanya Arc, jadi chain
+// Sepolia/Devnet tidak pernah ditawarkan di produksi (gagal-tertutup, bukan
+// diam-diam memakai chain testnet).
+const CHAINS = IS_ARC_MAINNET
+  ? {
+    [ARC_GATEWAY_KEY]: ARC_GATEWAY_CHAIN_ENTRY,
+  }
+  : {
+    [ARC_GATEWAY_KEY]: ARC_GATEWAY_CHAIN_ENTRY,
+    Ethereum_Sepolia: chainConfig(11155111, 'Ethereum Sepolia', 'ETH', 0, 'Ethereum', 'Sepolia', '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', 'ETHEREUM_SEPOLIA_RPC', 'https://ethereum-sepolia-rpc.publicnode.com'),
+    Base_Sepolia: chainConfig(84532, 'Base Sepolia', 'ETH', 6, 'Base', 'Sepolia', '0x036CbD53842c5426634e7929541eC2318f3dCF7e', 'BASE_SEPOLIA_RPC', 'https://sepolia.base.org'),
+    Arbitrum_Sepolia: chainConfig(421614, 'Arbitrum Sepolia', 'ETH', 3, 'Arbitrum', 'Sepolia', '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d', 'ARBITRUM_SEPOLIA_RPC', ['https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com']),
+  }
+
+// Nama chain Unified Balance valid untuk jaringan aktif (termasuk Solana Devnet
+// yang hanya ada di testnet).
+export const UNIFIED_BALANCE_CHAIN_NAMES = IS_ARC_MAINNET
+  ? [...Object.keys(CHAINS)]
+  : [...Object.keys(CHAINS), 'Solana_Devnet']
+
+/** True kalau nama chain Unified Balance adalah chain Solana (testnet saja). */
+export function isSolanaUnifiedChainName(chain) {
+  return /solana/i.test(String(chain || ''))
 }
 
 let gatewayInfoCache = null

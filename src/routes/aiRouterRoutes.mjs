@@ -29,10 +29,10 @@ import { callChatCompletionWithFallback, publicModels, validateChatCompletionRou
 import { delegateConfig, estimateDelegatedAiSpend, spendDelegatedAiPayment } from '../services/aiRouterSpendService.mjs'
 import { listAgentIdentities, verifyAgentOwnership } from '../services/agentIdentityService.mjs'
 import { submitAgentMemoProof } from '../services/arcMemoService.mjs'
-import { getGatewayDelegateStatus } from '../services/gatewayDelegateService.mjs'
+import { getGatewayDelegateStatus, UNIFIED_BALANCE_CHAIN_NAMES } from '../services/gatewayDelegateService.mjs'
 import { fetchUnifiedBalanceSummary } from '../services/gatewayBalanceService.mjs'
 import { readAiUsage } from '../services/supabasePersistence.mjs'
-import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
+import { ARC_CHAIN_KEY, ARC_GATEWAY_KEY } from '../config/arcNetwork.mjs'
 
 const router = Router()
 const aiResponseCache = new Map()
@@ -90,7 +90,7 @@ router.get('/delegate-status', async (req, res) => {
   const delegateAddress = normalizeOwner(req.query.delegateAddress)
   const chain = String(req.query.chain || '')
   if (!/^0x[a-f0-9]{40}$/.test(ownerAddress) || !/^0x[a-f0-9]{40}$/.test(delegateAddress)) return res.status(400).json({ error: 'Valid ownerAddress and delegateAddress are required' })
-  if (!['Arc_Testnet', 'Ethereum_Sepolia', 'Base_Sepolia', 'Arbitrum_Sepolia'].includes(chain)) return res.status(400).json({ error: 'Unsupported Unified Balance chain' })
+  if (!UNIFIED_BALANCE_CHAIN_NAMES.includes(chain)) return res.status(400).json({ error: 'Unsupported Unified Balance chain' })
   try {
     res.json({ ok: true, ...(await getGatewayDelegateStatus({ ownerAddress, delegateAddress, chain })) })
   } catch (error) {
@@ -677,11 +677,12 @@ function paymentRequired(res, message, detail) {
 }
 
 function readyDelegateChains(policy, ownerAddress) {
+  const evmChains = UNIFIED_BALANCE_CHAIN_NAMES.filter(name => name !== 'Solana_Devnet')
   if (delegateConfig().delegateAddress?.toLowerCase() === String(ownerAddress || '').toLowerCase()) {
-    return ['Arc_Testnet', 'Base_Sepolia', 'Ethereum_Sepolia', 'Arbitrum_Sepolia']
+    return evmChains
   }
   const ready = (policy?.delegateChains || []).filter(item => item?.status === 'ready').map(item => item.chain)
-  return ready.length ? ready : policy?.delegateStatus === 'ready' ? ['Arc_Testnet'] : []
+  return ready.length ? ready : policy?.delegateStatus === 'ready' ? [ARC_GATEWAY_KEY] : []
 }
 
 async function refreshAutoPayReadiness(ownerAddress) {

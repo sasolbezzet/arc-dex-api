@@ -5,7 +5,7 @@ import { listRelatedAddresses, listAgentBindings, listAgentBindingsForIdentity, 
 import { getDailySpend } from '../services/agentSpendLedger.mjs'
 import { verifyMessage } from 'viem'
 import { verifyOwnerToken } from '../services/authToken.mjs'
-import { buildAgentReadiness } from '../services/agentReadiness.mjs'
+import { buildAgentReadiness, DESTINATION_READINESS_CHAINS } from '../services/agentReadiness.mjs'
 import { ARC_CHAIN_KEY } from '../config/arcNetwork.mjs'
 
 const vault = Router()
@@ -254,11 +254,11 @@ vault.get('/agents/:agentKey/readiness', requireAuth, async (req, res) => {
     const token = getAgentTokenStatus({ clientId, ownerAddress, walletAddress })
     const mcpSession = (listMcpSessions(ownerAddress) || []).find(session => session.clientId === clientId && session.active === true)
     const session = getSessionKey(walletAddress, { sweep: false })
-    const chainAuthorizationStatus = {
-      [ARC_CHAIN_KEY]: isSessionAuthorizedForChain(walletAddress, ARC_CHAIN_KEY) ? 'authorized' : 'failed',
-      'base-sepolia': isSessionAuthorizedForChain(walletAddress, 'base-sepolia') ? 'authorized' : 'failed',
-      'arbitrum-sepolia': isSessionAuthorizedForChain(walletAddress, 'arbitrum-sepolia') ? 'authorized' : 'failed',
-    }
+    // Chain tujuan mengikuti jaringan aktif (mainnet: base/arbitrum-mainnet).
+    const chainAuthorizationStatus = Object.fromEntries([
+      [ARC_CHAIN_KEY, isSessionAuthorizedForChain(walletAddress, ARC_CHAIN_KEY) ? 'authorized' : 'failed'],
+      ...DESTINATION_READINESS_CHAINS.map(key => [key, isSessionAuthorizedForChain(walletAddress, key) ? 'authorized' : 'failed']),
+    ])
     const readiness = buildAgentReadiness({
       agentKey: canonicalAgentKey,
       clientId,

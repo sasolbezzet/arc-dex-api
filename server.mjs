@@ -35,7 +35,7 @@ import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './s
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
 import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus } from './src/services/circleWalletWebhookService.mjs'
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
-import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, IS_ARC_MAINNET, arcCircleApiKey, arcContractAddress, arcGatewayBaseUrl, arcGatewayChains, arcNetwork } from './src/config/arcNetwork.mjs'
+import { ARC_CCTP_DOMAIN, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, ARC_SDK_CHAIN_NAME, IS_ARC_MAINNET, arcCctpChains, arcCctpDomains, arcCircleApiKey, arcCircleWalletBlockchain, arcContractAddress, arcGatewayBaseUrl, arcGatewayChains, arcIrisBaseUrl, arcNetwork, arcSolanaCctp, arcTokenAddress, resolveMscaChainKey } from './src/config/arcNetwork.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
 import { startRefundWorker } from './src/services/x402RefundWorker.mjs'
@@ -846,6 +846,8 @@ app.post('/api/session/activate-binding', apiLimiter, requireAuth, async (req, r
 const DESTINATION_CHAIN_CONFIG = {
   'base-sepolia': { id: 84532, rpcUrl: process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org' },
   'arbitrum-sepolia': { id: 421614, rpcUrl: process.env.ARB_SEPOLIA_RPC_URL || 'https://sepolia-rollup.arbitrum.io/rpc' },
+  'base-mainnet': { id: 8453, rpcUrl: process.env.BASE_MAINNET_RPC_URL || 'https://mainnet.base.org' },
+  'arbitrum-mainnet': { id: 42161, rpcUrl: process.env.ARB_MAINNET_RPC_URL || 'https://arb1.arbitrum.io/rpc' },
 }
 
 app.get('/api/session/destination-status', apiLimiter, requireAuth, async (req, res) => {
@@ -1107,18 +1109,28 @@ const arcPublicClient = createPublicClient({
   transport: arcHttpTransports(),
 })
 
-const TOKENS = {
-  cirBTC: '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF',
-  USDC: '0x3600000000000000000000000000000000000000',
-  EURC: '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
-  USYC: '0xe9185F0c5F296Ed1797AaE4238D26CCaBEadb86C',
-}
+// Alamat token selalu dari registry jaringan aktif (src/config/arcNetwork.mjs),
+// bukan konstanta testnet: token yang tidak ada di mainnet (mis. cirBTC)
+// otomatis hilang dari daftar sehingga jalur send/swap-nya gagal-tertutup.
+// cirBTC hanya ada di Arc Testnet; di mainnet token ini belum ada, jadi
+// entrinya dihilangkan supaya send/swap cirBTC gagal-tertutup.
+const CIRBTC_TESTNET = '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF'
+const cirBtcAddress = IS_ARC_MAINNET ? null : CIRBTC_TESTNET
+
+const TOKENS = Object.fromEntries(
+  [
+    ['USDC', arcTokenAddress('USDC')],
+    ['EURC', arcTokenAddress('EURC')],
+    ['USYC', arcTokenAddress('USYC')],
+    ['cirBTC', cirBtcAddress],
+  ].filter(([, address]) => Boolean(address)),
+)
 
 const SEND_TOKEN_MAP = {
   USDC: 'USDC',
-  EURC: '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
-  USYC: '0xe9185F0c5F296Ed1797AaE4238D26CCaBEadb86C',
-  cirBTC: '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF',
+  EURC: arcTokenAddress('EURC'),
+  USYC: arcTokenAddress('USYC'),
+  cirBTC: cirBtcAddress,
 }
 
 const TOKEN_DECIMALS = {
@@ -1241,57 +1253,39 @@ async function quoteCirBtcAmmRoute(tokenIn, tokenOut, amount) {
   }
 }
 
-const CCTP = {
-  Arc_Testnet: {
-    domain: 26,
-    usdc: '0x3600000000000000000000000000000000000000',
-    tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
-    messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
-    explorer: `${ARC_EXPLORER_URL}/tx/`,
-    chain: arcTestnet,
-  },
-  Ethereum_Sepolia: {
-    domain: 0,
-    usdc: '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238',
-    tokenMessenger: '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa',
-    messageTransmitter: '0xe737e5cebeeba77efe34d4aa090756590b1ce275',
-    explorer: 'https://sepolia.etherscan.io/tx/',
-    chain: defineChain({ id: 11155111, name: 'Sepolia', nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: ['https://ethereum-sepolia-rpc.publicnode.com'] } } }),
-  },
-  Base_Sepolia: {
-    domain: 6,
-    usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
-    tokenMessenger: '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa',
-    messageTransmitter: '0xe737e5cebeeba77efe34d4aa090756590b1ce275',
-    explorer: 'https://sepolia.basescan.org/tx/',
-    chain: defineChain({ id: 84532, name: 'Base Sepolia', nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: ['https://sepolia.base.org'] } } }),
-  },
-  Arbitrum_Sepolia: {
-    domain: 3,
-    usdc: '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d',
-    tokenMessenger: '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa',
-    messageTransmitter: '0xe737e5cebeeba77efe34d4aa090756590b1ce275',
-    explorer: 'https://sepolia.arbiscan.io/tx/',
-    chain: defineChain({ id: 421614, name: 'Arbitrum Sepolia', nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: ['https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com'] } } }),
-  },
-  HyperEVM_Testnet: {
-    domain: 19,
-    usdc: '0x2B3370eE501B4a559b57D449569354196457D8Ab',
-    tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
-    messageTransmitter: '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275',
-    explorer: 'https://app.hyperliquid-testnet.xyz/explorer/tx/',
-    chain: defineChain({ id: 998, name: 'HyperEVM Testnet', nativeCurrency: { name: 'HYPE', symbol: 'HYPE', decimals: 18 }, rpcUrls: { default: { http: ['https://rpc.hyperliquid-testnet.xyz/evm'] } } }),
-  },
-}
+// Chain CCTP mengikuti registry jaringan aktif (src/config/arcNetwork.mjs):
+// testnet memakai nama *Sepolia/*Testnet, mainnet memakai nama chain mainnet
+// (Arc/Ethereum/Base/Arbitrum/HyperEVM) yang dikirim frontend ke
+// /api/get-attestation. Tidak ada nilai testnet yang bocor ke mainnet dan
+// sebaliknya, jadi attestation/mint selalu menyasar jaringan yang benar.
+const CCTP = Object.fromEntries(
+  Object.entries(arcCctpChains()).map(([name, cfg]) => [
+    name,
+    {
+      domain: cfg.domain,
+      usdc: cfg.usdc,
+      tokenMessenger: cfg.tokenMessenger,
+      messageTransmitter: cfg.messageTransmitter,
+      explorer: cfg.explorer,
+      retry: cfg.retry,
+      isArc: Boolean(cfg.isArc),
+      // Entri Arc memakai chain Arc aktif supaya fallback transport RPC ikut
+      // terpakai; chain lain dibangun dari RPC registry.
+      chain: cfg.isArc
+        ? arcTestnet
+        : defineChain({
+          id: cfg.chainId,
+          name: cfg.name,
+          nativeCurrency: cfg.nativeCurrency,
+          rpcUrls: { default: { http: [...cfg.rpcUrls] } },
+        }),
+    },
+  ]),
+)
+// Nama chain CCTP untuk Arc pada jaringan aktif (`Arc_Testnet` / `Arc`).
+const ARC_CCTP_NAME = Object.keys(CCTP).find(name => CCTP[name].isArc) || ARC_SDK_CHAIN_NAME
 
-const SOLANA_CCTP = {
-  domain: 5,
-  usdcMint: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
-  tokenMessengerProgram: 'CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe',
-  messageTransmitterProgram: 'CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC',
-  rpc: process.env.SOLANA_DEVNET_RPC || 'https://api.devnet.solana.com',
-  explorer: 'https://explorer.solana.com/tx/',
-}
+const SOLANA_CCTP = arcSolanaCctp()
 
 const RECEIVE_MESSAGE_ABI = [{
   type: 'function', name: 'receiveMessage',
@@ -1304,12 +1298,9 @@ const RECEIVE_MESSAGE_ABI = [{
 // Arc/Solana: ~detik finality → 30s polling  |  Arbitrum: ~1-5mnt → ~9mnt buffer
 // Sepolia/Base: ~12-19mnt finality → ~22mnt buffer
 const RETRY_CFG = {
-  Arc_Testnet: { maxRetries: 60, fastMode: true },
-  Solana_Devnet: { maxRetries: 60, fastMode: true },
-  Arbitrum_Sepolia: { maxRetries: 300, fastMode: false },
-  Ethereum_Sepolia: { maxRetries: 700, fastMode: false },
-  Base_Sepolia: { maxRetries: 700, fastMode: false },
-  HyperEVM_Testnet: { maxRetries: 300, fastMode: false },
+  ...Object.fromEntries(Object.entries(CCTP).map(([name, cfg]) => [name, cfg.retry])),
+  // Solana tidak punya entri CCTP EVM, jadi retry-nya ditambahkan terpisah.
+  [IS_ARC_MAINNET ? 'Solana' : 'Solana_Devnet']: { maxRetries: 60, fastMode: true },
 }
 
 const circleClient = initiateDeveloperControlledWalletsClient({
@@ -2230,6 +2221,13 @@ function walletRecordId(record) {
 }
 
 async function getOrCreateWallet(metamaskAddr) {
+  // Wallet proxy Circle (App Kit) hanya tersedia di Arc Testnet: SDK Circle yang
+  // terpasang belum mengekspor chain Arc mainnet. Di mainnet jalur ini
+  // gagal-tertutup supaya tidak ada wallet `ARC-TESTNET` yang dibuat untuk
+  // pengguna produksi.
+  if (IS_ARC_MAINNET) {
+    throw Object.assign(new Error('Wallet proxy Circle (App Kit) belum tersedia di Arc mainnet: SDK Circle terpasang hanya mendukung Arc Testnet.'), { status: 503 })
+  }
   const addr = metamaskAddr.toLowerCase()
   const db = loadWallets()
   if (db[addr]) {
@@ -2245,7 +2243,7 @@ async function getOrCreateWallet(metamaskAddr) {
   }
   const ws = await circleClient.createWalletSet({ name: `user-${addr.slice(0,8)}` })
   const wr = await circleClient.createWallets({
-    blockchains: ['ARC-TESTNET'], count: 1,
+    blockchains: [arcCircleWalletBlockchain()], count: 1,
     walletSetId: ws && ws.data && ws.data.walletSet ? ws.data.walletSet.id : '', accountType: 'SCA',
   })
   const wallet = wr && wr.data && Array.isArray(wr.data.wallets) ? wr.data.wallets[0] : undefined
@@ -2257,7 +2255,7 @@ async function getOrCreateWallet(metamaskAddr) {
 }
 
 async function pollAttestation(domain, txHash, maxRetries = 60, fastMode = false) {
-  const url = `https://iris-api-sandbox.circle.com/v2/messages/${domain}?transactionHash=${txHash}`
+  const url = `${arcIrisBaseUrl()}/v2/messages/${domain}?transactionHash=${txHash}`
   console.log(`[iris] polling: domain=${domain} tx=${txHash.slice(0,12)}... (fast=${fastMode})`)
   let lastStatus = ''
   let consecutiveRateLimits = 0
@@ -2302,7 +2300,7 @@ async function pollAttestation(domain, txHash, maxRetries = 60, fastMode = false
 }
 
 async function checkAttestationOnce(domain, txHash) {
-  const url = `https://iris-api-sandbox.circle.com/v2/messages/${domain}?transactionHash=${txHash}`
+  const url = `${arcIrisBaseUrl()}/v2/messages/${domain}?transactionHash=${txHash}`
   const r = await fetch(url, { headers: { Accept: 'application/json' } })
   if (!r.ok) return { complete: false, status: `http_${r.status}` }
   const ct = r.headers.get('content-type') || ''
@@ -2491,8 +2489,7 @@ app.get('/api/balance/:address', apiLimiter, async (req, res) => {
   try {
     const target = normalizeAddress(req.params.address, 'address')
     const requestedChain = String(req.query?.chain || ARC_CHAIN_KEY).trim().toLowerCase()
-    const chainAliases = { arc: ARC_CHAIN_KEY, 'arc_testnet': ARC_CHAIN_KEY, base: 'base-sepolia', 'base_sepolia': 'base-sepolia', arbitrum: 'arbitrum-sepolia', 'arbitrum_sepolia': 'arbitrum-sepolia' }
-    const chainKey = chainAliases[requestedChain] || requestedChain
+    const chainKey = resolveMscaChainKey(requestedChain)
     if (chainKey !== ARC_CHAIN_KEY) {
       const { fetchAllChainBalances } = await import('./src/services/multiChainBalance.mjs')
       const balances = await fetchAllChainBalances(target)
@@ -3133,7 +3130,9 @@ app.post('/api/get-attestation', attestationLimiter, async (req, res) => {
     const { txHash, fromChain, toChain, once } = req.body
     if (!txHash || !fromChain) return res.status(400).json({ error: 'Missing params' })
     const safeTxHash = normalizeTxHash(txHash, 'txHash')
-    const domains = { Arc_Testnet: 26, Ethereum_Sepolia: 0, Base_Sepolia: 6, Arbitrum_Sepolia: 3, HyperEVM_Testnet: 19, Solana_Devnet: 5 }
+    // Domain CCTP mengikuti registry jaringan aktif. Mainnet memakai nama chain
+    // mainnet (Arc/Ethereum/Base/Arbitrum/HyperEVM) yang dikirim frontend.
+    const domains = { ...arcCctpDomains(), [IS_ARC_MAINNET ? 'Solana' : 'Solana_Devnet']: SOLANA_CCTP.domain }
     const domain = domains[fromChain]
     if (domain === undefined) return res.status(400).json({ error: 'Unknown chain: ' + fromChain })
     if (toChain && domains[toChain] === undefined) return res.status(400).json({ error: 'Unknown destination chain: ' + toChain })
@@ -3228,9 +3227,9 @@ app.post('/api/mint-cctp-solana', attestationLimiter, requireAuth, async (req, r
     const safeBurnTxHash = normalizeTxHash(burnTxHash, 'burnTxHash')
     if (!/^[1-9A-HJ-NP-Za-km-z]{32,64}$/.test(String(toAddress))) return res.status(400).json({ error: 'Invalid Solana address' })
     if (fromChain && !CCTP[fromChain]) return res.status(400).json({ error: 'Unknown fromChain: ' + fromChain })
-    const solDomain = CCTP[fromChain]?.domain ?? 26
-    console.log('[mint-cctp-solana] fromChain=' + (fromChain || 'Arc_Testnet') + ' domain=' + solDomain)
-    const solRetry = RETRY_CFG[fromChain || 'Arc_Testnet'] || { maxRetries: 60, fastMode: false }
+    const solDomain = CCTP[fromChain]?.domain ?? ARC_CCTP_DOMAIN
+    console.log('[mint-cctp-solana] fromChain=' + (fromChain || ARC_CCTP_NAME) + ' domain=' + solDomain)
+    const solRetry = RETRY_CFG[fromChain || ARC_CCTP_NAME] || { maxRetries: 60, fastMode: false }
     const att = await pollAttestation(solDomain, safeBurnTxHash, solRetry.maxRetries, solRetry.fastMode)
     if (!att) return res.status(400).json({ error: 'Attestation timeout. Please retry.' })
 
@@ -3267,7 +3266,7 @@ app.post('/api/mint-cctp-from-solana', apiLimiter, requireServerSignedMintAuth, 
       try {
         console.log(`[mint-from-solana] attempt ${attempt+1}/3`)
         txHash = await wc.writeContract({
-          address: CCTP.Arc_Testnet.messageTransmitter,
+          address: CCTP[ARC_CCTP_NAME].messageTransmitter,
           abi: RECEIVE_MESSAGE_ABI,
           functionName: 'receiveMessage',
           args: [att.message, att.attestation],
@@ -3280,7 +3279,7 @@ app.post('/api/mint-cctp-from-solana', apiLimiter, requireServerSignedMintAuth, 
         await new Promise(r => setTimeout(r, 3000))
       }
     }
-    res.json({ success: true, txHash, explorerUrl: CCTP.Arc_Testnet.explorer + txHash })
+    res.json({ success: true, txHash, explorerUrl: CCTP[ARC_CCTP_NAME].explorer + txHash })
   } catch(e) { console.error('[mint-from-solana]', e.message); res.status(500).json({ error: e.message }) }
 })
 
@@ -3601,18 +3600,28 @@ app.post('/api/send', apiLimiter, requireAuth, async (req, res) => {
 // Executes a full CCTP bridge from the user's Circle proxy wallet WITHOUT a
 // browser signature. Only valid for source='circle'. EOA bridges must still be
 // signed in the browser (burn tx) — this endpoint rejects source='eoa'.
-// Chain names use the CCTP config keys (Arc_Testnet, Base_Sepolia, ...).
-// Kunci mengikuti vokabulari CCTP/BridgeKit yang dipakai frontend (Arc_Testnet).
-// Jalur ini testnet-only; `arcBridgeChain()` gagal jelas di mainnet.
+// Kunci mengikuti vokabulari CCTP/BridgeKit yang dipakai frontend: mainnet
+// memakai nama chain mainnet (`Arc`/`Ethereum`/`Base`/`Arbitrum`/`HyperEVM`),
+// testnet tetap memakai nama *Sepolia/*Testnet. Jalur Circle-source ini butuh
+// Arc, dan `arcBridgeChain()` gagal jelas di mainnet karena SDK terpasang belum
+// mendukung Arc mainnet.
 // Getter dipakai supaya panggilan itu tidak dievaluasi saat module load
 // (di mainnet ia melempar 503 dan akan menjatuhkan server sebelum listen).
-const BRIDGE_CHAIN_DEF = {
-  get Arc_Testnet() { return arcBridgeChain() },
-  Ethereum_Sepolia: BridgeKitChains.EthereumSepolia,
-  Base_Sepolia: BridgeKitChains.BaseSepolia,
-  Arbitrum_Sepolia: BridgeKitChains.ArbitrumSepolia,
-  HyperEVM_Testnet: BridgeKitChains.HyperEVMTestnet,
-}
+const BRIDGE_CHAIN_DEF = IS_ARC_MAINNET
+  ? {
+    get Arc() { return arcBridgeChain() },
+    Ethereum: BridgeKitChains.Ethereum,
+    Base: BridgeKitChains.Base,
+    Arbitrum: BridgeKitChains.Arbitrum,
+    HyperEVM: BridgeKitChains.HyperEVM,
+  }
+  : {
+    get Arc_Testnet() { return arcBridgeChain() },
+    Ethereum_Sepolia: BridgeKitChains.EthereumSepolia,
+    Base_Sepolia: BridgeKitChains.BaseSepolia,
+    Arbitrum_Sepolia: BridgeKitChains.ArbitrumSepolia,
+    HyperEVM_Testnet: BridgeKitChains.HyperEVMTestnet,
+  }
 
 app.post('/api/bridge', apiLimiter, requireAuth, async (req, res) => {
   try {

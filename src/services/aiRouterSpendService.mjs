@@ -7,6 +7,7 @@ import { privateKeyToAccount } from 'viem/accounts'
 import bs58 from 'bs58'
 import { solanaTreasuryAddress, treasuryAddress } from '../config/treasury.mjs'
 import { ARC_GATEWAY_KEY, arcGatewayBaseUrl, arcGatewayChains } from '../config/arcNetwork.mjs'
+import { isSolanaUnifiedChainName } from './gatewayDelegateService.mjs'
 
 let kit
 let adapter
@@ -92,7 +93,7 @@ function delegateSignerAddress() {
  */
 export async function readTreasuryUnifiedBalances(sourceAccount = treasuryAddress()) {
   const sources = GATEWAY_CHAINS
-    .map(({ chain, domain }) => ({ depositor: chain === 'Solana_Devnet' ? solanaTreasuryAddress() : sourceAccount, domain }))
+    .map(({ chain, domain }) => ({ depositor: isSolanaUnifiedChainName(chain) ? solanaTreasuryAddress() : sourceAccount, domain }))
     .filter(item => Boolean(item.depositor))
   if (sources.length === 0) return { totalUsdc: '0', byChain: {} }
   const response = await gatewayRequest('/v1/balances', { token: 'USDC', sources })
@@ -221,7 +222,7 @@ async function delegatedBalances(sourceAccount, solanaSourceAccount = '') {
   const response = await gatewayRequest('/v1/balances', {
     token: 'USDC',
     sources: GATEWAY_CHAINS
-      .map(({ chain, domain }) => ({ depositor: chain === 'Solana_Devnet' ? solanaSourceAccount : sourceAccount, domain }))
+      .map(({ chain, domain }) => ({ depositor: isSolanaUnifiedChainName(chain) ? solanaSourceAccount : sourceAccount, domain }))
       .filter(item => Boolean(item.depositor)),
   })
   return new Map((response?.balances || []).map(item => [Number(item.domain), usdcUnits(String(item.balance || '0'))]))
@@ -249,8 +250,8 @@ async function delegatedAllocations(sourceAccount, solanaSourceAccount, amount, 
 
 function delegatedSources(sourceAccount, solanaSourceAccount, allocations) {
   const sources = []
-  const evmAllocations = allocations.filter(item => item.chain !== 'Solana_Devnet')
-  const solanaAllocations = allocations.filter(item => item.chain === 'Solana_Devnet')
+  const evmAllocations = allocations.filter(item => !isSolanaUnifiedChainName(item.chain))
+  const solanaAllocations = allocations.filter(item => isSolanaUnifiedChainName(item.chain))
   if (evmAllocations.length) sources.push({ adapter: getAdapter(), sourceAccount, allocations: evmAllocations })
   if (solanaAllocations.length) {
     if (!solanaSourceAccount || !delegateConfig().solanaEnabled) throw new Error('Solana Auto Pay signer is not configured')
@@ -261,7 +262,7 @@ function delegatedSources(sourceAccount, solanaSourceAccount, allocations) {
 
 function sourcePriority(chain, destinationChain = ARC_GATEWAY_KEY) {
   if (chain === destinationChain) return 0
-  return ({ Base_Sepolia: 1, Arbitrum_Sepolia: 2, Ethereum_Sepolia: 3, Solana_Devnet: 4, Arc_Testnet: 5 })[chain] ?? 9
+  return ({ Base: 1, Arbitrum: 2, Ethereum: 3, Solana: 4, Base_Sepolia: 1, Arbitrum_Sepolia: 2, Ethereum_Sepolia: 3, Solana_Devnet: 4, Arc_Testnet: 5 })[chain] ?? 9
 }
 
 async function gatewayRequest(path, body) {

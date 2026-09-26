@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { randomUUID, createHash } from 'crypto'
+import { ARC_CHAIN_KEY } from '../src/config/arcNetwork.mjs'
 
 const PROOF_DB = './x402-proof-db.json'
 
@@ -46,7 +47,7 @@ export function withX402PaymentRequired(handler, config = {}) {
     const requirement = {
       amount: String(config.price || '0.01'),
       token: String(config.token || process.env.X402_DEFAULT_TOKEN || 'USDC'),
-      network: String(config.network || process.env.X402_DEFAULT_NETWORK || 'arc-testnet'),
+      network: String(config.network || process.env.X402_DEFAULT_NETWORK || ARC_CHAIN_KEY),
       recipient: String(config.recipient || process.env.X402_FEE_WALLET || ''),
       resource,
       requestId: req.headers['x-arcox-payment-request-id'] || randomUUID(),

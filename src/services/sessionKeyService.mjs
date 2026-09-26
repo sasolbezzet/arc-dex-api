@@ -53,12 +53,14 @@ const BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 const DESTINATION_VERIFICATION_GAS_LIMITS = {
   [ARC_CHAIN_KEY]: 270_000n,
   'base-sepolia': 270_000n,
+  'base-mainnet': 270_000n,
   // Circle's Arbitrum bundler rejects verification gas whose actual use is
   // below 40% of the requested limit. This receiveMessage path measured
   // 55.6k-81.8k in the latest prechecks, so 130k retains execution headroom
   // while keeping the minimum observed efficiency above 40%; larger limits
   // (140k, 150k, 200k, and 600k) were rejected before submission.
   'arbitrum-sepolia': 130_000n,
+  'arbitrum-mainnet': 130_000n,
 }
 const CIRCLE_GAS_PRICE_LEVELS = ['medium', 'fast', 'slow']
 
@@ -1712,7 +1714,7 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
 export function buildUserOperationParams({ account, calls, chainKey, baseClient, feeProfile } = {}) {
   const params = { account, calls }
   const destinationBridge = ['arc-bridge', 'arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source', 'arc-pay'].includes(String(feeProfile || ''))
-  if (chainKey !== 'arbitrum-sepolia' && !destinationBridge) return params
+  if (!['arbitrum-sepolia', 'arbitrum-mainnet'].includes(chainKey) && !destinationBridge) return params
   return (async () => {
     // Use Circle's UserOperation gas-price recommendation first so the
     // destination operation matches the same envelope expected by Gas Station.
@@ -1774,7 +1776,7 @@ export function resolveSessionPaymasterMode({ chainKey, feeProfile, requested = 
   const profile = String(feeProfile || '')
   const arcSourceBridge = chainKey === ARC_CHAIN_KEY && ['arc-bridge', 'arbitrum-destination'].includes(profile)
   if (arcSourceBridge) return 'native'
-  const circleGasStation = ['arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source', 'arc-pay'].includes(profile) || chainKey === 'arbitrum-sepolia'
+  const circleGasStation = ['arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source', 'arc-pay'].includes(profile) || ['arbitrum-sepolia', 'arbitrum-mainnet'].includes(chainKey)
   return circleGasStation ? 'circle-gas-station' : 'default'
 }
 

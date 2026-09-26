@@ -14,6 +14,7 @@
 // `refund_approved` for a treasury operator to complete manually.
 import { getX402Invoice, persistX402Invoices, publicInvoice, getAllX402Invoices } from '../middleware/x402Middleware.mjs'
 import { treasuryAddress } from '../config/treasury.mjs'
+import { ARC_GATEWAY_KEY } from '../config/arcNetwork.mjs'
 import { scheduleRefundAuditLog } from './supabasePersistence.mjs'
 
 function refundCooldownMs() { return Number(process.env.X402_REFUND_COOLDOWN_MS || 5 * 60 * 1000) }
@@ -217,7 +218,7 @@ export async function executeRefund(invoiceId, options = {}) {
         sourceAccount: options.sourceAccount || treasuryAddress(),
         amount,
         recipient: invoice.ownerWallet,
-        destinationChain: 'Arc_Testnet',
+        destinationChain: ARC_GATEWAY_KEY,
         maxTotalDebit: (Number(amount) + 0.01).toFixed(6),
       })
     }
