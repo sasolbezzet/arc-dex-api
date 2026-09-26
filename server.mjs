@@ -2593,8 +2593,8 @@ app.get('/api/multi-balance/:address', apiLimiter, async (req, res) => {
 
 // ── Supported chains list ──
 app.get('/api/chains', (_req, res) => {
-  import('./src/services/chains.mjs').then(({ CHAIN_LIST }) => {
-    res.json({ chains: CHAIN_LIST })
+  import('./src/services/chains.mjs').then(({ ACTIVE_CHAIN_LIST }) => {
+    res.json({ chains: ACTIVE_CHAIN_LIST })
   }).catch(e => res.status(500).json({ error: e?.message }))
 })
 

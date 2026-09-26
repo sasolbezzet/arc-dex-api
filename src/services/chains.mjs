@@ -19,6 +19,7 @@ export {
   resolveArcChainKey,
   isArcChainKey,
 } from '../config/arcNetwork.mjs'
+import { ARC_BALANCE_CHAIN_KEYS } from '../config/arcNetwork.mjs'
 
 const arc = arcNetwork()
 
@@ -141,6 +142,13 @@ export const CHAINS = {
 export const CHAIN_LIST = Object.entries(CHAINS).map(([key, c]) => ({
   key, ...c,
 }))
+
+/**
+ * Daftar chain untuk permukaan API (`/api/chains`) sesuai jaringan aktif.
+ * Entri Sepolia/mainnet tetap ada di CHAINS sebagai rute baca, tapi mainnet
+ * tidak pernah mengiklankan chain Sepolia dan sebaliknya.
+ */
+export const ACTIVE_CHAIN_LIST = CHAIN_LIST.filter(chain => ARC_BALANCE_CHAIN_KEYS.includes(chain.key))
 
 /** ERC-20 balanceOf(address) calldata */
 export function erc20BalanceOfCalldata(walletAddress) {
