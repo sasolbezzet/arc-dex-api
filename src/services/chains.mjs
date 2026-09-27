@@ -26,7 +26,8 @@ const arc = arcNetwork()
 // Circle Modular Wallet/MSCA support is narrower than Circle Gas Station support.
 // Ethereum Sepolia can use other Circle wallet products/Gas Station, but it is
 // not an MSCA network and must never enter the passkey/session UserOperation flow.
-// Mainnet (scope saat ini) hanya mengizinkan Arc.
+// Mainnet: Arc, Base, dan Arbitrum (lihat developers.circle.com/wallets/
+// supported-blockchains; Gas Station policy ketiganya sudah aktif).
 export const MSCA_SUPPORTED_CHAIN_KEYS = [...arc.mscaChainKeys]
 
 export const CHAINS = {
@@ -88,10 +89,10 @@ export const CHAINS = {
     },
   },
   // ── Chain mainnet non-Arc ──
-  // Read-only: saldo ERC-20/native + tujuan CCTP. MSCA sengaja TIDAK
-  // didaftarkan di sini — MSCA_SUPPORTED_CHAIN_KEYS tetap diambil dari
-  // registry jaringan aktif (mainnet saat ini hanya Arc). Semua alamat token di
-  // bawah diverifikasi on-chain lewat symbol()/decimals() sebelum dipakai.
+  // Saldo ERC-20/native + tujuan CCTP + target MSCA (Base/Arbitrum, sesuai
+  // MSCA_SUPPORTED_CHAIN_KEYS). Ethereum mainnet tetap bukan target MSCA.
+  // Semua alamat token di bawah diverifikasi on-chain lewat symbol()/decimals()
+  // sebelum dipakai.
   'ethereum-mainnet': {
     id: 1,
     name: 'Ethereum',

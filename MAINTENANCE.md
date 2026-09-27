@@ -23,13 +23,25 @@ Rules that must stay true when editing network code:
   fail closed with `arcContractMissingMessage()` instead of sending a transaction to a
   testnet address.
 - Never read a Circle key across environments: `arcCircleApiKey()`/`arcCircleClientKey()`
-  return the LIVE key on mainnet with no sandbox fallback.
+  return the LIVE key on mainnet with no sandbox fallback. Entity secret is also
+  per environment: mainnet reads `CIRCLE_ENTITY_SECRET_MAINNET`
+  (`arcCircleEntitySecret()`), registered once with
+  `node --env-file=.env scripts/register-entity-secret-mainnet.mjs --confirm --write-env`.
+  Without it Circle answers "The entity secret has not been set yet" on every
+  Circle Wallet swap/bridge.
 - State is separated by chain key (`arc-testnet` vs `arc-mainnet`); session keys,
   agent bindings, and invoices never mix between networks.
-- The installed Circle SDK (`@circle-fin/app-kit`, `@circle-fin/bridge-kit`) only
-  supports Arc testnet. On mainnet the swap/bridge paths fail with `503`
-  (`assertArcSdkPath` in `server.mjs` and the AMM/swap guards in `mcpServer.mjs`)
-  rather than silently using testnet. Do not remove those guards to "make it work".
+- Circle SDK 1.15.x (`@circle-fin/app-kit` >=1.15.3, `@circle-fin/bridge-kit`
+  >=1.15.1, `@circle-fin/adapter-viem-v2` >=1.18.0) exports Arc mainnet:
+  `SwapChain.Arc`, `BridgeKitChains.Arc`, and chain name `Arc`. Mainnet paths use
+  those; testnet keeps `Arc_Testnet`/`ArcTestnet`. The helpers in `server.mjs`
+  (`arcSwapChain`, `arcBridgeChain`, `arcKitSwapChainName`) fail closed with `503`
+  if a future SDK downgrade loses the mainnet constants — never silently testnet.
+- Mainnet swap/bridge authenticate with the LIVE API key (`arcSwapApiKey()` →
+  `CIRCLE_API_KEY_MAINNET`); `KIT_KEY` is the legacy testnet credential.
+- MSCA (Agent Wallet) mainnet chains come from `mscaChainKeys` in the registry:
+  Arc, Base, Arbitrum (`ethereum-mainnet` intentionally excluded). All three have
+  an active Gas Station policy verified against the LIVE client key.
 - Gateway chain naming: the Circle Gateway API calls the Arc chain `Arc` on **both**
   networks (`/v1/info`); the `network` field (`Testnet`/`Mainnet`) is the
   discriminator. The internal app/MCP vocabulary stays `Arc_Testnet`/`Arc`
@@ -38,8 +50,8 @@ Rules that must stay true when editing network code:
 Verify before deploying a network change:
 
 ```bash
-npm test                 # 340 unit/regression
-npm run probe:mainnet    # read-only Arc mainnet pre-flight (19 lulus / 0 blocker)
+npm test                 # 344 unit/regression
+npm run probe:mainnet    # read-only Arc mainnet pre-flight (22 lulus / 0 blocker)
 PORT=3999 node --env-file=.env server.mjs   # boot smoke on a scratch port
 ```
 

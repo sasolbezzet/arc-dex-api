@@ -39,10 +39,15 @@ ditiru di mainnet adalah implementasi **terkini**, bukan alamat logic lama itu.
   `null` kalau `*_MAINNET` belum diisi, sehingga fitur gagal-tertutup.
 - Deployer mainnet memakai **key terpisah** dari testnet (`AGENT_PRIVATE_KEY`
   testnet tidak boleh dipakai). Simpan hanya di `.env` VPS (mode 600).
-- Jalur swap/bridge SDK Circle (`@circle-fin/app-kit`, `@circle-fin/bridge-kit`)
-  pada versi yang terpasang hanya mengenal Arc testnet. Di mainnet jalur itu
-  sengaja mengembalikan `503` (`assertArcSdkPath`), bukan diam-diam ke testnet.
-  Aktifkan kembali hanya setelah SDK mengekspor chain mainnet.
+- Jalur swap/bridge SDK Circle memakai versi yang mengekspor Arc mainnet
+  (`@circle-fin/app-kit` >=1.15.3 / `bridge-kit` >=1.15.1: `SwapChain.Arc`,
+  `BridgeKitChains.Arc`). Mainnet memakai `Arc`; kalau konstanta itu hilang
+  (mis. downgrade), jalurnya gagal-tertutup `503`, bukan diam-diam ke testnet.
+- Entity secret Circle terdaftar per environment. LIVE harus punya
+  `CIRCLE_ENTITY_SECRET_MAINNET`; tanpa itu Circle menolak setiap operasi
+  Circle Wallet dengan "The entity secret has not been set yet". Daftarkan sekali
+  lewat `node --env-file=.env scripts/register-entity-secret-mainnet.mjs --confirm --write-env`
+  (recovery file + salinan secret disimpan di `~/.arcox`, mode 600).
 - Tidak menyalin private key, state, atau invoice antara testnet dan mainnet.
   State sudah terpisah oleh chain key (`arc-testnet` vs `arc-mainnet`).
 

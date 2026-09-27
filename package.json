@@ -28,12 +28,13 @@
     "ws": "^8.21.0"
   },
   "dependencies": {
-    "@circle-fin/adapter-circle-wallets": "^1.3.2",
+    "@circle-fin/adapter-circle-wallets": "^1.8.0",
     "@circle-fin/adapter-solana-kit": "^1.5.1",
-    "@circle-fin/adapter-viem-v2": "^1.11.2",
-    "@circle-fin/app-kit": "^1.7.0",
+    "@circle-fin/adapter-viem-v2": "^1.18.0",
+    "@circle-fin/app-kit": "^1.15.3",
+    "@circle-fin/bridge-kit": "^1.15.1",
     "@circle-fin/developer-controlled-wallets": "^10.3.1",
-    "@circle-fin/modular-wallets-core": "^1.0.15",
+    "@circle-fin/modular-wallets-core": "^1.0.16",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@solana/kit": "^5.5.1",
     "@solana/spl-token": "^0.4.14",

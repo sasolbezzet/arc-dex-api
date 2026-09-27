@@ -161,12 +161,15 @@ test('chain aliases normalise to the active Arc chain key', async () => {
   })
 })
 
-test('MSCA chain support is Arc-only on mainnet', async () => {
+test('MSCA chain support matches Circle supported blockchains per network', async () => {
   await withRegistry({}, (arc) => {
     assert.deepEqual(arc.arcNetwork().mscaChainKeys, ['arc-testnet', 'base-sepolia', 'arbitrum-sepolia'])
   })
   await withRegistry({ ARC_NETWORK: 'mainnet' }, (arc) => {
-    assert.deepEqual(arc.arcNetwork().mscaChainKeys, ['arc-mainnet'])
+    // Circle mendukung MSCA di Arc, Base, dan Arbitrum mainnet (Gas Station
+    // policy ketiganya aktif). Ethereum mainnet tetap dikecualikan.
+    assert.deepEqual(arc.arcNetwork().mscaChainKeys, ['arc-mainnet', 'base-mainnet', 'arbitrum-mainnet'])
+    assert.equal(arc.arcNetwork().mscaChainKeys.includes('ethereum-mainnet'), false)
   })
 })
 

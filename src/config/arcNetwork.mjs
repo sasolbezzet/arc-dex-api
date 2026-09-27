@@ -40,8 +40,8 @@ const TESTNET = {
   gatewayKey: 'Arc_Testnet',
   gatewayNetwork: 'Testnet',
   // Nama chain versi SDK Circle (Swap Kit/Bridge Kit) & CCTP yang dipakai
-  // jalur bridge MCP. Mainnet memakai 'Arc' mengikuti slug transport Circle
-  // (`arc`); jalur SDK mainnet tetap digerbang gagal-keras sampai SDK-nya ada.
+  // jalur bridge MCP. SDK Circle sejak 1.15.x mengekspor Arc mainnet sebagai
+  // `Arc` (judul "Arc Mainnet") mengikuti docs.arc.io/app-kit.
   sdkChainName: 'Arc_Testnet',
   gatewayWallet: '0x0077777d7EBA4688BDeF3E311b846F25870A19B9',
   gatewayMinter: '0x0022222ABE238Cc2C7Bb1f21003F0a260052475B',
@@ -197,9 +197,9 @@ const MAINNET = {
   // (lihat arcIrisBaseUrl) supaya attestation/fee tidak pernah dibaca dari
   // lingkungan uji.
   irisBaseUrl: 'https://iris-api.circle.com',
-  // Identifier blockchain Circle Wallets untuk Arc mainnet. SDK Circle yang
-  // terpasang belum mengekspor konstanta ini, jadi operator bisa menimpanya
-  // lewat ARC_CIRCLE_WALLET_BLOCKCHAIN setelah Circle merilis nilainya.
+  // Identifier blockchain Circle Wallets untuk Arc mainnet: `ARC` (lihat
+  // developers.circle.com/wallets/supported-blockchains — Arc `ARC`/`ARC-TESTNET`).
+  // Diverifikasi lewat API LIVE: GET /v1/w3s/wallets?blockchain=ARC → 200.
   circleWalletBlockchain: 'ARC',
   externalChainKeys: ['ethereum-mainnet', 'base-mainnet', 'arbitrum-mainnet'],
   // CCTP v2 mainnet: TokenMessengerV2/MessageTransmitterV2 memakai alamat
@@ -277,7 +277,12 @@ const MAINNET = {
     rpcEnv: 'SOLANA_MAINNET_RPC',
     explorer: 'https://explorer.solana.com/tx/',
   },
-  mscaChainKeys: ['arc-mainnet'],
+  // MSCA (Agent Wallet) mainnet. Circle mendukung MSCA di Arc, Base, dan
+  // Arbitrum mainnet (developers.circle.com/wallets/supported-blockchains) dan
+  // Gas Station policy mainnet untuk ketiganya sudah aktif — diverifikasi lewat
+  // pm_getPaymasterStubData dengan LIVE client key. Ethereum mainnet tetap
+  // dikecualikan (SCA/MSCA tidak didukung di sana).
+  mscaChainKeys: ['arc-mainnet', 'base-mainnet', 'arbitrum-mainnet'],
   // Unified Balance / Auto Pay mainnet: hanya Arc yang sudah diverifikasi lewat
   // GET https://gateway-api.circle.com/v1/info. Chain mainnet lain sengaja
   // belum didaftarkan supaya fitur gagal dengan pesan jelas alih-alih diam-diam
@@ -419,6 +424,21 @@ export function arcCircleClientKey(env = process.env) {
   return network.isMainnet
     ? String(env.CIRCLE_CLIENT_KEY_LIVE || '').trim()
     : String(env.CIRCLE_CLIENT_KEY || '').trim()
+}
+
+/**
+ * Entity secret Circle untuk developer-controlled wallet sesuai jaringan aktif.
+ *
+ * Entity secret terdaftar PER ENVIRONMENT: nilai sandbox tidak dikenal oleh
+ * LIVE, dan Circle menolaknya dengan "The entity secret has not been set yet"
+ * (persis error yang muncul saat swap/bridge Circle Wallet di mainnet). Karena
+ * itu mainnet memakai `CIRCLE_ENTITY_SECRET_MAINNET` tanpa fallback ke nilai
+ * sandbox.
+ */
+export function arcCircleEntitySecret(env = process.env) {
+  return network.isMainnet
+    ? String(env.CIRCLE_ENTITY_SECRET_MAINNET || '').trim()
+    : String(env.CIRCLE_ENTITY_SECRET || '').trim()
 }
 
 /**

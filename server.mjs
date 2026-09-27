@@ -35,7 +35,7 @@ import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './s
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
 import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus } from './src/services/circleWalletWebhookService.mjs'
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
-import { ARC_CCTP_DOMAIN, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, ARC_SDK_CHAIN_NAME, IS_ARC_MAINNET, arcCctpChains, arcCctpDomains, arcCircleApiKey, arcCircleWalletBlockchain, arcContractAddress, arcGatewayBaseUrl, arcGatewayChains, arcIrisBaseUrl, arcNetwork, arcSolanaCctp, arcTokenAddress, resolveMscaChainKey } from './src/config/arcNetwork.mjs'
+import { ARC_CCTP_DOMAIN, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, ARC_SDK_CHAIN_NAME, IS_ARC_MAINNET, arcCctpChains, arcCctpDomains, arcCircleApiKey, arcCircleClientKey, arcCircleEntitySecret, arcCircleWalletBlockchain, arcContractAddress, arcGatewayBaseUrl, arcGatewayChains, arcIrisBaseUrl, arcNetwork, arcSolanaCctp, arcTokenAddress, resolveMscaChainKey } from './src/config/arcNetwork.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
 import { startRefundWorker } from './src/services/x402RefundWorker.mjs'
@@ -133,7 +133,12 @@ app.use('/api/vault', vaultLimiter, vaultRoutes)
 // application/tenant path; dropping it causes upstream 404 responses.
 // Used so mobile browsers never fetch modular-sdk.circle.com directly
 // (mobile networks, ad-block, captive portals often block it).
-const CIRCLE_MODULAR_KEY = process.env.CIRCLE_CLIENT_KEY || process.env.VITE_CIRCLE_CLIENT_KEY || ''
+// Client Key harus mengikuti jaringan aktif: mainnet memakai
+// `CIRCLE_CLIENT_KEY_LIVE` (Circle menolak TEST client key di mainnet — lihat
+// developers.circle.com/wallets/modular), testnet memakai `CIRCLE_CLIENT_KEY`.
+// Sebelum ini produksi selalu mengirim TEST key ke endpoint mainnet sehingga
+// seluruh passkey/MSCA melalui proxy gagal.
+const CIRCLE_MODULAR_KEY = arcCircleClientKey() || process.env.CIRCLE_CLIENT_KEY || process.env.VITE_CIRCLE_CLIENT_KEY || ''
 const CIRCLE_MODULAR_BASE_URL = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc').replace(/\/+$/, '')
 app.use('/api/circle-modular', apiLimiter, express.json({ limit: '128kb' }), async (req, res) => {
   try {
@@ -985,6 +990,14 @@ app.get('/v1/models', apiLimiter, openAiModels)
 app.post('/v1/chat/completions', apiLimiter, openAiChatCompletions)
 
 const KIT_KEY = process.env.KIT_KEY
+// Kredensial App Kit / Stablecoin Service untuk jaringan aktif. App Kit 1.15.x
+// memakai `apiKey` (`LIVE_API_KEY:...` / `TEST_API_KEY:...`); `kitKey` format
+// lama masih dihormati SDK tetapi kredensial testnet tidak boleh dipakai di
+// mainnet. Jadi mainnet memakai LIVE API key jaringan aktif, testnet tetap
+// KIT_KEY seperti sebelumnya.
+function arcSwapApiKey() {
+  return IS_ARC_MAINNET ? arcCircleApiKey() : KIT_KEY
+}
 const PORT = process.env.PORT || 3001
 // Data paths are env-overridable so a staging instance (:3901) can run from
 // the same checkout without touching production files (Fase 6 isolation).
@@ -1045,18 +1058,26 @@ const arcTestnet = defineChain({
   blockExplorers: { default: { name: 'ArcScan', url: ARC_EXPLORER_URL } },
 })
 
-// SDK Circle (App Kit / Bridge Kit / Stablecoin Service) pada versi terpasang
-// hanya mengenal Arc testnet: `SwapChain.Arc_Testnet`, `BridgeKitChains.ArcTestnet`,
-// dan nama chain "Arc_Testnet". Saat `ARC_NETWORK=mainnet` aktif jalur ini harus
-// gagal dengan pesan jelas — bukan diam-diam menyasar testnet.
-function assertArcSdkPath(feature) {
-  if (!IS_ARC_MAINNET) return
-  throw Object.assign(new Error(`${feature} belum tersedia untuk Arc mainnet: SDK Circle yang terpasang hanya mendukung Arc Testnet.`), { status: 503 })
+// SDK Circle (App Kit / Bridge Kit) sejak 1.15.x mengekspor chain Arc mainnet
+// (`SwapChain.Arc`, `BridgeKitChains.Arc` — judul "Arc Mainnet") sesuai
+// docs.arc.io/app-kit, jadi mainnet memakai chain `Arc` dan testnet tetap
+// `Arc_Testnet`. Kalau versi SDK yang terpasang tidak mengekspor konstanta
+// mainnet, jalurnya gagal-tertutup dengan pesan jelas — tidak pernah
+// diam-diam menyasar Arc Testnet.
+function requireArcSdkChain(value, feature) {
+  if (value === undefined || value === null || value === '') {
+    throw Object.assign(new Error(`${feature} belum tersedia: SDK Circle terpasang tidak mengekspor chain Arc mainnet.`), { status: 503 })
+  }
+  return value
 }
-function arcSwapChain() { assertArcSdkPath('Swap via App Kit'); return SwapChain.Arc_Testnet }
-function arcBridgeChain() { assertArcSdkPath('Bridge via Bridge Kit'); return BridgeKitChains.ArcTestnet }
-function arcKitSwapChainName() { assertArcSdkPath('Swap Stablecoin Service'); return 'Arc_Testnet' }
-if (IS_ARC_MAINNET) console.log('[network] Arc mainnet aktif (chain 5042). Jalur swap/bridge SDK Circle dinonaktifkan sampai SDK mainnet tersedia.')
+function arcSwapChain() {
+  return IS_ARC_MAINNET ? requireArcSdkChain(SwapChain.Arc, 'Swap via App Kit di Arc mainnet') : SwapChain.Arc_Testnet
+}
+function arcBridgeChain() {
+  return IS_ARC_MAINNET ? requireArcSdkChain(BridgeKitChains.Arc, 'Bridge via Bridge Kit di Arc mainnet') : BridgeKitChains.ArcTestnet
+}
+function arcKitSwapChainName() { return IS_ARC_MAINNET ? 'Arc' : 'Arc_Testnet' }
+if (IS_ARC_MAINNET) console.log('[network] Arc mainnet aktif (chain 5042). Swap/Bridge App Kit memakai chain "Arc".')
 // Save original fetch before override — needed by fetchWithRetry
 const _originalFetch = globalThis.fetch
 
@@ -1303,14 +1324,24 @@ const RETRY_CFG = {
   [IS_ARC_MAINNET ? 'Solana' : 'Solana_Devnet']: { maxRetries: 60, fastMode: true },
 }
 
+// Entity secret mengikuti jaringan aktif (terdaftar per environment Circle):
+// mainnet memakai `CIRCLE_ENTITY_SECRET_MAINNET`, testnet `CIRCLE_ENTITY_SECRET`.
+// Tanpa ini Circle menolak transaksi wallet dengan "The entity secret has not
+// been set yet", jadi kekurangannya diperingatkan saat boot alih-alih hanya
+// terlihat sebagai 500 di UI.
 const circleClient = initiateDeveloperControlledWalletsClient({
   apiKey: arcCircleApiKey(),
-  entitySecret: process.env.CIRCLE_ENTITY_SECRET,
+  entitySecret: arcCircleEntitySecret(),
 })
 const circleAdapter = createCircleWalletsAdapter({
   apiKey: arcCircleApiKey(),
-  entitySecret: process.env.CIRCLE_ENTITY_SECRET,
+  entitySecret: arcCircleEntitySecret(),
 })
+if (!arcCircleEntitySecret()) {
+  console.warn(IS_ARC_MAINNET
+    ? '[circle] CIRCLE_ENTITY_SECRET_MAINNET belum diset: jalur Circle Wallet (swap/bridge) akan gagal sampai entity secret LIVE didaftarkan (lihat docs/mainnet-x402-readiness.md).'
+    : '[circle] CIRCLE_ENTITY_SECRET belum diset: jalur Circle Wallet tidak akan berfungsi.')
+}
 const kit = new AppKit()
 
 for (const issue of treasuryConfigurationIssues()) console.warn(`[treasury] ${issue}`)
@@ -1557,7 +1588,7 @@ function noSwapRouteResponse(res, err) {
 }
 
 function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount, customFeeBps = PLATFORM_FEE_BPS }) {
-  if (!KIT_KEY) throw new Error('KIT_KEY belum dikonfigurasi')
+  if (!arcSwapApiKey()) throw new Error(IS_ARC_MAINNET ? 'CIRCLE_API_KEY_MAINNET belum dikonfigurasi' : 'KIT_KEY belum dikonfigurasi')
   if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) throw new Error('Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut))
   if (tokenIn === tokenOut) throw new Error('Token swap harus berbeda')
   return {
@@ -1709,7 +1740,7 @@ async function stablecoinRequest(path, { method = 'GET', query, body } = {}) {
       method,
       signal: controller.signal,
       headers: {
-        Authorization: `Bearer ${KIT_KEY}`,
+        Authorization: `Bearer ${arcSwapApiKey()}`,
         'Content-Type': 'application/json',
         'User-Agent': 'arcox-api/1.0',
       },
@@ -2220,37 +2251,58 @@ function walletRecordId(record) {
   return ''
 }
 
+// Wallet proxy Circle untuk jaringan aktif. Arc mainnet memakai chain code
+// `ARC` dan mendukung SCA pada developer-controlled wallet (lihat
+// developers.circle.com/wallets/supported-blockchains: Arc `ARC` → EOA, SCA),
+// jadi tidak ada lagi gate 503 di mainnet.
+//
+// Record lama dari wallets-db.json dibuat di lingkungan Circle yang berbeda
+// (testnet). Circle memisahkan wallet per environment, jadi record yang tidak
+// ditemukan di jaringan aktif diganti dengan wallet baru untuk jaringan ini —
+// bukan dipakai ulang (yang akan mengirim dana ke wallet testnet).
+function walletLookupMiss(error) {
+  const status = Number(error?.status || error?.response?.status || 0)
+  const message = String(error?.message || '')
+  return status === 404 || /not found|does not exist|no such wallet/i.test(message)
+}
+
 async function getOrCreateWallet(metamaskAddr) {
-  // Wallet proxy Circle (App Kit) hanya tersedia di Arc Testnet: SDK Circle yang
-  // terpasang belum mengekspor chain Arc mainnet. Di mainnet jalur ini
-  // gagal-tertutup supaya tidak ada wallet `ARC-TESTNET` yang dibuat untuk
-  // pengguna produksi.
-  if (IS_ARC_MAINNET) {
-    throw Object.assign(new Error('Wallet proxy Circle (App Kit) belum tersedia di Arc mainnet: SDK Circle terpasang hanya mendukung Arc Testnet.'), { status: 503 })
-  }
   const addr = metamaskAddr.toLowerCase()
+  const activeBlockchain = arcCircleWalletBlockchain()
   const db = loadWallets()
-  if (db[addr]) {
-    const record = db[addr]
-    const walletResponse = await circleClient.getWallet({ id: walletRecordId(record) })
-    const walletData = walletResponse && typeof walletResponse === 'object' ? walletResponse.data : undefined
-    const wallet = walletData && typeof walletData === 'object' ? walletData.wallet : undefined
-    if (wallet && wallet.id && wallet.address && (typeof db[addr] === 'string' || db[addr].address !== wallet.address)) {
-      db[addr] = { id: wallet.id, address: wallet.address }
-      saveWallets(db)
+  const record = db[addr]
+  if (record) {
+    const recordBlockchain = typeof record === 'object' && record ? String(record.blockchain || '') : ''
+    // Record dari jaringan lain tidak pernah dipakai ulang: alamat wallet
+    // berbeda per environment dan dananya tidak akan pernah sampai.
+    if (!recordBlockchain || recordBlockchain === activeBlockchain) {
+      try {
+        const walletResponse = await circleClient.getWallet({ id: walletRecordId(record) })
+        const walletData = walletResponse && typeof walletResponse === 'object' ? walletResponse.data : undefined
+        const wallet = walletData && typeof walletData === 'object' ? walletData.wallet : undefined
+        if (wallet && wallet.id && wallet.address) {
+          if (typeof db[addr] === 'string' || db[addr].address !== wallet.address || db[addr].blockchain !== activeBlockchain) {
+            db[addr] = { id: wallet.id, address: wallet.address, blockchain: activeBlockchain }
+            saveWallets(db)
+          }
+          return wallet
+        }
+      } catch (error) {
+        if (!walletLookupMiss(error)) throw error
+        console.warn(`[wallet] record lama tidak ada di ${activeBlockchain}; membuat wallet baru untuk ${addr.slice(0, 10)}…`)
+      }
     }
-    return wallet
   }
   const ws = await circleClient.createWalletSet({ name: `user-${addr.slice(0,8)}` })
   const wr = await circleClient.createWallets({
-    blockchains: [arcCircleWalletBlockchain()], count: 1,
+    blockchains: [activeBlockchain], count: 1,
     walletSetId: ws && ws.data && ws.data.walletSet ? ws.data.walletSet.id : '', accountType: 'SCA',
   })
   const wallet = wr && wr.data && Array.isArray(wr.data.wallets) ? wr.data.wallets[0] : undefined
   if (!wallet || !wallet.id || !wallet.address) throw new Error('Circle wallet creation response is incomplete')
-  db[addr] = { id: wallet.id, address: wallet.address }
+  db[addr] = { id: wallet.id, address: wallet.address, blockchain: activeBlockchain }
   saveWallets(db)
-  console.log(`[wallet] new: ${addr} → ${wallet.address}`)
+  console.log(`[wallet] new: ${addr} → ${wallet.address} (${activeBlockchain})`)
   return wallet
 }
 
@@ -2321,7 +2373,7 @@ app.get('/api/config', (_, res) => {
   // KIT_KEY is a server-side App Kit credential and must never be exposed to
   // browser clients. The frontend only uses this endpoint as an API health
   // check, so return capability metadata rather than the secret itself.
-  res.json({ appKitConfigured: Boolean(KIT_KEY) })
+  res.json({ appKitConfigured: Boolean(arcSwapApiKey()) })
 })
 
 function hashAgentText(text) {
@@ -2969,7 +3021,7 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
     if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
-    if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
+    if (!arcSwapApiKey()) return res.status(500).json({ error: IS_ARC_MAINNET ? 'CIRCLE_API_KEY_MAINNET belum dikonfigurasi' : 'KIT_KEY belum dikonfigurasi' })
     if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
     if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
     // cirBTC swaps use on-chain AMM router — Circle API doesn't support cirBTC
@@ -2993,7 +3045,7 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
         tokenIn,
         tokenOut,
         amountIn: platformFee.netAmount,
-        config: { kitKey: KIT_KEY, allowanceStrategy: 'approve' },
+        config: { apiKey: arcSwapApiKey(), allowanceStrategy: 'approve' },
       })
       const fee = (estimate.fees || []).reduce((sum, f) => sum + Number(f.amount || 0), 0)
       return res.json({
@@ -3026,7 +3078,7 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
     if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
-    if (!KIT_KEY) return res.status(500).json({ error: 'KIT_KEY belum dikonfigurasi' })
+    if (!arcSwapApiKey()) return res.status(500).json({ error: IS_ARC_MAINNET ? 'CIRCLE_API_KEY_MAINNET belum dikonfigurasi' : 'KIT_KEY belum dikonfigurasi' })
     if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
     if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
     // Circle Wallet cannot execute swaps where the input is cirBTC; on-chain AMM router is required.
@@ -3045,7 +3097,7 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
       tokenIn: swapTokenParam(tokenIn),
       tokenOut: swapTokenParam(tokenOut),
       amountIn: platformFee.netAmount,
-      config: { kitKey: KIT_KEY, allowanceStrategy: 'approve' },
+      config: { apiKey: arcSwapApiKey(), allowanceStrategy: 'approve' },
     }
     try {
       await estimateCircleSwapRoute({
