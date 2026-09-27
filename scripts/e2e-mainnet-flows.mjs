@@ -16,7 +16,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
-import { createPublicClient, custom, defineChain, getAddress } from 'viem'
+import { createPublicClient, custom, defineChain, encodeFunctionData, getAddress } from 'viem'
 import { toWebAuthnAccount } from 'viem/account-abstraction'
 import { toCircleSmartAccount, toCircleModularWalletClient } from '@circle-fin/modular-wallets-core'
 import { createPasskey, makePasskeyGetFn } from './e2e-webauthn.mjs'
@@ -41,6 +41,23 @@ function record(ok, label, detail = '') {
   console.log(`   ${ok ? '✅' : '❌'} ${label}${detail ? ` — ${detail}` : ''}`)
 }
 const short = value => `${String(value).slice(0, 10)}…${String(value).slice(-6)}`
+// A browser posts PublicKeyCredential.toJSON(): every assertion buffer becomes
+// a base64url string. Raw Uint8Array fields would reach Circle as {"0":...} and
+// fail verification with "Missing or invalid parameters".
+const base64Url = value => Buffer.from(value).toString('base64url')
+function assertionPayload(assertion) {
+  return {
+    id: assertion.id,
+    rawId: assertion.id,
+    type: 'public-key',
+    response: {
+      clientDataJSON: base64Url(assertion.response.clientDataJSON),
+      authenticatorData: base64Url(assertion.response.authenticatorData),
+      signature: base64Url(assertion.response.signature),
+      ...(assertion.response.userHandle ? { userHandle: assertion.response.userHandle } : {}),
+    },
+  }
+}
 
 async function post(path, body, { token = '', timeoutMs = 120_000 } = {}) {
   const res = await fetch(`${BASE}${path}`, {
@@ -117,6 +134,68 @@ console.log('\n④ Swap Personal Wallet (EOA)')
   record(Number(res.payload?.platformFee?.bps) > 0, 'platform fee terbaca dari router mainnet', `${res.payload?.platformFee?.bps ?? '-'} bps → ${res.payload?.platformFee?.treasury ?? '-'}`)
 }
 
+// ── ④b Adapter swap mainnet: payload NYATA dari Stablecoin Service ──
+// Circle menandatangani ExecutionParams di domain EIP-712 adapter miliknya
+// (ADAPTER_CONTRACT_EVM_MAINNET di @circle-fin/provider-stablecoin-service-swap).
+// Kalau env diarahkan ke proxy self-deployed, setiap execute() revert
+// InvalidSignature (0x8baa579f) TEPAT setelah approve USDC sukses — inilah
+// gejala "transaksi hanya berhasil di fase approve".
+const CIRCLE_SWAP_ADAPTER_MAINNET = '0x7FB8c7260b63934d8da38aF902f87ae6e284a845'
+console.log('\n④b Adapter swap mainnet (verifikasi payload nyata)')
+{
+  const res = await post('/api/eoa-swap-prepare', { metamaskAddress: ownerAddress, tokenIn: 'USDC', tokenOut: 'EURC', amountIn: '0.1' }, { token: ownerToken })
+  const adapter = String(res.payload?.adapterContract || '')
+  record(adapter.toLowerCase() === CIRCLE_SWAP_ADAPTER_MAINNET.toLowerCase(), 'adapterContract = adapter mainnet Circle', adapter || '(kosong)')
+
+  const leg = res.payload?.legs?.[0]
+  if (adapter && leg?.executionParams && leg?.signature) {
+    const ep = leg.executionParams
+    const data = encodeFunctionData({
+      abi: [{
+        type: 'function', name: 'execute', stateMutability: 'payable',
+        inputs: [
+          { name: 'params', type: 'tuple', components: [
+            { name: 'instructions', type: 'tuple[]', components: [
+              { name: 'target', type: 'address' }, { name: 'data', type: 'bytes' }, { name: 'value', type: 'uint256' },
+              { name: 'tokenIn', type: 'address' }, { name: 'amountToApprove', type: 'uint256' },
+              { name: 'tokenOut', type: 'address' }, { name: 'minTokenOut', type: 'uint256' },
+            ] },
+            { name: 'tokens', type: 'tuple[]', components: [{ name: 'token', type: 'address' }, { name: 'beneficiary', type: 'address' }] },
+            { name: 'execId', type: 'uint256' }, { name: 'deadline', type: 'uint256' }, { name: 'metadata', type: 'bytes' },
+          ] },
+          { name: 'tokenInputs', type: 'tuple[]', components: [
+            { name: 'permitType', type: 'uint8' }, { name: 'token', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'permitCalldata', type: 'bytes' },
+          ] },
+          { name: 'signature', type: 'bytes' },
+        ],
+      }],
+      functionName: 'execute',
+      args: [{
+        instructions: ep.instructions.map(i => ({
+          target: i.target, data: i.data, value: BigInt(i.value), tokenIn: i.tokenIn,
+          amountToApprove: BigInt(i.amountToApprove), tokenOut: i.tokenOut, minTokenOut: BigInt(i.minTokenOut),
+        })),
+        tokens: ep.tokens,
+        execId: BigInt(ep.execId),
+        deadline: BigInt(ep.deadline),
+        metadata: ep.metadata || '0x',
+      }, [{ permitType: 0, token: leg.tokenInAddress, amount: BigInt(leg.amountBaseUnits), permitCalldata: '0x' }], leg.signature],
+    })
+    // Tanpa approve/dana, revert yang BENAR adalah soal allowance/saldo ERC-20.
+    // Revert InvalidSignature berarti domain adapter masih salah.
+    const sim = await jsonRpc('arc', 'eth_call', [{ from: ownerAddress, to: adapter, data }, 'latest'])
+    const error = sim.body?.error || {}
+    const invalidSignature = String(error.data || '').toLowerCase().startsWith('0x8baa579f')
+    const allowanceOrBalance = /allowance|balance/i.test(String(error.message || ''))
+    record(!invalidSignature, 'execute() menerima signature Circle (bukan InvalidSignature)', invalidSignature
+      ? `InvalidSignature 0x8baa579f — domain adapter salah (${adapter})`
+      : error.message ? String(error.message).slice(0, 110) : 'signature lolos verifikasi')
+    record(!invalidSignature && (allowanceOrBalance || !error.data || Boolean(sim.body?.result)), 'revert yang tersisa hanya soal allowance/saldo (tanpa dana uji)', String(error.message || 'success').slice(0, 110))
+  } else {
+    record(false, 'payload swap EOA lengkap (executionParams + signature)', JSON.stringify(res.payload).slice(0, 140))
+  }
+}
+
 // ── ⑤ Attestation CCTP (Iris produksi) ──
 console.log('\n⑤ Attestation CCTP mainnet')
 {
@@ -144,9 +223,12 @@ if (!FULL) {
     }
     const loginOptions = await post('/api/auth/passkey-options', { mode: 'Login', username: '' })
     const loginFlowId = String(loginOptions.payload?.flowId || '')
-    const loginCredential = await loginOptions.payload?.options?.challenge
-      ? { id: state.credentialId, response: await credential.getFn({ publicKey: { challenge: loginOptions.payload.options.challenge } }) }
-      : null
+    const challenge = loginOptions.payload?.options?.challenge
+    // getFn menandatangani assertion di atas challenge sebagai BYTES (browser
+    // memberi ArrayBuffer); mengirim string base64url membuat challenge kosong
+    // dan Circle menolaknya sebagai signature tidak valid.
+    const assertion = challenge ? await credential.getFn({ publicKey: { challenge: fromB64(challenge) } }) : null
+    const loginCredential = assertion ? assertionPayload(assertion) : null
     const login = loginCredential
       ? await post('/api/auth/passkey-login', { credential: loginCredential, mode: 'Login', flowId: loginFlowId })
       : { status: 0, payload: {} }
