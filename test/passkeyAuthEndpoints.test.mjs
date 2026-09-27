@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createHmac } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -18,11 +19,16 @@ function ownerToken(secret) {
   return `${payload}.${signature}`
 }
 
-async function withHttp(fn) {
+// `server.mjs` memuat `.env` (dotenv/config), jadi environment test harus
+// ditentukan eksplisit — kalau tidak, hasilnya bergantung pada .env mesin yang
+// menjalankan test (mis. ARC_NETWORK=mainnet di VPS produksi).
+async function withHttp(fn, overrides = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-passkey-http-'))
   const secret = TEST_AUTH_SECRET
   const names = [
     'VERCEL', 'AUTH_SECRET', 'CIRCLE_CLIENT_URL', 'CIRCLE_CLIENT_KEY',
+    'ARC_NETWORK', 'CIRCLE_CLIENT_KEY_LIVE', 'CIRCLE_API_KEY', 'CIRCLE_API_KEY_MAINNET',
+    'CIRCLE_ENTITY_SECRET', 'CIRCLE_ENTITY_SECRET_MAINNET',
     'SESSION_KEYS_PATH', 'SESSION_KEY_ENCRYPTION_KEY', 'VAULT_PATH',
     'VAULT_ACTIVITY_PATH', 'VAULT_SESSION_PATH', 'OAUTH_PATH',
     'OAUTH_TOKENS_PATH', 'OAUTH_STATE_PATH', 'WALLET_DB', 'TX_HISTORY_DB',
@@ -32,8 +38,16 @@ async function withHttp(fn) {
   const previous = Object.fromEntries(names.map(name => [name, process.env[name]]))
   process.env.VERCEL = '1'
   process.env.AUTH_SECRET = secret
+  process.env.ARC_NETWORK = 'testnet'
   process.env.CIRCLE_CLIENT_URL = 'https://circle.test/v1/rpc/w3s/buidl'
   process.env.CIRCLE_CLIENT_KEY = 'test-circle-client-key'
+  process.env.CIRCLE_CLIENT_KEY_LIVE = 'live-circle-client-key'
+  // Developer-controlled wallet adapter (>=1.8.0) memvalidasi opsi saat
+  // konstruksi, jadi test memberi nilai yang valid untuk kedua environment.
+  process.env.CIRCLE_API_KEY = 'TEST_API_KEY:test:test'
+  process.env.CIRCLE_API_KEY_MAINNET = 'LIVE_API_KEY:test:test'
+  process.env.CIRCLE_ENTITY_SECRET = 'a'.repeat(64)
+  process.env.CIRCLE_ENTITY_SECRET_MAINNET = 'b'.repeat(64)
   process.env.SESSION_KEYS_PATH = join(dir, 'session-keys.json')
   process.env.SESSION_KEY_ENCRYPTION_KEY = 'test-only-session-encryption-key'
   process.env.VAULT_PATH = join(dir, 'vault.json')
@@ -51,6 +65,7 @@ async function withHttp(fn) {
   process.env.SUPABASE_URL = ''
   process.env.SUPABASE_SERVICE_ROLE_KEY = ''
   process.env.SUPABASE_PERSISTENCE_MODE = 'off'
+  for (const [name, value] of Object.entries(overrides)) process.env[name] = value
 
   await writeFile(process.env.SESSION_KEYS_PATH, JSON.stringify({ users: {}, aliases: {}, agentBindings: {} }))
   await writeFile(process.env.VAULT_PATH, JSON.stringify({ credentials: [], limits: {}, approvals: [], agentCardLinks: {} }))
@@ -147,4 +162,75 @@ test('Plugin passkey-options forwards a valid owner proof to Circle', async () =
     const request = JSON.parse(circleRequests[0].options.body)
     assert.equal(request.method, 'rp_getLoginOptions')
   })
+})
+
+// Regression: produksi pernah mengirim Client Key sandbox ke Circle di mainnet,
+// sehingga seluruh passkey/MSCA Agent Wallet gagal meski transport sudah benar.
+// Registry jaringan di-snapshot saat module load, jadi mainnet harus diuji di
+// proses terpisah (pola child-process yang sama dengan mcpOAuth.test.mjs).
+test('Plugin passkey-options forwards the LIVE client key on mainnet', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arcox-passkey-mainnet-'))
+  const serverUrl = new URL('../server.mjs', import.meta.url).href
+  const script = `
+    const previousFetch = globalThis.fetch
+    const seen = []
+    globalThis.fetch = async (url, options = {}) => {
+      if (String(url).startsWith('http://127.0.0.1')) return previousFetch(url, options)
+      const headers = options?.headers || {}
+      seen.push({ url: String(url), authorization: headers.Authorization || headers.authorization || '' })
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 'circle-test', result: { challenge: 'AQ', rpId: 'arcoxdex.vercel.app' } }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    const { app } = await import(${JSON.stringify(serverUrl)})
+    const server = await new Promise((resolve, reject) => {
+      const listener = app.listen(0, '127.0.0.1', () => resolve(listener))
+      listener.on('error', reject)
+    })
+    const base = 'http://127.0.0.1:' + server.address().port
+    try {
+      const res = await previousFetch(base + '/api/auth/passkey-options', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'Register', username: 'mainnet-client-key-probe' }),
+      })
+      const body = await res.json().catch(() => ({}))
+      console.log(JSON.stringify({ status: res.status, success: body.success, seen }))
+    } finally {
+      server.close()
+    }
+  `
+  const out = execFileSync(process.execPath, ['--input-type=module', '--eval', script], {
+    env: {
+      ...process.env,
+      VERCEL: '1',
+      ARC_NETWORK: 'mainnet',
+      AUTH_SECRET: TEST_AUTH_SECRET,
+      CIRCLE_CLIENT_URL: 'https://circle.test/v1/rpc/w3s/buidl',
+      CIRCLE_CLIENT_KEY: 'sandbox-client-key',
+      CIRCLE_CLIENT_KEY_LIVE: 'live-client-key',
+      CIRCLE_API_KEY: 'TEST_API_KEY:test:test',
+      CIRCLE_API_KEY_MAINNET: 'LIVE_API_KEY:test:test',
+      CIRCLE_ENTITY_SECRET: 'a'.repeat(64),
+      CIRCLE_ENTITY_SECRET_MAINNET: 'b'.repeat(64),
+      SESSION_KEYS_PATH: join(dir, 'session-keys.json'),
+      VAULT_PATH: join(dir, 'vault.json'),
+      VAULT_ACTIVITY_PATH: join(dir, 'activity.json'),
+      VAULT_SESSION_PATH: join(dir, 'vault-sessions.json'),
+      WALLET_DB: join(dir, 'wallets.json'),
+      TX_HISTORY_DB: join(dir, 'tx-history.json'),
+      INVOICE_DB: join(dir, 'invoices.json'),
+      WEBHOOK_DB: join(dir, 'webhooks.json'),
+      SUPABASE_URL: '',
+      SUPABASE_SERVICE_ROLE_KEY: '',
+      SUPABASE_PERSISTENCE_MODE: 'off',
+    },
+    encoding: 'utf8',
+    timeout: 60_000,
+  })
+  const result = JSON.parse(out.trim().split('\n').at(-1))
+  assert.equal(result.status, 200)
+  assert.equal(result.success, true)
+  assert.equal(result.seen.length, 1)
+  assert.equal(result.seen[0].url, 'https://circle.test/v1/rpc/w3s/buidl')
+  assert.equal(result.seen[0].authorization, 'Bearer live-client-key')
+  await rm(dir, { recursive: true, force: true })
 })

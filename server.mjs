@@ -361,7 +361,10 @@ async function verifyPluginOwnerProof({ ownerAddress, ownerSessionToken, agentWa
 async function verifiedPasskeyWalletAddress({ credential, mode = 'Login', flowId = '' } = {}) {
   const normalizedCredential = normalizeIncomingWebAuthnCredential(credential)
   const clientUrl = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc/w3s/buidl').replace(/\/+$/, '')
-  const clientKey = process.env.CIRCLE_CLIENT_KEY || ''
+  // Client Key harus dari environment jaringan aktif: Circle menolak TEST key
+  // di verifikasi passkey mainnet, dan kegagalannya muncul sebagai
+  // "Circle API error" yang membingungkan di UI.
+  const clientKey = arcCircleClientKey()
   if (!clientKey) throw new Error('Circle Modular credential verification is not configured')
   cleanupPasskeyFlows()
   const flow = flowId ? passkeyFlows.get(String(flowId)) : null
@@ -418,7 +421,7 @@ app.post('/api/auth/passkey-options', apiLimiter, async (req, res) => {
       }
     }
     const clientUrl = (process.env.CIRCLE_CLIENT_URL || 'https://modular-sdk.circle.com/v1/rpc/w3s/buidl').replace(/\/+$/, '')
-    const clientKey = process.env.CIRCLE_CLIENT_KEY || ''
+    const clientKey = arcCircleClientKey()
     if (!clientKey) return res.status(503).json({ error: 'Circle Modular credential verification is not configured' })
     const method = mode === 'Register' ? 'rp_getRegistrationOptions' : 'rp_getLoginOptions'
     const upstream = await fetch(clientUrl, {
@@ -948,7 +951,7 @@ app.post('/api/pending-txs/:txId/submit', apiLimiter, requireAuth, async (req, r
     const { toModularTransport } = await import('@circle-fin/modular-wallets-core')
     const { createPublicClient, defineChain } = await import('viem')
     const CLIENT_URL = process.env.CIRCLE_CLIENT_URL
-    const CLIENT_KEY = process.env.CIRCLE_CLIENT_KEY
+    const CLIENT_KEY = arcCircleClientKey()
     const chainKey = tx.chainKey || ARC_CHAIN_KEY
     const { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } = await import('./src/services/chains.mjs')
     const chain = CHAINS[chainKey]
