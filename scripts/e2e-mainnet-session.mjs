@@ -8,25 +8,39 @@
 //   ③ POST /api/auth/passkey-login  (Login)       → vault token + walletAddress (MSCA)
 //   ④ derivasi ulang MSCA dengan SDK Circle       → harus sama dengan ③
 //   ⑤ POST /api/session/generate-key              → delegate EOA server
-//   ⑥ addOwners UserOperation (paymaster sponsored) → deploy MSCA + izinkan delegate
-//   ⑦ POST /api/session/authorization-attempt + /api/session/setup → session ACTIVE
-//   ⑧ verifikasi: kode kontrak MSCA on-chain + /api/session/status
+//   ⑥a POST circle_createAddressMapping           → daftarkan wallet di Circle
+//   ⑥b deploy MSCA UserOperation #1 (paymaster)   → tunggu receipt, MSCA ber-kode
+//   ⑦ addOwners UserOperation #2 (paymaster)      → izinkan delegate sebagai owner
+//   ⑧ POST /api/session/authorization-attempt + /api/session/setup → session ACTIVE
+//   ⑨ verifikasi: kode kontrak MSCA on-chain + /api/session/status
 //
 // Semua panggilan Circle Modular dirutekan lewat proxy produksi
 // /api/circle-modular/arc (server memakai LIVE client key), jadi jalurnya identik
 // dengan browser — bukan client key testnet.
 //
-// STATUS (27 Sep 2026): langkah ①-⑥a LULUS on production (login passkey, derivasi
-// MSCA, owner session, reserve delegate, circle_createAddressMapping), tetapi
-// langkah ⑥ addOwners DITOLAK bundler Circle:
-//   eth_estimateUserOperationGas → -32600 "Cannot find target wallet in the
-//   system. Either the specified wallet doesn't exist or it's not accessible to
-//   the caller."
-// Terjadi untuk wallet mainnet lama (0x1eE70434…) maupun passkey yang BARU
-// diregistrasi di mainnet (0xC9796A7C…), jadi bukan soal umur wallet.
-// Tidak ada tx/biaya yang terpakai saat gagal — userop tidak pernah masuk.
-// Belum ada Agent Wallet mainnet yang pernah terdeploy, jadi jalur eksekusi MSCA
-// mainnet memang belum pernah terbukti.
+// STATUS (28 Sep 2026) — dua temuan yang diverifikasi terhadap produksi mainnet:
+//
+// 1. URUTAN (diperbaiki di sini dan di frontend/modularWallet.ts). addOwners
+//    tidak boleh menjadi UserOperation pertama di mainnet; deploy MSCA harus
+//    UserOp #1 (⑥b, tunggu receipt + verifikasi bytecode) dan addOwners UserOp
+//    #2 (⑦). Di testnet Circle menerima keduanya dalam satu UserOp, sehingga
+//    asumsi lama (addOwners mengangkat factory initCode) tidak pernah gagal di
+//    sana.
+//
+// 2. -32600 "Cannot find target wallet in the system" BUKAN soal urutan. Error
+//    itu muncul untuk SEMUA UserOperation ke MSCA mainnet (Arc, Base, dan
+//    Arbitrum) walaupun `circle_getAddress` sudah mengembalikan wallet yang
+//    sama (state LIVE, blockchain ARC) dan `circle_getAddressMapping` mengenali
+//    ownernya. Payload userOp yang sama persis diterima beberapa saat kemudian
+//    (`eth_estimateUserOperationGas` → preVerificationGas/callGasLimit),
+//    termasuk lewat endpoint Circle langsung dengan LIVE client key yang sama.
+//    Jadi ini kondisi sisi Circle yang sementara, bukan bug payload kita;
+//    mengulang langkah pada saat itu juga sudah cukup.
+//
+// 3. FEE. Setelah wallet resolvable, Arc mainnet menolak UserOperation dengan
+//    `precheck failed: maxPriorityFeePerGas is 0 but must be at least 1000000000`.
+//    Skrip (dan frontend) sekarang mengirim lantai 1 gwei dari
+//    circle_getUserOperationGasPrice untuk deploy MAUPUN addOwners.
 //
 // Pemakaian:
 //   node --env-file=.env scripts/e2e-mainnet-session.mjs [--register]
@@ -65,6 +79,11 @@ const PASSKEY_STATE = process.env.MAINNET_PASSKEY_STATE || (REGISTER ? '/tmp/arc
 const SESSION_STATE = process.env.MAINNET_SESSION_STATE || '/tmp/arcox-mainnet-session-state.json'
 const CHAIN_KEY = ARC_CHAIN_KEY
 const chain = CHAINS[CHAIN_KEY]
+// RPC mainnet eksplisit. `chain.rpcUrl` mengikuti ARC_MAINNET_RPC_URL → RPC →
+// RPC publik, dan shell lokal bisa mengekspor `RPC` milik TESTNET (Canteen/dRPC),
+// sehingga pembacaan kode/saldo akan menyasar jaringan yang salah dan melaporkan
+// MSCA 0 byte walaupun UserOperation-nya sukses di mainnet.
+const RPC = process.env.ARC_MAINNET_RPC_URL || 'https://rpc.mainnet.arc.io'
 
 if (!REGISTER && !existsSync(PASSKEY_STATE)) throw new Error(`state passkey tidak ada: ${PASSKEY_STATE} (jalankan scripts/e2e-mainnet-flows.mjs --full dulu, atau pakai --register)`)
 let passkey = existsSync(PASSKEY_STATE) ? JSON.parse(readFileSync(PASSKEY_STATE, 'utf8')) : {}
@@ -103,14 +122,36 @@ const modularTransport = custom({
 }, { key: 'circle-modular-proxy', name: 'Circle Modular (proxy produksi)' })
 const modularClient = toCircleModularWalletClient({
   client: createPublicClient({
-    chain: defineChain({ id: chain.id, name: chain.name, nativeCurrency: chain.nativeCurrency, rpcUrls: { default: { http: [chain.rpcUrl] } } }),
+    chain: defineChain({ id: chain.id, name: chain.name, nativeCurrency: chain.nativeCurrency, rpcUrls: { default: { http: [RPC] } } }),
     transport: modularTransport,
   }),
 })
 
+// Arc mainnet menolak UserOperation dengan maxPriorityFeePerGas 0
+// (`precheck failed: maxPriorityFeePerGas is 0 but must be at least 1000000000`).
+// Tanyakan harga ke Circle lalu terapkan lantai 1 gwei — logika yang sama dengan
+// circleGasFees() di frontend (arc-dex/src/services/modularWallet.ts).
+const GAS_FEE_FLOOR = { maxPriorityFeePerGas: 1_000_000_000n, maxFeePerGas: 2_000_000_000n }
+async function circleGasFees() {
+  try {
+    const price = await modularClient.request({ method: 'circle_getUserOperationGasPrice', params: [] }).catch(() => null)
+    for (const level of [price?.medium, price?.fast, price?.slow]) {
+      if (!level) continue
+      const suggestedMax = BigInt(level.maxFeePerGas || 0)
+      const suggestedPriority = BigInt(level.maxPriorityFeePerGas || 0)
+      if (suggestedMax <= 0n && suggestedPriority <= 0n) continue
+      const priority = suggestedPriority > GAS_FEE_FLOOR.maxPriorityFeePerGas ? suggestedPriority : GAS_FEE_FLOOR.maxPriorityFeePerGas
+      const max = suggestedMax >= priority ? suggestedMax : GAS_FEE_FLOOR.maxFeePerGas
+      return { maxPriorityFeePerGas: priority, maxFeePerGas: max }
+    }
+  } catch { /* pakai lantai aman */ }
+  return GAS_FEE_FLOOR
+}
+
 console.log('ARCOX — aktivasi Agent Wallet (MSCA) + session key Arc MAINNET')
 console.log(`api      : ${BASE}`)
 console.log(`chain    : ${CHAIN_KEY} (id ${chain.id})`)
+console.log(`rpc      : ${RPC}`)
 console.log(`passkey  : ${passkey.credentialId ? `${String(passkey.credentialId).slice(0, 14)}…` : '(kosong)'}`)
 
 // ── ①-③ Login passkey (token di-scope ke MSCA) ───────────────────────────────
@@ -296,8 +337,66 @@ console.log('\n⑥a circle_createAddressMapping (daftarkan wallet ke sistem Circ
   record((res.ok && !data.error) || alreadyKnown, 'wallet terdaftar/dipetakan di Circle', data.error ? `${message.slice(0, 150)}` : 'ok')
 }
 
-// ── ⑥ addOwners userop (deploy MSCA + authorize delegate) ───────────────────
-console.log('\n⑥ addOwners UserOperation (paymaster sponsored — biaya gas ditanggung paymaster)')
+// ── ⑥b deploy MSCA (UserOp #1) ──────────────────────────────────────────────
+// MSCA hasil derivasi masih counterfactual (0 byte kode). Bundler Circle
+// menolak UserOperation apa pun yang menyasar alamat tanpa kode dengan -32600
+// "Cannot find target wallet in the system", jadi deploy harus menjadi UserOp
+// pertama yang sukses sebelum addOwners boleh dikirim sebagai UserOp kedua.
+console.log('\n⑥b deploy MSCA UserOperation #1 (paymaster sponsored)')
+const mainnetRpc = createPublicClient({
+  chain: defineChain({ id: chain.id, name: chain.name, nativeCurrency: chain.nativeCurrency, rpcUrls: { default: { http: [RPC] } } }),
+  transport: http(RPC, { timeout: 15000 }),
+})
+const gasFees = await circleGasFees()
+console.log('   fee      :', `priority ${gasFees.maxPriorityFeePerGas} wei / max ${gasFees.maxFeePerGas} wei`)
+if (!session.deployed) {
+  try {
+    const deployHash = await sendUserOperation(modularClient, {
+      account: smartAccount,
+      // UserOp ke diri sendiri tanpa data: cukup untuk mengangkat factory
+      // initCode dan men-deploy MSCA deterministik.
+      calls: [{ to: derived, value: 0n, data: '0x' }],
+      paymaster: true,
+      ...gasFees,
+    })
+    session.deployUserOpHash = deployHash
+    persist()
+    console.log('   deployUserOpHash:', deployHash)
+    const receipt = await waitForUserOperationReceipt(modularClient, { hash: deployHash, timeout: 180_000 })
+    session.deployTx = receipt?.receipt?.transactionHash || ''
+    session.deployed = receipt?.success === true
+    persist()
+    record(receipt?.success === true, 'deploy MSCA sukses on-chain (UserOp #1)', `tx ${session.deployTx || '-'}`)
+  } catch (error) {
+    record(false, 'deploy MSCA gagal', String(error?.details || error?.shortMessage || error?.message || error).slice(0, 240))
+  }
+} else {
+  console.log('   • MSCA ditandai sudah deployed di state (deployTx:', session.deployTx || '-', ')')
+}
+// addOwners hanya valid kalau kontraknya benar-benar ada — verifikasi lewat RPC,
+// bukan lewat state lokal.
+{
+  const code = await mainnetRpc.getCode({ address: derived }).catch(() => '0x')
+  const hasCode = Boolean(code && code !== '0x')
+  session.deployed = hasCode
+  persist()
+  record(hasCode, 'MSCA punya bytecode sebelum addOwners', `${((code || '0x').length - 2) / 2} byte`)
+}
+
+// ── idempotensi: sesi yang sudah ACTIVE diadopsi, bukan diautorisasi ulang ──
+// Sama seperti `setupSessionKey` di frontend: mengirim addOwners kedua ke
+// delegate yang sudah menjadi owner hanya membuang kuota Gas Station, dan
+// re-verifikasi hash lama tidak lagi mungkin begitu index UserOperation bundler
+// Circle terbatas (itu yang membuat setup gagal pada run berulang).
+const preStatus = await apiGet('/api/session/status', token)
+const alreadyActive = preStatus.session?.active === true
+  && String(preStatus.session.walletAddress || '').toLowerCase() === derived.toLowerCase()
+if (alreadyActive) {
+  session.sessionActive = true
+  persist()
+  record(true, 'sesi ini sudah ACTIVE di Arc mainnet (idempoten)', JSON.stringify({ delegate: preStatus.session.delegateAddress, reason: preStatus.session.statusReason }).slice(0, 160))
+}
+
 const ADD_OWNERS_ABI = [{
   type: 'function',
   name: 'addOwners',
@@ -312,42 +411,48 @@ const ADD_OWNERS_ABI = [{
   outputs: [],
 }]
 let userOpHash = session.userOpHash || ''
-if (!userOpHash) {
-  const callData = encodeFunctionData({ abi: ADD_OWNERS_ABI, functionName: 'addOwners', args: [[delegate], [1n], [], [], 0n] })
-  try {
-    userOpHash = await sendUserOperation(modularClient, { account: smartAccount, callData, paymaster: true })
-    session.userOpHash = userOpHash
-    persist()
-    console.log('   userOpHash:', userOpHash)
-    const receipt = await waitForUserOperationReceipt(modularClient, { hash: userOpHash, timeout: 180_000 })
-    record(receipt?.success === true, 'addOwners sukses on-chain', `tx ${receipt?.receipt?.transactionHash || '-'}`)
-    session.userOpTx = receipt?.receipt?.transactionHash || ''
-    persist()
-  } catch (error) {
-    record(false, 'addOwners gagal', String(error?.details || error?.shortMessage || error?.message || error).slice(0, 240))
+if (alreadyActive) {
+  console.log('\n⑦⑧ dilewati — wallet ini sudah punya sesi ACTIVE di Arc mainnet')
+} else {
+  // ── ⑦ addOwners userop (authorize delegate — UserOp #2) ───────────────────
+  console.log('\n⑦ addOwners UserOperation #2 (paymaster sponsored — biaya gas ditanggung paymaster)')
+  if (!userOpHash) {
+    const callData = encodeFunctionData({ abi: ADD_OWNERS_ABI, functionName: 'addOwners', args: [[delegate], [1n], [], [], 0n] })
+    try {
+      userOpHash = await sendUserOperation(modularClient, { account: smartAccount, callData, paymaster: true, ...gasFees })
+      session.userOpHash = userOpHash
+      persist()
+      console.log('   userOpHash:', userOpHash)
+      const receipt = await waitForUserOperationReceipt(modularClient, { hash: userOpHash, timeout: 180_000 })
+      record(receipt?.success === true, 'addOwners sukses on-chain', `tx ${receipt?.receipt?.transactionHash || '-'}`)
+      session.userOpTx = receipt?.receipt?.transactionHash || ''
+      persist()
+    } catch (error) {
+      record(false, 'addOwners gagal', String(error?.details || error?.shortMessage || error?.message || error).slice(0, 240))
+    }
+  } else {
+    console.log('   • userOpHash dipakai ulang dari state:', userOpHash)
   }
-} else {
-  console.log('   • userOpHash dipakai ulang dari state:', userOpHash)
+
+  // ── ⑧ authorization-attempt + setup (Arc ACTIVE) ──────────────────────────
+  console.log('\n⑧ /api/session/authorization-attempt + /api/session/setup')
+  if (userOpHash) {
+    const attempt = await api('/api/session/authorization-attempt', { walletAddress, delegateAddress: delegate, authorizationUserOpHash: userOpHash, chainKey: CHAIN_KEY }, token)
+    record(attempt.status === 200, 'authorization-attempt tercatat', `HTTP ${attempt.status}`)
+    const setup = await api('/api/session/setup', { walletAddress, delegateAddress: delegate, authorizationUserOpHash: userOpHash, chainKey: CHAIN_KEY }, token)
+    session.ownerAddress = ownerAccount.address
+    record(setup.status === 200 && setup.active === true, 'session ACTIVE di Arc mainnet', JSON.stringify(setup).slice(0, 200))
+    session.sessionActive = setup.status === 200 && setup.active === true
+    persist()
+  } else {
+    record(false, 'tidak bisa setup tanpa userOpHash', 'addOwners belum selesai')
+  }
 }
 
-// ── ⑦ authorization-attempt + setup (Arc ACTIVE) ────────────────────────────
-console.log('\n⑦ /api/session/authorization-attempt + /api/session/setup')
-if (userOpHash) {
-  const attempt = await api('/api/session/authorization-attempt', { walletAddress, delegateAddress: delegate, authorizationUserOpHash: userOpHash, chainKey: CHAIN_KEY }, token)
-  record(attempt.status === 200, 'authorization-attempt tercatat', `HTTP ${attempt.status}`)
-  const setup = await api('/api/session/setup', { walletAddress, delegateAddress: delegate, authorizationUserOpHash: userOpHash, chainKey: CHAIN_KEY }, token)
-  session.ownerAddress = ownerAccount.address
-  record(setup.status === 200 && setup.active === true, 'session ACTIVE di Arc mainnet', JSON.stringify(setup).slice(0, 200))
-  session.sessionActive = setup.status === 200 && setup.active === true
-  persist()
-} else {
-  record(false, 'tidak bisa setup tanpa userOpHash', 'addOwners belum selesai')
-}
-
-// ── ⑧ verifikasi ────────────────────────────────────────────────────────────
-console.log('\n⑧ verifikasi')
+// ── ⑨ verifikasi ────────────────────────────────────────────────────────────
+console.log('\n⑨ verifikasi')
 {
-  const rpc = createPublicClient({ chain: defineChain({ id: chain.id, name: chain.name, nativeCurrency: chain.nativeCurrency, rpcUrls: { default: { http: [chain.rpcUrl] } } }), transport: http(chain.rpcUrl, { timeout: 15000 }) })
+  const rpc = createPublicClient({ chain: defineChain({ id: chain.id, name: chain.name, nativeCurrency: chain.nativeCurrency, rpcUrls: { default: { http: [RPC] } } }), transport: http(RPC, { timeout: 15000 }) })
   const code = await rpc.getCode({ address: derived }).catch(() => '0x')
   const deployed = Boolean(code && code !== '0x')
   const native = await rpc.getBalance({ address: derived }).catch(() => 0n)
