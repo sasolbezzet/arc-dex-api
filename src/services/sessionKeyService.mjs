@@ -1714,7 +1714,16 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
 export function buildUserOperationParams({ account, calls, chainKey, baseClient, feeProfile } = {}) {
   const params = { account, calls }
   const destinationBridge = ['arc-bridge', 'arc-destination', 'base-destination', 'arbitrum-destination', 'base-to-arc-source', 'arbitrum-to-arc-source', 'arc-pay'].includes(String(feeProfile || ''))
-  if (!['arbitrum-sepolia', 'arbitrum-mainnet'].includes(chainKey) && !destinationBridge) return params
+  // Arc mainnet's bundler rejects a zero tip with `precheck failed:
+  // maxPriorityFeePerGas is 0 but must be at least 1000000000`, so Arc mainnet
+  // requires an explicit fee envelope exactly like Arbitrum. Leaving this to
+  // viem's default produced a zero tip and every session execution failed with
+  // `user_operation_precheck_failed`. Arc testnet accepts the default, so it
+  // keeps its previous behaviour.
+  const requiresFeeEnvelope = ['arbitrum-sepolia', 'arbitrum-mainnet'].includes(chainKey)
+    || (IS_ARC_MAINNET && chainKey === ARC_CHAIN_KEY)
+    || destinationBridge
+  if (!requiresFeeEnvelope) return params
   return (async () => {
     // Use Circle's UserOperation gas-price recommendation first so the
     // destination operation matches the same envelope expected by Gas Station.

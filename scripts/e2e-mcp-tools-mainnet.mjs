@@ -185,7 +185,10 @@ if (sessionActive) {
   record(swapQuote.reason === 'no_session', 'arcox_quote_swap menunggu sesi MSCA (bukan error)', `reason=${swapQuote.reason}`)
 }
 
-const sendQuote = (await callTool('arcox_quote_send', { to: eoa, amount: '0.01', token: 'USDC', fromChain: ARC_CHAIN_KEY, source: 'session' })).payload || {}
+// `execute` menolak `quote_parameters_mismatch` kalau amount tidak sama persis
+// dengan amount saat quote, jadi keduanya memakai satu konstanta yang sama.
+const SEND_AMOUNT = '0.01'
+const sendQuote = (await callTool('arcox_quote_send', { to: eoa, amount: SEND_AMOUNT, token: 'USDC', fromChain: ARC_CHAIN_KEY, source: 'session' })).payload || {}
 if (sessionActive) {
   record(Boolean(sendQuote.previewId), 'arcox_quote_send → preview', `${sendQuote.amount} ${sendQuote.token} dari ${sendQuote.fromChain} → ${short(sendQuote.to || eoa)}`)
 } else {
@@ -220,10 +223,15 @@ if (!sessionActive) {
   note('arcox_execute_send dilewati: Agent Wallet belum berdana di Arc mainnet', `USDC=${balances.USDC}`)
 } else {
   const execute = (await callTool('arcox_execute_send', {
-    to: eoa, amount: '0.005', token: 'USDC', fromChain: ARC_CHAIN_KEY, source: 'session',
+    to: eoa, amount: SEND_AMOUNT, token: 'USDC', fromChain: ARC_CHAIN_KEY, source: 'session',
     previewId: sendQuote.previewId, confirmed: true, confirmationText: 'ya',
   })).payload || {}
-  record(execute.status === 'executed' || execute.executed === true, 'arcox_execute_send → tx nyata', `${execute.status} tx ${short(execute.txHash || '-')}`)
+  const rejected = execute.message || execute.error || execute.reason || execute.code || ''
+  record(
+    execute.status === 'executed' || execute.executed === true,
+    'arcox_execute_send → tx nyata',
+    `${execute.status}${rejected ? ` — ${String(rejected).slice(0, 240)}` : ''} tx ${short(execute.txHash || '-')}`,
+  )
 }
 
 const failed = results.filter(item => !item.ok)
