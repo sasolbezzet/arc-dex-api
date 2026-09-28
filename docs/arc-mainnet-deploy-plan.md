@@ -315,3 +315,56 @@ RPC diambil dari `ARC_MAINNET_RPC_URL` bila diset, kalau tidak dari
       diperbarui: alamat mainnet + bukti tx.
 - [ ] Catat tx hash deploy di `MAINTENANCE.md`.
 - [ ] Pantau `/api/x402/stats` dan treasury harian di minggu pertama.
+
+## 8. Agent Wallet (MSCA) 3-chain — status 28 Sep 2026
+
+MSCA sudah ter-deploy **nyata** di **Arc** dan **Base** mainnet (alamat
+deterministik `0xC9796A7C3c5205b0f05fE2A070003cDFfadAE331`, 133 byte kode di
+kedua chain) dan delegate `0x91946f2847D7f3d92511Fb2714C522560A800C66`
+ter-otorisasi di keduanya — `/api/session/destination-status` →
+`{deployed:true, authorized:true}`.
+
+Dua penyebab kegagalan 3-chain yang sudah diperbaiki:
+
+1. **Lantai fee 1 gwei milik Arc bocor ke Base/Arbitrum.** Gas aslinya ~0.02
+   gwei, jadi lantai itu melipatgandakan fee UserOperation 50-400x dan paymaster
+   Gas Station menolaknya: `Exceeded max spend USD per transaction of the policy`.
+   Sekarang lantai 1 gwei **hanya** untuk Arc (`mscaFees.ts` di frontend,
+   `NON_ARC_MIN_PRIORITY_FEE_WEI` di `sessionKeyService.mjs`).
+2. **Wallet belum terdaftar di sistem Circle untuk chain tujuan**
+   (`-32600 Cannot find target wallet in the system`). Deploy butuh
+   `circle_getAddress` pada tenant chain tersebut. SDK browser melakukannya
+   otomatis (`toModularTransport` mengeset key `MODULAR_WALLETS_TRANSPORT_KEY`,
+   yang memicu panggilan itu di `toCircleSmartAccount`); skrip CLI harus
+   memanggilnya eksplisit.
+
+### Blocker Arbitrum: policy Gas Station (butuh aksi di Circle Console)
+
+Arbitrum mainnet masih `deployed:false`, dan ini **bukan bug kode**. Base fee
+Arbitrum ~20.000.000 wei (0.02 gwei), sehingga `maxFeePerGas` harus > 22e6 agar
+UserOperation bisa masuk blok, tetapi policy paymaster menolak ≥21,5e6:
+
+| maxFeePerGas | gas ≈ | hasil |
+| --- | --- | --- |
+| 20e6 | 1,82M | lolos policy, tapi pending (di bawah base fee saat itu) |
+| 21,5e6 | 1,82M | ditolak: `Exceeded max spend USD per transaction of the policy` |
+
+20e6 × 1,82M gas = 3,64e13 wei ≈ 0,0000364 ETH. Dengan ETH ≈ $2.675, batas
+"Maximum spend per transaction" policy Arbitrum saat ini ≈ **$0.10**, sedangkan
+deploy di Arbitrum (Circle menyarankan maxFee 42e6) butuh ≈ **$0.20**.
+
+Perbaikannya ada di konsol Circle (tidak ada API untuk mengubah policy — lihat
+developers.circle.com/wallets/gas-station/policy-management):
+
+1. Login Circle Console → toggle **mainnet** → **Gas Station**.
+2. Pilih policy **Arbitrum** (transaksi hanya memakai policy **default**;
+   jadikan policy ini default kalau belum).
+3. Naikkan **Maximum spend per transaction** ke ≥ $0.50 (disarankan $1) dan
+   **Maximum spend per day** sesuai kuota harian.
+4. **Update** lalu **Activate**.
+5. Ulangi uji:
+   `MAINNET_PASSKEY_STATE=/tmp/arcox-mainnet-e2e-state-fresh.json node --env-file=.env scripts/e2e-mainnet-session.mjs`
+
+Catatan docs Circle: batas per-transaksi **tidak berlaku untuk transaksi pertama**
+dari sebuah SCA wallet. Wallet ini sudah bertransaksi di Arc, jadi tidak memakai
+pengecualian tersebut.
