@@ -22,3 +22,24 @@ test('Arc RPC fallback list contains only valid non-duplicate endpoints', () => 
   assert.ok(urls.includes(PUBLIC_ARC_RPC))
   assert.equal(new Set(urls).size, urls.length)
 })
+
+const MAINNET = { isMainnet: true, publicRpc: 'https://rpc.mainnet.arc.io', drpcRpc: '' }
+
+test('mainnet ignores a testnet RPC exported as RPC', () => {
+  const previous = process.env.RPC
+  process.env.RPC = 'https://rpc.testnet.arc-node.thecanteenapp.com/v1/abc'
+  try {
+    assert.equal(resolveArcRpc({ network: MAINNET }), 'https://rpc.mainnet.arc.io')
+  } finally {
+    if (previous === undefined) delete process.env.RPC
+    else process.env.RPC = previous
+  }
+})
+
+test('mainnet ignores a testnet dRPC endpoint from ARC_MAINNET_RPC_URL', () => {
+  assert.equal(resolveArcRpc({ applicationRpc: 'https://arc-testnet.drpc.org', network: MAINNET }), 'https://rpc.mainnet.arc.io')
+})
+
+test('mainnet keeps an explicit mainnet RPC', () => {
+  assert.equal(resolveArcRpc({ applicationRpc: 'https://custom-mainnet.example/rpc', network: MAINNET }), 'https://custom-mainnet.example/rpc')
+})

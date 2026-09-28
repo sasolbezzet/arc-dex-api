@@ -50,6 +50,11 @@ const CLIENT_URL = process.env.CIRCLE_CLIENT_URL || ''
 const CLIENT_KEY = arcCircleClientKey()
 const CLIENT_KEY_ENV = IS_ARC_MAINNET ? 'CIRCLE_CLIENT_KEY_LIVE' : 'CIRCLE_CLIENT_KEY'
 const BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
+// Base/Arbitrum tidak menuntut tip 1 gwei seperti Arc (gas aslinya ~0.02 gwei).
+// Lantai Arc yang diterapkan di sana melipatgandakan fee UserOperation 50-400x
+// sehingga paymaster Gas Station menolaknya dengan `Exceeded max spend USD per
+// transaction of the policy` — itu yang memblokir deploy MSCA di chain tujuan.
+const NON_ARC_MIN_PRIORITY_FEE_WEI = 1_000_000n
 const DESTINATION_VERIFICATION_GAS_LIMITS = {
   [ARC_CHAIN_KEY]: 270_000n,
   'base-sepolia': 270_000n,
@@ -1743,7 +1748,13 @@ export function buildUserOperationParams({ account, calls, chainKey, baseClient,
     }
     const gasPrice = circleFees?.maxFeePerGas ?? (baseClient?.getGasPrice ? await baseClient.getGasPrice().catch(() => 0n) : 0n)
     const suggestedPriority = circleFees?.maxPriorityFeePerGas ?? (baseClient?.request ? await baseClient.request({ method: 'eth_maxPriorityFeePerGas' }).catch(() => 0n) : 0n)
-    const fees = normalizeUserOperationFees({ maxFeePerGas: gasPrice, maxPriorityFeePerGas: suggestedPriority })
+    // Arc mainnet's bundler rejects a zero tip, so the 1 gwei floor stays Arc-only.
+    // Base/Arbitrum use Circle's own recommendation; forcing the Arc floor there
+    // made the Gas Station paymaster reject the operation as too expensive.
+    const minPriorityFeePerGas = IS_ARC_MAINNET && chainKey === ARC_CHAIN_KEY
+      ? BUNDLER_MIN_PRIORITY_FEE_WEI
+      : NON_ARC_MIN_PRIORITY_FEE_WEI
+    const fees = normalizeUserOperationFees({ maxFeePerGas: gasPrice, maxPriorityFeePerGas: suggestedPriority, minPriorityFeePerGas })
     params.maxFeePerGas = fees.maxFeePerGas
     params.maxPriorityFeePerGas = fees.maxPriorityFeePerGas
     // Circle's bundler requires a reasonable verification-gas efficiency. The

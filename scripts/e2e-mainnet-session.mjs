@@ -465,6 +465,156 @@ console.log('\n⑨ verifikasi')
   persist()
 }
 
+// ── ⑩ deploy + otorisasi MSCA di Base & Arbitrum mainnet ────────────────────
+// Jalur yang sama dengan `authorizeDestinationChains` di frontend: MSCA
+// deterministik yang sama harus punya bytecode (UserOp #1) dan delegate harus
+// di-addOwners (UserOp #2) di setiap chain tujuan, lalu backend memverifikasi
+// hash-nya per chain lewat /api/session/authorize-chain.
+for (const chainKey of ['base-mainnet', 'arbitrum-mainnet']) {
+  const dest = CHAINS[chainKey]
+  const destRpc = dest.rpcUrl
+  console.log(`\n⑩ ${chainKey} — deploy MSCA + addOwners (UserOp #1 & #2)`)
+  console.log(`   rpc      : ${destRpc}`)
+  const readClient = createPublicClient({
+    chain: defineChain({ id: dest.id, name: dest.name, nativeCurrency: dest.nativeCurrency, rpcUrls: { default: { http: [destRpc] } } }),
+    transport: http(destRpc, { timeout: 20_000 }),
+  })
+  const destTransport = custom({
+    async request({ method, params }) {
+      const res = await fetch(`${BASE}/api/circle-modular/${dest.transportSlug}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params: params ?? [] }),
+      })
+      const json = await res.json().catch(() => ({}))
+      if (json.error) throw new Error(`${method} gagal: ${JSON.stringify(json.error).slice(0, 200)}`)
+      return json.result
+    },
+  }, { key: `circle-modular-${dest.transportSlug}`, name: `Circle Modular ${chainKey}` })
+  const destClient = toCircleModularWalletClient({
+    client: createPublicClient({
+      chain: defineChain({ id: dest.id, name: dest.name, nativeCurrency: dest.nativeCurrency, rpcUrls: { default: { http: [destRpc] } } }),
+      transport: destTransport,
+    }),
+  })
+  const destAccount = await toCircleSmartAccount({ client: destClient, owner })
+  record(getAddress(destAccount.address).toLowerCase() === derived.toLowerCase(), `${chainKey}: alamat MSCA deterministik sama`, getAddress(destAccount.address))
+
+  // Base/Arbitrum tidak mewarisi mapping WebAuthn dari Arc, jadi daftarkan dulu.
+  // `circle_getAddress` juga MENDAFTARKAN wallet ke sistem Circle untuk chain ini
+  // (state LIVE, blockchain BASE/ARB). SDK melakukannya otomatis di frontend lewat
+  // `toCircleSmartAccount` karena transport-nya ber-key MODULAR_WALLETS_TRANSPORT_KEY;
+  // skrip ini memakai transport proxy, jadi harus memanggilnya eksplisit. Tanpa
+  // langkah ini bundler Circle menjawab -32600 "Cannot find target wallet in the
+  // system" untuk deploy MAUPUN addOwners di chain tujuan.
+  {
+    const { x, y } = parsePublicKey(passkey.publicKey)
+    const params = [{
+      scaConfiguration: {
+        initialOwnershipConfiguration: {
+          weightedMultisig: { webauthnOwners: [{ publicKeyX: x.toString(), publicKeyY: y.toString(), weight: 1 }], thresholdWeight: 1 },
+        },
+        scaCore: 'circle_6900_v1',
+      },
+      metadata: { name: 'arcox-agent-wallet' },
+    }]
+    const registered = await fetch(`${BASE}/api/circle-modular/w3s/buidl/${dest.transportSlug}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'circle_getAddress', params }),
+    }).then(res => res.json()).catch(() => ({}))
+    const registeredAddress = String(registered?.result?.address || '')
+    record(registeredAddress.toLowerCase() === derived.toLowerCase(), `${chainKey}: wallet terdaftar di Circle (state LIVE)`, `${registeredAddress || JSON.stringify(registered?.error || {}).slice(0, 160)}`)
+    // Mapping passkey↔wallet (idempoten, off-chain).
+    const mapping = await fetch(`${BASE}/api/circle-modular/w3s/buidl/${dest.transportSlug}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: Date.now(),
+        method: 'circle_createAddressMapping',
+        params: [{ walletAddress: derived, owners: [{ type: 'WEBAUTHOWNER', identifier: { publicKeyX: x.toString(), publicKeyY: y.toString() } }] }],
+      }),
+    })
+    const data = await mapping.json().catch(() => ({}))
+    const message = String(data?.error?.message || '')
+    const alreadyKnown = /already|exists|duplicate|known/i.test(message)
+    record((mapping.ok && !data.error) || alreadyKnown, `${chainKey}: wallet terpetakan di Circle`, data.error ? message.slice(0, 140) : 'ok')
+  }
+
+  // Base/Arbitrum TIDAK memakai lantai 1 gwei milik Arc. Gas aslinya ~0.02 gwei;
+  // lantai Arc di sana melipatgandakan fee dan paymaster Gas Station menolaknya
+  // dengan `Exceeded max spend USD per transaction of the policy`.
+  const DEST_FEE_FLOOR = { maxPriorityFeePerGas: 1_000_000n, maxFeePerGas: 2_000_000n }
+  const destGasFees = async () => {
+    try {
+      const price = await destClient.request({ method: 'circle_getUserOperationGasPrice', params: [] }).catch(() => null)
+      for (const level of [price?.medium, price?.fast, price?.slow]) {
+        if (!level) continue
+        const suggestedMax = BigInt(level.maxFeePerGas || 0)
+        const suggestedPriority = BigInt(level.maxPriorityFeePerGas || 0)
+        if (suggestedMax <= 0n && suggestedPriority <= 0n) continue
+        const priority = suggestedPriority > DEST_FEE_FLOOR.maxPriorityFeePerGas ? suggestedPriority : DEST_FEE_FLOOR.maxPriorityFeePerGas
+        const max = suggestedMax >= priority ? suggestedMax : DEST_FEE_FLOOR.maxFeePerGas
+        return { maxPriorityFeePerGas: priority, maxFeePerGas: max }
+      }
+    } catch { /* pakai lantai aman */ }
+    return DEST_FEE_FLOOR
+  }
+
+  let destCode = await readClient.getCode({ address: derived }).catch(() => '0x')
+  if (!destCode || destCode === '0x') {
+    try {
+      const fees = await destGasFees()
+      const depHash = await sendUserOperation(destClient, {
+        account: destAccount,
+        calls: [{ to: derived, value: 0n, data: '0x' }],
+        paymaster: true,
+        ...fees,
+      })
+      console.log(`   deployUserOpHash:`, depHash)
+      const receipt = await waitForUserOperationReceipt(destClient, { hash: depHash, timeout: 180_000 })
+      record(receipt?.success === true, `${chainKey}: deploy MSCA sukses on-chain (UserOp #1)`, `tx ${receipt?.receipt?.transactionHash || '-'}`)
+      session.destinations = { ...(session.destinations || {}), [chainKey]: { deployUserOpHash: depHash, deployTx: receipt?.receipt?.transactionHash || '' } }
+      persist()
+    } catch (error) {
+      record(false, `${chainKey}: deploy MSCA gagal`, String(error?.details || error?.shortMessage || error?.message || error).slice(0, 240))
+    }
+    destCode = await readClient.getCode({ address: derived }).catch(() => '0x')
+  } else {
+    console.log(`   • MSCA sudah punya kode di ${chainKey}`)
+  }
+  record(Boolean(destCode && destCode !== '0x'), `${chainKey}: MSCA ber-bytecode`, `${((destCode || '0x').length - 2) / 2} byte`)
+
+  const beforeStatus = await apiGet(`/api/session/destination-status?chainKey=${chainKey}&walletAddress=${encodeURIComponent(derived)}`, token)
+  console.log('   destination-status sebelum:', JSON.stringify({ deployed: beforeStatus.deployed, authorized: beforeStatus.authorized }))
+
+  if (beforeStatus.authorized !== true) {
+    try {
+      const callData = encodeFunctionData({ abi: ADD_OWNERS_ABI, functionName: 'addOwners', args: [[delegate], [1n], [], [], 0n] })
+      const fees = await destGasFees()
+      const authHash = await sendUserOperation(destClient, { account: destAccount, callData, paymaster: true, ...fees })
+      console.log(`   addOwners userOpHash:`, authHash)
+      const receipt = await waitForUserOperationReceipt(destClient, { hash: authHash, timeout: 180_000 })
+      record(receipt?.success === true, `${chainKey}: addOwners sukses on-chain (UserOp #2)`, `tx ${receipt?.receipt?.transactionHash || '-'}`)
+      const authorize = await api('/api/session/authorize-chain', {
+        walletAddress: derived,
+        delegateAddress: delegate,
+        chainKey,
+        authorizationUserOpHash: authHash,
+      }, token)
+      record(authorize.status === 200 && authorize.success === true, `${chainKey}: authorize-chain terverifikasi backend`, JSON.stringify(authorize).slice(0, 220))
+    } catch (error) {
+      record(false, `${chainKey}: addOwners/authorize gagal`, String(error?.details || error?.shortMessage || error?.message || error).slice(0, 260))
+    }
+  } else {
+    console.log(`   • ${chainKey} sudah authorized (idempoten)`)
+  }
+
+  const afterStatus = await apiGet(`/api/session/destination-status?chainKey=${chainKey}&walletAddress=${encodeURIComponent(derived)}`, token)
+  record(afterStatus.deployed === true && afterStatus.authorized === true, `${chainKey}: destination-status siap (deployed + authorized)`, JSON.stringify({ deployed: afterStatus.deployed, authorized: afterStatus.authorized }))
+}
+
 console.log('\nState sesi disimpan di', SESSION_STATE)
 const failed = results.filter(item => !item.ok)
 console.log('Ringkasan')

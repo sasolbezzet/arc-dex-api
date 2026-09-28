@@ -37,6 +37,19 @@ function validRpc(value) {
   }
 }
 
+// Host yang jelas milik testnet. `RPC` sering diekspor oleh shell/agent lokal
+// (Canteen/dRPC testnet), dan resolveArcRpc() memakai `RPC` sebagai cadangan
+// mainnet — tanpa filter ini lalu lintas mainnet bisa diarahkan ke endpoint uji.
+const TESTNET_RPC_PATTERN = /(?:^|[.\-/])(?:arc-)?testnet[.\-/]|testnet|sepolia|devnet/i
+
+/** RPC yang aman untuk jaringan Arc aktif: mainnet tidak menerima host testnet. */
+function usableRpc(value, isMainnet) {
+  const rpc = validRpc(value)
+  if (!rpc) return ''
+  if (isMainnet && TESTNET_RPC_PATTERN.test(rpc)) return ''
+  return rpc
+}
+
 /**
  * RPC yang dipakai untuk jaringan Arc aktif.
  *
@@ -60,8 +73,8 @@ export function resolveArcRpc({
     : applicationRpc
 
   if (isMainnet) {
-    const envRpc = validRpc(rpc)
-    const canteenAllowed = validRpc(configuredRpc)
+    const envRpc = usableRpc(rpc, true)
+    const canteenAllowed = usableRpc(configuredRpc, true)
     // Operator tetap boleh menunjuk endpoint sendiri lewat CANTEEN_RPC_URL,
     // tetapi hanya kalau diminta eksplisit (tidak ada auto-fallback Canteen).
     return (preferCanteen ? canteenAllowed || envRpc : envRpc) || network.publicRpc
