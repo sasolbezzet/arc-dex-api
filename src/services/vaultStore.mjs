@@ -480,6 +480,96 @@ export function reconcileCircleWalletWebhook({ walletAddress, txHash, userOpHash
   return { matched: matches.matches.length, updated: matches.matches.length, matches: matches.matches }
 }
 
+// ── Webhook failure alerts ──
+// Event Circle yang gagal (KYC ditolak, challenge gagal, transfer reverted)
+// harus meninggalkan tanda yang tahan restart dan terikat ke owner, supaya wallet
+// tidak terlihat "aman-aman saja" di UI. Alert bersifat informasional: tidak
+// memindahkan dana dan tidak pernah membatalkan approval sendiri.
+const WEBHOOK_FAILURE_DEDUPE_MS = 30 * 60 * 1000
+const WEBHOOK_FAILURE_MAX = 500
+const addressKey = value => String(value || '').toLowerCase()
+
+function isAddressKey(value) {
+  return /^0x[0-9a-f]{40}$/.test(String(value || ''))
+}
+
+export function recordWebhookFailure(owner, alert = {}) {
+  const address = addressKey(owner)
+  if (!isAddressKey(address)) return null
+  const family = String(alert.family || 'unknown')
+  const subjectId = alert.subjectId ? String(alert.subjectId) : null
+  const eventType = String(alert.eventType || '')
+  const dedupeKey = `${family}:${subjectId || eventType || 'unknown'}`
+  return withVaultLock(() => {
+    const v = loadVault()
+    if (!Array.isArray(v.webhookFailures)) v.webhookFailures = []
+    const now = Date.now()
+    const existing = v.webhookFailures.find(item => item.owner === address
+      && item.dedupeKey === dedupeKey
+      && now - Number(item.ts || 0) < WEBHOOK_FAILURE_DEDUPE_MS)
+    if (existing) {
+      // Dedupe jendela pendek: Circle boleh mengirim ulang event yang sama tanpa
+      // membanjiri daftar alert. `count` + `ts` menandai masih berulang.
+      existing.count = Number(existing.count || 1) + 1
+      existing.ts = now
+      existing.status = alert.status ?? existing.status ?? null
+      if (eventType) existing.eventType = eventType
+      existing.acknowledged = false
+      delete existing.acknowledgedAt
+      saveVault(v)
+      return { ...existing, duplicate: true }
+    }
+    const entry = {
+      id: randomUUID(),
+      owner: address,
+      dedupeKey,
+      family,
+      subjectId,
+      eventType,
+      status: alert.status ?? null,
+      message: String(alert.message || ''),
+      simulated: Boolean(alert.simulated),
+      acknowledged: false,
+      count: 1,
+      ts: now,
+    }
+    v.webhookFailures.push(entry)
+    if (v.webhookFailures.length > WEBHOOK_FAILURE_MAX) {
+      const acknowledged = v.webhookFailures
+        .filter(item => item.acknowledged)
+        .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0))
+      const drop = new Set(acknowledged.slice(0, v.webhookFailures.length - WEBHOOK_FAILURE_MAX).map(item => item.id))
+      if (drop.size) v.webhookFailures = v.webhookFailures.filter(item => !drop.has(item.id))
+    }
+    saveVault(v)
+    return { ...entry, duplicate: false }
+  })
+}
+
+export function listWebhookFailures(owner, { includeAcknowledged = false, limit = 20 } = {}) {
+  const address = addressKey(owner)
+  if (!isAddressKey(address)) return []
+  const v = loadVault()
+  return (v.webhookFailures || [])
+    .filter(item => item.owner === address && (includeAcknowledged || !item.acknowledged))
+    .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
+    .slice(0, limit)
+}
+
+export function acknowledgeWebhookFailure(owner, id) {
+  const address = addressKey(owner)
+  if (!isAddressKey(address)) return null
+  return withVaultLock(() => {
+    const v = loadVault()
+    const entry = (v.webhookFailures || []).find(item => item.id === id && item.owner === address)
+    if (!entry) return null
+    entry.acknowledged = true
+    entry.acknowledgedAt = Date.now()
+    saveVault(v)
+    return entry
+  })
+}
+
 // ── Session key info (lightweight, stored in vault) ──
 // Full delegate private key stored in sessionKeyService (separate file).
 // This stores only the public address + wallet address for the vault UI.

@@ -34,6 +34,7 @@ import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
 import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus, circleNotificationFamily, isSupportedCircleNotificationType, normalizeCircleNotification, CIRCLE_NOTIFICATION_CATALOG, CIRCLE_SUBSCRIPTION_NOTIFICATION_TYPES, summarizeCircleNotificationState } from './src/services/circleWalletWebhookService.mjs'
+import { handleCircleNotificationOutcome } from './src/services/circleNotificationOutcome.mjs'
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { ARC_CCTP_DOMAIN, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, ARC_SDK_CHAIN_NAME, IS_ARC_MAINNET, arcCctpChains, arcCctpDomains, arcCircleApiKey, arcCircleClientKey, arcCircleEntitySecret, arcCircleWalletBlockchain, arcContractAddress, arcGatewayBaseUrl, arcGatewayChains, arcIrisBaseUrl, arcNetwork, arcSolanaCctp, arcTokenAddress, resolveMscaChainKey } from './src/config/arcNetwork.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
@@ -1012,6 +1013,9 @@ const JSON_BACKUP_DIR = './runtime-backups'
 const AUTH_SECRET = process.env.AUTH_SECRET || ''
 const ARCOX_PAY_BASE_URL = (process.env.ARCOX_PAY_BASE_URL || process.env.ARCOX_WEB_URL || 'https://arcoxdex.vercel.app').replace(/\/$/, '')
 const ENABLE_DEV_TOOLS = String(process.env.ENABLE_DEV_TOOLS || 'false').toLowerCase() === 'true'
+// Simulasi event Circle DIPISAH dari ENABLE_DEV_TOOLS supaya bisa dinyalakan di
+// produksi tanpa membuka /api/dev/*. Kosong + dev tools mati ⇒ endpoint 404.
+const WEBHOOK_SIMULATION_SECRET = String(process.env.WEBHOOK_SIMULATION_SECRET || '').trim()
 const AUTH_TTL_MS = Number(process.env.AUTH_TTL_MS || 24 * 60 * 60 * 1000)
 const LOGIN_WINDOW_MS = 5 * 60 * 1000
 const DEFAULT_SIWE_DOMAINS = ['localhost', 'localhost:5173', 'localhost:4173', 'arcoxdex.vercel.app']
@@ -3963,7 +3967,9 @@ app.post('/api/webhooks/circle-wallet', apiLimiter, async (req, res) => {
       notification: normalized,
     })
     let reconciliation = { matched: 0, updated: 0, ignored: true, reason: 'duplicate_event' }
+    let failureAlert = null
     if (!saved.duplicate) {
+      failureAlert = await handleCircleNotificationOutcome(normalized)
       const { reconcileCircleWalletWebhook } = await import('./src/services/vaultStore.mjs')
       reconciliation = reconcileCircleWalletWebhook({
         walletAddress: extracted.walletAddress,
@@ -3995,6 +4001,7 @@ app.post('/api/webhooks/circle-wallet', apiLimiter, async (req, res) => {
       userOpHash: extracted.userOpHash,
       walletAddress: extracted.walletAddress,
       notification: normalized,
+      failureAlertId: failureAlert?.id || null,
       reconciliation,
       autoMint: saved.event.autoMint || [],
     })
@@ -4015,6 +4022,28 @@ app.post('/api/webhooks/circle-gateway', apiLimiter, async (req, res) => {
   }
 })
 
+async function loadWebhookFailureAlerts(owner, includeAcknowledged = false) {
+  try {
+    const { listWebhookFailures } = await import('./src/services/vaultStore.mjs')
+    return listWebhookFailures(owner, { includeAcknowledged })
+  } catch {
+    return []
+  }
+}
+
+function webhookSimulationEnabled() {
+  return Boolean(WEBHOOK_SIMULATION_SECRET) || ENABLE_DEV_TOOLS
+}
+
+function webhookSimulationAuthorized(req) {
+  if (WEBHOOK_SIMULATION_SECRET) {
+    const provided = String(req.headers['x-simulation-secret'] || '')
+    return provided.length === WEBHOOK_SIMULATION_SECRET.length
+      && timingSafeEqual(Buffer.from(provided), Buffer.from(WEBHOOK_SIMULATION_SECRET))
+  }
+  return ENABLE_DEV_TOOLS
+}
+
 // Webhook inbox: ringkasan event yang sudah tersimpan, dipakai UI untuk
 // memantau status challenges/rampSession. Payload mentah dan alamat wallet
 // (milik user lain pada akun Circle yang sama) sengaja TIDAK pernah dikirim.
@@ -4030,6 +4059,7 @@ function serializeWebhookEvent(event = {}) {
     status: event.status || notification.status || null,
     processed: Boolean(event.processed),
     matched: Boolean(event.matched),
+    simulated: Boolean(event.simulated),
     createdAt: event.createdAt || null,
     reference: {
       txHash: notification.txHash || event.relatedTxHash || null,
@@ -4075,8 +4105,97 @@ app.get('/api/webhooks/events', apiLimiter, requireAuth, async (req, res) => {
       total: matches.length,
       families,
       state: summarizeCircleNotificationState(scoped),
+      alerts: await loadWebhookFailureAlerts(req.owner),
       events: matches.slice(0, limit).map(serializeWebhookEvent),
     })
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message })
+  }
+})
+
+app.get('/api/webhooks/alerts', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const includeAcknowledged = String(req.query.includeAcknowledged || '') === 'true'
+    res.json({ ok: true, alerts: await loadWebhookFailureAlerts(req.owner, includeAcknowledged) })
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message })
+  }
+})
+
+app.post('/api/webhooks/alerts/:id/ack', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const { acknowledgeWebhookFailure } = await import('./src/services/vaultStore.mjs')
+    const alert = acknowledgeWebhookFailure(req.owner, String(req.params.id || ''))
+    if (!alert) return res.status(404).json({ ok: false, error: 'Alert not found' })
+    res.json({ ok: true, alert })
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message })
+  }
+})
+
+// Simulasi event Circle untuk mengisi/menguji tabel status tanpa signature Circle
+// (Circle memegang private key-nya, jadi event tiruan tidak bisa ditandatangani).
+// Digerbangi WEBHOOK_SIMULATION_SECRET (atau ENABLE_DEV_TOOLS untuk lokal); event
+// yang disuntikkan ditandai `simulated` supaya bisa dibedakan dan dibersihkan.
+app.post('/api/webhooks/simulate', apiLimiter, requireAuth, async (req, res) => {
+  if (!webhookSimulationEnabled()) return res.status(404).json({ ok: false, error: 'Webhook simulation disabled' })
+  if (!webhookSimulationAuthorized(req)) return res.status(403).json({ ok: false, error: 'Invalid simulation secret' })
+  try {
+    const body = req.body || {}
+    const items = Array.isArray(body?.events) ? body.events : Array.isArray(body) ? body : [body]
+    if (!items.length || items.length > 50) return res.status(400).json({ ok: false, error: 'Provide 1-50 events' })
+    const results = []
+    for (const item of items) {
+      const notificationType = String(item?.notificationType || item?.eventType || '')
+      if (!isSupportedCircleNotificationType(notificationType)) {
+        results.push({ notificationType: notificationType || null, ok: false, error: 'Unsupported notification type' })
+        continue
+      }
+      const notification = item?.notification && typeof item.notification === 'object' ? item.notification : {}
+      const notificationId = String(item?.notificationId || `sim_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`)
+      const payload = { subscriptionId: 'simulated', notificationId, notificationType, notification, timestamp: nowIso(), version: 2 }
+      const normalized = normalizeCircleNotification(payload)
+      const saved = await saveGenericWebhookEvent('circle-wallets', notificationId, notificationType, payload, {
+        family: normalized.family,
+        subtype: normalized.subtype || undefined,
+        simulated: true,
+        status: normalized.status || undefined,
+        relatedTxHash: normalized.txHash || undefined,
+        relatedUserOpHash: normalized.userOpHash || undefined,
+        walletAddress: normalized.walletAddress || undefined,
+        notification: normalized,
+      })
+      const alert = saved.duplicate ? null : await handleCircleNotificationOutcome(normalized, { simulated: true })
+      results.push({
+        notificationId,
+        notificationType,
+        ok: true,
+        duplicate: Boolean(saved.duplicate),
+        family: normalized.family,
+        status: normalized.status || null,
+        alertId: alert?.id || null,
+      })
+    }
+    res.json({ ok: true, simulated: true, results })
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message })
+  }
+})
+
+app.delete('/api/webhooks/simulate', apiLimiter, requireAuth, async (req, res) => {
+  if (!webhookSimulationEnabled()) return res.status(404).json({ ok: false, error: 'Webhook simulation disabled' })
+  if (!webhookSimulationAuthorized(req)) return res.status(403).json({ ok: false, error: 'Invalid simulation secret' })
+  try {
+    const removed = withWebhookDbLock(() => {
+      const db = loadWebhookEvents()
+      let count = 0
+      for (const [key, event] of Object.entries(db)) {
+        if (event && typeof event === 'object' && event.simulated) { delete db[key]; count += 1 }
+      }
+      if (count) saveWebhookEvents(db)
+      return count
+    })
+    res.json({ ok: true, removed })
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message })
   }

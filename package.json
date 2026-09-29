@@ -8,6 +8,7 @@
     "test": "npm run check && node --test test/*.test.mjs",
     "diag:mcp": "node scripts/diag-mcp-connector.mjs",
     "webhook:register": "node --env-file=.env scripts/register-circle-webhook.mjs",
+    "webhook:simulate": "node --env-file=.env scripts/simulate-circle-webhook.mjs",
     "probe:mainnet": "node --env-file=.env scripts/probe-arc-mainnet-readiness.mjs",
     "test:e2e:flows": "node --env-file=.env scripts/e2e-three-agent-flows.mjs",
     "test:e2e:ui": "node scripts/e2e-plugin-ui-flows.mjs",

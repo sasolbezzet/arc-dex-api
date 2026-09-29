@@ -23,7 +23,7 @@ function ownerToken(address) {
 
 // server.mjs memuat `.env` lewat dotenv, jadi environment test harus eksplisit —
 // kalau tidak, hasilnya bergantung pada .env mesin yang menjalankan test.
-async function withHttp(fn) {
+async function withHttp(fn, overrides = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'arcox-circle-webhook-'))
   const names = [
     'VERCEL', 'AUTH_SECRET', 'ARC_NETWORK', 'CIRCLE_API_KEY', 'CIRCLE_API_KEY_MAINNET',
@@ -65,6 +65,9 @@ async function withHttp(fn) {
   process.env.SUPABASE_URL = ''
   process.env.SUPABASE_SERVICE_ROLE_KEY = ''
   process.env.SUPABASE_PERSISTENCE_MODE = 'off'
+  process.env.ENABLE_DEV_TOOLS = 'false'
+  process.env.WEBHOOK_SIMULATION_SECRET = ''
+  for (const [name, value] of Object.entries(overrides)) process.env[name] = value
 
   await writeFile(process.env.SESSION_KEYS_PATH, JSON.stringify({ users: {}, aliases: {}, agentBindings: {} }))
   await writeFile(process.env.VAULT_PATH, JSON.stringify({ credentials: [], limits: {}, approvals: [] }))
@@ -115,7 +118,19 @@ async function withHttp(fn) {
         const response = await previousFetch(`${localBase}${path}`, { headers })
         return { status: response.status, body: await response.json() }
       }
-      await fn({ deliver, get })
+      const post = async (path, body, headers = {}) => {
+        const response = await previousFetch(`${localBase}${path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: JSON.stringify(body),
+        })
+        return { status: response.status, body: await response.json() }
+      }
+      const del = async (path, headers = {}) => {
+        const response = await previousFetch(`${localBase}${path}`, { method: 'DELETE', headers })
+        return { status: response.status, body: await response.json() }
+      }
+      await fn({ deliver, get, post, del })
     } finally {
       await new Promise(resolve => listener.close(resolve))
     }
@@ -246,6 +261,84 @@ test('inbox surfaces failed challenges and ramp sessions', async () => {
     assert.equal(session.failed, true)
     assert.equal(session.kycStatus, 'REJECTED')
     assert.deepEqual(inbox.body.state.failures.map(failure => failure.eventType), ['rampSession.kycRejected', 'challenges.setPin'])
+  })
+})
+
+test('event simulation stays off unless explicitly configured', async () => {
+  await withHttp(async ({ post }) => {
+    const result = await post('/api/webhooks/simulate', { events: [{ notificationType: 'challenges.setPin' }] }, { Authorization: `Bearer ${ownerToken(MSCA)}` })
+    assert.equal(result.status, 404)
+    assert.equal(result.body.ok, false)
+  })
+})
+
+test('simulated events fill the status table, raise alerts and can be purged', async () => {
+  await withHttp(async ({ get, post, del }) => {
+    const auth = { Authorization: `Bearer ${ownerToken(MSCA)}` }
+    const body = {
+      events: [
+        { notificationType: 'challenges.createWallet', notification: { id: 'sim-c1', status: 'COMPLETE', walletAddress: MSCA } },
+        { notificationType: 'challenges.setPin', notification: { id: 'sim-c2', status: 'FAILED', walletAddress: MSCA } },
+        { notificationType: 'rampSession.kycRejected', notification: { id: 'sim-s1', kycStatus: 'REJECTED', walletAddress: MSCA } },
+      ],
+    }
+    assert.equal((await post('/api/webhooks/simulate', body, auth)).status, 403)
+    assert.equal((await post('/api/webhooks/simulate', body, { ...auth, 'X-Simulation-Secret': 'wrong' })).status, 403)
+    assert.equal((await post('/api/webhooks/simulate', body, {})).status, 401)
+
+    const simulated = await post('/api/webhooks/simulate', body, { ...auth, 'X-Simulation-Secret': 'sim-secret' })
+    assert.equal(simulated.status, 200, JSON.stringify(simulated.body))
+    assert.equal(simulated.body.results.length, 3)
+    assert.deepEqual(simulated.body.results.map(item => item.family), ['challenges', 'challenges', 'rampSession'])
+
+    const inbox = await get('/api/webhooks/events', auth)
+    assert.equal(inbox.body.total, 3)
+    assert.equal(inbox.body.events.every(event => event.simulated === true), true)
+    assert.equal(inbox.body.state.challenges.length, 2)
+    assert.equal(inbox.body.state.challenges.find(item => item.challengeId === 'sim-c2').failed, true)
+    assert.equal(inbox.body.state.rampSessions[0].sessionId, 'sim-s1')
+    assert.equal(inbox.body.state.rampSessions[0].failed, true)
+    // Kegagalan dengan alamat wallet menghasilkan alert owner-scoped.
+    assert.equal(inbox.body.alerts.length, 2)
+    const alert = inbox.body.alerts.find(item => item.family === 'rampSession')
+    assert.equal(alert.simulated, true)
+
+    const acknowledged = await post(`/api/webhooks/alerts/${alert.id}/ack`, {}, auth)
+    assert.equal(acknowledged.status, 200)
+    assert.equal(acknowledged.body.alert.acknowledged, true)
+    assert.equal((await get('/api/webhooks/events', auth)).body.alerts.length, 1)
+
+    const purged = await del('/api/webhooks/simulate', { ...auth, 'X-Simulation-Secret': 'sim-secret' })
+    assert.equal(purged.status, 200)
+    assert.equal(purged.body.removed, 3)
+    const after = await get('/api/webhooks/events', auth)
+    assert.equal(after.body.total, 0)
+    assert.deepEqual(after.body.state.challenges, [])
+    assert.deepEqual(after.body.state.rampSessions, [])
+  }, { WEBHOOK_SIMULATION_SECRET: 'sim-secret' })
+})
+
+test('a real failed event records an alert for its wallet', async () => {
+  await withHttp(async ({ deliver, get }) => {
+    const auth = { Authorization: `Bearer ${ownerToken(MSCA)}` }
+    const delivered = await deliver({
+      notificationId: 'alert-1',
+      notificationType: 'challenges.contractExecution',
+      notification: { id: 'challenge-alert', status: 'FAILED', walletAddress: MSCA },
+    })
+    assert.equal(delivered.status, 200)
+    assert.ok(delivered.body.failureAlertId)
+
+    const inbox = await get('/api/webhooks/events', auth)
+    assert.equal(inbox.body.alerts.length, 1)
+    assert.equal(inbox.body.alerts[0].family, 'challenges')
+    assert.equal(inbox.body.alerts[0].status, 'failed')
+    assert.equal(inbox.body.alerts[0].subjectId, 'challenge-alert')
+    assert.equal(inbox.body.alerts[0].simulated, false)
+
+    // Event sukses tidak menambah alert.
+    await deliver({ notificationId: 'alert-2', notificationType: 'challenges.setPin', notification: { id: 'challenge-ok', status: 'COMPLETE', walletAddress: MSCA } })
+    assert.equal((await get('/api/webhooks/events', auth)).body.alerts.length, 1)
   })
 })
 

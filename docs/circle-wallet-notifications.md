@@ -113,6 +113,66 @@ UI-nya adalah kartu “🔔 Webhook Inbox” di halaman Info
 (`src/components/WebhookInboxPanel.tsx`): filter per family, banner merah saat ada
 kegagalan, dan daftar status challenge + ramp session.
 
+## Aksi saat event gagal (alert)
+
+Event bernilai negatif diproses lewat `handleCircleNotificationOutcome`
+(`src/services/circleNotificationOutcome.mjs`) — jalur yang sama dipakai endpoint
+asli maupun simulasi:
+
+1. Alert tersimpan di vault, terikat **owner** (`vault.webhookFailures`):
+   `family`, `eventType`, `status`, `subjectId`, `count`, `ts`, `simulated`,
+   `acknowledged`. Dedupe 30 menit per `(family, subjectId|eventType)` — event
+   ulangan menaikkan `count`, bukan menambah baris.
+2. `webhook_failure` ditulis ke log aktivitas owner.
+3. Notifikasi eksternal dikirim (lihat bawah).
+
+Endpoint owner-scoped:
+
+| Endpoint | Fungsi |
+| --- | --- |
+| `GET /api/webhooks/alerts` | daftar alert belum di-ack (`?includeAcknowledged=true` untuk semua) |
+| `POST /api/webhooks/alerts/:id/ack` | tandai alert sudah ditangani |
+
+UI: blok merah “⚠ N alert wallet perlu tindakan” di kartu Webhook Inbox, lengkap
+ dengan tombol **Acknowledge**.
+
+Batas tegas: helper ini **tidak memindahkan dana** dan **tidak membatalkan
+approval**. Rekonsiliasi approval tetap hanya lewat hash tx/userOp yang cocok.
+
+## Notifikasi eksternal
+
+`src/services/webhookAlertNotifier.mjs` mengirim ringkasan kegagalan ke semua
+target yang aktif:
+
+- `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` → pesan Telegram.
+- `WEBHOOK_ALERT_URL` → `POST` JSON generik (Slack/Discord/n8n), body
+  `{ text, alert }`.
+
+Sifatnya best-effort: tidak pernah melempar error (jalur webhook tetap balas
+`200`), timeout 8 detik, dan di-throttle 10 menit per `(family, subjectId)` agar
+retry Circle tidak membanjiri chat. Tanpa target dikonfigurasi ⇒ no-op.
+
+## Menguji dengan event tiruan
+
+Circle memegang private key-nya, jadi event tiruan **tidak bisa** ditandatangani
+seperti event asli — mengirim payload buatan ke endpoint webhook akan ditolak
+`401`. Dua jalur simulasi:
+
+```bash
+# Jalan pintas di VPS: tulis ke WEBHOOK_DB lewat jalur normalisasi + alert yang
+# sama dengan endpoint asli (tanpa env tambahan).
+npm run webhook:simulate -- --local
+npm run webhook:simulate -- --local --purge
+
+# Lewat HTTP: sekaligus menguji auth/token, butuh WEBHOOK_SIMULATION_SECRET.
+npm run webhook:simulate -- --http --url https://arcoxdex.vercel.app
+```
+
+Event tiruan selalu ditandai `simulated: true` sehingga terlihat di inbox
+(“· simulasi”) dan bisa dibersihkan dengan `--purge`. Endpoint
+`POST/DELETE /api/webhooks/simulate` digerbangi `WEBHOOK_SIMULATION_SECRET`
+(dinonaktifkan secara default, terpisah dari `ENABLE_DEV_TOOLS`).
+
 ## Mendaftarkan subscription
 
 ```bash
