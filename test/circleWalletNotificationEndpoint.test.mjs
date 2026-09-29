@@ -318,6 +318,24 @@ test('simulated events fill the status table, raise alerts and can be purged', a
   }, { WEBHOOK_SIMULATION_SECRET: 'sim-secret' })
 })
 
+test('a failed ramp session is attributed through its deposit address', async () => {
+  await withHttp(async ({ get, post }) => {
+    const auth = { Authorization: `Bearer ${ownerToken(MSCA)}`, 'X-Simulation-Secret': 'sim-secret' }
+    const simulated = await post('/api/webhooks/simulate', {
+      events: [{ notificationType: 'rampSession.kycRejected', notification: { id: 'sim-ramp-attr', kycStatus: 'REJECTED', depositAddress: MSCA } }],
+    }, auth)
+    assert.equal(simulated.status, 200, JSON.stringify(simulated.body))
+
+    const inbox = await get('/api/webhooks/events', { Authorization: `Bearer ${ownerToken(MSCA)}` })
+    assert.equal(inbox.body.alerts.length, 1)
+    assert.equal(inbox.body.alerts[0].family, 'rampSession')
+    assert.equal(inbox.body.alerts[0].addressSource, 'depositAddress')
+    assert.equal(inbox.body.alerts[0].subjectId, 'sim-ramp-attr')
+    // Ramp session tetap tidak masuk tabel challenge/session sebagai subjek hash.
+    assert.equal(inbox.body.state.rampSessions[0].failed, true)
+  }, { WEBHOOK_SIMULATION_SECRET: 'sim-secret' })
+})
+
 test('a real failed event records an alert for its wallet', async () => {
   await withHttp(async ({ deliver, get }) => {
     const auth = { Authorization: `Bearer ${ownerToken(MSCA)}` }

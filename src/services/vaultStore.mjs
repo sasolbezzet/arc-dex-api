@@ -528,6 +528,8 @@ export function recordWebhookFailure(owner, alert = {}) {
       eventType,
       status: alert.status ?? null,
       message: String(alert.message || ''),
+      // `walletAddress` atau `depositAddress` — supaya atribusi bisa diaudit.
+      addressSource: alert.addressSource || null,
       simulated: Boolean(alert.simulated),
       acknowledged: false,
       count: 1,

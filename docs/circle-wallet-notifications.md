@@ -121,8 +121,15 @@ asli maupun simulasi:
 
 1. Alert tersimpan di vault, terikat **owner** (`vault.webhookFailures`):
    `family`, `eventType`, `status`, `subjectId`, `count`, `ts`, `simulated`,
-   `acknowledged`. Dedupe 30 menit per `(family, subjectId|eventType)` — event
-   ulangan menaikkan `count`, bukan menambah baris.
+   `addressSource`, `acknowledged`. Dedupe 30 menit per
+   `(family, subjectId|eventType)` — event ulangan menaikkan `count`, bukan
+   menambah baris.
+
+   Atribusi owner memakai `walletAddress`. Ramp session biasanya hanya membawa
+   `depositAddress`, jadi field itu dipakai sebagai fallback **hanya** untuk
+   family `rampSession` dan asalnya dicatat di `addressSource`. Tanpa alamat yang
+   sah, event tetap tersimpan di inbox tetapi tidak menghasilkan alert milik
+   siapa pun.
 2. `webhook_failure` ditulis ke log aktivitas owner.
 3. Notifikasi eksternal dikirim (lihat bawah).
 

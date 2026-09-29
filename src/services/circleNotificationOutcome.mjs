@@ -21,14 +21,23 @@ export async function handleCircleNotificationOutcome(normalized = {}, options =
   const status = normalized.status || null
   if (!isNegativeCircleNotification(eventType, status)) return null
 
+  const family = normalized.family || circleNotificationFamily(eventType)
+  // `walletAddress` selalu jadi rujukan utama. Ramp session hanya membawa
+  // `depositAddress` (alamat deposit sesi itu), jadi dipakai sebagai fallback
+  // HANYA untuk family ini; `addressSource` mencatat dari mana asalnya supaya
+  // alert tidak pernah diam-diam salah atribusi.
   const wallet = String(normalized.walletAddress || '')
-  const owner = isAddress(wallet) ? getAddress(wallet).toLowerCase() : ''
+  const deposit = family === 'rampSession' ? String(normalized.depositAddress || '') : ''
+  const addressSource = isAddress(wallet) ? 'walletAddress' : isAddress(deposit) ? 'depositAddress' : null
+  const attributed = addressSource === 'walletAddress' ? wallet : addressSource === 'depositAddress' ? deposit : ''
+  const owner = isAddress(attributed) ? getAddress(attributed).toLowerCase() : ''
   const alert = {
-    family: normalized.family || circleNotificationFamily(eventType),
+    family,
     eventType,
     status,
     subjectId: circleNotificationSubjectId(eventType, normalized) || null,
     walletAddress: owner || null,
+    addressSource,
     createdAt: new Date().toISOString(),
     simulated,
   }
