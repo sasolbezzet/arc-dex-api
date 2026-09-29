@@ -33,7 +33,7 @@ import { paymentLogMatches } from './src/services/invoiceVerify.mjs'
 import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
-import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus } from './src/services/circleWalletWebhookService.mjs'
+import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus, circleNotificationFamily, isSupportedCircleNotificationType, normalizeCircleNotification, CIRCLE_NOTIFICATION_CATALOG, CIRCLE_SUBSCRIPTION_NOTIFICATION_TYPES } from './src/services/circleWalletWebhookService.mjs'
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { ARC_CCTP_DOMAIN, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, ARC_SDK_CHAIN_NAME, IS_ARC_MAINNET, arcCctpChains, arcCctpDomains, arcCircleApiKey, arcCircleClientKey, arcCircleEntitySecret, arcCircleWalletBlockchain, arcContractAddress, arcGatewayBaseUrl, arcGatewayChains, arcIrisBaseUrl, arcNetwork, arcSolanaCctp, arcTokenAddress, resolveMscaChainKey } from './src/config/arcNetwork.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
@@ -3921,6 +3921,11 @@ app.get('/api/webhooks/circle-wallet', (_req, res) => {
     provider: 'circle',
     product: 'wallets',
     message: 'Circle Wallets webhook endpoint is alive. Use POST for callbacks.',
+    // The exact list an operator must tick when creating the Circle
+    // notification subscription for this endpoint.
+    notificationTypes: CIRCLE_SUBSCRIPTION_NOTIFICATION_TYPES,
+    catalog: CIRCLE_NOTIFICATION_CATALOG,
+    supportsWildcardTestEvent: true,
   })
 })
 
@@ -3931,20 +3936,31 @@ app.post('/api/webhooks/circle-wallet', apiLimiter, async (req, res) => {
     const verification = await verifyCircleWebhookSignature(req, rawBody)
     if (!verification.ok) return res.status(401).json({ ok: false, provider: 'circle', product: 'wallets', error: verification.error })
 
-    const eventId = firstWebhookString(payload.notificationId, payload.id, payload.eventId, payload.notification?.id)
-    const eventType = firstWebhookString(payload.notificationType, payload.type, payload.eventType, payload.notification?.type)
-    const walletEventPrefixes = ['transactions.', 'challenges.', 'contracts.', 'modularWallet.', 'travelRule.', 'rampSession.']
+    const normalized = normalizeCircleNotification(payload)
+    const eventId = normalized.notificationId || firstWebhookString(payload.notificationId, payload.id, payload.eventId, payload.notification?.id)
+    const eventType = normalized.eventType || firstWebhookString(payload.notificationType, payload.type, payload.eventType, payload.notification?.type)
     if (!eventId) return res.status(400).json({ ok: false, provider: 'circle', product: 'wallets', error: 'notificationId is required' })
-    if (eventType !== 'webhooks.test' && !walletEventPrefixes.some(prefix => eventType.startsWith(prefix))) {
-      return res.status(400).json({ ok: false, provider: 'circle', product: 'wallets', error: 'Unsupported Wallets notification type' })
+    // Accept every concrete Circle notification type plus the family wildcards /
+    // bare family names (challenges, contracts, …) and the synthetic test event.
+    if (!isSupportedCircleNotificationType(eventType)) {
+      return res.status(400).json({
+        ok: false,
+        provider: 'circle',
+        product: 'wallets',
+        error: 'Unsupported Wallets notification type',
+        eventType: eventType || null,
+        supportedNotificationTypes: CIRCLE_SUBSCRIPTION_NOTIFICATION_TYPES,
+      })
     }
-    const notification = payload.notification && typeof payload.notification === 'object' ? payload.notification : payload.data && typeof payload.data === 'object' ? payload.data : {}
     const extracted = extractCircleWalletTransaction(payload)
     const saved = await saveGenericWebhookEvent('circle-wallets', eventId, eventType, payload, {
+      family: normalized.family,
+      subtype: normalized.subtype || undefined,
       relatedTxHash: extracted.txHash || undefined,
       relatedUserOpHash: extracted.userOpHash || undefined,
       walletAddress: extracted.walletAddress || undefined,
       status: extracted.status || undefined,
+      notification: normalized,
     })
     let reconciliation = { matched: 0, updated: 0, ignored: true, reason: 'duplicate_event' }
     if (!saved.duplicate) {
@@ -3973,10 +3989,12 @@ app.post('/api/webhooks/circle-wallet', apiLimiter, async (req, res) => {
       duplicate: Boolean(saved.duplicate),
       eventId,
       eventType,
-      status: extracted.status || firstWebhookString(notification.status, notification.state) || null,
+      family: circleNotificationFamily(eventType),
+      status: extracted.status || normalized.status || null,
       txHash: extracted.txHash,
       userOpHash: extracted.userOpHash,
       walletAddress: extracted.walletAddress,
+      notification: normalized,
       reconciliation,
       autoMint: saved.event.autoMint || [],
     })
@@ -3994,6 +4012,68 @@ app.post('/api/webhooks/circle-gateway', apiLimiter, async (req, res) => {
     res.json({ ok: true, ...result })
   } catch(e) {
     res.status(400).json({ ok: false, error: e.message })
+  }
+})
+
+// Webhook inbox: ringkasan event yang sudah tersimpan, dipakai UI untuk
+// memantau status challenges/rampSession. Payload mentah dan alamat wallet
+// (milik user lain pada akun Circle yang sama) sengaja TIDAK pernah dikirim.
+function serializeWebhookEvent(event = {}) {
+  const notification = event.notification && typeof event.notification === 'object' ? event.notification : {}
+  return {
+    id: event.id || null,
+    notificationId: event.notificationId || null,
+    provider: event.provider || null,
+    eventType: event.eventType || null,
+    family: event.family || circleNotificationFamily(event.eventType),
+    subtype: event.subtype || notification.subtype || null,
+    status: event.status || notification.status || null,
+    processed: Boolean(event.processed),
+    matched: Boolean(event.matched),
+    createdAt: event.createdAt || null,
+    reference: {
+      txHash: notification.txHash || event.relatedTxHash || null,
+      userOpHash: notification.userOpHash || event.relatedUserOpHash || null,
+      challengeId: notification.challengeId || null,
+      sessionId: notification.sessionId || null,
+      contractAddress: notification.contractAddress || null,
+      blockHeight: notification.blockHeight ?? null,
+    },
+  }
+}
+
+app.get('/api/webhooks/events', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const provider = String(req.query.provider || 'circle-wallets').trim()
+    const family = String(req.query.family || '').trim()
+    const type = String(req.query.type || '').trim()
+    const status = String(req.query.status || '').trim().toLowerCase()
+    const requested = Number(req.query.limit ?? 50)
+    const limit = Number.isFinite(requested) ? Math.min(Math.max(Math.trunc(requested), 1), 200) : 50
+
+    const db = loadWebhookEvents()
+    const families = {}
+    const matches = []
+    for (const event of Object.values(db)) {
+      if (!event || typeof event !== 'object') continue
+      if (provider && event.provider !== provider) continue
+      const eventFamily = event.family || circleNotificationFamily(event.eventType)
+      families[eventFamily] = (families[eventFamily] || 0) + 1
+      if (family && eventFamily !== family) continue
+      if (type && event.eventType !== type) continue
+      if (status && String(event.status || '').toLowerCase() !== status) continue
+      matches.push(event)
+    }
+    matches.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+    res.json({
+      ok: true,
+      provider: provider || null,
+      total: matches.length,
+      families,
+      events: matches.slice(0, limit).map(serializeWebhookEvent),
+    })
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message })
   }
 })
 

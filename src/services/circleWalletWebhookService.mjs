@@ -85,3 +85,219 @@ export function isSuccessfulCircleWalletStatus(status) {
 export function isFailedCircleWalletStatus(status) {
   return ['failed', 'reverted', 'denied', 'rejected', 'cancelled', 'canceled', 'error'].includes(String(status || '').toLowerCase())
 }
+
+// ── Circle notification catalog ──
+// Canonical event list from Circle Docs (Create a notification subscription:
+// developers.circle.com/api-reference/contracts/common/create-subscription) and
+// the Arc Docs contracts.eventLog payload shape
+// (docs.arc.io/arc/tutorials/monitor-contract-events). Keeping the list in one
+// place lets the webhook route reject unroutable events and lets the GET probe
+// publish exactly what an operator should subscribe to.
+export const CIRCLE_NOTIFICATION_CATALOG = Object.freeze({
+  transactions: Object.freeze(['transactions.inbound', 'transactions.outbound']),
+  challenges: Object.freeze([
+    'challenges.accelerateTransaction',
+    'challenges.cancelTransaction',
+    'challenges.changePin',
+    'challenges.contractExecution',
+    'challenges.createTransaction',
+    'challenges.createWallet',
+    'challenges.initialize',
+    'challenges.restorePin',
+    'challenges.setPin',
+    'challenges.setSecurityQuestions',
+  ]),
+  contracts: Object.freeze(['contracts.eventLog']),
+  modularWallet: Object.freeze(['modularWallet.userOperation', 'modularWallet.inboundTransfer', 'modularWallet.outboundTransfer']),
+  travelRule: Object.freeze(['travelRule.statusUpdate', 'travelRule.deny', 'travelRule.approve']),
+  rampSession: Object.freeze([
+    'rampSession.completed',
+    'rampSession.depositReceived',
+    'rampSession.expired',
+    'rampSession.failed',
+    'rampSession.kycApproved',
+    'rampSession.kycRejected',
+    'rampSession.kycSubmitted',
+  ]),
+})
+
+// Every concrete notification type Circle accepts, in the order the docs list
+// them. The route treats the bare family name (for example `challenges`) and the
+// family wildcard (`challenges.*`) as aliases for "the whole category", because
+// the Console groups the checkboxes that way.
+export const CIRCLE_NOTIFICATION_TYPES = Object.freeze(
+  Object.values(CIRCLE_NOTIFICATION_CATALOG).flat(),
+)
+
+// The subscription payload that receives every notification this endpoint can
+// route. Circle expands each `<family>.*` wildcard server-side.
+//
+// `webhooks.test` is deliberately NOT part of this list: the LIVE
+// `POST /v2/notifications/subscriptions` API rejects it with "API parameter
+// invalid". The synthetic test event is instead triggered by the subscription's
+// own `POST /v2/notifications/subscriptions/{id}/test` operation, so the route
+// still accepts it (see `isSupportedCircleNotificationType`).
+export const CIRCLE_SUBSCRIPTION_NOTIFICATION_TYPES = Object.freeze(
+  Object.keys(CIRCLE_NOTIFICATION_CATALOG).map(family => `${family}.*`),
+)
+
+export function circleNotificationFamily(eventType = '') {
+  const family = String(eventType || '').trim().split('.')[0]
+  if (!family) return 'unknown'
+  if (family === 'webhooks') return 'test'
+  return Object.prototype.hasOwnProperty.call(CIRCLE_NOTIFICATION_CATALOG, family) ? family : 'unknown'
+}
+
+// Accepts the concrete types plus the wildcards and family aliases Circle's own
+// subscription API accepts. `webhooks.test` is the synthetic probe Circle fires
+// from the Console, so it is always routable.
+export function isSupportedCircleNotificationType(eventType = '') {
+  const type = String(eventType || '').trim()
+  if (!type) return false
+  if (type === '*' || type === 'webhooks.test') return true
+  if (CIRCLE_NOTIFICATION_TYPES.includes(type)) return true
+  const [family, ...rest] = type.split('.')
+  if (!Object.prototype.hasOwnProperty.call(CIRCLE_NOTIFICATION_CATALOG, family)) return false
+  const suffix = rest.join('.')
+  return suffix === '*' || suffix === ''
+}
+
+function firstStringValue(objects, keys) {
+  for (const object of objects) {
+    for (const key of keys) {
+      const value = stringValue(object?.[key]).trim()
+      if (value) return value
+    }
+  }
+  return null
+}
+
+function firstAmount(objects) {
+  for (const object of objects) {
+    if (Array.isArray(object?.amounts) && object.amounts.length) return String(object.amounts[0])
+    const value = stringValue(object?.amount).trim()
+    if (value) return value
+  }
+  return null
+}
+
+function notificationBody(payload = {}) {
+  const candidate = payload?.notification && typeof payload.notification === 'object'
+    ? payload.notification
+    : payload?.data && typeof payload.data === 'object'
+      ? payload.data
+      : payload
+  return candidate && typeof candidate === 'object' && !Array.isArray(candidate) ? candidate : {}
+}
+
+function ids(objects, keys) {
+  for (const object of objects) {
+    for (const key of keys) {
+      const value = stringValue(object?.[key]).trim()
+      if (value) return value
+    }
+  }
+  return null
+}
+
+/**
+ * Normalize a Circle notification envelope into the fields ARCOX uses for
+ * routing and reconciliation. The raw payload is always persisted alongside
+ * this summary, so fields Circle adds later stay accessible.
+ *
+ * Envelope: { subscriptionId, notificationId, notificationType, notification, timestamp, version }
+ */
+export function normalizeCircleNotification(payload = {}) {
+  const eventType = circleWalletEventType(payload)
+  const notificationId = circleWalletNotificationId(payload)
+  const notification = notificationBody(payload)
+  const objects = nestedObjects(payload)
+  const family = circleNotificationFamily(eventType)
+  const subtype = eventType.split('.').slice(1).join('.')
+  const hashes = extractCircleWalletTransaction(payload)
+  const common = {
+    eventType,
+    notificationId,
+    subscriptionId: firstStringValue(objects, ['subscriptionId']) || String(payload.subscriptionId || '') || null,
+    family,
+    subtype: subtype || null,
+    status: firstStatus(objects) || null,
+    blockchain: firstStringValue(objects, ['blockchain', 'network']) || null,
+    txHash: hashes.txHash,
+    userOpHash: hashes.userOpHash,
+    walletAddress: hashes.walletAddress,
+    amount: firstAmount(objects),
+    token: firstStringValue(objects, ['token', 'tokenSymbol', 'currency']) || null,
+    timestamp: firstStringValue([payload, notification], ['timestamp', 'createDate']) || null,
+    version: payload.version === undefined || payload.version === null ? null : payload.version,
+  }
+
+  if (family === 'transactions') {
+    return {
+      ...common,
+      walletId: ids(objects, ['walletId']),
+      contractAddress: ids(objects, ['contractAddress']),
+      sourceAddress: ids(objects, ['sourceAddress', 'fromAddress']),
+      destinationAddress: ids(objects, ['destinationAddress', 'toAddress']),
+      refId: ids(objects, ['refId', 'reference']),
+      errorReason: ids(objects, ['errorReason', 'errorDetails']) || null,
+      state: firstStringValue([notification], ['state', 'status']) || null,
+    }
+  }
+
+  if (family === 'challenges') {
+    return {
+      ...common,
+      challengeId: ids([notification, payload], ['id', 'challengeId']),
+      walletId: ids(objects, ['walletId']),
+      transactionId: ids(objects, ['transactionId']),
+      challengeType: eventType,
+    }
+  }
+
+  if (family === 'contracts') {
+    return {
+      ...common,
+      contractAddress: ids(objects, ['contractAddress', 'address']),
+      eventSignature: ids(objects, ['eventSignature']) || null,
+      eventSignatureHash: ids(objects, ['eventSignatureHash']) || null,
+      blockHash: ids(objects, ['blockHash']) || null,
+      blockHeight: notification.blockHeight ?? null,
+      logIndex: notification.logIndex === undefined ? null : notification.logIndex,
+      topics: Array.isArray(notification.topics) ? notification.topics : null,
+      data: typeof notification.data === 'string' ? notification.data : null,
+      firstConfirmDate: firstStringValue([notification], ['firstConfirmDate']) || null,
+    }
+  }
+
+  if (family === 'modularWallet') {
+    return {
+      ...common,
+      walletId: ids(objects, ['walletId']),
+      contractAddress: ids(objects, ['contractAddress']),
+      sourceAddress: ids(objects, ['sourceAddress', 'fromAddress']),
+      destinationAddress: ids(objects, ['destinationAddress', 'toAddress']),
+    }
+  }
+
+  if (family === 'rampSession') {
+    return {
+      ...common,
+      sessionId: ids(objects, ['sessionId', 'id', 'rampSessionId']),
+      walletId: ids(objects, ['walletId']),
+      kycStatus: ids(objects, ['kycStatus']) || null,
+      depositAddress: ids(objects, ['depositAddress', 'address']),
+      errorReason: ids(objects, ['errorReason', 'errorDetails']) || null,
+    }
+  }
+
+  if (family === 'travelRule') {
+    return {
+      ...common,
+      transferId: ids(objects, ['transferId', 'id']),
+      walletId: ids(objects, ['walletId']),
+    }
+  }
+
+  return { ...common, notification }
+}
