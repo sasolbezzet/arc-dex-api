@@ -220,6 +220,32 @@ test('inbox lists stored events for an authenticated owner without leaking paylo
     const filtered = await get('/api/webhooks/events?family=rampSession', { Authorization: `Bearer ${ownerToken(MSCA)}` })
     assert.equal(filtered.body.total, 1)
     assert.equal(filtered.body.events[0].eventType, 'rampSession.kycApproved')
+
+    // Ringkasan status tetap dihitung dari seluruh event, bukan hasil filter.
+    assert.equal(inbox.body.state.challenges.length, 1)
+    assert.equal(inbox.body.state.challenges[0].challengeId, 'challenge-7')
+    assert.equal(inbox.body.state.challenges[0].succeeded, true)
+    assert.equal(inbox.body.state.rampSessions.length, 1)
+    assert.equal(inbox.body.state.rampSessions[0].sessionId, 'session-7')
+    assert.deepEqual(inbox.body.state.failures, [])
+    assert.equal(filtered.body.state.rampSessions.length, 1)
+  })
+})
+
+test('inbox surfaces failed challenges and ramp sessions', async () => {
+  await withHttp(async ({ deliver, get }) => {
+    await deliver({ notificationId: 'fail-1', notificationType: 'challenges.setPin', notification: { id: 'challenge-fail', status: 'FAILED' } })
+    await deliver({ notificationId: 'fail-2', notificationType: 'rampSession.kycRejected', notification: { id: 'session-fail', kycStatus: 'REJECTED' } })
+
+    const inbox = await get('/api/webhooks/events', { Authorization: `Bearer ${ownerToken(MSCA)}` })
+    assert.equal(inbox.status, 200, JSON.stringify(inbox.body))
+    const challenge = inbox.body.state.challenges.find(item => item.challengeId === 'challenge-fail')
+    assert.equal(challenge.failed, true)
+    assert.equal(challenge.status, 'failed')
+    const session = inbox.body.state.rampSessions.find(item => item.sessionId === 'session-fail')
+    assert.equal(session.failed, true)
+    assert.equal(session.kycStatus, 'REJECTED')
+    assert.deepEqual(inbox.body.state.failures.map(failure => failure.eventType), ['rampSession.kycRejected', 'challenges.setPin'])
   })
 })
 

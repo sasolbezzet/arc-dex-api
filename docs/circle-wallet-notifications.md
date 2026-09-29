@@ -79,6 +79,40 @@ daftar yang harus dicentang di Circle Console.
 Response `POST` memuat `family`, `status`, `txHash`, `userOpHash`, `walletAddress`,
 `notification` (ringkasan ternormalisasi), `reconciliation`, dan `autoMint`.
 
+## Inbox & status (`GET /api/webhooks/events`)
+
+Owner-authenticated. Query: `family`, `type`, `status`, `limit` (maks 200),
+`provider` (default `circle-wallets`).
+
+```json
+{
+  "ok": true,
+  "total": 12,
+  "families": { "challenges": 4, "rampSession": 2, "transactions": 6 },
+  "state": {
+    "challenges":   [{ "challengeId": "…", "status": "failed", "failed": true, "succeeded": false, "occurrences": 2, "updatedAt": "…" }],
+    "rampSessions": [{ "sessionId": "…", "kycStatus": "APPROVED", "failed": false, "succeeded": true, "occurrences": 2, "updatedAt": "…" }],
+    "failures":     [{ "eventType": "rampSession.kycRejected", "family": "rampSession", "status": null, "subjectId": "…", "createdAt": "…" }]
+  },
+  "events": [ { "eventType": "…", "family": "…", "subtype": "…", "status": "…", "processed": true, "reference": { "txHash": "…", "challengeId": null, "sessionId": null } } ]
+}
+```
+
+Aturan:
+
+- `state` dihitung dari **seluruh** event provider ini, bukan hasil filter, supaya
+  ringkasan tetap utuh saat UI memfilter satu family.
+- `state` adalah status TERKINI per `challengeId`/`sessionId`; `failed`/`succeeded`
+  mengikuti event terbaru (bukan sticky), plus jumlah `occurrences`.
+- Hasil negatif dibaca dari subtype (`rampSession.kycRejected`, `…expired`,
+  `…failed`) **atau** dari `status` payload (`FAILED`, `REVERTED`, `DENIED`, …).
+- `failures` = event negatif terbaru, dipakai UI untuk menampilkan peringatan.
+- Payload mentah dan alamat wallet **tidak pernah** ikut di response.
+
+UI-nya adalah kartu “🔔 Webhook Inbox” di halaman Info
+(`src/components/WebhookInboxPanel.tsx`): filter per family, banner merah saat ada
+kegagalan, dan daftar status challenge + ramp session.
+
 ## Mendaftarkan subscription
 
 ```bash
@@ -107,7 +141,10 @@ dijawab `400`. Karena itu daftar wildcard per family dipakai.
 
 - Route ini sengaja tidak mengeksekusi transaksi apa pun; ia hanya mencatat,
   mencocokkan, dan membangunkan worker attestation auto-mint.
-- `challenges.*` dan `rampSession.*` dicatat sebagai status, bukan sebagai bukti
-  settlement.
+- `challenges.*` dan `rampSession.*` dicatat sebagai status terkini per challenge/
+  ramp session (lihat `state` di inbox), bukan sebagai bukti settlement. Status
+  akhir transaksi tetap ditentukan receipt + attestation.
+- Aksi per-event yang tersedia sejauh ini adalah pelaporan status + rekonsiliasi
+  hash ke approval bridge. Belum ada efek samping lain (mis. mengubah saldo).
 - Route gateway (`gateway.*`) punya handler terpisah di
   `docs/circle-gateway-webhooks.md`.

@@ -33,7 +33,7 @@ import { paymentLogMatches } from './src/services/invoiceVerify.mjs'
 import { getPolicy } from './src/services/aiRouterStore.mjs'
 import { estimateDelegatedUnifiedSpend, spendDelegatedUnifiedBalance } from './src/services/aiRouterSpendService.mjs'
 import { requireTreasuryAddress, treasuryConfigurationIssues } from './src/config/treasury.mjs'
-import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus, circleNotificationFamily, isSupportedCircleNotificationType, normalizeCircleNotification, CIRCLE_NOTIFICATION_CATALOG, CIRCLE_SUBSCRIPTION_NOTIFICATION_TYPES } from './src/services/circleWalletWebhookService.mjs'
+import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCircleWalletStatus, isSuccessfulCircleWalletStatus, circleNotificationFamily, isSupportedCircleNotificationType, normalizeCircleNotification, CIRCLE_NOTIFICATION_CATALOG, CIRCLE_SUBSCRIPTION_NOTIFICATION_TYPES, summarizeCircleNotificationState } from './src/services/circleWalletWebhookService.mjs'
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { ARC_CCTP_DOMAIN, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, ARC_SDK_CHAIN_NAME, IS_ARC_MAINNET, arcCctpChains, arcCctpDomains, arcCircleApiKey, arcCircleClientKey, arcCircleEntitySecret, arcCircleWalletBlockchain, arcContractAddress, arcGatewayBaseUrl, arcGatewayChains, arcIrisBaseUrl, arcNetwork, arcSolanaCctp, arcTokenAddress, resolveMscaChainKey } from './src/config/arcNetwork.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
@@ -4054,9 +4054,13 @@ app.get('/api/webhooks/events', apiLimiter, requireAuth, async (req, res) => {
     const db = loadWebhookEvents()
     const families = {}
     const matches = []
+    // Status challenge/ramp session dihitung dari SELURUH event provider ini,
+    // bukan hanya hasil filter, supaya ringkasannya tetap utuh saat UI memfilter.
+    const scoped = []
     for (const event of Object.values(db)) {
       if (!event || typeof event !== 'object') continue
       if (provider && event.provider !== provider) continue
+      scoped.push(event)
       const eventFamily = event.family || circleNotificationFamily(event.eventType)
       families[eventFamily] = (families[eventFamily] || 0) + 1
       if (family && eventFamily !== family) continue
@@ -4070,6 +4074,7 @@ app.get('/api/webhooks/events', apiLimiter, requireAuth, async (req, res) => {
       provider: provider || null,
       total: matches.length,
       families,
+      state: summarizeCircleNotificationState(scoped),
       events: matches.slice(0, limit).map(serializeWebhookEvent),
     })
   } catch (error) {

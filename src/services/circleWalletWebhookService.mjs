@@ -301,3 +301,87 @@ export function normalizeCircleNotification(payload = {}) {
 
   return { ...common, notification }
 }
+
+// Subtype yang menandakan hasil negatif. Dipakai supaya `rampSession.kycRejected`
+// dan `challenges.*` yang gagal tetap terdeteksi walau payload-nya tidak memberi
+// `status` eksplisit.
+const NEGATIVE_NOTIFICATION_SUBTYPES = Object.freeze(['failed', 'expired', 'rejected', 'denied', 'kycRejected', 'cancelled', 'canceled', 'error', 'reverted'])
+const POSITIVE_NOTIFICATION_SUBTYPES = Object.freeze(['completed', 'complete', 'confirmed', 'succeeded', 'success', 'approved', 'kycApproved', 'depositReceived'])
+
+export function isNegativeCircleNotification(eventType = '', status = '') {
+  const subtype = String(eventType || '').split('.').slice(1).join('.')
+  if (subtype && NEGATIVE_NOTIFICATION_SUBTYPES.includes(subtype)) return true
+  return isFailedCircleWalletStatus(status)
+}
+
+export function isPositiveCircleNotification(eventType = '', status = '') {
+  const subtype = String(eventType || '').split('.').slice(1).join('.')
+  if (subtype && POSITIVE_NOTIFICATION_SUBTYPES.includes(subtype)) return true
+  return isSuccessfulCircleWalletStatus(status)
+}
+
+/** Id subjek yang bisa dilacak statusnya lintas event (challenge / ramp session). */
+export function circleNotificationSubjectId(eventType = '', notification = {}) {
+  const family = circleNotificationFamily(eventType)
+  if (family === 'challenges') return notification?.challengeId ? String(notification.challengeId) : null
+  if (family === 'rampSession') return notification?.sessionId ? String(notification.sessionId) : null
+  return null
+}
+
+/**
+ * Ringkas event webhook yang sudah tersimpan menjadi status TERKINI per challenge
+ * dan ramp session, plus daftar kegagalan terbaru.
+ *
+ * Sengaja dihitung dari event yang sudah ada (bukan store baru) supaya tidak ada
+ * state kedua yang bisa divergen dari inbox, dan aman dipanggil berkali-kali.
+ */
+export function summarizeCircleNotificationState(events = [], { failureLimit = 20 } = {}) {
+  const latest = new Map()
+  const occurrences = new Map()
+  const failures = []
+
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue
+    const notification = event.notification && typeof event.notification === 'object' ? event.notification : {}
+    const eventType = String(event.eventType || notification.eventType || '')
+    const family = event.family || circleNotificationFamily(eventType)
+    const status = String(event.status || notification.status || '').toLowerCase()
+    const createdAt = event.createdAt || null
+    const subjectId = circleNotificationSubjectId(eventType, notification)
+
+    if (isNegativeCircleNotification(eventType, status)) {
+      failures.push({ eventType, family, status: status || null, subjectId, createdAt })
+    }
+    if (!subjectId) continue
+
+    const key = `${family}:${subjectId}`
+    occurrences.set(key, (occurrences.get(key) || 0) + 1)
+    const previous = latest.get(key)
+    if (!previous || String(createdAt || '') >= String(previous.createdAt || '')) {
+      latest.set(key, { family, subjectId, eventType, status, kycStatus: notification.kycStatus || null, walletId: notification.walletId || null, createdAt })
+    }
+  }
+
+  const challenges = []
+  const rampSessions = []
+  for (const entry of latest.values()) {
+    const key = `${entry.family}:${entry.subjectId}`
+    const summary = {
+      status: entry.status || null,
+      failed: isNegativeCircleNotification(entry.eventType, entry.status),
+      succeeded: isPositiveCircleNotification(entry.eventType, entry.status),
+      lastEventType: entry.eventType,
+      occurrences: occurrences.get(key) || 1,
+      updatedAt: entry.createdAt,
+    }
+    if (entry.family === 'challenges') challenges.push({ challengeId: entry.subjectId, type: entry.eventType, ...summary })
+    else if (entry.family === 'rampSession') rampSessions.push({ sessionId: entry.subjectId, kycStatus: entry.kycStatus, ...summary })
+  }
+
+  const byUpdatedAt = (a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''))
+  challenges.sort(byUpdatedAt)
+  rampSessions.sort(byUpdatedAt)
+  failures.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+
+  return { challenges, rampSessions, failures: failures.slice(0, failureLimit) }
+}

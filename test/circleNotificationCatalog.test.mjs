@@ -158,6 +158,59 @@ test('contracts.eventLog normalizes the Arc Docs payload', async () => {
   assert.equal(normalized.firstConfirmDate, '2026-01-21T06:53:12Z')
 })
 
+test('outcome classification reads both the subtype and the payload status', async () => {
+  const { isNegativeCircleNotification, isPositiveCircleNotification } = await load()
+  assert.equal(isNegativeCircleNotification('rampSession.kycRejected', ''), true)
+  assert.equal(isNegativeCircleNotification('rampSession.expired', ''), true)
+  assert.equal(isNegativeCircleNotification('challenges.createWallet', 'failed'), true)
+  assert.equal(isNegativeCircleNotification('transactions.outbound', 'reverted'), true)
+  assert.equal(isNegativeCircleNotification('challenges.createWallet', 'complete'), false)
+  assert.equal(isPositiveCircleNotification('rampSession.kycApproved', ''), true)
+  assert.equal(isPositiveCircleNotification('rampSession.completed', ''), true)
+  assert.equal(isPositiveCircleNotification('challenges.createWallet', 'complete'), true)
+  assert.equal(isPositiveCircleNotification('rampSession.kycRejected', ''), false)
+})
+
+test('state summary folds challenges and ramp sessions to the latest status', async () => {
+  const { summarizeCircleNotificationState } = await load()
+  const summary = summarizeCircleNotificationState([
+    { eventType: 'challenges.createWallet', family: 'challenges', status: 'complete', createdAt: '2026-09-29T10:00:00.000Z', notification: { challengeId: 'c1' } },
+    { eventType: 'challenges.createWallet', family: 'challenges', status: 'failed', createdAt: '2026-09-29T11:00:00.000Z', notification: { challengeId: 'c1' } },
+    { eventType: 'rampSession.kycRejected', family: 'rampSession', status: null, createdAt: '2026-09-29T09:00:00.000Z', notification: { sessionId: 's1' } },
+    { eventType: 'rampSession.kycApproved', family: 'rampSession', status: null, createdAt: '2026-09-29T12:00:00.000Z', notification: { sessionId: 's1', kycStatus: 'APPROVED' } },
+    { eventType: 'transactions.inbound', family: 'transactions', status: 'confirmed', createdAt: '2026-09-29T13:00:00.000Z', notification: {} },
+  ])
+
+  assert.equal(summary.challenges.length, 1)
+  assert.equal(summary.challenges[0].challengeId, 'c1')
+  assert.equal(summary.challenges[0].status, 'failed')
+  assert.equal(summary.challenges[0].failed, true)
+  assert.equal(summary.challenges[0].occurrences, 2)
+  assert.equal(summary.challenges[0].updatedAt, '2026-09-29T11:00:00.000Z')
+
+  assert.equal(summary.rampSessions.length, 1)
+  assert.equal(summary.rampSessions[0].sessionId, 's1')
+  assert.equal(summary.rampSessions[0].kycStatus, 'APPROVED')
+  assert.equal(summary.rampSessions[0].failed, false)
+  assert.equal(summary.rampSessions[0].succeeded, true)
+  assert.equal(summary.rampSessions[0].occurrences, 2)
+
+  assert.deepEqual(summary.failures.map(failure => failure.eventType), ['challenges.createWallet', 'rampSession.kycRejected'])
+  assert.equal(summary.failures[0].subjectId, 'c1')
+})
+
+test('state summary ignores events without a trackable subject', async () => {
+  const { summarizeCircleNotificationState, circleNotificationSubjectId } = await load()
+  assert.equal(circleNotificationSubjectId('transactions.inbound', { txHash: TX }), null)
+  assert.equal(circleNotificationSubjectId('contracts.eventLog', { contractAddress: CONTRACT }), null)
+  const summary = summarizeCircleNotificationState([
+    { eventType: 'transactions.outbound', family: 'transactions', status: 'failed', createdAt: '2026-09-29T10:00:00.000Z' },
+  ])
+  assert.deepEqual(summary.challenges, [])
+  assert.deepEqual(summary.rampSessions, [])
+  assert.equal(summary.failures.length, 1)
+})
+
 test('modularWallet and rampSession families normalize their references', async () => {
   const { normalizeCircleNotification } = await load()
   const userOperation = normalizeCircleNotification({
