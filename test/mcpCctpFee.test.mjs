@@ -9,6 +9,23 @@ test('CCTP maxFee uses the live minimumFee rate plus a 20% safety buffer', async
   assert.equal(fee.bufferBps, 2000)
 })
 
+test('CCTP maxFee stays non-zero for dust transfers so the fast lane is eligible', async () => {
+  const { calculateCctpMaxFee } = await import('../src/services/mcpServer.mjs?cctp-fee-dust-' + Date.now())
+  // 0.01425 USDC at 0.35 bps truncates to 0 and makes Iris delay the message
+  // with `insufficient_fee`, forcing the slow finalized lane (~20 min on
+  // Base/Arbitrum). The cap must round up instead.
+  const dust = calculateCctpMaxFee({ amount: 14_250n, minimumFee: '0.35' })
+  assert.equal(dust.protocolFee, 1n)
+  assert.equal(dust.maxFee, 2n)
+  const small = calculateCctpMaxFee({ amount: 19_000n, minimumFee: '0.35' })
+  assert.equal(small.protocolFee, 1n)
+  assert.equal(small.maxFee, 2n)
+  // A zero fee rate still means a zero cap.
+  const free = calculateCctpMaxFee({ amount: 14_250n, minimumFee: '0' })
+  assert.equal(free.protocolFee, 0n)
+  assert.equal(free.maxFee, 0n)
+})
+
 test('CCTP fee quote calls Circle Iris for the exact source/destination domains', async () => {
   const { getCctpFeeQuote } = await import('../src/services/mcpServer.mjs?cctp-fee-api-' + Date.now())
   const route = {

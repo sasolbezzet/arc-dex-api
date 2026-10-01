@@ -16,7 +16,7 @@ export function registerDocsCatalogTools(ctx) {
 
   const arcoxPages = [
     { id: 'swap', title: 'Swap', purpose: 'Swap retail tokens on Arc Mainnet from Agent Wallet (MSCA).', userInputs: ['tokenIn', 'tokenOut', 'amountIn'], actions: ['arcox_quote_swap', 'arcox_execute_swap'] },
-    { id: 'bridge', title: 'Bridge', purpose: 'Bridge USDC across Arc/Base/Arbitrum via verified ArcoxRouter + CCTP.', userInputs: ['fromChain', 'toChain', 'token', 'amount'], actions: ['arcox_quote_bridge', 'arcox_execute_bridge', 'arcox_bridge_status', 'arcox_retry_bridge_mint'] },
+    { id: 'bridge', title: 'Bridge', purpose: 'Bridge USDC across Arc/Base/Arbitrum via verified ArcoxRouter + CCTP.', userInputs: ['fromChain', 'toChain', 'token', 'amount'], actions: ['arcox_quote_bridge', 'arcox_execute_bridge', 'arcox_bridge_history', 'arcox_bridge_status', 'arcox_retry_bridge_mint'] },
     { id: 'send', title: 'Send', purpose: 'Send supported tokens to another address from the Agent Wallet.', userInputs: ['recipient', 'token', 'amount'], actions: ['arcox_quote_send', 'arcox_execute_send'] },
     { id: 'pay', title: 'ARCOX Pay', purpose: 'Create and pay USDC invoice/payment requests on Arc Mainnet.', userInputs: ['amount', 'merchantAddress'], actions: ['arcox_create_payment_request', 'arcox_quote_payment_request', 'arcox_pay_payment_request', 'arcox_check_payment_status'] },
     { id: 'intel', title: 'Intel', purpose: 'Read-only Arkham address/entity/token/portfolio intelligence through ARCOX API (x402 paid). No swap, bridge, send, buy, or sell execution.', userInputs: ['address/entity/token'], actions: ['arcox_intel_search', 'arcox_intel_get_address', 'arcox_intel_get_entity', 'arcox_intel_get_token', 'arcox_intel_get_balances', 'arcox_intel_get_portfolio', 'arcox_intel_get_portfolio_series', 'arcox_intel_get_flows', 'arcox_intel_get_history', 'arcox_intel_get_volume', 'arcox_intel_get_counterparties', 'arcox_intel_get_transfers', 'arcox_intel_get_global_transfers', 'arcox_intel_get_swaps', 'arcox_intel_get_risk', 'arcox_intel_get_loans', 'arcox_intel_get_network', 'arcox_intel_get_market', 'arcox_intel_get_solana_subaccounts', 'arcox_intel_get_hypercore', 'arcox_intel_get_polymarket', 'arcox_x402_pay_invoice'] },
@@ -41,6 +41,7 @@ export function registerDocsCatalogTools(ctx) {
     'Always quote before swap, bridge, send, or invoice payment.',
     'Never execute a value-moving action without explicit user confirmation (yes/ya).',
     'Bridge pending is normal after burn; poll arcox_bridge_status and retry mint with the burn tx.',
+    'A chain balance can come only from a bridge or a mint, and a 0 balance means no funds there: read arcox_wallet_balances + arcox_bridge_history before explaining a balance change.',
     'Agent may prepare plans, but user-owned funds require explicit confirmation.',
   ]
   const arcoxDocsCatalog = [

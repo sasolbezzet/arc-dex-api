@@ -180,6 +180,46 @@ test('destination nonce check supports Arc and fails closed on RPC errors', asyn
   assert.equal(unavailable.reason, 'destination_nonce_check_unavailable')
 })
 
+test('destination nonce check resolves mainnet Base and fails closed without a chain id', async () => {
+  const { destinationMintAlreadyProcessed, destinationChainId } = await import('../src/services/mcpServer.mjs?nonce-base-mainnet-' + Date.now() + '-' + Math.random())
+  // Real Arc→Base mainnet CCTP message header: version, source domain 26,
+  // destination domain 6, then the 32-byte nonce.
+  const status = { message: '0x' + [
+    '00000001',
+    '0000001a',
+    '00000006',
+    'b48ffe184269c23c5bcfbabff30f96ef3b2039d5193e9b2ee26330ae5181a6b5',
+  ].join('') }
+  const route = {
+    toKey: 'Base',
+    destination: {
+      chainId: 8453,
+      rpcUrl: 'https://example.invalid/base',
+      messageTransmitter: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
+    },
+  }
+  assert.equal(destinationChainId(route), 8453)
+  const calls = []
+  const unused = await destinationMintAlreadyProcessed({ status, route, client: { readContract: async args => { calls.push(args); return 0n } } })
+  assert.deepEqual({ checked: unused.checked, processed: unused.processed }, { checked: true, processed: false })
+  assert.equal(calls[0].address, '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64')
+  assert.equal(calls[0].functionName, 'usedNonces')
+  assert.equal(calls[0].args[0], '0xb48ffe184269c23c5bcfbabff30f96ef3b2039d5193e9b2ee26330ae5181a6b5')
+  const minted = await destinationMintAlreadyProcessed({ status, route, client: { readContract: async () => 1n } })
+  assert.equal(minted.processed, true)
+  // An unknown destination must still fail closed before any RPC read.
+  const unresolvable = await destinationMintAlreadyProcessed({
+    status,
+    route: { toKey: 'Unknown_Destination', destination: { rpcUrl: route.destination.rpcUrl, messageTransmitter: route.destination.messageTransmitter } },
+    client: { readContract: async () => { throw new Error('must not be called') } },
+  })
+  assert.deepEqual({ checked: unresolvable.checked, processed: unresolvable.processed, reason: unresolvable.reason }, {
+    checked: false,
+    processed: false,
+    reason: 'destination_nonce_check_unavailable',
+  })
+})
+
 test('route mismatch is terminal and is not repeatedly polled', async () => {
   const { waitForCctpBridgeStatus } = await import('../src/services/mcpServer.mjs?cctp-terminal-' + Date.now() + '-' + Math.random())
   const previousFetch = globalThis.fetch

@@ -55,15 +55,17 @@ const BUNDLER_MIN_PRIORITY_FEE_WEI = 1_000_000_000n
 // sehingga paymaster Gas Station menolaknya dengan `Exceeded max spend USD per
 // transaction of the policy` — itu yang memblokir deploy MSCA di chain tujuan.
 const NON_ARC_MIN_PRIORITY_FEE_WEI = 1_000_000n
+// Circle's rollup bundlers reject a UserOperation whose verification-gas use is
+// below 40% of the requested limit. Base and Arbitrum account validation
+// measures ~55.6k-81.8k (Base mainnet 69.6k on the receiveMessage mint), so
+// 130k keeps execution headroom while staying above the floor for both the
+// destination mint and the source approve+bridge burn. Values of 140k-600k and
+// the original 270k were rejected with `Verification gas limit efficiency too
+// low. Required: 0.4, Actual: 0.258`.
 const DESTINATION_VERIFICATION_GAS_LIMITS = {
   [ARC_CHAIN_KEY]: 270_000n,
-  'base-sepolia': 270_000n,
-  'base-mainnet': 270_000n,
-  // Circle's Arbitrum bundler rejects verification gas whose actual use is
-  // below 40% of the requested limit. This receiveMessage path measured
-  // 55.6k-81.8k in the latest prechecks, so 130k retains execution headroom
-  // while keeping the minimum observed efficiency above 40%; larger limits
-  // (140k, 150k, 200k, and 600k) were rejected before submission.
+  'base-sepolia': 130_000n,
+  'base-mainnet': 130_000n,
   'arbitrum-sepolia': 130_000n,
   'arbitrum-mainnet': 130_000n,
 }

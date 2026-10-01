@@ -311,8 +311,11 @@ test('simulated events fill the status table, raise alerts and can be purged', a
     const purged = await del('/api/webhooks/simulate', { ...auth, 'X-Simulation-Secret': 'sim-secret' })
     assert.equal(purged.status, 200)
     assert.equal(purged.body.removed, 3)
+    // The simulated alerts raised by these events must not survive the purge.
+    assert.equal(purged.body.alertsRemoved, 2)
     const after = await get('/api/webhooks/events', auth)
     assert.equal(after.body.total, 0)
+    assert.deepEqual(after.body.alerts, [])
     assert.deepEqual(after.body.state.challenges, [])
     assert.deepEqual(after.body.state.rampSessions, [])
   }, { WEBHOOK_SIMULATION_SECRET: 'sim-secret' })

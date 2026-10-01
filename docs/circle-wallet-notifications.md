@@ -176,9 +176,14 @@ npm run webhook:simulate -- --http --url https://arcoxdex.vercel.app
 ```
 
 Event tiruan selalu ditandai `simulated: true` sehingga terlihat di inbox
-(“· simulasi”) dan bisa dibersihkan dengan `--purge`. Endpoint
+(“· simulasi”) dan bisa dibersihkan dengan `--purge`. Purge menghapus **dua**
+sisi sekaligus: event dari webhook DB dan alert kegagalan tiruan di vault
+(`purgeSimulatedWebhookFailures`), jadi daftar “wallet perlu tindakan” tidak
+meninggalkan alert palsu setelah event-nya dibersihkan. Alert nyata
+(`simulated !== true`) tidak pernah ikut terhapus. Endpoint
 `POST/DELETE /api/webhooks/simulate` digerbangi `WEBHOOK_SIMULATION_SECRET`
-(dinonaktifkan secara default, terpisah dari `ENABLE_DEV_TOOLS`).
+(dinonaktifkan secara default, terpisah dari `ENABLE_DEV_TOOLS`) dan
+mengembalikan `{ ok, removed, alertsRemoved }` pada DELETE.
 
 ## Mendaftarkan subscription
 

@@ -77,6 +77,27 @@ test('repeats inside the dedupe window bump the counter instead of flooding', as
   })
 })
 
+test('purging simulated alerts removes only the simulated ones', async () => {
+  await withVault(async (vault) => {
+    vault.recordWebhookFailure(OWNER, { family: 'challenges', eventType: 'challenges.setPin', subjectId: 'sim-1', simulated: true })
+    vault.recordWebhookFailure(OWNER, { family: 'rampSession', eventType: 'rampSession.failed', subjectId: 'sim-2', simulated: true })
+    vault.recordWebhookFailure(OTHER, { family: 'rampSession', eventType: 'rampSession.expired', subjectId: 'sim-3', simulated: true })
+    const real = vault.recordWebhookFailure(OWNER, { family: 'challenges', eventType: 'challenges.setPin', subjectId: 'real-1', simulated: false })
+
+    // Owner-scoped purge only touches that owner's simulated alerts.
+    const scoped = vault.purgeSimulatedWebhookFailures(OWNER)
+    assert.equal(scoped, 2)
+    assert.deepEqual(vault.listWebhookFailures(OWNER).map(item => item.id), [real.id])
+    assert.equal(vault.listWebhookFailures(OTHER).length, 1)
+
+    // A global purge removes the rest without touching real alerts.
+    assert.equal(vault.purgeSimulatedWebhookFailures(), 1)
+    assert.equal(vault.listWebhookFailures(OTHER).length, 0)
+    assert.equal(vault.listWebhookFailures(OWNER).length, 1)
+    assert.equal(vault.purgeSimulatedWebhookFailures('not-an-address'), 0)
+  })
+})
+
 test('acknowledging an alert hides it until explicitly requested', async () => {
   await withVault(async (vault) => {
     const alert = vault.recordWebhookFailure(OWNER, { family: 'rampSession', eventType: 'rampSession.failed', subjectId: 's3' })

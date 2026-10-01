@@ -572,6 +572,27 @@ export function acknowledgeWebhookFailure(owner, id) {
   })
 }
 
+/**
+ * Hapus alert kegagalan yang berasal dari event tiruan. Dipakai oleh purge
+ * simulasi (script `--purge` dan DELETE /api/webhooks/simulate) supaya event
+ * tiruan tidak meninggalkan alert palsu di UI setelah datanya dibersihkan.
+ * Tanpa `owner` penyapuan berlaku untuk semua owner, sama seperti purge event.
+ * Alert nyata (simulated !== true) tidak pernah ikut terhapus.
+ */
+export function purgeSimulatedWebhookFailures(owner) {
+  const address = addressKey(owner)
+  const scoped = isAddressKey(address)
+  return withVaultLock(() => {
+    const v = loadVault()
+    if (!Array.isArray(v.webhookFailures)) return 0
+    const before = v.webhookFailures.length
+    v.webhookFailures = v.webhookFailures.filter(item => !(item.simulated && (!scoped || item.owner === address)))
+    const removed = before - v.webhookFailures.length
+    if (removed) saveVault(v)
+    return removed
+  })
+}
+
 // ── Session key info (lightweight, stored in vault) ──
 // Full delegate private key stored in sessionKeyService (separate file).
 // This stores only the public address + wallet address for the vault UI.

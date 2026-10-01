@@ -97,7 +97,12 @@ async function runLocal({ purge }) {
       if (event && typeof event === 'object' && event.simulated) { delete db[key]; removed += 1 }
     }
     writeDb(db)
+    // Event tiruan yang gagal juga meninggalkan alert di vault, jadi purge
+    // harus membersihkan keduanya supaya UI tidak menampilkan alert palsu.
+    const { purgeSimulatedWebhookFailures } = await import('../src/services/vaultStore.mjs')
+    const alertsRemoved = await purgeSimulatedWebhookFailures()
     console.log(`🗑️  ${removed} event tiruan dihapus dari ${DB_PATH}`)
+    console.log(`🗑️  ${alertsRemoved} alert tiruan dihapus dari vault`)
     return
   }
   const results = []
@@ -147,6 +152,7 @@ async function runHttp({ url, purge }) {
     const body = await response.json().catch(() => ({}))
     if (!response.ok) throw new Error(`Purge gagal (${response.status}): ${JSON.stringify(body)}`)
     console.log(`🗑️  ${body.removed} event tiruan dihapus via ${endpoint}`)
+    console.log(`🗑️  ${body.alertsRemoved ?? 0} alert tiruan dihapus dari vault`)
     return
   }
   const response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ events: cannedEvents() }) })

@@ -47,7 +47,7 @@ const TOOL_PROFILES = {
     'arcox_get_request',
   ],
   core: [
-    'arcox_wallet_balances', 'arcox_transaction_history', 'arcox_session_status',
+    'arcox_wallet_balances', 'arcox_transaction_history', 'arcox_bridge_history', 'arcox_session_status',
     'arcox_mcp_info', 'arcox_route_status', 'arcox_get_request',
     'arcox_quote_swap', 'arcox_execute_swap',
     'arcox_quote_bridge', 'arcox_execute_bridge', 'arcox_bridge_status', 'arcox_retry_bridge_mint',
@@ -990,6 +990,7 @@ import { registerArcoxPayTools } from './mcp/arcoxPayTools.mjs'
 import { registerCardTools } from './mcp/cardTools.mjs'
 import { registerAiRouterTools } from './mcp/aiRouterTools.mjs'
 import { fetchAllChainBalances } from './multiChainBalance.mjs'
+import { BRIDGE_HISTORY_SOURCE, addDecimalAmounts, summarizeBridgeHistory } from './bridgeHistory.mjs'
 import { CHAINS, MSCA_SUPPORTED_CHAIN_KEYS } from './chains.mjs'
 import { arcRpcUrls, resolveArcRpc } from '../config/arcRpc.mjs'
 import { ARC_BALANCE_CHAIN_KEYS, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_EXTERNAL_CHAIN_KEYS, ARC_SDK_CHAIN_NAME, ARC_USDC_ADDRESS, IS_ARC_MAINNET, arcCircleContract, arcContractAddress, arcIrisBaseUrl, arcTokenAddress } from '../config/arcNetwork.mjs'
@@ -1040,6 +1041,21 @@ async function isDeployedSmartAccount(address) {
   const client = createPublicClient({ chain: defineChain({ id: ARC_CHAIN_ID, name: ARC_CHAIN_NAME, nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 }, rpcUrls: { default: { http: [arcRpc] } } }), transport: http(arcRpc) })
   const code = await client.getBytecode({ address }).catch(() => undefined)
   return Boolean(code && code !== '0x')
+}
+
+/**
+ * Resolve the owner identity used for owner-scoped history/approval reads.
+ * Approvals and browser history are stored under the owner EOA (or the passkey
+ * self-alias); reading them with the MSCA as the auth subject returned empty
+ * lists even though the bridges were executed for exactly that wallet.
+ */
+async function resolveHistoryOwnerAddress(userId, walletAddress) {
+  try {
+    const { resolveOwnerAddressForWallet } = await import('./sessionKeyService.mjs')
+    return resolveOwnerAddressForWallet(userId, walletAddress) || userId
+  } catch {
+    return userId
+  }
 }
 
 function mscaRequiredResult() {
@@ -1108,6 +1124,15 @@ function executionChainKey(slug) {
     eth_mainnet: 'ethereum-mainnet',
     base_mainnet: 'base-mainnet',
     arbitrum_mainnet: 'arbitrum-mainnet',
+    // The BRIDGE_CCTP registry keys a mainnet destination as `Base`/`Arbitrum`
+    // while persisted bridge records store `base-mainnet`/`arbitrum-mainnet`.
+    // Without these aliases the two spellings never compare equal, so a retry
+    // could not find the original intent (it created a duplicate audit row) and
+    // an inbound Base→Arc source burn lost its paymaster fee profile.
+    base: 'base-mainnet',
+    arbitrum: 'arbitrum-mainnet',
+    ethereum: 'ethereum-mainnet',
+    hyperevm: 'hyperevm-mainnet',
   }
   return aliases[s] || s
 }
@@ -1247,7 +1272,15 @@ export function calculateCctpMaxFee({ amount, minimumFee, bufferBps = CCTP_FEE_B
   // minimumFee is expressed in basis points. Keeping two decimal places as an
   // integer avoids floating point errors (1.3 bps = 130 / 1,000,000).
   const feeRateHundredthsBps = parseFeeRateHundredthsBps(minimumFee)
-  const protocolFee = (transferAmount * feeRateHundredthsBps) / 1_000_000n
+  // Round the protocol fee up instead of truncating: whole-base-unit
+  // truncation yields maxFee = 0 for transfers below ~0.03 USDC (or any rate
+  // under one base unit), which makes Circle's Iris mark the burn
+  // `delayReason: insufficient_fee` and settle it on the slow finalized lane —
+  // ~20 minutes on Base/Arbitrum instead of a Fast Transfer. One base unit is
+  // the smallest cap that still lets the fast lane execute.
+  const protocolFee = transferAmount > 0n && feeRateHundredthsBps > 0n
+    ? (transferAmount * feeRateHundredthsBps + 999_999n) / 1_000_000n
+    : 0n
   const maxFee = (protocolFee * BigInt(10_000 + buffer) + 9_999n) / 10_000n
   return { protocolFee, maxFee, feeRateHundredthsBps, bufferBps: buffer }
 }
@@ -1359,7 +1392,15 @@ function bridgeRpcUrls(chainConfig) {
       ? [process.env.BASE_SEPOLIA_RPC_URL, 'https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com']
       : key === 'arbitrum_sepolia' || chainId === 421614
         ? [process.env.ARB_SEPOLIA_RPC_URL, 'https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com']
-        : [chainConfig?.rpcUrl]
+        // Mainnet needs more than one endpoint: a single flaky public RPC must
+        // not hold a settled bridge as `destination_nonce_check_unavailable`.
+        : key === 'base' || chainId === 8453
+          ? [chainConfig?.rpcUrl, process.env.BASE_MAINNET_RPC_URL, 'https://mainnet.base.org', 'https://base-rpc.publicnode.com']
+          : key === 'arbitrum' || chainId === 42161
+            ? [chainConfig?.rpcUrl, process.env.ARB_MAINNET_RPC_URL, 'https://arb1.arbitrum.io/rpc', 'https://arbitrum-one-rpc.publicnode.com']
+            : key === 'ethereum' || chainId === 1
+              ? [chainConfig?.rpcUrl, process.env.ETH_MAINNET_RPC_URL, 'https://ethereum-rpc.publicnode.com']
+              : [chainConfig?.rpcUrl]
   return [...new Set(configured.filter(Boolean))]
 }
 
@@ -1950,19 +1991,40 @@ export function hashlessDestinationRetryAllowed(approval, now = Date.now()) {
     && now - recordedAt >= HASHLESS_DESTINATION_RECOVERY_DELAY_MS
 }
 
+// Every BRIDGE_CCTP destination carries its own `chainId`, so a route built
+// from that registry never needs a hardcoded table; the table below only covers
+// fixture/legacy routes without `destination.chainId`. Mainnet entries are
+// mandatory: while Base/Arbitrum mainnet were missing here, an Arc→Base bridge
+// reported `destination_nonce_check_unavailable` forever and the destination
+// mint retry stayed held even though the CCTP message was ready and unused.
+const DESTINATION_CHAIN_IDS = {
+  [ARC_SDK_CHAIN_NAME]: ARC_CHAIN_ID,
+  Arc_Testnet: 5042002,
+  Base_Sepolia: 84532,
+  Arbitrum_Sepolia: 421614,
+  Ethereum_Sepolia: 11155111,
+  Base: 8453,
+  Arbitrum: 42161,
+  Ethereum: 1,
+  HyperEVM: 999,
+  HyperEVM_Testnet: 998,
+}
+export function destinationChainId(route) {
+  const configured = Number(route?.destination?.chainId)
+  if (Number.isInteger(configured) && configured > 0) return configured
+  return DESTINATION_CHAIN_IDS[route?.toKey] || null
+}
+
 export async function destinationMintAlreadyProcessed({ status, route, client: injectedClient } = {}) {
   const nonce = extractCctpMessageNonce(status?.message)
   const rpcUrl = route?.destination?.rpcUrl
   const messageTransmitter = route?.destination?.messageTransmitter
-  if (!nonce || !rpcUrl || !messageTransmitter) return { checked: false, processed: false, nonce, reason: 'destination_nonce_check_unavailable' }
+  const chainId = destinationChainId(route)
+  if (!nonce || !rpcUrl || !messageTransmitter || !chainId) return { checked: false, processed: false, nonce, reason: 'destination_nonce_check_unavailable' }
   try {
-    const destinationInfo = {
-      [ARC_SDK_CHAIN_NAME]: { id: ARC_CHAIN_ID },
-      Base_Sepolia: { id: 84532 },
-      Arbitrum_Sepolia: { id: 421614 },
-    }[route.toKey]
-    if (!destinationInfo) return { checked: false, processed: false, nonce, reason: 'destination_nonce_check_unavailable' }
-    const client = injectedClient || bridgePublicClient(route.destination)
+    // `name` keeps bridgeRpcUrls on the registry key when the route config
+    // itself has no name (BRIDGE_CCTP entries only carry chainId/rpcUrl).
+    const client = injectedClient || bridgePublicClient({ ...route.destination, chainId, name: route.toKey })
     const processed = await client.readContract({
       address: getAddress(messageTransmitter),
       abi: USED_NONCES_ABI,
@@ -1988,14 +2050,9 @@ async function destinationMscaPreflight({ route, walletAddress, requireAuthoriza
   if (!destinationInfo) return { ok: false, reason: 'destination_msca_route_not_supported', message: 'Destination MSCA UserOperation belum mendukung chain tujuan ini.' }
   if (!route?.destination?.rpcUrl || !route.destination.messageTransmitter) return { ok: false, reason: 'destination_chain_not_configured' }
   const { createPublicClient } = await import('viem')
-  const rpcUrls = [...new Set([
-    route.destination.rpcUrl,
-    ...(route.toKey === ARC_SDK_CHAIN_NAME ? arcRpcUrls({ preferCanteen: process.env.USE_CANTEEN_RPC === 'true' }) : []),
-    ...(route.toKey === 'Base_Sepolia' ? [process.env.BASE_SEPOLIA_RPC_URL, 'https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com'] : []),
-    ...(route.toKey === 'Arbitrum_Sepolia' ? [process.env.ARB_SEPOLIA_RPC_URL, 'https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia-rpc.publicnode.com'] : []),
-    ...(route.toKey === 'Base' ? [process.env.BASE_MAINNET_RPC_URL, 'https://mainnet.base.org'] : []),
-    ...(route.toKey === 'Arbitrum' ? [process.env.ARB_MAINNET_RPC_URL, 'https://arb1.arbitrum.io/rpc'] : []),
-  ].filter(Boolean))]
+  // Shared with the destination nonce check so both reads always iterate the
+  // same endpoint list, including mainnet public fallbacks.
+  const rpcUrls = bridgeRpcUrls(route.destination)
   let code
   let sawSuccessfulRpcRead = false
   for (const rpcUrl of rpcUrls) {
@@ -2375,6 +2432,20 @@ export function sourceBridgePendingOperation(details = {}) {
   return null
 }
 
+/**
+ * A single burn hash identifies exactly one CCTP message. Matching is done on
+ * the canonical execution chain key so the two spellings of a mainnet
+ * destination (`Base` in the BRIDGE_CCTP registry, `base-mainnet` in the
+ * persisted record) still reconcile to the same intent — otherwise a retry
+ * creates a duplicate audit row instead of healing the original one.
+ */
+export function bridgeIntentMatchesBurn(details, { burnTxHash, toKey } = {}) {
+  if (!burnTxHash || !toKey) return false
+  const destinationKey = details?.destinationMintChainKey || details?.destinationChainKey || details?.toChain
+  return details?.burnTxHash === burnTxHash
+    && executionChainKey(destinationKey) === executionChainKey(toKey)
+}
+
 async function findBridgeApprovalForMintAudit(userId, burnTxHash, toKey, walletAddress = '') {
   try {
     const vault = await import('./vaultStore.mjs')
@@ -2382,9 +2453,7 @@ async function findBridgeApprovalForMintAudit(userId, burnTxHash, toKey, walletA
     for (const approval of vault.listApprovals(userId) || []) {
       let details
       try { details = JSON.parse(approval.details || '{}') } catch { details = null }
-      if (details?.burnTxHash !== burnTxHash) continue
-      const destinationKey = details?.destinationMintChainKey || details?.destinationChainKey || details?.toChain
-      if (executionChainKey(destinationKey) !== executionChainKey(toKey)) continue
+      if (!bridgeIntentMatchesBurn(details, { burnTxHash, toKey })) continue
       const route = bridgeConfig(details?.fromChain, details?.toChain)
       if (!await bridgeLegacyApprovalMatchesWallet(approval, details, route, walletAddress)) continue
       matches.push({ approval, details, phase: details.settlementPhase || 'intent_created' })
@@ -2412,10 +2481,9 @@ async function findPendingBridgeIntent(userId, burnTxHash, toKey, walletAddress 
       if (!['pending_confirmation', 'pending_signature'].includes(approval.status)) continue
       let details
       try { details = JSON.parse(approval.details || '{}') } catch { details = null }
-      const destinationKey = details?.destinationChainKey || details?.toChain
       const route = bridgeConfig(details?.fromChain, details?.toChain)
       if (!await bridgeLegacyApprovalMatchesWallet(approval, details, route, walletAddress)) continue
-      if (details?.burnTxHash === burnTxHash && executionChainKey(destinationKey) === executionChainKey(toKey) && !details.destinationUserOpHash) {
+      if (bridgeIntentMatchesBurn(details, { burnTxHash, toKey }) && !details.destinationUserOpHash) {
         return { approval, details, phase: details.settlementPhase || 'intent_created' }
       }
     }
@@ -2469,6 +2537,42 @@ async function markBridgePendingResolved(userId, pending, status, extra = {}) {
     const vault = await import('./vaultStore.mjs')
     vault.updateApprovalStatus(userId, pending.approval.id, status, extra)
   } catch { /* audit persistence must not change transaction safety */ }
+}
+
+// A burn hash identifies exactly one CCTP message, so every audit row that
+// carries it describes the same destination mint. A retry that could not match
+// the original row used to create a duplicate and leave the first one in a
+// failed-precheck state; resolving all of them keeps the history truthful.
+export function bridgeIntentRows(intent) {
+  if (Array.isArray(intent?.all) && intent.all.length) return intent.all
+  return intent ? [intent] : []
+}
+
+export function bridgeIntentMintEvidence(intent) {
+  const withMint = bridgeIntentRows(intent).find(row => row.details?.mintTxHash || row.details?.destinationUserOpHash)
+  return {
+    txHash: withMint?.details?.mintTxHash || null,
+    userOpHash: withMint?.details?.destinationUserOpHash || null,
+    explorerUrl: withMint?.approval?.explorerUrl || null,
+  }
+}
+
+async function resolveAllBridgeIntentRows(userId, intent, { txHash = null, userOpHash = null, explorerUrl = null } = {}) {
+  for (const row of bridgeIntentRows(intent)) {
+    await markBridgePendingResolved(userId, row, 'success', {
+      ...(txHash || row.approval?.txHash ? { txHash: txHash || row.approval.txHash } : {}),
+      ...(userOpHash || row.approval?.userOpHash ? { userOpHash: userOpHash || row.approval.userOpHash } : {}),
+      ...(explorerUrl || row.approval?.explorerUrl ? { explorerUrl: explorerUrl || row.approval.explorerUrl } : {}),
+      details: jsonText({
+        ...row.details,
+        settlementStatus: 'success',
+        settlementPhase: 'destination_minted',
+        destinationMintStatus: 'minted',
+        mintTxHash: row.details?.mintTxHash || txHash || null,
+        destinationUserOpHash: row.details?.destinationUserOpHash || userOpHash || null,
+      }),
+    })
+  }
 }
 
 async function resumePendingBridgeApproval(userId, approval, details, info) {
@@ -2709,6 +2813,9 @@ async function mintDestinationViaMsca({ status, route, walletAddress, userId, se
       burnTxHash: status.burnTxHash,
       destinationChainKey: destinationKey,
       destinationUserOpHash: result.userOpHash || null,
+      // Persist the destination transaction too, so a healed/already-minted
+      // audit row can prove the mint without re-deriving it from the UserOperation.
+      mintTxHash: result.txHash || null,
       settlementStatus: 'success',
     }, 'success', { txHash: result.txHash, userOpHash: result.userOpHash })
     destinationMintLocks.delete(lockKey)
@@ -3251,15 +3358,33 @@ export function createMcpServer(userId, context = {}) {
 
   // ── READ-ONLY TOOLS ──
 
-  registerTool('arcox_wallet_balances', 'Show Agent Wallet (MSCA) balances on Arc, Ethereum Sepolia, Base Sepolia, and Arbitrum Sepolia', {}, async () => {
+  registerTool('arcox_wallet_balances', `Show Agent Wallet (MSCA) balances on every active-network chain (${ARC_BALANCE_CHAIN_KEYS.join(', ')}). Each chain is always reported, incl. native gas token + USDC/EURC: a 0 value means the wallet really holds no funds there, not a failed lookup (check per-chain status/errors).`, {}, async () => {
     const msca = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     try {
       const chains = await fetchAllChainBalances(msca.walletAddress)
+      const chainSummary = Object.fromEntries(ARC_BALANCE_CHAIN_KEYS.map(key => [key, {
+        label: CHAINS[key]?.name || key,
+        chainId: CHAINS[key]?.id ?? null,
+        USDC: chains[key]?.USDC ?? null,
+        EURC: chains[key]?.EURC ?? null,
+        nativeBalance: chains[key]?.nativeBalance ?? null,
+        nativeSymbol: chains[key]?.nativeSymbol || CHAINS[key]?.nativeCurrency?.symbol || null,
+        status: chains[key]?.status || 'unavailable',
+        explorerUrl: CHAINS[key]?.explorerUrl ? `${CHAINS[key].explorerUrl}/address/${msca.walletAddress}` : null,
+      }]))
+      const totalUsdc = ARC_BALANCE_CHAIN_KEYS.reduce((total, key) => addDecimalAmounts(total, chainSummary[key]?.USDC || '0'), '0')
       return { content: [{ type: 'text', text: jsonText({
         walletAddress: msca.walletAddress,
         walletType: 'MSCA',
         chains,
+        summary: {
+          totalUsdc,
+          perChain: Object.fromEntries(Object.entries(chainSummary).map(([key, value]) => [key, { label: value.label, USDC: value.USDC, nativeBalance: value.nativeBalance, nativeSymbol: value.nativeSymbol, status: value.status }])),
+          emptyChains: ARC_BALANCE_CHAIN_KEYS.filter(key => chainSummary[key]?.status === 'ok' && ['0', '', null].includes(chainSummary[key]?.USDC)),
+          unavailableChains: ARC_BALANCE_CHAIN_KEYS.filter(key => !['ok', 'partial'].includes(chainSummary[key]?.status || '')),
+        },
+        chainSummary,
         // Backward-compatible Arc summary for older Claude/GPT prompts. The
         // canonical multi-chain data lives under chains[chainKey].
         USDC: chains[ARC_CHAIN_KEY]?.USDC ?? null,
@@ -3284,11 +3409,63 @@ export function createMcpServer(userId, context = {}) {
     }
   })
 
-  registerTool('arcox_transaction_history', 'Check transaction history and auto-mint worker status', {}, async () => {
+  registerTool('arcox_transaction_history', 'Check transaction history and auto-mint worker status. Includes bridges executed by the agent (MSCA), so a destination-chain balance change can always be traced to its burn/mint rows.', {}, async () => {
     const msca = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
-    const data = await apiGet(`/api/tx-history?address=${encodeURIComponent(msca.walletAddress)}`, msca.walletAddress)
-    return { content: [{ type: 'text', text: jsonText({ ...data, walletAddress: msca.walletAddress, walletType: 'MSCA' }) }] }
+    // Authenticate as the owner identity (EOA alias when one exists): the
+    // history/approvals of this wallet are owner-scoped, so minting the token
+    // for the MSCA itself returned an empty history.
+    const historyOwner = await resolveHistoryOwnerAddress(userId, msca.walletAddress)
+    const data = await apiGet(`/api/tx-history?address=${encodeURIComponent(msca.walletAddress)}`, historyOwner)
+    const bridges = Array.isArray(data?.bridges) ? data.bridges : []
+    const summary = summarizeBridgeHistory(bridges)
+    return { content: [{ type: 'text', text: jsonText({
+      ...data,
+      walletAddress: msca.walletAddress,
+      walletType: 'MSCA',
+      historyOwner,
+      bridgeSummary: { total: summary.total, pending: summary.pending, success: summary.success, error: summary.error, pendingMint: summary.pendingMint },
+      note: 'bridgeSummary merangkum baris bridge Agent Wallet (MSCA) di dalam history; detail lengkap tersedia lewat arcox_bridge_history.',
+    }) }] }
+  })
+
+  registerTool('arcox_bridge_history', 'List Agent Wallet (MSCA) bridge history with from/to chain, amount, burn/mint tx hashes, explorer links, settlement phase and auto-mint status. Use it when a chain balance changed or the user asks why funds are on Base/Arbitrum/Arc.', {
+    chain: z.string().optional().describe('Only rows that involve this chain, e.g. Arc, Base, Arbitrum, Ethereum'),
+    status: z.string().optional().describe('Only rows with this status: pending, success, or error'),
+    limit: z.number().optional().describe('Maximum rows to return (default 25, max 100)'),
+  }, async (params) => {
+    const msca = await resolveActiveMsca(userId, boundMscaWalletAddress)
+    if (!msca) return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
+    const historyOwner = await resolveHistoryOwnerAddress(userId, msca.walletAddress)
+    const limit = Math.min(Math.max(Number(params.limit) || 25, 1), 100)
+    const data = await apiGet(`/api/bridge-history?address=${encodeURIComponent(msca.walletAddress)}&limit=${limit}`, historyOwner)
+    const rows = Array.isArray(data?.bridges) ? data.bridges : []
+    const chainFilter = String(params.chain || '').trim().toLowerCase()
+    const statusFilter = String(params.status || '').trim().toLowerCase()
+    const bridges = rows.filter(row => {
+      if (chainFilter && String(row.from || '').toLowerCase() !== chainFilter && String(row.to || '').toLowerCase() !== chainFilter) return false
+      if (statusFilter && String(row.status || '').toLowerCase() !== statusFilter) return false
+      return true
+    })
+    const summary = summarizeBridgeHistory(bridges)
+    return { content: [{ type: 'text', text: jsonText({
+      schemaVersion: 1,
+      status: 'ok',
+      walletAddress: msca.walletAddress,
+      walletType: 'MSCA',
+      historyOwner,
+      ownerScope: 'eoa-and-linked-msca',
+      source: BRIDGE_HISTORY_SOURCE,
+      count: bridges.length,
+      summary: { total: summary.total, pending: summary.pending, success: summary.success, error: summary.error, chains: summary.chains },
+      pendingMint: summary.pendingMint,
+      bridges,
+      nextAction: summary.pendingMint.length
+        ? 'Untuk setiap pendingMint jalankan arcox_bridge_status({burnTxHash, fromChain, toChain}); jika attestation siap, lanjutkan arcox_retry_bridge_mint dengan confirmed=true dan confirmationText=yes. Worker auto-mint juga tetap berjalan untuk burn yang sama.'
+        : null,
+      note: 'Semua baris berasal dari approval bridge Agent Wallet (MSCA); mint destination bisa selesai lewat worker auto-mint sehingga mintTx terisi menyusul.',
+      ...(data?.error ? { error: data.error } : {}),
+    }) }] }
   })
 
   registerTool('arcox_route_status', 'Check if a swap/bridge/send route is supported', {
@@ -3670,6 +3847,11 @@ export function createMcpServer(userId, context = {}) {
     const gate = await canAutoExecute(userId, source, params.amount, executionChainKey(params.fromChain), info.walletAddress, agentKey, dailyLimit)
 
     if (!gate.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, message: gate.message || 'Session key MSCA tidak dapat mengeksekusi bridge.' }) }] }
+    // Once the source burn is final, its hash is the only recovery anchor. Any
+    // later failure (attestation polling, receipt read, mint transport) must
+    // surface that hash as pending settlement instead of a bare bridge_error.
+    let burnTxHashRef = null
+    let burnUserOpHashRef = null
     try {
       const amount = parseUnits(String(params.amount).trim(), 6)
       if (amount <= 0n) throw new Error('Amount bridge tidak valid')
@@ -3860,6 +4042,8 @@ export function createMcpServer(userId, context = {}) {
         return { content: [{ type: 'text', text: jsonText({ status: 'settlement_pending', executed: false, approvalSubmitted: true, sourceSubmitted: true, approvalId, sourceApprovalUserOpHash, userOpHash: result.userOpHash, userOpExplorerUrl: result.explorerUrl || null, reason: result.reason || 'user_operation_pending', safeToRetry: false, message: 'Approval berhasil dan burn UserOperation sudah diterima bundler tetapi receipt belum tersedia. Jangan ulangi burn.' }) }] }
       }
       if (result.status !== 'success') return { content: [{ type: 'text', text: jsonText({ status: 'session_failed', executed: false, approvalId, approvalSubmitted: true, sourceSubmitted: Boolean(result.userOpHash), error: result.reason || 'Bridge burn UserOperation gagal', userOpHash: result.userOpHash || null, safeToRetry: result.safeToRetry === true, userOpAccepted: result.userOpAccepted || (result.userOpHash ? 'yes' : 'unknown') }) }] }
+      burnTxHashRef = result.txHash
+      burnUserOpHashRef = result.userOpHash || null
       const burnProof = await verifyBridgeBurn({ burnTxHash: result.txHash, route, walletAddress: info.walletAddress, amount })
       if (!burnProof.ok) return { content: [{ type: 'text', text: jsonText({ status: 'burn_submitted', executed: true, verified: false, burnTxHash: result.txHash, userOpHash: result.userOpHash, reason: burnProof.reason, message: 'Source UserOperation berhasil tetapi bukti event router belum terverifikasi. Jangan ulangi burn; periksa transaksi ini secara read-only.' }) }] }
       const bridgeStatus = await waitForCctpBridgeStatus({
@@ -3996,6 +4180,22 @@ export function createMcpServer(userId, context = {}) {
             : 'Burn MSCA berhasil; destination mint masih pending. Jalankan arcox_bridge_status lalu retry setelah attestation siap.'),
       }) }] }
     } catch (e) {
+      // The burn already happened, so this is a settlement problem, not a
+      // failed bridge: report the hash and let status/retry (or the auto-mint
+      // worker) finish it instead of suggesting a retry that would burn again.
+      if (burnTxHashRef) {
+        return { content: [{ type: 'text', text: jsonText({
+          status: 'settlement_pending',
+          executed: true,
+          sourceSubmitted: true,
+          burnTxHash: burnTxHashRef,
+          userOpHash: burnUserOpHashRef,
+          safeToRetry: false,
+          reason: 'bridge_post_burn_reconciliation_required',
+          error: e?.message ? String(e.message).slice(0, 300) : null,
+          message: 'Burn source sudah final tetapi settlement destination belum selesai. Jangan burn ulang; lanjutkan dengan arcox_bridge_status atau arcox_retry_bridge_mint memakai burnTxHash ini.',
+        }) }] }
+      }
       return { content: [{ type: 'text', text: jsonText({ status: 'bridge_error', executed: false, error: e?.message || 'MSCA bridge gagal' }) }] }
     }
   })
@@ -4124,19 +4324,7 @@ export function createMcpServer(userId, context = {}) {
         }) }] }
       }
       if (nonceDecision === 'minted') {
-        if (bridgeAuditIntent) {
-          await markBridgePendingResolved(userId, bridgeAuditIntent, 'success', {
-            ...(bridgeAuditIntent.approval?.txHash ? { txHash: bridgeAuditIntent.approval.txHash } : {}),
-            ...(bridgeAuditIntent.approval?.explorerUrl ? { explorerUrl: bridgeAuditIntent.approval.explorerUrl } : {}),
-            ...(bridgeAuditIntent.approval?.userOpHash ? { userOpHash: bridgeAuditIntent.approval.userOpHash } : {}),
-            details: jsonText({
-              ...bridgeAuditIntent.details,
-              settlementStatus: 'success',
-              settlementPhase: 'destination_minted',
-              destinationMintStatus: 'minted',
-            }),
-          })
-        }
+        if (bridgeAuditIntent) await resolveAllBridgeIntentRows(userId, bridgeAuditIntent, bridgeIntentMintEvidence(bridgeAuditIntent))
         return { content: [{ type: 'text', text: jsonText({
           status: 'minted', executed: false, idempotent: true, burnTxHash: params.burnTxHash,
           walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: bridgeAuditIntent?.details?.mintTxHash || null,
@@ -4146,18 +4334,10 @@ export function createMcpServer(userId, context = {}) {
       }
       const mint = await mintDestinationViaMsca({ status, route, walletAddress: info.walletAddress, userId, sessionLookupId: info.walletAddress, approvalId: bridgeAuditIntent?.approval?.id || null, allowHashlessRecovery: true })
       if (mint.success && bridgeAuditIntent) {
-        await markBridgePendingResolved(userId, bridgeAuditIntent, 'success', {
-          ...(mint.txHash ? { txHash: mint.txHash } : {}),
-          ...(mint.explorerUrl ? { explorerUrl: mint.explorerUrl } : {}),
-          ...(mint.userOpHash ? { userOpHash: mint.userOpHash } : {}),
-          details: jsonText({
-            ...bridgeAuditIntent.details,
-            settlementStatus: 'success',
-            settlementPhase: 'destination_minted',
-            destinationMintStatus: 'minted',
-            mintTxHash: mint.txHash || bridgeAuditIntent.details?.mintTxHash || null,
-            destinationUserOpHash: mint.userOpHash || bridgeAuditIntent.details?.destinationUserOpHash || null,
-          }),
+        await resolveAllBridgeIntentRows(userId, bridgeAuditIntent, {
+          txHash: mint.txHash || null,
+          userOpHash: mint.userOpHash || null,
+          explorerUrl: mint.explorerUrl || null,
         })
       }
       return { content: [{ type: 'text', text: jsonText({        status: mint.success ? 'minted' : (mint.error === 'destination_mint_in_flight' || mint.error === 'destination_nonce_check_unavailable' ? 'settlement_pending' : 'mint_failed'), executed: mint.success && !mint.idempotent, idempotent: Boolean(mint.idempotent), burnTxHash: params.burnTxHash, walletAddress: info.walletAddress, walletType: 'MSCA', mintTxHash: mint.txHash || null, destinationUserOpHash: mint.userOpHash || null, destinationExplorerUrl: mint.explorerUrl || null, destinationMintStatus: mint.success ? 'minted' : 'pending', safeToRetry: mint.success ? false : (mint.safeToRetry ?? false), error: mint.success ? null : mint.error, message: mint.success ? (mint.idempotent ? 'Destination mint sudah selesai sebelumnya.' : 'Destination receiveMessage berhasil via MSCA UserOperation.') : (mint.error === 'destination_mint_in_flight' ? 'Destination mint UserOperation masih pending. Jangan retry sampai status UserOperation final.' : 'Destination mint belum aman untuk diulang; pastikan status UserOperation dan nonce destination sudah final.') }) }] }

@@ -41,6 +41,7 @@ import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleMod
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
 import { startRefundWorker } from './src/services/x402RefundWorker.mjs'
 import { readPaymentInvoice, readTransactionHistory, scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, shadowReadWebhookEvent, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
+import { mergeBridgeRecordsIntoHistory, readBridgeHistoryForOwners } from './src/services/bridgeHistory.mjs'
 import { verifyOwnerToken } from './src/services/authToken.mjs'
 import { claimWebhookEvent, completeWebhookEvent, listAutoMintJobs, readAutoMintJob, claimAutoMintLease, releaseAutoMintLease, supabaseOperationalStatus, upsertAutoMintJob } from './src/services/supabaseOperationalState.mjs'
 
@@ -3738,12 +3739,52 @@ app.post('/api/bridge', apiLimiter, requireAuth, async (req, res) => {
   }
 })
 
+// Bridge history of the owner's Agent Wallet (MSCA). Agent-executed bridges
+// live in vault approvals, not in the browser history store; this endpoint (and
+// the merge below) makes them visible to the web UI and to MCP tools.
+async function readOwnerBridgeHistory(authAddress, { walletAddress = '', limit = 100 } = {}) {
+  const { listRelatedAddresses } = await import('./src/services/sessionKeyService.mjs')
+  const owners = listRelatedAddresses(authAddress)
+  return await readBridgeHistoryForOwners(owners, { walletAddress, limit })
+}
+
+app.get('/api/bridge-history', apiLimiter, requireAuth, async (req, res) => {
+  try {
+    const walletAddress = String(req.query?.address || req.query?.wallet || '').trim()
+    const limit = Math.min(Math.max(Number(req.query?.limit) || 50, 1), 200)
+    const read = await readOwnerBridgeHistory(req.authAddress, { walletAddress, limit })
+    res.json({
+      success: true,
+      owner: req.authAddress,
+      walletAddress: walletAddress || null,
+      ownerScope: 'eoa-and-linked-msca',
+      count: read.records.length,
+      bridges: read.records,
+      persistenceSource: read.sources,
+      ...(read.error ? { error: read.error } : {}),
+    })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 app.get('/api/tx-history', apiLimiter, requireAuth, async (req, res) => {
   try {
     const db = loadTxHistory()
     const localItems = Array.isArray(db[req.authAddress]) ? db[req.authAddress] : []
     const read = await readTransactionHistory(req.authAddress, localItems, 100)
-    res.json({ success: true, history: read.items.slice(0, 100) })
+    // `?address=` only narrows the bridge rows to that Agent Wallet; the
+    // owner-scoped history rows stay visible so an agent authenticated as the
+    // MSCA still sees the EOA-written entries.
+    const walletAddress = String(req.query?.address || req.query?.wallet || '').trim()
+    const bridges = await readOwnerBridgeHistory(req.authAddress, { walletAddress, limit: 100 })
+      .catch(error => ({ records: [], error: error?.message || 'bridge history read failed' }))
+    const history = mergeBridgeRecordsIntoHistory(read.items, bridges.records, 100)
+    res.json({
+      success: true,
+      history,
+      bridges: bridges.records,
+      bridgeCount: bridges.records.length,
+      ...(bridges.error ? { bridgeError: bridges.error } : {}),
+    })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
@@ -4195,7 +4236,11 @@ app.delete('/api/webhooks/simulate', apiLimiter, requireAuth, async (req, res) =
       if (count) saveWebhookEvents(db)
       return count
     })
-    res.json({ ok: true, removed })
+    // Event tiruan juga menulis alert kegagalan ke vault; kalau tidak ikut
+    // dibersihkan, alert palsu tetap tampil di UI setelah purge.
+    const { purgeSimulatedWebhookFailures } = await import('./src/services/vaultStore.mjs')
+    const alertsRemoved = await purgeSimulatedWebhookFailures()
+    res.json({ ok: true, removed, alertsRemoved })
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message })
   }

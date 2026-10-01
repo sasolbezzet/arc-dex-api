@@ -117,15 +117,22 @@ Karakteristik yang berlaku sekarang:
   - Field tasks-extension `execution` **tidak** dikirim, karena server tidak
     mengiklankan capability `tasks` dan klien dengan skema ketat gagal
     mem-parse seluruh daftar tool jika field asing ikut terkirim.
-- 88 tool tersedia untuk semua agent (`arcox_wallet_balances`,
-  `arcox_quote_bridge`/`arcox_execute_bridge`, `arcox_intel_*`, `arcox_card_*`,
-  `arcox_x402_*`, `arcox_agent_*`, `call_ai_model`, …).
+- 89 tool tersedia untuk semua agent (`arcox_wallet_balances`,
+  `arcox_quote_bridge`/`arcox_execute_bridge`/`arcox_bridge_history`,
+  `arcox_intel_*`, `arcox_card_*`, `arcox_x402_*`, `arcox_agent_*`,
+  `call_ai_model`, …).
+- `arcox_bridge_history` membaca riwayat bridge Agent Wallet (MSCA) dari
+  approval `action: bridge` milik owner cluster (EOA + MSCA terkait), termasuk
+  burn/mint tx, explorer link, phase settlement, dan status auto-mint. Tool ini
+  yang menjelaskan kenapa saldo Base/Arbitrum/Arc berubah, sedangkan
+  `arcox_wallet_balances` selalu melaporkan setiap chain (nilai 0 = benar-benar
+  kosong, bukan gagal baca).
 - Klien dengan kuota tool kecil (mis. connector penyedia AI) bisa meminta
   subset yang konsisten lewat URL atau header; default tetap daftar penuh:
 
   ```text
   https://arcoxdex.vercel.app/mcp?profile=lite    # 13 tool transaksi inti
-  https://arcoxdex.vercel.app/mcp?profile=core    # 41 tool
+  https://arcoxdex.vercel.app/mcp?profile=core    # 42 tool
   x-arcox-tool-profile: core                       # lewat header
   ```
 
