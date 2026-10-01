@@ -117,22 +117,40 @@ Karakteristik yang berlaku sekarang:
   - Field tasks-extension `execution` **tidak** dikirim, karena server tidak
     mengiklankan capability `tasks` dan klien dengan skema ketat gagal
     mem-parse seluruh daftar tool jika field asing ikut terkirim.
-- 89 tool tersedia untuk semua agent (`arcox_wallet_balances`,
+- 92 tool tersedia untuk semua agent (`arcox_wallet_balances`,
   `arcox_quote_bridge`/`arcox_execute_bridge`/`arcox_bridge_history`,
-  `arcox_intel_*`, `arcox_card_*`, `arcox_x402_*`, `arcox_agent_*`,
-  `call_ai_model`, …).
+  `arcox_intel_*`, `arcox_marketplace_*`, `arcox_card_*`, `arcox_x402_*`,
+  `arcox_agent_*`, `call_ai_model`, …).
 - `arcox_bridge_history` membaca riwayat bridge Agent Wallet (MSCA) dari
   approval `action: bridge` milik owner cluster (EOA + MSCA terkait), termasuk
   burn/mint tx, explorer link, phase settlement, dan status auto-mint. Tool ini
   yang menjelaskan kenapa saldo Base/Arbitrum/Arc berubah, sedangkan
   `arcox_wallet_balances` selalu melaporkan setiap chain (nilai 0 = benar-benar
   kosong, bukan gagal baca).
+- Marketplace x402 (mirror dari direktori discovery Circle, ~2.6k endpoint
+  pihak ketiga) bisa dijelajahi gratis dan dibeli lewat ARCOX dengan platform
+  fee di atas harga provider:
+
+  ```text
+  GET  /api/marketplace/stats                 # jumlah resource, band harga, status executor
+  GET  /api/marketplace/catalog?q=odds        # cari endpoint + harga provider
+  GET  /api/marketplace/quote?resource=mkt_…  # harga provider + platform fee + total
+  POST /api/marketplace/call                  # beli lewat ARCOX (x402, perlu executor)
+  POST /api/marketplace/sync                  # refresh mirror (owner-gated)
+  ```
+
+  Pencarian dan quote tidak pernah menagih; `POST /api/marketplace/call`
+  menolak jalan (HTTP 503) sampai `X402_MARKETPLACE_EXECUTOR=cli` dan
+  `X402_MARKETPLACE_PAYER_ADDRESS` diisi wallet agent yang sudah didanai — jadi
+  mirror ini aman dinyalakan sebelum ada dana yang bisa dibelanjakan. Harga
+  provider disimpan per chain dalam base units, dan platform fee dihitung di
+  atasnya (`X402_PLATFORM_FEE_BPS`, default 5%).
 - Klien dengan kuota tool kecil (mis. connector penyedia AI) bisa meminta
   subset yang konsisten lewat URL atau header; default tetap daftar penuh:
 
   ```text
   https://arcoxdex.vercel.app/mcp?profile=lite    # 13 tool transaksi inti
-  https://arcoxdex.vercel.app/mcp?profile=core    # 42 tool
+  https://arcoxdex.vercel.app/mcp?profile=core    # 45 tool
   x-arcox-tool-profile: core                       # lewat header
   ```
 

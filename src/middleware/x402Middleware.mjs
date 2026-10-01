@@ -9,6 +9,7 @@ import { ARC_RPC_LOG_CHUNK_SIZE, arcRpcUrls, resolveArcRpc } from '../config/arc
 import { ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_GATEWAY_KEY, ARC_USDC_ADDRESS, arcCircleApiKey, arcCircleBaseUrl, arcCircleContract, arcGatewayBaseUrl } from '../config/arcNetwork.mjs'
 import { readX402Invoice, scheduleWebhookEventUpsert, scheduleX402InvoiceUpsert, shadowReadWebhookEvent } from '../services/supabasePersistence.mjs'
 import { claimWebhookEvent, completeWebhookEvent } from '../services/supabaseOperationalState.mjs'
+import { applyPlatformFee, platformFeeBps, platformFeeFixedUsdc, platformFeeEnabledForServices, publicPlatformFee } from '../services/platformFee.mjs'
 
 const invoices = globalThis.__arcoxX402Invoices || new Map()
 globalThis.__arcoxX402Invoices = invoices
@@ -137,16 +138,52 @@ export function x402Config() {
     circleTreasuryWalletId: process.env.CIRCLE_X402_TREASURY_WALLET_ID || '',
     circleTreasuryAddress: treasuryAddress(),
     memoContract: ARC_MEMO_CONTRACT,
+    platformFee: publicPlatformFee(),
   }
 }
 
-function normalizeAmount(value) {
+function normalizeAmount(value, { allowZero = false } = {}) {
   const raw = String(value ?? '').trim()
   if (!/^\d+(?:\.\d{1,6})?$/.test(raw)) throw new Error('Invalid x402 amount')
   const [whole, fraction = ''] = raw.split('.')
   const baseUnits = BigInt(whole) * 1_000_000n + BigInt((fraction + '000000').slice(0, 6))
-  if (baseUnits <= 0n) throw new Error('Invalid x402 amount')
+  if (baseUnits < 0n || (baseUnits <= 0n && !allowZero)) throw new Error('Invalid x402 amount')
   return `${baseUnits / 1_000_000n}.${String(baseUnits % 1_000_000n).padStart(6, '0')}`
+}
+
+/**
+ * Decide the net/fee/total split for an invoice. Callers that price a resale
+ * (the marketplace) hand over the split explicitly; ARCOX's own resources get
+ * the platform fee only when it is switched on for services, so nothing that
+ * already charges a fixed price changes silently.
+ */
+function resolveInvoiceFeePlan(input, baseAmount) {
+  const split = input.split && (input.split.netAmount || input.split.netBaseUnits)
+    ? { netAmount: input.split.netAmount, feeAmount: input.split.feeAmount || '0', source: input.split.source || 'explicit' }
+    : input.platformFee?.applied && input.platformFee?.amountUsdc !== undefined
+      ? { netAmount: baseAmount, feeAmount: input.platformFee.amountUsdc, source: input.platformFee.source || 'explicit' }
+      : null
+  if (split) {
+    const netAmount = normalizeAmount(split.netAmount)
+    const feeAmount = normalizeAmount(split.feeAmount, { allowZero: true })
+    const feeUnits = BigInt(feeAmount.split('.')[0]) * 1_000_000n + BigInt(feeAmount.split('.')[1] || '0')
+    const netUnits = BigInt(netAmount.split('.')[0]) * 1_000_000n + BigInt(netAmount.split('.')[1] || '0')
+    return {
+      applied: feeUnits > 0n,
+      source: split.source,
+      bps: Number(input.platformFee?.bps ?? input.split.bps ?? platformFeeBps()) || 0,
+      fixedUsdc: '0',
+      netAmount,
+      feeAmount,
+      totalAmount: `${(netUnits + feeUnits) / 1_000_000n}.${String((netUnits + feeUnits) % 1_000_000n).padStart(6, '0')}`,
+    }
+  }
+  const plan = applyPlatformFee(baseAmount, {
+    enabled: platformFeeEnabledForServices(),
+    bps: platformFeeBps(),
+    fixedUsdc: platformFeeFixedUsdc(),
+  })
+  return { ...plan, source: plan.applied ? 'arcox_services' : 'none' }
 }
 
 function safeNormalizeAmount(value) {
@@ -226,7 +263,8 @@ export function createX402Invoice(input = {}) {
   const invoiceId = input.invoiceId || `arcox_x402_${randomUUID().replaceAll('-', '').slice(0, 16)}`
   const paymentId = input.paymentId || `x402_${randomUUID().replaceAll('-', '').slice(0, 16)}`
   const baseAmount = normalizeAmount(input.amount || cfg.baseAmount)
-  const uniqueAmount = normalizeAmount(input.uniqueAmount || nextUniqueAmount(baseAmount))
+  const feePlan = resolveInvoiceFeePlan(input, baseAmount)
+  const uniqueAmount = normalizeAmount(input.uniqueAmount || nextUniqueAmount(feePlan.totalAmount))
   const agentId = /^\d+$/.test(String(input.agentId || '')) ? String(input.agentId) : ''
   const paymentMethod = input.paymentMethod || 'arc-usdc-direct'
   const agentMemo = paymentMethod === 'unified-balance-gateway' || paymentMethod === 'arc-usdc-memo'
@@ -267,10 +305,20 @@ export function createX402Invoice(input = {}) {
       directArc: true,
       unifiedBalance: true,
     },
+    platformFeeAmount: feePlan.feeAmount,
+    platformFeeBps: feePlan.bps,
+    platformFeeSource: feePlan.source,
     fee: {
       asset: 'USDC',
-      amount: '0',
-      note: 'No ARCOX x402 platform fee added to the invoice amount.',
+      bps: feePlan.bps,
+      fixedUsdc: feePlan.fixedUsdc,
+      amount: feePlan.feeAmount,
+      netAmount: feePlan.netAmount,
+      totalAmount: uniqueAmount,
+      source: feePlan.source,
+      note: feePlan.applied
+        ? `ARCOX platform fee ${feePlan.bps} bps charged on top of the ${feePlan.netAmount} USDC service price.`
+        : 'No ARCOX x402 platform fee added to the invoice amount.',
     },
     createdAt: new Date(now).toISOString(),
     expiresAt: new Date(now + cfg.ttlSeconds * 1000).toISOString(),
@@ -459,6 +507,8 @@ export function getX402Stats() {
   let revenueUsdc = 0
   let revenueLast24hUsdc = 0
   let paid24h = 0
+  let platformFeeUsdc = 0
+  let upstreamCostUsdc = 0
   let open = 0
   const refunds = { pending_review: 0, refund_approved: 0, refunded: 0, manual_review: 0, refund_failed_manual: 0, refundedUsdc: 0 }
   const providerErrors = { provider_not_found: 0, provider_error: 0 }
@@ -474,6 +524,8 @@ export function getX402Stats() {
     if (status === 'paid') {
       const amount = Number(invoice.uniqueAmount || invoice.amount || 0) || 0
       revenueUsdc += amount
+      platformFeeUsdc += Number(invoice.platformFeeAmount || 0) || 0
+      upstreamCostUsdc += Number(invoice.upstream?.amountUsdc || 0) || 0
       const paidAt = Date.parse(invoice.paidAt || '')
       if (paidAt && now - paidAt < dayMs) {
         revenueLast24hUsdc += amount
@@ -507,6 +559,12 @@ export function getX402Stats() {
     byRefundStatus,
     revenueUsdc: round6(revenueUsdc),
     revenueLast24hUsdc: round6(revenueLast24hUsdc),
+    // Platform fee is ARCOX's own margin on top of the service price; upstream
+    // cost is what a marketplace resale paid the provider. Gross revenue minus
+    // upstream cost is the real margin on the paid invoices.
+    platformFeeUsdc: round6(platformFeeUsdc),
+    upstreamCostUsdc: round6(upstreamCostUsdc),
+    marginUsdc: round6(revenueUsdc - upstreamCostUsdc),
     paid24h,
     refunds: { ...refunds, refundedUsdc: round6(refunds.refundedUsdc) },
     providerErrors,
@@ -578,6 +636,15 @@ export function publicInvoice(invoice) {
     settlementStatus: invoice.settlementStatus || invoice.status,
     route: invoice.route,
     fee: invoice.fee,
+    platformFee: {
+      bps: invoice.platformFeeBps || 0,
+      amountUsdc: invoice.platformFeeAmount || '0.000000',
+      asset: 'USDC',
+      chargedOn: 'top-of-price',
+      source: invoice.platformFeeSource || 'none',
+    },
+    ...(invoice.upstream ? { upstream: invoice.upstream } : {}),
+    ...(invoice.upstreamQuote ? { upstreamQuote: invoice.upstreamQuote } : {}),
     unifiedBalanceEstimate: invoice.unifiedBalanceEstimate,
     spendTxHash: invoice.spendTxHash,
     transferId: invoice.transferId,
@@ -914,6 +981,19 @@ async function findFinalizedGatewayTransfer(invoice) {
   return transfer
 }
 
+/**
+ * Invoice fields a paid route may set beyond price/service: an explicit
+ * net/fee split (marketplace resale), an explicit platform-fee record, and the
+ * upstream quote the buyer is being charged for.
+ */
+function invoiceExtras(config = {}) {
+  const extras = {}
+  if (config.split) extras.split = config.split
+  if (config.platformFee) extras.platformFee = config.platformFee
+  if (config.upstreamQuote) extras.upstreamQuote = config.upstreamQuote
+  return extras
+}
+
 export function withArcoxX402(handler, config = {}) {
   return async (req, res, next) => {
     if (String(process.env.ARCOX_INTEL_ENABLED || 'true').toLowerCase() === 'false') {
@@ -1000,6 +1080,7 @@ export function withArcoxX402(handler, config = {}) {
         paymentMethod: 'arc-usdc-direct',
         amount: priceFromEnv(config.priceEnv || '', config.amount || cfg.baseAmount),
         resource,
+        ...invoiceExtras(config),
       })
     } catch (error) {
       return res.status(error.statusCode || 429).json({ error: error.message })

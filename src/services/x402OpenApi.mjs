@@ -18,6 +18,7 @@ export function x402OpenApiSpec() {
     tags: [
       { name: 'x402', description: 'Invoice lifecycle, payment requests, refunds, stats' },
       { name: 'intel', description: 'Read-only Arkham intelligence resources (x402-paid)' },
+      { name: 'marketplace', description: 'Mirror of the Circle x402 discovery directory: free catalog/quote, fee-quoted resale' },
     ],
     paths: {
       '/api/x402/config': {
@@ -66,6 +67,49 @@ export function x402OpenApiSpec() {
       '/api/intel/provider-health': {
         get: { tags: ['intel'], summary: 'Arkham provider circuit-breaker state', description: 'Per-service circuit state (closed/open/half-open) with failure counts. Free endpoint.', responses: { 200: { description: 'Circuit states' } } },
       },
+      '/api/marketplace/stats': {
+        get: { tags: ['marketplace'], summary: 'Mirror statistics', description: 'Resource/provider/chain counts, price buckets, last sync time, and the outbound payment executor status. Free endpoint.', responses: { 200: { description: 'Stats' } } },
+      },
+      '/api/marketplace/catalog': {
+        get: {
+          tags: ['marketplace'], summary: 'Search the mirrored x402 directory',
+          description: 'Keyword/category/chain/price filters over every resource in the Circle x402 discovery directory. Returns provider prices and the ARCOX platform fee; never charges. Free endpoint.',
+          parameters: [
+            { name: 'q', in: 'query', schema: { type: 'string' } },
+            { name: 'category', in: 'query', schema: { type: 'string' } },
+            { name: 'network', in: 'query', schema: { type: 'string' } },
+            { name: 'maxPriceUsdc', in: 'query', schema: { type: 'number' } },
+            { name: 'gatewayOnly', in: 'query', schema: { type: 'boolean' } },
+            { name: 'limit', in: 'query', schema: { type: 'integer', maximum: 100 } },
+            { name: 'offset', in: 'query', schema: { type: 'integer' } },
+          ],
+          responses: { 200: { description: 'Matching resources' } },
+        },
+      },
+      '/api/marketplace/quote': {
+        get: {
+          tags: ['marketplace'], summary: 'Quote one resource with the ARCOX platform fee',
+          description: 'Returns the provider price for the chosen chain, the ARCOX platform fee on top, the total the buyer pays, and the exact upstream URL that would be called. Free endpoint.',
+          parameters: [
+            { name: 'resource', in: 'query', required: true, schema: { type: 'string' }, description: 'Resource id (mkt_...), full URL, or unique URL fragment' },
+            { name: 'chain', in: 'query', schema: { type: 'string' } },
+          ],
+          responses: { 200: { description: 'Quote' }, 404: { description: 'Resource not found' } },
+        },
+      },
+      '/api/marketplace/sync': {
+        post: { tags: ['marketplace'], summary: 'Refresh the mirror (owner-gated)', description: 'Pages through the Circle x402 discovery directory and rewrites the local catalogue. Requires an active authenticated MSCA session.', responses: { 200: { description: 'Sync summary' }, 401: { description: 'Unauthenticated' }, 502: { description: 'Discovery unreachable' } } },
+      },
+      '/api/marketplace/call': {
+        post: {
+          tags: ['marketplace'], summary: 'Buy a mirrored resource through ARCOX (x402-paid + platform fee)',
+          description: 'Creates an ARCOX x402 invoice for the provider price plus the platform fee, pays the provider through the configured outbound executor once the invoice is paid, and returns the provider response. Requires the executor to be configured; returns 503 otherwise. Requires an authenticated active MSCA (Authorization + X-Arcox-Owner).',
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: {
+            resource: { type: 'string' }, id: { type: 'string' }, chain: { type: 'string' }, data: {}, headers: { type: 'object' }, maxAmountUsdc: { type: 'number' },
+          } } } } },
+          responses: { 200: { description: 'Provider response with fee breakdown' }, 402: { description: 'x402 invoice (provider price + platform fee)' }, 400: { description: 'Unpayable resource or cap exceeded' }, 503: { description: 'Payment executor not configured' } },
+        },
+      },
     },
     components: {
       securitySchemes: {
@@ -92,6 +136,7 @@ export function x402OpenApiSpec() {
       chainId: cfg.chainId,
       usdcAddress: cfg.usdcAddress,
       defaultPrice: priceFromEnv('X402_BASE_AMOUNT', '0.005'),
+      platformFee: cfg.platformFee,
     },
   }
 }

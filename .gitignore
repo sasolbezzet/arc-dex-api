@@ -20,6 +20,8 @@ invoices-db.json
 webhook-events-db.json
 x402-invoices-db.json
 ai-router-db.json
+# Cached mirror of the public x402 discovery directory (rebuilt by the sync worker).
+x402-marketplace-db.json
 runtime-backups/
 logs/
 .codegraph/

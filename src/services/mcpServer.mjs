@@ -59,6 +59,7 @@ const TOOL_PROFILES = {
     'arcox_pay_payment_request', 'arcox_check_payment_status', 'arcox_pay_list_recent_payments',
     'arcox_x402_pay_invoice', 'arcox_x402_invoice_status',
     'arcox_intel_get_address', 'arcox_intel_get_token', 'arcox_intel_get_tx', 'arcox_intel_search',
+    'arcox_marketplace_search', 'arcox_marketplace_inspect', 'arcox_marketplace_call',
     'arcox_card_balance', 'arcox_card_list', 'arcox_card_spend', 'arcox_card_transactions',
     'get_ai_router_status', 'list_ai_models', 'call_ai_model',
   ],
@@ -984,6 +985,7 @@ const BACKEND_URL = process.env.ARCOX_BACKEND_URL || 'http://localhost:3001'
 import { mintOwnerToken, verifyOwnerToken } from './authToken.mjs'
 import { markX402ServiceOutcome, publicInvoice } from '../middleware/x402Middleware.mjs'
 import { registerIntelTools } from './mcp/intelTools.mjs'
+import { registerMarketplaceTools } from './mcp/marketplaceTools.mjs'
 import { registerDocsCatalogTools } from './mcp/docsCatalogTools.mjs'
 import { registerAgenticTools } from './mcp/agenticTools.mjs'
 import { registerArcoxPayTools } from './mcp/arcoxPayTools.mjs'
@@ -4729,6 +4731,7 @@ export function createMcpServer(userId, context = {}) {
     getX402Invoice, publicInvoice,
   }
   registerIntelTools(toolCtx)
+  registerMarketplaceTools(toolCtx)
   registerDocsCatalogTools(toolCtx)
   registerAgenticTools(toolCtx)
   registerArcoxPayTools(toolCtx)

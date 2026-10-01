@@ -52,8 +52,13 @@ test('profil core memuat intel dasar dan card, bukan tool mahal lain', async () 
   assert.ok(names.includes('arcox_intel_get_address'), 'intel dasar tersedia')
   assert.ok(names.includes('arcox_card_spend'), 'card spend tersedia')
   assert.ok(names.includes('arcox_bridge_history'), 'riwayat bridge MSCA tersedia untuk agent')
+  // Marketplace discovery + buying travel together in core: an agent that can
+  // only see the catalogue could not act on what it found.
+  assert.ok(names.includes('arcox_marketplace_search'), 'pencarian marketplace tersedia')
+  assert.ok(names.includes('arcox_marketplace_inspect'), 'quote marketplace tersedia')
+  assert.ok(names.includes('arcox_marketplace_call'), 'pembelian marketplace tersedia')
   assert.ok(!names.includes('arcox_card_fund'), 'card fund tidak diekspos di core')
-  assert.ok(names.length < 45, `masih jauh lebih kecil dari daftar penuh (${names.length})`)
+  assert.ok(names.length < 48, `masih jauh lebih kecil dari daftar penuh (${names.length})`)
 })
 
 test('quote dan execute selalu berpasangan di setiap profil', async () => {

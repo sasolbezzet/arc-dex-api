@@ -20,6 +20,7 @@ export function registerDocsCatalogTools(ctx) {
     { id: 'send', title: 'Send', purpose: 'Send supported tokens to another address from the Agent Wallet.', userInputs: ['recipient', 'token', 'amount'], actions: ['arcox_quote_send', 'arcox_execute_send'] },
     { id: 'pay', title: 'ARCOX Pay', purpose: 'Create and pay USDC invoice/payment requests on Arc Mainnet.', userInputs: ['amount', 'merchantAddress'], actions: ['arcox_create_payment_request', 'arcox_quote_payment_request', 'arcox_pay_payment_request', 'arcox_check_payment_status'] },
     { id: 'intel', title: 'Intel', purpose: 'Read-only Arkham address/entity/token/portfolio intelligence through ARCOX API (x402 paid). No swap, bridge, send, buy, or sell execution.', userInputs: ['address/entity/token'], actions: ['arcox_intel_search', 'arcox_intel_get_address', 'arcox_intel_get_entity', 'arcox_intel_get_token', 'arcox_intel_get_balances', 'arcox_intel_get_portfolio', 'arcox_intel_get_portfolio_series', 'arcox_intel_get_flows', 'arcox_intel_get_history', 'arcox_intel_get_volume', 'arcox_intel_get_counterparties', 'arcox_intel_get_transfers', 'arcox_intel_get_global_transfers', 'arcox_intel_get_swaps', 'arcox_intel_get_risk', 'arcox_intel_get_loans', 'arcox_intel_get_network', 'arcox_intel_get_market', 'arcox_intel_get_solana_subaccounts', 'arcox_intel_get_hypercore', 'arcox_intel_get_polymarket', 'arcox_x402_pay_invoice'] },
+    { id: 'marketplace', title: 'x402 Marketplace', purpose: 'Search the mirrored Circle x402 directory (~2.6k third-party paid APIs) and buy a resource through ARCOX with the platform fee billed on the invoice.', userInputs: ['query/category/resource'], actions: ['arcox_marketplace_search', 'arcox_marketplace_inspect', 'arcox_marketplace_call', 'arcox_x402_pay_invoice'] },
     { id: 'ai_router', title: 'AI Router', purpose: 'Manage API keys, list models, call models, and inspect usage.', userInputs: ['prompt'], actions: ['get_ai_router_status', 'create_ai_api_key', 'list_ai_models', 'call_ai_model', 'get_usage_logs'] },
   ]
   const arcoxActions = [
@@ -28,6 +29,7 @@ export function registerDocsCatalogTools(ctx) {
     { id: 'send', page: 'send', intentExamples: ['send 5 usdc ke 0x...', 'kirim usdc dari agent wallet'], requiredSlots: ['recipient', 'token', 'amount'], safeExecution: 'quote_then_confirm' },
     { id: 'pay_invoice', page: 'pay', intentExamples: ['create payment request 10 usdc ke 0x...', 'bayar invoice arcox'], requiredSlots: ['amount', 'merchantAddress'], safeExecution: 'quote_then_confirm' },
     { id: 'intel', page: 'intel', intentExamples: ['analyze address 0x...', 'check token btc', 'show wallet balances', 'show token holders'], requiredSlots: ['address/entity/token'], safeExecution: 'x402_paid_read' },
+    { id: 'marketplace', page: 'marketplace', intentExamples: ['cari api berbayar untuk odds', 'how much for a web search api', 'beli endpoint marketplace'], requiredSlots: ['query/resource'], safeExecution: 'x402_paid_read' },
   ]
   const arcoxChainSupport = {
     Arc: { bridge: true, router: '0x9Fd14A94bDbEFf73EDB22853cc77416B65E2A0c0', circleWallet: true, aliases: ['arc', 'arc mainnet'] },
@@ -43,6 +45,8 @@ export function registerDocsCatalogTools(ctx) {
     'Bridge pending is normal after burn; poll arcox_bridge_status and retry mint with the burn tx.',
     'A chain balance can come only from a bridge or a mint, and a 0 balance means no funds there: read arcox_wallet_balances + arcox_bridge_history before explaining a balance change.',
     'Agent may prepare plans, but user-owned funds require explicit confirmation.',
+    'Marketplace prices are the provider price plus the ARCOX platform fee: quote first (arcox_marketplace_inspect) and tell the user both numbers before buying.',
+    'A marketplace purchase is refused while ARCOX has no configured payment executor; report that instead of pretending the call succeeded.',
   ]
   const arcoxDocsCatalog = [
     { id: 'overview', title: 'ARCOX Overview', tags: ['dex', 'arc', 'wallet'], body: 'ARCOX DEX is a retail Arc Mainnet app for swap, bridge, send, ARCOX Pay invoices, and agent workflows. Value-moving actions must quote before execution.' },
@@ -50,6 +54,7 @@ export function registerDocsCatalogTools(ctx) {
     { id: 'bridge-retry', title: 'Bridge Retry', tags: ['bridge', 'retry', 'cctp'], body: 'CCTP bridge has approve, burn, attestation, and mint stages. If burn succeeded but mint is pending, retry mint instead of repeating the burn.' },
     { id: 'mcp-safety', title: 'MCP Safety Rules', tags: ['mcp', 'agent', 'safety'], body: 'Agents must call quote tools first, show preview, receive explicit confirmation, then execute with previewId and confirmationText.' },
     { id: 'intel-x402', title: 'Intel x402', tags: ['intel', 'x402', 'arkham'], body: 'ARCOX Intel is x402 paid: unpaid requests return an invoice; pay via arcox_x402_pay_invoice then retry with paymentId.' },
+    { id: 'marketplace-x402', title: 'x402 Marketplace', tags: ['marketplace', 'x402', 'providers'], body: 'The ARCOX marketplace mirrors the Circle x402 discovery directory. Search and quote are free; buying settles the provider price plus the ARCOX platform fee (5% by default) on one x402 invoice.' },
   ]
 
   registerTool('arcox_search_docs', 'Search ARCOX product and MCP documentation. Use this before guessing an unfamiliar ARCOX flow.', {

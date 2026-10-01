@@ -22,6 +22,7 @@ import { withX402PaymentRequired } from './middleware/x402.mjs'
 import arkhamRoutes from './src/routes/arkhamRoutes.mjs'
 import treasuryRoutes from './src/routes/treasuryRoutes.mjs'
 import x402Routes from './src/routes/x402Routes.mjs'
+import marketplaceRoutes from './src/routes/marketplaceRoutes.mjs'
 import aiRouterRoutes, { openAiChatCompletions, openAiModels } from './src/routes/aiRouterRoutes.mjs'
 import vaultRoutes from './src/routes/vaultRoutes.mjs'
 import cardRoutes from './src/routes/cardRoutes.mjs'
@@ -40,6 +41,7 @@ import { ARC_CCTP_DOMAIN, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLO
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
 import { startRefundWorker } from './src/services/x402RefundWorker.mjs'
+import { startMarketplaceSyncWorker } from './src/services/x402MarketplaceSyncWorker.mjs'
 import { readPaymentInvoice, readTransactionHistory, scheduleAiUsageUpsert, schedulePaymentInvoiceUpsert, scheduleTransactionHistoryUpsert, scheduleWebhookEventUpsert, shadowReadWebhookEvent, supabasePersistenceStatus } from './src/services/supabasePersistence.mjs'
 import { mergeBridgeRecordsIntoHistory, readBridgeHistoryForOwners } from './src/services/bridgeHistory.mjs'
 import { verifyOwnerToken } from './src/services/authToken.mjs'
@@ -123,6 +125,10 @@ const attestationLimiter = rateLimit({ windowMs: 60 * 1000, max: 45, keyPrefix: 
 app.use('/api/intel', apiLimiter, arkhamRoutes)
 app.use('/api/treasury', apiLimiter, treasuryRoutes)
 app.use('/api/x402', apiLimiter, x402Routes)
+// Mirror of the Circle x402 discovery directory (free search/quote) plus the
+// fee-quoted resale path. Mounted next to x402 so one prefix owns the whole
+// paid-resource surface.
+app.use('/api/marketplace', apiLimiter, marketplaceRoutes)
 app.use('/api/cards', apiLimiter, cardRoutes)
 app.use('/api/connect', apiLimiter, connectRoutes)
 app.use('/api/msca', apiLimiter, mscaRoutes)
@@ -4357,5 +4363,8 @@ if (!process.env.VERCEL) {
     console.log('        invoices, circle-gateway webhook, eco route-preview')
     console.log('[supabase] persistence:', JSON.stringify({ ...supabasePersistenceStatus(), ...supabaseOperationalStatus() }))
     startRefundWorker()
+    // Mirror of the Circle x402 discovery directory: keeps /api/marketplace
+    // quotes from going stale without a request ever waiting on the refresh.
+    startMarketplaceSyncWorker()
   })
 }

@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "check": "node --check server.mjs && node --check src/routes/aiRouterRoutes.mjs && node --check src/routes/arkhamRoutes.mjs && node --check src/routes/treasuryRoutes.mjs && node --check src/routes/x402Routes.mjs",
+    "check": "node --check server.mjs && node --check src/routes/aiRouterRoutes.mjs && node --check src/routes/arkhamRoutes.mjs && node --check src/routes/treasuryRoutes.mjs && node --check src/routes/x402Routes.mjs && node --check src/routes/marketplaceRoutes.mjs",
     "test": "npm run check && node --test test/*.test.mjs",
     "diag:mcp": "node scripts/diag-mcp-connector.mjs",
     "webhook:register": "node --env-file=.env scripts/register-circle-webhook.mjs",

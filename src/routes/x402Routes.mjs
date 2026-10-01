@@ -196,6 +196,9 @@ function publicConfig() {
     paymentMethod: 'arc-usdc-direct',
     paymentMethods: ['arc-usdc-direct', 'unified-balance-gateway'],
     baseAmount: cfg.baseAmount,
+    // ARCOX platform fee policy: the fee a buyer pays on top of the service
+    // price (only added to ARCOX's own services when servicesEnabled).
+    platformFee: cfg.platformFee,
     expiresInSeconds: cfg.ttlSeconds,
     abuseLimits: {
       maxUnpaidPerOwner: Number(process.env.X402_MAX_UNPAID_PER_OWNER || 10),
