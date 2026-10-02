@@ -139,12 +139,22 @@ Karakteristik yang berlaku sekarang:
   POST /api/marketplace/sync                  # refresh mirror (owner-gated)
   ```
 
-  Pencarian dan quote tidak pernah menagih; `POST /api/marketplace/call`
-  menolak jalan (HTTP 503) sampai `X402_MARKETPLACE_EXECUTOR=cli` dan
-  `X402_MARKETPLACE_PAYER_ADDRESS` diisi wallet agent yang sudah didanai — jadi
-  mirror ini aman dinyalakan sebelum ada dana yang bisa dibelanjakan. Harga
-  provider disimpan per chain dalam base units, dan platform fee dihitung di
-  atasnya (`X402_PLATFORM_FEE_BPS`, default 5%).
+  Pencarian dan quote tidak pernah menagih. Pembelian menolak jalan (HTTP 503)
+  sampai executor diisi, jadi mirror ini aman dinyalakan sebelum ada dana yang
+  bisa dibelanjakan:
+
+  ```text
+  X402_MARKETPLACE_EXECUTOR=wallet   # bayar dari EOA ARCOX (exact/EIP-3009, chain EVM)
+  X402_MARKETPLACE_PAYER_PRIVATE_KEY=0x…
+  X402_MARKETPLACE_EXECUTOR=cli      # bayar lewat Circle CLI (juga melayani seller Gateway)
+  X402_MARKETPLACE_PAYER_ADDRESS=0x…
+  ```
+
+  Harga provider disimpan per chain dalam base units beserta rail-nya
+  (`vanilla` / `gateway` / `permit2` / `solana`), dan platform fee dihitung di
+  atasnya (`X402_PLATFORM_FEE_BPS`, default 5%). Buyer (MSCA user) membayar
+  invoice x402 ARCOX = harga provider + fee, dan fee itu masuk ke treasury x402;
+  ARCOX lalu melunasi provider dari wallet executor yang dikonfigurasi.
 - Klien dengan kuota tool kecil (mis. connector penyedia AI) bisa meminta
   subset yang konsisten lewat URL atau header; default tetap daftar penuh:
 

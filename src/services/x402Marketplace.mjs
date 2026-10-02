@@ -73,6 +73,19 @@ function priceUsdcValue(amount) {
 }
 
 /**
+ * Which settlement rail an accept uses. Circle Gateway advertises itself as the
+ * EIP-712 domain name ("GatewayWalletBatched"), vanilla USDC uses "USD Coin",
+ * Permit2 is flagged in extra, and Solana uses a sponsored fee payer.
+ */
+export function acceptRail(accept) {
+  const extra = accept?.extra || {}
+  if (extra.assetTransferMethod === 'permit2') return 'permit2'
+  if (String(extra.name || '') === 'GatewayWalletBatched' || extra.gateway) return 'gateway'
+  if (String(accept?.network || '').startsWith('solana:')) return 'solana'
+  return 'vanilla'
+}
+
+/**
  * Normalise one discovery record into the catalogue row ARCOX serves, quotes,
  * and mirrors into MCP results. Prices per accepted chain are kept as strings
  * (base units + USDC) so no float rounding reaches an invoice.
@@ -96,6 +109,10 @@ export function normalizeMarketplaceItem(item) {
         amountUsdc: usdc(accept.amount),
         amount: priceUsdcValue(accept.amount),
         maxTimeoutSeconds: Number(accept.maxTimeoutSeconds || 0) || null,
+        rail: acceptRail(accept),
+        // Kept verbatim: the EIP-712 domain (name/version) and the Gateway asset
+        // list are what a payer needs to sign or batch a payment.
+        extra: accept.extra || null,
       }
     })
     .sort((a, b) => a.amount - b.amount)
@@ -324,21 +341,24 @@ export function marketplaceCatalogStats() {
  * the cheapest chain the Circle CLI can pay from. Falls back to the cheapest
  * accept overall so the buyer still sees the provider's real price.
  */
-export function selectMarketplaceAccept(entry, { chain = '', network = '' } = {}) {
+export function selectMarketplaceAccept(entry, { chain = '', network = '', rail = '' } = {}) {
   const accepts = Array.isArray(entry?.accepts) ? entry.accepts : []
   if (!accepts.length) return null
+  const wantedRail = String(rail || '').toLowerCase()
+  const pool = wantedRail ? accepts.filter(accept => acceptRail(accept) === wantedRail) : accepts
+  const candidates = pool.length ? pool : accepts
   const wantedChain = String(chain || '').toUpperCase()
   const wantedNetwork = String(network || '').toLowerCase()
   if (wantedChain) {
-    const match = accepts.find(accept => String(accept.cliChain || '').toUpperCase() === wantedChain)
-      || accepts.find(accept => accept.chain.toUpperCase() === wantedChain)
+    const match = candidates.find(accept => String(accept.cliChain || '').toUpperCase() === wantedChain)
+      || candidates.find(accept => accept.chain.toUpperCase() === wantedChain)
     if (match) return match
   }
   if (wantedNetwork) {
-    const match = accepts.find(accept => accept.network.toLowerCase() === wantedNetwork || accept.chain.toLowerCase() === wantedNetwork)
+    const match = candidates.find(accept => accept.network.toLowerCase() === wantedNetwork || accept.chain.toLowerCase() === wantedNetwork)
     if (match) return match
   }
-  return accepts.find(accept => accept.cliChain) || accepts[0]
+  return candidates.find(accept => accept.cliChain) || candidates[0]
 }
 
 /**
@@ -360,6 +380,7 @@ export function marketplaceQuote(entry, { chain = '', network = '', bps, fixedUs
     chain: accept ? accept.chain : '',
     network: accept ? accept.network : '',
     cliChain: accept ? accept.cliChain : null,
+    rail: accept ? acceptRail(accept) : '',
     payable: allowPayable(accept, executor),
     gateway: Boolean(entry.supportsCircleGateway),
     payTo: accept ? accept.payTo : '',

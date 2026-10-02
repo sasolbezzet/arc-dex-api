@@ -308,6 +308,8 @@ export function createX402Invoice(input = {}) {
     platformFeeAmount: feePlan.feeAmount,
     platformFeeBps: feePlan.bps,
     platformFeeSource: feePlan.source,
+    // What the buyer is being resold (marketplace proxy invoices only).
+    ...(input.upstreamQuote ? { upstreamQuote: input.upstreamQuote } : {}),
     fee: {
       asset: 'USDC',
       bps: feePlan.bps,

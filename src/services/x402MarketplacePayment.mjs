@@ -9,8 +9,9 @@
 // Disabled by default. With X402_MARKETPLACE_EXECUTOR unset the marketplace is
 // discovery + quoting only, so no caller can spend ARCOX funds by accident.
 import { execFile } from 'child_process'
+import { payWithWallet, walletPayerStatus } from './x402WalletPayer.mjs'
 
-const EXECUTOR_MODES = new Set(['disabled', 'cli'])
+const EXECUTOR_MODES = new Set(['disabled', 'cli', 'wallet'])
 const SAFE_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
 const HEADER_NAME = /^[A-Za-z0-9-]+$/
 const SHELL_METACHARS = /[;&|$`"'()<>\\\n\r\t]/
@@ -31,6 +32,15 @@ export function marketplaceExecutorConfig() {
 /** What the route reports before it will accept a paid marketplace call. */
 export function marketplaceExecutorStatus() {
   const config = marketplaceExecutorConfig()
+  if (config.mode === 'wallet') {
+    const wallet = walletPayerStatus()
+    return {
+      ...wallet,
+      defaultChain: config.defaultChain,
+      maxUpstreamUsdc: config.maxUpstreamUsdc,
+      schemes: ['exact (EIP-3009)'],
+    }
+  }
   const addressValid = /^0x[0-9a-fA-F]{40}$/.test(config.payerAddress)
   const problems = []
   if (config.mode !== 'cli') problems.push('executor_disabled')
@@ -42,6 +52,7 @@ export function marketplaceExecutorStatus() {
     defaultChain: config.defaultChain,
     maxUpstreamUsdc: config.maxUpstreamUsdc,
     allowedChains: ['ARC', 'BASE', 'ARB', 'MATIC', 'ETH', 'OP', 'UNI', 'AVAX', 'MONAD', 'SOL'],
+    schemes: ['exact (EIP-3009)', 'GatewayWalletBatched'],
     problems,
     hint: problems.length
       ? 'Marketplace calls stay discovery/quote-only until X402_MARKETPLACE_EXECUTOR=cli and X402_MARKETPLACE_PAYER_ADDRESS are set to a funded agent wallet.'
@@ -113,7 +124,7 @@ function parseCliJson(stdout) {
  */
 export async function payMarketplaceEndpoint({
   resource, method = 'GET', data, headers = {}, chain = '', maxAmountUsdc,
-  timeoutMs, spawnImpl,
+  timeoutMs, spawnImpl, fetchImpl,
 } = {}) {
   const config = marketplaceExecutorConfig()
   const status = marketplaceExecutorStatus()
@@ -124,6 +135,18 @@ export async function payMarketplaceEndpoint({
   if (!Number.isFinite(cap) || cap <= 0) return { ok: false, reason: 'invalid_max_amount' }
   if (cap > config.maxUpstreamUsdc) {
     return { ok: false, reason: 'upstream_price_above_cap', error: `upstream price ${cap} USDC exceeds X402_MARKETPLACE_MAX_UPSTREAM_USDC ${config.maxUpstreamUsdc}` }
+  }
+  if (config.mode === 'wallet') {
+    const wallet = await payWithWallet({
+      resource: validation.url, method: validation.method, data, headers, chain, maxAmountUsdc: cap, timeoutMs, fetchImpl,
+    })
+    return {
+      ...wallet,
+      method: validation.method,
+      resource: validation.url,
+      chain: wallet.settlement?.chain || String(chain || config.defaultChain).toUpperCase(),
+      executor: 'wallet',
+    }
   }
   const args = buildMarketplacePayArgs({
     config, resource: validation.url, method: validation.method, data, headers, chain, maxAmountUsdc: cap,
@@ -146,6 +169,7 @@ export async function payMarketplaceEndpoint({
     method: validation.method,
     resource: validation.url,
     chain: String(chain || config.defaultChain).toUpperCase(),
+    executor: 'cli',
     command: [config.bin, ...args.slice(0, 3), '-X', validation.method, '--address', config.payerAddress, '--chain', String(chain || config.defaultChain).toUpperCase()],
   }
 }

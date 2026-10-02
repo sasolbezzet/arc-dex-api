@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 process.env.X402_MARKETPLACE_EXECUTOR = 'cli'
 process.env.X402_MARKETPLACE_PAYER_ADDRESS = '0x08223b59f3Dc0135500Fbc62d5537A5c501cf017'
 process.env.X402_MARKETPLACE_MAX_UPSTREAM_USDC = '5'
+delete process.env.X402_MARKETPLACE_PAYER_PRIVATE_KEY
 process.env.X402_MARKETPLACE_PAYER_CHAIN = 'ARC'
 
 const {
@@ -112,6 +113,48 @@ test('the per-call price cap blocks an over-priced resource before any payment',
   assert.equal(result.ok, false)
   assert.equal(result.reason, 'upstream_price_above_cap')
   assert.equal(calls.length, 0)
+})
+
+test('wallet mode signs the payment from the ARCOX key instead of shelling out', async () => {
+  process.env.X402_MARKETPLACE_EXECUTOR = 'wallet'
+  process.env.X402_MARKETPLACE_PAYER_PRIVATE_KEY = '0x' + '22'.repeat(32)
+  delete process.env.X402_MARKETPLACE_PAYER_ADDRESS
+  const status = marketplaceExecutorStatus()
+  assert.equal(status.mode, 'wallet')
+  assert.equal(status.configured, true)
+  assert.equal(status.schemes.join(','), 'exact (EIP-3009)')
+
+  const accept = {
+    scheme: 'exact', network: 'eip155:5042', asset: '0x3600000000000000000000000000000000000000',
+    payTo: '0xB98eF29eb2be19Ae646A8FC0248255B90A332dbC', amount: '7000', maxTimeoutSeconds: 60,
+    extra: { name: 'USD Coin', version: '2' },
+  }
+  const requests = []
+  const fetchImpl = async (url, init) => {
+    requests.push(init)
+    if (init.headers['PAYMENT-SIGNATURE']) return { status: 200, ok: true, headers: new Headers(), json: async () => ({ arc: true }) }
+    return {
+      status: 402, ok: false,
+      headers: new Headers({ 'payment-required': Buffer.from(JSON.stringify({ x402Version: 2, accepts: [accept] })).toString('base64') }),
+      json: async () => ({}),
+    }
+  }
+  const result = await payMarketplaceEndpoint({
+    resource: 'https://api.exa.ai/search', method: 'POST', data: { query: 'x' }, chain: 'ARC', maxAmountUsdc: 0.007, fetchImpl,
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.executor, 'wallet')
+  assert.deepEqual(result.providerPayload, { arc: true })
+  assert.equal(result.settlement.chain, 'Arc')
+  assert.equal(result.settlement.amountUsdc, '0.007000')
+  assert.equal(requests.length, 2)
+
+  delete process.env.X402_MARKETPLACE_PAYER_PRIVATE_KEY
+  const unconfigured = marketplaceExecutorStatus()
+  assert.equal(unconfigured.configured, false)
+  assert.deepEqual(unconfigured.problems, ['payer_private_key_missing'])
+  process.env.X402_MARKETPLACE_EXECUTOR = 'cli'
+  process.env.X402_MARKETPLACE_PAYER_ADDRESS = '0x08223b59f3Dc0135500Fbc62d5537A5c501cf017'
 })
 
 test('an unconfigured executor never reaches the CLI', async () => {
