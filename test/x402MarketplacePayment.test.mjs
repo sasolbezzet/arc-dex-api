@@ -115,19 +115,19 @@ test('the per-call price cap blocks an over-priced resource before any payment',
   assert.equal(calls.length, 0)
 })
 
-test('wallet mode signs the payment from the ARCOX key instead of shelling out', async () => {
-  process.env.X402_MARKETPLACE_EXECUTOR = 'wallet'
-  process.env.X402_MARKETPLACE_PAYER_PRIVATE_KEY = '0x' + '22'.repeat(32)
-  delete process.env.X402_MARKETPLACE_PAYER_ADDRESS
+test('msca mode needs no platform key and never shells out', async () => {
+  process.env.X402_MARKETPLACE_EXECUTOR = 'msca'
   const status = marketplaceExecutorStatus()
-  assert.equal(status.mode, 'wallet')
+  assert.equal(status.mode, 'msca')
   assert.equal(status.configured, true)
-  assert.equal(status.schemes.join(','), 'exact (EIP-3009)')
+  assert.deepEqual(status.rails, ['vanilla'])
+  assert.deepEqual(status.problems, [])
+  assert.equal(status.payerAddress, undefined)
 
   const accept = {
     scheme: 'exact', network: 'eip155:5042', asset: '0x3600000000000000000000000000000000000000',
     payTo: '0xB98eF29eb2be19Ae646A8FC0248255B90A332dbC', amount: '7000', maxTimeoutSeconds: 60,
-    extra: { name: 'USD Coin', version: '2' },
+    extra: { name: 'USDC', version: '2' },
   }
   const requests = []
   const fetchImpl = async (url, init) => {
@@ -139,22 +139,30 @@ test('wallet mode signs the payment from the ARCOX key instead of shelling out',
       json: async () => ({}),
     }
   }
+  const { runner, calls } = fakeRunner({ stdout: '{}' })
   const result = await payMarketplaceEndpoint({
-    resource: 'https://api.exa.ai/search', method: 'POST', data: { query: 'x' }, chain: 'ARC', maxAmountUsdc: 0.007, fetchImpl,
+    resource: 'https://api.exa.ai/search', method: 'POST', data: { query: 'x' }, chain: 'ARC',
+    payerMsca: '0xC9796A7C3c5205b0f05fE2A070003cDFfadAE331', chainKey: 'arc-mainnet',
+    acceptSnapshot: accept, maxAmountUsdc: 0.007, fetchImpl, spawnImpl: runner,
+    signer: async () => '0x' + '12'.repeat(65), balanceReader: async () => 10_000n,
   })
   assert.equal(result.ok, true)
-  assert.equal(result.executor, 'wallet')
+  assert.equal(result.executor, 'msca')
   assert.deepEqual(result.providerPayload, { arc: true })
   assert.equal(result.settlement.chain, 'Arc')
   assert.equal(result.settlement.amountUsdc, '0.007000')
+  assert.equal(result.settlement.payer, '0xC9796A7C3c5205b0f05fE2A070003cDFfadAE331')
   assert.equal(requests.length, 2)
+  assert.equal(calls.length, 0, 'MSCA payments must never fall through to the CLI')
 
-  delete process.env.X402_MARKETPLACE_PAYER_PRIVATE_KEY
-  const unconfigured = marketplaceExecutorStatus()
-  assert.equal(unconfigured.configured, false)
-  assert.deepEqual(unconfigured.problems, ['payer_private_key_missing'])
+  const noPayer = await payMarketplaceEndpoint({
+    resource: 'https://api.exa.ai/search', chain: 'ARC', chainKey: 'arc-mainnet', maxAmountUsdc: 0.007, fetchImpl,
+  })
+  assert.equal(noPayer.ok, false)
+  assert.equal(noPayer.reason, 'msca_payer_missing')
+  assert.equal(requests.length, 2, 'no request is made without a payer')
+
   process.env.X402_MARKETPLACE_EXECUTOR = 'cli'
-  process.env.X402_MARKETPLACE_PAYER_ADDRESS = '0x08223b59f3Dc0135500Fbc62d5537A5c501cf017'
 })
 
 test('an unconfigured executor never reaches the CLI', async () => {

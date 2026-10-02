@@ -61,10 +61,20 @@ test('a discovery record normalises into a priced catalogue row', () => {
   assert.equal(arc.amountUsdc, '0.100000')
   assert.equal(arc.cliChain, 'ARC')
   assert.equal(entry.input.body.properties.q.type, 'string')
+  // Agent Wallet payability: vanilla rail on an MSCA chain (Arc/Base), never
+  // Solana, and never a Gateway-batched accept.
+  assert.equal(arc.mscaPayable, true)
+  assert.equal(entry.mscaPayable, true)
+  assert.deepEqual(entry.mscaChains, ['Arc', 'Base'])
+  const gatewayAccept = normalizeMarketplaceItem(discoveryItem({
+    accepts: [{ ...ARC_ACCEPT, extra: { name: 'GatewayWalletBatched', version: '1', verifyingContract: '0x77777777dcc4d5a8b6e418fd04d8997ef11000ee' } }],
+  }))
+  assert.equal(gatewayAccept.mscaPayable, false)
+  assert.equal(gatewayAccept.accepts[0].mscaPayable, false)
 })
 
 test('a chain the CLI cannot pay from stays visible but unpayable', () => {
-  assert.deepEqual(chainInfo('eip155:146'), { label: 'Sonic', cliChain: null, evmChainId: 146 })
+  assert.deepEqual(chainInfo('eip155:146'), { label: 'Sonic', cliChain: null, evmChainId: 146, mscaChain: false })
   assert.equal(chainInfo('eip155:9999').cliChain, null)
   assert.equal(chainInfo('eip155:5042').cliChain, 'ARC')
   const entry = normalizeMarketplaceItem(discoveryItem({ accepts: [{ ...BASE_ACCEPT, network: 'eip155:146' }] }))
@@ -97,6 +107,20 @@ test('quotes add the platform fee on top of the provider price', () => {
   const informational = marketplaceQuote(entry, { chain: 'ARC', executor: { configured: false } })
   assert.equal(informational.payable, false)
   assert.equal(informational.totalUsdc, '0.105000')
+
+  // In msca mode payability means "the buyer's own Agent Wallet can settle it".
+  const mscaQuote = marketplaceQuote(entry, { chain: 'ARC', executor: { mode: 'msca', configured: true } })
+  assert.equal(mscaQuote.payable, true)
+  assert.equal(mscaQuote.mscaPayable, true)
+  assert.equal(mscaQuote.asset, ARC_ACCEPT.asset)
+  assert.equal(mscaQuote.maxTimeoutSeconds, ARC_ACCEPT.maxTimeoutSeconds)
+  const gatewayEntry = normalizeMarketplaceItem(discoveryItem({
+    accepts: [{ ...ARC_ACCEPT, extra: { name: 'GatewayWalletBatched', version: '1', verifyingContract: '0x77777777dcc4d5a8b6e418fd04d8997ef11000ee' } }],
+  }))
+  const gatewayQuote = marketplaceQuote(gatewayEntry, { chain: 'ARC', executor: { mode: 'msca', configured: true } })
+  assert.equal(gatewayQuote.rail, 'gateway')
+  assert.equal(gatewayQuote.mscaPayable, false)
+  assert.equal(gatewayQuote.payable, false)
 })
 
 test('the fee rate is configurable per quote and reflected in the public policy', () => {

@@ -1717,6 +1717,23 @@ async function buildSmartAccountClient(walletAddress, delegatePrivateKey, chainK
   return { smartAccount, modularClient, baseClient }
 }
 
+/**
+ * Sign EIP-712 typed data as the session's MSCA, without submitting anything.
+ * The SDK wraps the digest with Circle's replay-safe hash and ABI-encodes the
+ * validator signature, which is exactly what an ERC-1271 verifier (x402
+ * facilitator, GatewayWallet, Permit2) must receive for a contract account.
+ * Used by the x402 marketplace executor so an agent pays from its own MSCA.
+ */
+export async function signTypedDataWithSession(userId, typedData, { chainKey } = {}) {
+  const entry = getSessionKey(userId)
+  if (!entry?.active) throw new Error('Session not available: no_session')
+  const targetChain = chainKey || entry.chain || ARC_CHAIN_KEY
+  if (!MSCA_SUPPORTED_CHAIN_KEYS.includes(targetChain)) throw new Error(`Session not available: msca_unsupported_chain (${targetChain})`)
+  if (!isSessionAuthorizedForChain(userId, targetChain)) throw new Error(`Session not authorized for chain: ${targetChain}`)
+  const { smartAccount } = await buildSmartAccountClient(entry.walletAddress, entry.delegatePrivateKey, targetChain)
+  return smartAccount.signTypedData(typedData)
+}
+
 /** Build the exact UserOperation parameters used by sendUserOperation. */
 export function buildUserOperationParams({ account, calls, chainKey, baseClient, feeProfile } = {}) {
   const params = { account, calls }

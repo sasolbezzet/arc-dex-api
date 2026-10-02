@@ -46,7 +46,7 @@ export function registerDocsCatalogTools(ctx) {
     'A chain balance can come only from a bridge or a mint, and a 0 balance means no funds there: read arcox_wallet_balances + arcox_bridge_history before explaining a balance change.',
     'Agent may prepare plans, but user-owned funds require explicit confirmation.',
     'Marketplace prices are the provider price plus the ARCOX platform fee: quote first (arcox_marketplace_inspect) and tell the user both numbers before buying.',
-    'A marketplace purchase is refused while ARCOX has no configured payment executor; report that instead of pretending the call succeeded.',
+    'A marketplace purchase is refused unless the buying agent\u2019s own MSCA is the payer (X402_MARKETPLACE_EXECUTOR=msca): ARCOX never settles providers from a platform wallet, and Gateway/Permit2/Solana accepts are not payable from a contract account.',
   ]
   const arcoxDocsCatalog = [
     { id: 'overview', title: 'ARCOX Overview', tags: ['dex', 'arc', 'wallet'], body: 'ARCOX DEX is a retail Arc Mainnet app for swap, bridge, send, ARCOX Pay invoices, and agent workflows. Value-moving actions must quote before execution.' },

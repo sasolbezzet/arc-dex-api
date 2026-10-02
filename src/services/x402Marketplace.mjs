@@ -31,6 +31,10 @@ const PAGE_SIZE = 100
 // CAIP-2 network → chain label + the blockchain key the Circle CLI accepts for
 // `circle services pay --chain`. Only chains the CLI can actually pay from are
 // given a key; everything else stays discoverable but not payable.
+// `mscaChain` marks networks where an ARCOX Agent Wallet (MSCA) can hold USDC
+// and settle a vanilla EIP-3009 payment itself. Gateway-only accepts on all
+// networks stay out of reach for a contract account (Circle's facilitator
+// verifies ECDSA only), so payability is a per-rail property.
 const CHAINS = {
   'eip155:1': { label: 'Ethereum', cliChain: 'ETH', evmChainId: 1 },
   'eip155:10': { label: 'Optimism', cliChain: 'OP', evmChainId: 10 },
@@ -42,20 +46,34 @@ const CHAINS = {
   'eip155:480': { label: 'World Chain', cliChain: null, evmChainId: 480 },
   'eip155:999': { label: 'HyperEVM', cliChain: null, evmChainId: 999 },
   'eip155:1329': { label: 'Sei', cliChain: null, evmChainId: 1329 },
-  'eip155:42161': { label: 'Arbitrum One', cliChain: 'ARB', evmChainId: 42161 },
+  'eip155:42161': { label: 'Arbitrum One', cliChain: 'ARB', evmChainId: 42161, mscaChain: true },
   'eip155:43114': { label: 'Avalanche', cliChain: 'AVAX', evmChainId: 43114 },
-  'eip155:8453': { label: 'Base', cliChain: 'BASE', evmChainId: 8453 },
-  'eip155:5042': { label: 'Arc', cliChain: 'ARC', evmChainId: 5042 },
+  'eip155:8453': { label: 'Base', cliChain: 'BASE', evmChainId: 8453, mscaChain: true },
+  'eip155:5042': { label: 'Arc', cliChain: 'ARC', evmChainId: 5042, mscaChain: true },
   'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp': { label: 'Solana', cliChain: 'SOL', evmChainId: null },
 }
 
 export function chainInfo(network) {
   const known = CHAINS[String(network || '')]
-  if (known) return known
+  if (known) return { mscaChain: false, ...known }
   const raw = String(network || '')
-  if (!raw) return { label: 'unknown', cliChain: null, evmChainId: null }
+  if (!raw) return { label: 'unknown', cliChain: null, evmChainId: null, mscaChain: false }
   // Unknown CAIP-2 network: keep the raw id so nothing is silently dropped.
-  return { label: raw.split(':')[0] === 'solana' ? raw : `chain ${raw}`, cliChain: null, evmChainId: null }
+  return { label: raw.split(':')[0] === 'solana' ? raw : `chain ${raw}`, cliChain: null, evmChainId: null, mscaChain: false }
+}
+
+/**
+ * Whether an accept can be settled by the buyer's own MSCA: vanilla EIP-3009 on
+ * a chain where an Agent Wallet exists. Gateway/Permit2/Solana accepts are
+ * quoted (the provider really charges them) but never sold as MSCA-payable.
+ */
+export function acceptMscaPayable(accept) {
+  return Boolean(accept) && acceptRail(accept) === 'vanilla' && Boolean(chainInfo(accept.network).mscaChain)
+}
+
+/** Entry-level flag for the catalogue: at least one MSCA-settleable accept. */
+export function entryMscaPayable(entry) {
+  return (Array.isArray(entry?.accepts) ? entry.accepts : []).some(acceptMscaPayable)
 }
 
 /** Stable id for a resource URL. Survives listing churn and re-syncs. */
@@ -110,6 +128,7 @@ export function normalizeMarketplaceItem(item) {
         amount: priceUsdcValue(accept.amount),
         maxTimeoutSeconds: Number(accept.maxTimeoutSeconds || 0) || null,
         rail: acceptRail(accept),
+        mscaPayable: acceptRail(accept) === 'vanilla' && Boolean(chain.mscaChain),
         // Kept verbatim: the EIP-712 domain (name/version) and the Gateway asset
         // list are what a payer needs to sign or batch a payment.
         extra: accept.extra || null,
@@ -118,6 +137,7 @@ export function normalizeMarketplaceItem(item) {
     .sort((a, b) => a.amount - b.amount)
   const cheapest = accepts[0] || null
   const payableAccepts = accepts.filter(accept => accept.cliChain)
+  const mscaAccepts = accepts.filter(accept => accept.mscaPayable)
   const tagList = Array.isArray(provider.tags) ? provider.tags.map(tag => String(tag)) : []
   return {
     id: marketplaceId(resource),
@@ -144,6 +164,8 @@ export function normalizeMarketplaceItem(item) {
     accepts,
     chains: [...new Set(accepts.map(accept => accept.chain))],
     payableChains: [...new Set(payableAccepts.map(accept => accept.cliChain))],
+    mscaPayable: mscaAccepts.length > 0,
+    mscaChains: [...new Set(mscaAccepts.map(accept => accept.chain))],
     lastUpdated: String(item?.lastUpdated || ''),
   }
 }
@@ -380,10 +402,15 @@ export function marketplaceQuote(entry, { chain = '', network = '', bps, fixedUs
     chain: accept ? accept.chain : '',
     network: accept ? accept.network : '',
     cliChain: accept ? accept.cliChain : null,
+    chainId: accept ? chainInfo(accept.network).evmChainId : null,
     rail: accept ? acceptRail(accept) : '',
     payable: allowPayable(accept, executor),
+    mscaPayable: acceptMscaPayable(accept),
     gateway: Boolean(entry.supportsCircleGateway),
     payTo: accept ? accept.payTo : '',
+    asset: accept ? accept.asset : '',
+    maxTimeoutSeconds: accept ? accept.maxTimeoutSeconds : null,
+    extra: accept ? accept.extra : null,
     upstream: {
       amountUsdc: fee.netAmount,
       amountBaseUnits: fee.netBaseUnits,
@@ -402,9 +429,11 @@ export function marketplaceQuote(entry, { chain = '', network = '', bps, fixedUs
 }
 
 function allowPayable(accept, executor) {
-  if (!accept || !accept.cliChain) return false
-  if (executor === undefined) return true
-  return Boolean(executor?.configured)
+  if (!accept) return false
+  // No executor context (pure discovery) keeps the historical CLI-wallet view.
+  if (executor === undefined) return Boolean(accept.cliChain)
+  if (executor?.mode === 'msca') return acceptMscaPayable(accept)
+  return Boolean(executor?.configured) && Boolean(accept.cliChain)
 }
 
 export function marketplaceFeeConfig() {

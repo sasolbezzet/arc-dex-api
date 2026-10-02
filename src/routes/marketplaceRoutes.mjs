@@ -2,14 +2,20 @@
 //
 // Discovery and quoting are free and open: an agent can list every resource in
 // the Circle x402 directory, see the provider's price per chain, and see
-// exactly what ARCOX's platform fee adds — without paying anything. Only
-// /call settles money, and only when an outbound payment executor is
-// configured, so the mirror can ship safely before any wallet is funded.
+// exactly what ARCOX's platform fee adds — without paying anything.
+//
+// /call is the only money path, and in `msca` executor mode the money is the
+// buyer's own: the calling agent pays ARCOX's fee invoice from its Agent Wallet
+// (MSCA), then ARCOX settles the provider with an x402 payment signed by that
+// same MSCA (ERC-1271 on the vanilla EIP-3009 rail). The provider price never
+// passes through an ARCOX key, and a failed delivery leaves the fee
+// refund-review-eligible.
 import { Router } from 'express'
 import { markX402ServiceOutcome, persistX402Invoices, publicInvoice, withArcoxX402 } from '../middleware/x402Middleware.mjs'
 import { verifyOwnerToken } from '../services/authToken.mjs'
 import { validateSession, getSessionKeyInfo } from '../services/vaultStore.mjs'
 import {
+  entryMscaPayable,
   getMarketplaceEntry,
   marketplaceCatalogStats,
   marketplaceQuote,
@@ -17,6 +23,7 @@ import {
   syncMarketplaceCatalog,
 } from '../services/x402Marketplace.mjs'
 import { marketplaceExecutorStatus, payMarketplaceEndpoint } from '../services/x402MarketplacePayment.mjs'
+import { mscaNetworkForChainKey } from '../services/x402MscaPayer.mjs'
 import { platformFeeBps } from '../services/platformFee.mjs'
 
 const router = Router()
@@ -42,6 +49,7 @@ function compactEntry(entry) {
     priceUsdc: entry.priceUsdc,
     chains: entry.chains,
     payableChains: entry.payableChains,
+    mscaPayable: entryMscaPayable(entry),
     gateway: entry.supportsCircleGateway,
     vanilla: entry.supportsVanillaX402,
     tags: entry.tags,
@@ -83,7 +91,7 @@ router.get('/catalog', (req, res) => {
     limit: result.limit,
     items: result.items.map(compactEntry),
     platformFee: { bps: platformFeeBps(), chargedOn: 'top-of-price' },
-    safeNextStep: 'Quote a resource with /api/marketplace/quote, then POST /api/marketplace/call to buy it through ARCOX.',
+    safeNextStep: 'Quote a resource with /api/marketplace/quote, then POST /api/marketplace/call to buy it through ARCOX. mscaPayable marks resources an Agent Wallet can settle itself.',
   })
 })
 
@@ -122,17 +130,56 @@ router.post('/call', async (req, res, next) => {
   const body = req.body || {}
   const entry = getMarketplaceEntry(body.resource || body.id || body.url || '')
   if (!entry) return res.status(404).json({ ok: false, error: 'marketplace resource not found' })
-  const quote = marketplaceQuote(entry, { chain: body.chain || '', network: body.network || '' })
-  if (!quote?.cliChain) {
-    return res.status(400).json({ ok: false, error: 'resource has no chain ARCOX can pay from', quote })
+
+  // The buyer must be an authenticated Agent Wallet: in msca mode its own MSCA
+  // is the payer for both legs, so there is no platform key to fall back on.
+  const authOwner = await authenticatedOwner(req)
+  if (!authOwner) {
+    return res.status(401).json({ ok: false, error: 'Active authenticated MSCA session required to buy from the marketplace' })
+  }
+  const authSession = await getSessionKeyInfo(authOwner.owner)
+  const chainKey = String(authSession?.chain || 'arc-mainnet')
+  const buyerNetwork = mscaNetworkForChainKey(chainKey)
+  if (!buyerNetwork) {
+    return res.status(400).json({ ok: false, error: `Agent Wallet on ${chainKey} cannot settle x402 payments yet` })
+  }
+
+  // Only the vanilla EIP-3009 rail is settleable by a contract account, so the
+  // quote is pinned to it instead of surfacing a price the buyer cannot pay.
+  const quote = marketplaceQuote(entry, { network: buyerNetwork, rail: 'vanilla', executor })
+  if (!quote || quote.rail !== 'vanilla' || !quote.mscaPayable) {
+    return res.status(400).json({
+      ok: false,
+      error: `resource has no vanilla EIP-3009 accept on ${buyerNetwork} that an Agent Wallet can settle`,
+      quote,
+      mscaPayable: false,
+    })
   }
   const upstreamCap = Number(process.env.X402_MARKETPLACE_MAX_UPSTREAM_USDC || 5)
   if (Number(quote.upstream.amountUsdc) > upstreamCap) {
     return res.status(400).json({ ok: false, error: `upstream price exceeds the ${upstreamCap} USDC per-call cap`, quote })
   }
   const payerMax = Number(body.maxAmountUsdc)
-  if (Number.isFinite(payerMax) && payerMax > 0 && Number(quote.totalUsdc) > payerMax) {
-    return res.status(400).json({ ok: false, error: `quote total ${quote.totalUsdc} USDC exceeds maxAmountUsdc ${payerMax}`, quote })
+  if (Number.isFinite(payerMax) && payerMax > 0 && Number(quote.upstream.amountUsdc) > payerMax) {
+    return res.status(400).json({ ok: false, error: `provider price ${quote.upstream.amountUsdc} USDC exceeds maxAmountUsdc ${payerMax}`, quote })
+  }
+  // Fee-only invoice: the provider is paid by the buyer's MSCA, so the ARCOX
+  // invoice must charge exactly the platform fee, not the resale price.
+  const feeAmountUsdc = quote.platformFee.amountUsdc
+  if (!(Number(feeAmountUsdc) > 0)) {
+    return res.status(400).json({ ok: false, error: 'marketplace platform fee is disabled; enable X402_PLATFORM_FEE_BPS before proxying purchases' })
+  }
+  const acceptSnapshot = {
+    rail: 'vanilla',
+    network: quote.network,
+    chain: quote.chain,
+    chainId: quote.chainId,
+    asset: quote.asset,
+    payTo: quote.payTo,
+    amount: quote.upstream.amountBaseUnits,
+    amountUsdc: quote.upstream.amountUsdc,
+    maxTimeoutSeconds: quote.maxTimeoutSeconds,
+    extra: quote.extra,
   }
 
   const resource = `/api/marketplace/call/${entry.id}`
@@ -144,7 +191,10 @@ router.post('/call', async (req, res, next) => {
       data: body.data,
       headers: body.headers,
       chain: quote.cliChain,
+      chainKey,
+      payerMsca: invoice?.ownerWallet || authOwner.walletAddress,
       maxAmountUsdc: Number(quote.upstream.amountUsdc),
+      acceptSnapshot: invoice?.upstreamPayment || acceptSnapshot,
     })
     if (payment.ok && invoice) {
       invoice.upstream = {
@@ -152,7 +202,10 @@ router.post('/call', async (req, res, next) => {
         resource: entry.resource,
         provider: entry.provider,
         chain: quote.chain,
-        cliChain: quote.cliChain,
+        network: quote.network,
+        rail: 'vanilla',
+        payer: invoice.ownerWallet,
+        txHash: payment.settlement?.txHash || '',
         paidAt: new Date().toISOString(),
       }
       invoice.serviceStatus = 'service_unlocked'
@@ -171,37 +224,39 @@ router.post('/call', async (req, res, next) => {
       platformFee: quote.platformFee,
       x402Payment: invoice ? publicInvoice(invoice) : null,
       result: payment.ok ? payment.providerPayload : null,
+      settlement: payment.ok ? payment.settlement || null : null,
       upstream: {
         resource: entry.resource,
         provider: entry.provider,
         method: payment.method,
+        executor: payment.executor || '',
+        payer: invoice?.ownerWallet || authOwner.walletAddress,
         ok: payment.ok,
         reason: payment.reason || '',
         error: payment.error || '',
       },
       safeNextStep: payment.ok
-        ? 'Hasil provider sudah diteruskan. ARCOX menagih harga provider + platform fee pada invoice ini.'
-        : 'Provider gagal dibayar. Invoice sudah ditandai refund-review (pending_review) oleh auto-refund worker; jangan charge ulang sebelum rekonsiliasi.',
+        ? 'Hasil provider sudah diteruskan. Harga provider dibayar langsung dari Agent Wallet MSCA; invoice ARCOX hanya menagih platform fee.'
+        : 'Provider gagal dibayar dari Agent Wallet. Fee sudah ditandai refund-review (pending_review) oleh auto-refund worker; jangan charge ulang sebelum rekonsiliasi.',
     })
   }, {
     service: 'arcox_marketplace',
-    amount: quote.upstream.amountUsdc,
+    amount: feeAmountUsdc,
     resource,
-    platformFee: {
-      applied: Number(quote.platformFee.amountUsdc) > 0,
-      bps: quote.platformFee.bps,
-      amountUsdc: quote.platformFee.amountUsdc,
-      source: 'marketplace',
-    },
+    // Zero net: this invoice resells nothing, it only bills ARCOX's fee on a
+    // purchase the buyer's own wallet settles with the provider.
+    split: { netAmount: '0', feeAmount: feeAmountUsdc, source: 'marketplace' },
     upstreamQuote: {
       resource: entry.resource,
       provider: entry.provider,
       category: entry.category,
       amountUsdc: quote.upstream.amountUsdc,
       chain: quote.chain,
+      network: quote.network,
       cliChain: quote.cliChain,
       quotedAt: quote.quotedAt,
     },
+    upstreamPayment: acceptSnapshot,
   })(req, res, next)
 })
 

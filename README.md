@@ -144,17 +144,20 @@ Karakteristik yang berlaku sekarang:
   bisa dibelanjakan:
 
   ```text
-  X402_MARKETPLACE_EXECUTOR=wallet   # bayar dari EOA ARCOX (exact/EIP-3009, chain EVM)
-  X402_MARKETPLACE_PAYER_PRIVATE_KEY=0x…
-  X402_MARKETPLACE_EXECUTOR=cli      # bayar lewat Circle CLI (juga melayani seller Gateway)
+  X402_MARKETPLACE_EXECUTOR=msca   # provider dibayar oleh MSCA agent pembeli (EIP-3009/ERC-1271)
+  X402_MARKETPLACE_PAYER_CHAIN=ARC # chain default untuk CLI key/alamat pembayar mode cli
+  X402_MARKETPLACE_EXECUTOR=cli    # bayar lewat Circle CLI dari satu wallet platform (melayani seller Gateway)
   X402_MARKETPLACE_PAYER_ADDRESS=0x…
   ```
 
   Harga provider disimpan per chain dalam base units beserta rail-nya
-  (`vanilla` / `gateway` / `permit2` / `solana`), dan platform fee dihitung di
-  atasnya (`X402_PLATFORM_FEE_BPS`, default 5%). Buyer (MSCA user) membayar
-  invoice x402 ARCOX = harga provider + fee, dan fee itu masuk ke treasury x402;
-  ARCOX lalu melunasi provider dari wallet executor yang dikonfigurasi.
+  (`vanilla` / `gateway` / `permit2` / `solana`). Di mode `msca` invoice x402
+  ARCOX hanya menagih **fee platform** (`X402_PLATFORM_FEE_BPS`, default 5%):
+  harga provider dibayar langsung oleh Agent Wallet (MSCA) pembeli ke endpoint
+  provider lewat EIP-3009 yang diverifikasi ERC-1271, jadi tidak ada kunci
+  platform yang bisa membelanjakan dana agent. Konsekuensinya seller yang hanya
+  menerima Gateway/Permit2/Solana tidak bisa dibeli dari MSCA — mode `cli` tetap
+  disediakan untuk jalur itu.
 - Klien dengan kuota tool kecil (mis. connector penyedia AI) bisa meminta
   subset yang konsisten lewat URL atau header; default tetap daftar penuh:
 

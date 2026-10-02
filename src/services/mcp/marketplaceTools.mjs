@@ -4,8 +4,9 @@
 // the x402 directory, what does it cost, and what would ARCOX charge me".
 // arcox_marketplace_call is the only paid tool — it follows the same x402
 // invoice lifecycle as the Intel tools (402 → pay → retry with paymentId) so
-// the user always approves the spend, and the ARCOX platform fee is billed on
-// the invoice itself rather than hidden in a price.
+// the user always approves the spend. The invoice charges only the ARCOX
+// platform fee: the provider price is settled directly from the buying agent's
+// own MSCA, so the fee is never hidden in a marked-up provider price.
 export function registerMarketplaceTools(ctx) {
   const { registerTool, jsonText, z, backendUrl, mintOwnerToken, resolveMsca } = ctx
 
@@ -45,10 +46,10 @@ export function registerMarketplaceTools(ctx) {
     const r = await fetch(`${backendUrl}/api/marketplace/quote?${search.toString()}`)
     const data = await r.json().catch(() => ({}))
     if (!data?.ok) return { content: [{ type: 'text', text: jsonText({ readOnly: true, ok: false, ...data, safeNextStep: 'Cari dulu dengan arcox_marketplace_search.' }) }] }
-    return { content: [{ type: 'text', text: jsonText({ readOnly: true, ...data, resourceInput: data.resource?.input || null, safeNextStep: `Bayar ${data.quote?.totalUsdc} USDC (provider ${data.quote?.upstream?.amountUsdc} + platform fee ${data.quote?.platformFee?.amountUsdc}) lewat arcox_marketplace_call, lalu setujui invoice x402.` }) }] }
+    return { content: [{ type: 'text', text: jsonText({ readOnly: true, ...data, resourceInput: data.resource?.input || null, safeNextStep: `Bayar fee ${data.quote?.platformFee?.amountUsdc} USDC lewat arcox_marketplace_call (harga provider ${data.quote?.upstream?.amountUsdc} USDC dibayar langsung dari Agent Wallet MSCA pembeli), lalu setujui invoice x402.` }) }] }
   })
 
-  registerTool('arcox_marketplace_call', 'Buy a mirrored x402 marketplace resource through ARCOX. Returns an x402 invoice first (provider price + ARCOX platform fee); after the user approves and pays it, retry with paymentId to receive the provider response. Paid tool.', {
+  registerTool('arcox_marketplace_call', 'Buy a mirrored x402 marketplace resource through ARCOX. Returns an x402 invoice for the ARCOX platform fee only; the provider price is paid directly from the agent\u2019s own Agent Wallet (MSCA, ERC-1271/EIP-3009). After the user approves and pays the invoice, retry with paymentId to receive the provider response. Paid tool.', {
     resource: z.string().describe('Resource id (mkt_...), full URL, or unique URL fragment'),
     id: z.string().optional().describe('Alias of resource when using the mkt_ id'),
     chain: z.string().optional().describe('Preferred payment chain for the provider (e.g. ARC, BASE, ARB)'),

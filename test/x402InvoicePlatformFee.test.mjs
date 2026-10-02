@@ -65,3 +65,38 @@ test('an explicit split (marketplace resale) is honoured as given', () => {
   assert.equal(publicShape.platformFee.source, 'marketplace')
   assert.equal(publicShape.upstreamQuote.provider, 'Exa')
 })
+
+test('an MSCA-purchased marketplace invoice bills only the platform fee', () => {
+  // The provider price never touches this invoice: the buyer's own Agent
+  // Wallet settles it directly, so the invoice charges the fee and carries the
+  // locked seller terms the retry is allowed to sign.
+  const invoice = createX402Invoice({
+    service: 'arcox_marketplace',
+    amount: '0.000350',
+    ownerWallet: OWNER,
+    resource: '/api/marketplace/call/mkt_bbbbbbbbbbbb',
+    uniqueAmount: '0.000350',
+    split: { netAmount: '0', feeAmount: '0.000350', source: 'marketplace' },
+    upstreamQuote: { resource: 'https://api.exa.ai/search', provider: 'Exa', amountUsdc: '0.007000' },
+    upstreamPayment: {
+      rail: 'vanilla', network: 'eip155:5042', chain: 'Arc', chainId: 5042,
+      asset: '0x3600000000000000000000000000000000000000',
+      payTo: '0xB98eF29eb2be19Ae646A8FC0248255B90A332dbC',
+      amount: '7000', amountUsdc: '0.007000', maxTimeoutSeconds: 3600,
+      extra: { name: 'USDC', version: '2' },
+    },
+  })
+  assert.equal(invoice.baseAmount, '0.000350')
+  assert.equal(invoice.platformFeeAmount, '0.000350')
+  assert.equal(invoice.platformFeeBps, 500)
+  assert.equal(invoice.platformFeeSource, 'marketplace')
+  assert.equal(invoice.fee.netAmount, '0.000000')
+  assert.equal(invoice.fee.totalAmount, '0.000350')
+  assert.equal(invoice.uniqueAmount, '0.000350')
+  assert.match(invoice.fee.note, /marketplace fee/)
+  assert.match(invoice.fee.note, /0\.007000 USDC provider purchase/)
+  const shape = publicInvoice(invoice)
+  assert.equal(shape.upstreamPayment.amount, '7000')
+  assert.equal(shape.upstreamPayment.rail, 'vanilla')
+  assert.equal(shape.upstreamQuote.provider, 'Exa')
+})

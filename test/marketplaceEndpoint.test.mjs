@@ -201,6 +201,10 @@ test('the catalogue is free to search and shows provider prices', async () => {
     assert.equal(body.items[1].payableChains.length, 2, 'rantai yang bisa dibayar ikut terlihat')
     assert.equal(body.items[1].payableChains.includes('ARC'), true)
     assert.deepEqual(body.items[0].payableChains, [], 'rantai yang tidak bisa dibayar CLI tetap jujur dilaporkan')
+    // The Agent Wallet flag follows the same honesty rule: only resources with
+    // a vanilla EIP-3009 accept on an MSCA chain are marked payable.
+    assert.equal(body.items[1].mscaPayable, true)
+    assert.equal(body.items[0].mscaPayable, false)
   })
 })
 
@@ -227,6 +231,7 @@ test('a quote shows the provider price, the platform fee, and the total', async 
     assert.equal(body.quote.platformFee.amountUsdc, '0.005000')
     assert.equal(body.quote.totalUsdc, '0.105000')
     assert.equal(body.quote.chain, 'Arc')
+    assert.equal(body.quote.mscaPayable, true)
     // The executor is off, so the quote is explicitly informational.
     assert.equal(body.quote.payable, false)
     assert.equal(body.executor.configured, false)
@@ -272,6 +277,23 @@ test('buying through the marketplace is refused until a payment executor is conf
     assert.equal(body.ok, false)
     assert.equal(body.executor.configured, false)
     assert.match(body.error, /executor is not configured/)
+  })
+})
+
+test('an msca executor needs no platform key but still requires a live Agent Wallet', async () => {
+  await withHttp(async ({ get, post, token }) => {
+    process.env.X402_MARKETPLACE_EXECUTOR = 'msca'
+    const stats = await get('/api/marketplace/stats')
+    assert.equal(stats.body.executor.mode, 'msca')
+    assert.equal(stats.body.executor.configured, true)
+    assert.deepEqual(stats.body.executor.rails, ['vanilla'])
+
+    const anonymous = await post('/api/marketplace/call', { resource: 'mkt_aaaaaaaaaaaa' })
+    assert.equal(anonymous.status, 401)
+    // A well-formed owner token still needs an active MSCA session, so the
+    // paid route cannot be reached with a platform key or an empty fixture.
+    const noSession = await post('/api/marketplace/call', { resource: 'mkt_aaaaaaaaaaaa' }, { Authorization: `Bearer ${token}`, 'X-Arcox-Owner': OWNER })
+    assert.equal(noSession.status, 401)
   })
 })
 

@@ -164,7 +164,9 @@ function resolveInvoiceFeePlan(input, baseAmount) {
       ? { netAmount: baseAmount, feeAmount: input.platformFee.amountUsdc, source: input.platformFee.source || 'explicit' }
       : null
   if (split) {
-    const netAmount = normalizeAmount(split.netAmount)
+    // A marketplace resale paid directly by the buyer's own wallet bills the
+    // fee only, so a zero net amount is a legitimate split here.
+    const netAmount = normalizeAmount(split.netAmount, { allowZero: true })
     const feeAmount = normalizeAmount(split.feeAmount, { allowZero: true })
     const feeUnits = BigInt(feeAmount.split('.')[0]) * 1_000_000n + BigInt(feeAmount.split('.')[1] || '0')
     const netUnits = BigInt(netAmount.split('.')[0]) * 1_000_000n + BigInt(netAmount.split('.')[1] || '0')
@@ -310,6 +312,9 @@ export function createX402Invoice(input = {}) {
     platformFeeSource: feePlan.source,
     // What the buyer is being resold (marketplace proxy invoices only).
     ...(input.upstreamQuote ? { upstreamQuote: input.upstreamQuote } : {}),
+    // The exact seller accept the buyer approved, so the retry can only sign
+    // the quoted terms (or fail) instead of repricing mid-payment.
+    ...(input.upstreamPayment ? { upstreamPayment: input.upstreamPayment } : {}),
     fee: {
       asset: 'USDC',
       bps: feePlan.bps,
@@ -318,9 +323,11 @@ export function createX402Invoice(input = {}) {
       netAmount: feePlan.netAmount,
       totalAmount: uniqueAmount,
       source: feePlan.source,
-      note: feePlan.applied
-        ? `ARCOX platform fee ${feePlan.bps} bps charged on top of the ${feePlan.netAmount} USDC service price.`
-        : 'No ARCOX x402 platform fee added to the invoice amount.',
+      note: feePlan.source === 'marketplace'
+        ? `ARCOX marketplace fee ${feePlan.bps} bps (${feePlan.feeAmount} USDC) on a ${input.upstreamQuote?.amountUsdc || '0.000000'} USDC provider purchase settled directly from the buyer's MSCA.`
+        : feePlan.applied
+          ? `ARCOX platform fee ${feePlan.bps} bps charged on top of the ${feePlan.netAmount} USDC service price.`
+          : 'No ARCOX x402 platform fee added to the invoice amount.',
     },
     createdAt: new Date(now).toISOString(),
     expiresAt: new Date(now + cfg.ttlSeconds * 1000).toISOString(),
@@ -647,6 +654,7 @@ export function publicInvoice(invoice) {
     },
     ...(invoice.upstream ? { upstream: invoice.upstream } : {}),
     ...(invoice.upstreamQuote ? { upstreamQuote: invoice.upstreamQuote } : {}),
+    ...(invoice.upstreamPayment ? { upstreamPayment: invoice.upstreamPayment } : {}),
     unifiedBalanceEstimate: invoice.unifiedBalanceEstimate,
     spendTxHash: invoice.spendTxHash,
     transferId: invoice.transferId,
@@ -993,6 +1001,7 @@ function invoiceExtras(config = {}) {
   if (config.split) extras.split = config.split
   if (config.platformFee) extras.platformFee = config.platformFee
   if (config.upstreamQuote) extras.upstreamQuote = config.upstreamQuote
+  if (config.upstreamPayment) extras.upstreamPayment = config.upstreamPayment
   return extras
 }
 

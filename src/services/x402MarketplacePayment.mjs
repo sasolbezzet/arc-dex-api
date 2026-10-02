@@ -1,17 +1,20 @@
 // Outbound payment executor for mirrored marketplace resources.
 //
 // ARCOX quotes every marketplace resource itself (see x402Marketplace.mjs), but
-// actually buying one settles USDC with the provider's own x402 endpoint. That
-// settlement runs through the Circle CLI's audited `circle services pay` flow
-// with an agent wallet: ARCOX never sees the provider's key, and ARCOX's own
-// treasury keys are not exposed to arbitrary caller-supplied URLs.
-//
+// actually buying one settles USDC with the provider's own x402 endpoint. Two
+// executors exist:
+//   - `msca` pays from the buying agent's own Agent Wallet (ERC-1271 signature
+//     from its session key), so the agent's money buys the agent's data and no
+//     platform key can spend it;
+//   - `cli` shells out to the Circle CLI's `circle services pay` with one
+//     agent wallet, which is also the only path that can pay Gateway sellers.
 // Disabled by default. With X402_MARKETPLACE_EXECUTOR unset the marketplace is
-// discovery + quoting only, so no caller can spend ARCOX funds by accident.
+// discovery + quoting only, so no caller can spend funds by accident.
 import { execFile } from 'child_process'
-import { payWithWallet, walletPayerStatus } from './x402WalletPayer.mjs'
+import { payFromMsca } from './x402MscaPayer.mjs'
 
-const EXECUTOR_MODES = new Set(['disabled', 'cli', 'wallet'])
+const EXECUTOR_MODES = new Set(['disabled', 'cli', 'msca'])
+const CHAIN_KEY_BY_CLI_CHAIN = { ARC: 'arc-mainnet', BASE: 'base-mainnet', ARB: 'arbitrum-mainnet' }
 const SAFE_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
 const HEADER_NAME = /^[A-Za-z0-9-]+$/
 const SHELL_METACHARS = /[;&|$`"'()<>\\\n\r\t]/
@@ -32,13 +35,19 @@ export function marketplaceExecutorConfig() {
 /** What the route reports before it will accept a paid marketplace call. */
 export function marketplaceExecutorStatus() {
   const config = marketplaceExecutorConfig()
-  if (config.mode === 'wallet') {
-    const wallet = walletPayerStatus()
+  if (config.mode === 'msca') {
+    // No platform key exists in this mode: every paid call names the buying
+    // agent's own wallet, and the route refuses any call that is not.
     return {
-      ...wallet,
+      mode: 'msca',
+      configured: true,
+      payer: 'invoice MSCA owner (per request)',
       defaultChain: config.defaultChain,
       maxUpstreamUsdc: config.maxUpstreamUsdc,
-      schemes: ['exact (EIP-3009)'],
+      rails: ['vanilla'],
+      schemes: ['exact (EIP-3009 over ERC-1271)'],
+      problems: [],
+      hint: 'Providers are paid from the buying agent\u2019s own MSCA. Gateway, Permit2, and Solana accepts are not payable from a contract account.',
     }
   }
   const addressValid = /^0x[0-9a-fA-F]{40}$/.test(config.payerAddress)
@@ -55,7 +64,7 @@ export function marketplaceExecutorStatus() {
     schemes: ['exact (EIP-3009)', 'GatewayWalletBatched'],
     problems,
     hint: problems.length
-      ? 'Marketplace calls stay discovery/quote-only until X402_MARKETPLACE_EXECUTOR=cli and X402_MARKETPLACE_PAYER_ADDRESS are set to a funded agent wallet.'
+      ? 'Marketplace calls stay discovery/quote-only until X402_MARKETPLACE_EXECUTOR=msca (agent pays the provider from its own wallet) or X402_MARKETPLACE_EXECUTOR=cli with a funded X402_MARKETPLACE_PAYER_ADDRESS.'
       : '',
   }
 }
@@ -84,6 +93,13 @@ export function validateMarketplaceRequest({ resource, method = 'GET', headers =
     if (SHELL_METACHARS.test(text) || /[^\x20-\x7e]/.test(text)) return { ok: false, error: `invalid header value for ${name}` }
   }
   return { ok: true, url, method: verb }
+}
+
+/** Preflight the paying MSCA's Arc balance so an empty wallet fails fast. */
+async function defaultMscaBalanceReader(chainKey, address) {
+  if (String(chainKey) !== 'arc-mainnet') return null
+  const { readArcUsdcBalance } = await import('./cardOnchain.mjs')
+  return readArcUsdcBalance(address)
 }
 
 export function buildMarketplacePayArgs({ config, resource, method, data, headers = {}, chain, maxAmountUsdc }) {
@@ -125,6 +141,9 @@ function parseCliJson(stdout) {
 export async function payMarketplaceEndpoint({
   resource, method = 'GET', data, headers = {}, chain = '', maxAmountUsdc,
   timeoutMs, spawnImpl, fetchImpl,
+  // MSCA mode inputs: the wallet that pays (the invoice owner) and the accept
+  // the buyer approved at quote time.
+  payerMsca, chainKey = '', acceptSnapshot, signer, balanceReader,
 } = {}) {
   const config = marketplaceExecutorConfig()
   const status = marketplaceExecutorStatus()
@@ -136,16 +155,19 @@ export async function payMarketplaceEndpoint({
   if (cap > config.maxUpstreamUsdc) {
     return { ok: false, reason: 'upstream_price_above_cap', error: `upstream price ${cap} USDC exceeds X402_MARKETPLACE_MAX_UPSTREAM_USDC ${config.maxUpstreamUsdc}` }
   }
-  if (config.mode === 'wallet') {
-    const wallet = await payWithWallet({
-      resource: validation.url, method: validation.method, data, headers, chain, maxAmountUsdc: cap, timeoutMs, fetchImpl,
+  if (config.mode === 'msca') {
+    const targetChainKey = chainKey || CHAIN_KEY_BY_CLI_CHAIN[String(chain || config.defaultChain).toUpperCase()] || ''
+    const payment = await payFromMsca({
+      resource: validation.url, method: validation.method, data, headers,
+      payerMsca, chainKey: targetChainKey, acceptSnapshot, maxAmountUsdc: cap, timeoutMs, fetchImpl, signer,
+      balanceReader: balanceReader || defaultMscaBalanceReader,
     })
     return {
-      ...wallet,
+      ...payment,
       method: validation.method,
       resource: validation.url,
-      chain: wallet.settlement?.chain || String(chain || config.defaultChain).toUpperCase(),
-      executor: 'wallet',
+      chain: payment.settlement?.chain || String(chain || config.defaultChain).toUpperCase(),
+      executor: 'msca',
     }
   }
   const args = buildMarketplacePayArgs({
