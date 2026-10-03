@@ -51,7 +51,8 @@ const TESTNET = {
     ETH: null, // native on Arc adalah USDC
     EURC: '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a',
     USYC: '0xe9185F0c5F296Ed1797AaE4238D26CCaBEadb86C',
-    cirBTC: null,
+    // cirBTC Arc Testnet (docs Circle cirBTC contract addresses).
+    cirBTC: '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF',
   },
   cctp: {
     tokenMessenger: '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA',
@@ -183,7 +184,9 @@ const MAINNET = {
     ETH: null,
     EURC: '0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1',
     USYC: '0x8a5D989Bbb96929F689B0200f435f53dA42bF490',
-    cirBTC: null,
+    // cirBTC Arc Mainnet live sejak 24 Sep 2026 (docs.arc.io/arc/references/
+    // contract-addresses + developers.circle.com/assets/cirbtc-contract-addresses).
+    cirBTC: '0x171A4217b86A807A64eB94757Db6849fb4bDbAA0',
   },
   cctp: {
     tokenMessenger: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
@@ -364,9 +367,17 @@ export function arcGatewayChains() {
   return network.gatewayChains.map(entry => ({ ...entry }))
 }
 
-/** Alamat token aktif (null kalau token tidak ada di jaringan ini). */
+/**
+ * Alamat token aktif (null kalau token tidak ada di jaringan ini).
+ *
+ * Lookup case-insensitive karena sebagian simbol token sengaja mixed-case
+ * (mis. `cirBTC`), sementara pemanggil mengirim `CIRBTC`/`cirBTC` bebas.
+ */
 export function arcTokenAddress(symbol) {
-  return network.tokens[String(symbol || '').toUpperCase()] ?? null
+  const wanted = String(symbol || '').trim().toUpperCase()
+  if (!wanted) return null
+  const entry = Object.entries(network.tokens).find(([name]) => name.toUpperCase() === wanted)
+  return entry ? entry[1] ?? null : null
 }
 
 /** Alamat kontrak pihak Circle sesuai jaringan aktif. */

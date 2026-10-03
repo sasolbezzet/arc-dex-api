@@ -72,7 +72,10 @@ test('Circle contracts and tokens follow the active network', async () => {
   await withRegistry({}, (arc) => {
     assert.equal(arc.arcCircleContract('tokenMessenger'), '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA')
     assert.equal(arc.arcTokenAddress('EURC'), '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a')
-    assert.equal(arc.arcTokenAddress('cirBTC'), null)
+    // cirBTC live di kedua jaringan; lookup tidak boleh case-sensitive
+    // karena kunci registry sengaja mixed-case (`cirBTC`).
+    assert.equal(arc.arcTokenAddress('cirBTC'), '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF')
+    assert.equal(arc.arcTokenAddress('CIRBTC'), '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF')
   })
   await withRegistry({ ARC_NETWORK: 'mainnet' }, (arc) => {
     assert.equal(arc.arcCircleContract('tokenMessenger'), '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d')
@@ -80,6 +83,7 @@ test('Circle contracts and tokens follow the active network', async () => {
     assert.equal(arc.arcCircleContract('identityRegistry'), '0x8004A169FB4a3325136EB29fA0ceB6D2e539a432')
     assert.equal(arc.arcTokenAddress('EURC'), '0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1')
     assert.equal(arc.arcTokenAddress('USYC'), '0x8a5D989Bbb96929F689B0200f435f53dA42bF490')
+    assert.equal(arc.arcTokenAddress('cirBTC'), '0x171A4217b86A807A64eB94757Db6849fb4bDbAA0')
   })
 })
 

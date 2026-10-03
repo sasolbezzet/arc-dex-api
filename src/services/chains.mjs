@@ -105,7 +105,8 @@ export const CHAINS = {
       USDC:   '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
       ETH:    null, // native
       EURC:   '0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c',
-      cirBTC: null, // belum ada di mainnet
+      // cirBTC Ethereum mainnet live sejak 24 Sep 2026.
+      cirBTC: '0x72DFB2E44f59C5AD2bAFE84314E5b99a7cd5075E',
     },
   },
   'base-mainnet': {

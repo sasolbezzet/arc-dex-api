@@ -38,6 +38,7 @@ import { extractCircleWalletTransaction, isFailedCircleWalletStatus, isFinalCirc
 import { handleCircleNotificationOutcome } from './src/services/circleNotificationOutcome.mjs'
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { ARC_CCTP_DOMAIN, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, ARC_SDK_CHAIN_NAME, IS_ARC_MAINNET, arcCctpChains, arcCctpDomains, arcCircleApiKey, arcCircleClientKey, arcCircleEntitySecret, arcCircleWalletBlockchain, arcContractAddress, arcGatewayBaseUrl, arcGatewayChains, arcIrisBaseUrl, arcNetwork, arcSolanaCctp, arcTokenAddress, resolveMscaChainKey } from './src/config/arcNetwork.mjs'
+import { describeSwapToken, resolveSwapChain, swapAdapterAddress, swapChainList } from './src/services/swapChains.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
 import { startRefundWorker } from './src/services/x402RefundWorker.mjs'
@@ -1145,12 +1146,10 @@ const arcPublicClient = createPublicClient({
 })
 
 // Alamat token selalu dari registry jaringan aktif (src/config/arcNetwork.mjs),
-// bukan konstanta testnet: token yang tidak ada di mainnet (mis. cirBTC)
-// otomatis hilang dari daftar sehingga jalur send/swap-nya gagal-tertutup.
-// cirBTC hanya ada di Arc Testnet; di mainnet token ini belum ada, jadi
-// entrinya dihilangkan supaya send/swap cirBTC gagal-tertutup.
-const CIRBTC_TESTNET = '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF'
-const cirBtcAddress = IS_ARC_MAINNET ? null : CIRBTC_TESTNET
+// bukan konstanta terpisah per lingkungan. cirBTC live di Arc mainnet
+// (0x171A4217…) dan Arc Testnet (0xf0C4a4CE…); alamatnya mengikuti jaringan
+// aktif supaya tidak ada nilai testnet yang bocor ke mainnet.
+const cirBtcAddress = arcTokenAddress('cirBTC')
 
 const TOKENS = Object.fromEntries(
   [
@@ -1176,8 +1175,9 @@ const TOKEN_DECIMALS = {
 }
 
 function swapTokenParam(token) {
-  if (token === 'USYC' || token === 'cirBTC') return TOKENS[token]
-  return token
+  // App Kit menerima simbol bawaan atau contract address; token registry
+  // (USYC/cirBTC) dan CA arbitrary sama-sama dikirim sebagai alamat.
+  return TOKENS[token] || token
 }
 
 // Fee router on-chain bisa punya bps berbeda per jaringan (mainnet di-deploy 500),
@@ -1209,11 +1209,6 @@ const CIRBTC_AMM_ROUTER_ABI = [
   { type: 'function', name: 'swapUsdcToCirBtc', stateMutability: 'nonpayable', inputs: [{ name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' }], outputs: [{ name: 'amountOut', type: 'uint256' }] },
   { type: 'function', name: 'swapCirBtcToUsdc', stateMutability: 'nonpayable', inputs: [{ name: 'amountIn', type: 'uint256' }, { name: 'minAmountOut', type: 'uint256' }], outputs: [{ name: 'amountOut', type: 'uint256' }] },
 ]
-function isCirBtcSwap(tokenIn, tokenOut) {
-  // USDC↔cirBTC direct AMM route and EURC↔cirBTC 2-leg AMM route.
-  return (tokenIn === 'USDC' && tokenOut === 'cirBTC') || (tokenIn === 'cirBTC' && tokenOut === 'USDC') ||
-    (tokenIn === 'EURC' && tokenOut === 'cirBTC') || (tokenIn === 'cirBTC' && tokenOut === 'EURC')
-}
 function isEurcCirBtcSwap(tokenIn, tokenOut) {
   return (tokenIn === 'EURC' && tokenOut === 'cirBTC') || (tokenIn === 'cirBTC' && tokenOut === 'EURC')
 }
@@ -1527,11 +1522,6 @@ function normalizeArcToken(value) {
   return raw.toUpperCase()
 }
 
-function tokenSymbolForAddress(address) {
-  const match = Object.entries(TOKENS).find(([, tokenAddress]) => tokenAddress.toLowerCase() === String(address || '').toLowerCase())
-  return (match ? match[0] : undefined) || 'USDC'
-}
-
 function decimalToUnits(value, decimals) {
   const raw = normalizeAmount(value)
   const [whole, frac = ''] = raw.split('.')
@@ -1548,10 +1538,8 @@ function unitsToDecimal(units, decimals) {
   return `${sign}${whole.toString()}${frac ? `.${frac}` : ''}`
 }
 
-function splitPlatformFee(amount, token) {
-  token = normalizeArcToken(token)
-  const decimals = TOKEN_DECIMALS[token]
-  if (decimals === undefined) throw new Error('Unsupported token decimals: ' + token)
+function splitPlatformFeeUnits(amount, decimals) {
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) throw new Error('Unsupported token decimals: ' + decimals)
   const amountUnits = decimalToUnits(amount, decimals)
   const feeBps = Number.isFinite(PLATFORM_FEE_BPS) && PLATFORM_FEE_BPS > 0 ? Math.floor(PLATFORM_FEE_BPS) : 0
   const feeUnits = (amountUnits * BigInt(feeBps)) / 10_000n
@@ -1565,6 +1553,110 @@ function splitPlatformFee(amount, token) {
     feeAmount: unitsToDecimal(feeUnits, decimals),
     netAmount: unitsToDecimal(netUnits, decimals),
   }
+}
+
+function splitPlatformFee(amount, token) {
+  token = normalizeArcToken(token)
+  const decimals = TOKEN_DECIMALS[token]
+  if (decimals === undefined) throw new Error('Unsupported token decimals: ' + token)
+  return splitPlatformFeeUnits(amount, decimals)
+}
+
+// ── Chain-aware swap helpers (multi-chain + token arbitrary / paste CA) ──
+// Circle Stablecoin Service (via aggregator LiFi) merutekan token apa pun yang
+// punya likuiditas di chain itu, jadi CA yang ditempel user tidak perlu
+// didaftarkan: cukup divalidasi sebagai kontrak ERC-20 di chain terpilih.
+function sameSwapToken(a, b) {
+  return a.address.toLowerCase() === b.address.toLowerCase()
+}
+
+function swapTokenLabel(token) {
+  return token.symbol || token.label || token.address
+}
+
+function isCirBtcSymbolPair(tokenIn, tokenOut) {
+  const symbols = [tokenIn.symbol, tokenOut.symbol]
+  return symbols.includes('cirBTC') &&
+    (symbols.includes('USDC') || symbols.includes('EURC'))
+}
+
+// Router AMM ARCOX hanya ada di Arc Testnet (Circle belum merutekan cirBTC di
+// sana saat router di-deploy). Di seluruh chain mainnet cirBTC sudah dirutekan
+// Circle Stablecoin Service, jadi tidak ada special case AMM.
+function usesCirBtcAmmRouter(chainKey, tokenIn, tokenOut) {
+  return chainKey === 'arc-testnet' && isCirBtcSymbolPair(tokenIn, tokenOut)
+}
+
+function stablecoinSwapQuery({ owner, chain, tokenIn, tokenOut, amountUnits, customFeeBps = 0 }) {
+  return {
+    tokenInAddress: tokenIn.address,
+    tokenInChain: chain.circleSwapChain,
+    tokenOutAddress: tokenOut.address,
+    tokenOutChain: chain.circleSwapChain,
+    fromAddress: owner,
+    toAddress: owner,
+    amount: String(amountUnits),
+    slippageBps: 300,
+    // Fee platform dibayar DI DALAM swap lewat adapter Circle (percentageBps),
+    // bukan transfer terpisah: kalau transfer terpisah gagal setelah swap,
+    // user sudah menerima output dan fee tidak pernah masuk treasury.
+    ...(customFeeBps > 0 ? {
+      config: {
+        customFee: {
+          percentageBps: Math.floor(customFeeBps),
+          recipientAddress: normalizeAddress(platformTreasury(), 'ARCOX_TREASURY_WALLET_ADDRESS'),
+        },
+      },
+    } : {}),
+  }
+}
+
+async function quoteStablecoinSwapRoute({ owner, chain, tokenIn, tokenOut, amountUnits }) {
+  const data = await stablecoinRequest('/v1/stablecoinKits/quote', {
+    query: stablecoinSwapQuery({ owner, chain, tokenIn, tokenOut, amountUnits }),
+  })
+  const quote = data?.quote || data
+  let estimatedUnits = 0n
+  let minUnits = 0n
+  try { estimatedUnits = BigInt(quote?.estimatedAmount || '0') } catch { estimatedUnits = 0n }
+  try { minUnits = BigInt(quote?.minAmount || '0') } catch { minUnits = 0n }
+  if (estimatedUnits <= 0n) {
+    throw Object.assign(new Error('Circle tidak mengembalikan estimasi output untuk pasangan ini.'), { code: 'NO_SWAP_ROUTE' })
+  }
+  return { quote, estimatedUnits, minUnits, provider: quote?.route?.provider || quote?.provider || 'circle' }
+}
+
+async function prepareStablecoinSwapLeg({ owner, chain, tokenIn, tokenOut, amountUnits, customFeeBps = 0 }) {
+  const prepared = await stablecoinRequest('/v1/stablecoinKits/swap', {
+    method: 'POST',
+    body: stablecoinSwapQuery({ owner, chain, tokenIn, tokenOut, amountUnits, customFeeBps }),
+  })
+  if (!prepared?.transaction?.executionParams || !prepared?.transaction?.signature) {
+    throw new Error('Stablecoin Service tidak mengembalikan payload EVM swap yang valid.')
+  }
+  const stopLimitUnits = BigInt(prepared.stopLimit || '0')
+  return {
+    tokenIn: swapTokenLabel(tokenIn),
+    tokenOut: swapTokenLabel(tokenOut),
+    tokenInAddress: prepared.tokenInAddress || tokenIn.address,
+    tokenOutAddress: prepared.tokenOutAddress || tokenOut.address,
+    tokenInDecimals: tokenIn.decimals,
+    tokenOutDecimals: tokenOut.decimals,
+    amountBaseUnits: String(amountUnits),
+    amountIn: unitsToDecimal(BigInt(amountUnits), tokenIn.decimals),
+    amountOut: unitsToDecimal(BigInt(prepared.estimatedAmount || '0'), tokenOut.decimals),
+    minAmountOut: stopLimitUnits > 0n ? unitsToDecimal(stopLimitUnits, tokenOut.decimals) : '',
+    stopLimit: prepared.stopLimit,
+    estimatedAmount: prepared.estimatedAmount,
+    fees: prepared.fees || [],
+    gasLimit: prepared.transaction.gasLimit,
+    executionParams: prepared.transaction.executionParams,
+    signature: prepared.transaction.signature,
+  }
+}
+
+function swapTokenPayload(token) {
+  return { address: token.address, symbol: token.symbol || null, label: swapTokenLabel(token), decimals: token.decimals, custom: Boolean(token.custom) }
 }
 
 function normalizeTxHash(value, field = 'txHash') {
@@ -1625,76 +1717,41 @@ function buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount, customFee
   }
 }
 
-function isEurcToCirBtc(tokenIn, tokenOut) {
-  return tokenIn === 'EURC' && tokenOut === 'cirBTC'
+// Nama chain SDK App Kit untuk entri registry swap. Fail-closed: kalau SDK
+// terpasang tidak mengekspor chain itu, permintaan ditolak alih-alih memakai
+// chain default yang salah (mis. testnet saat produksi mainnet).
+function circleAppKitChain(chain) {
+  const value = SwapChain[chain.circleSwapChain]
+  if (value === undefined || value === null || value === '') {
+    throw Object.assign(
+      new Error(`Swap via App Kit di ${chain.name} belum tersedia: SDK Circle terpasang tidak mengekspor chain '${chain.circleSwapChain}'.`),
+      { status: 503 },
+    )
+  }
+  return value
 }
 
-async function estimateCircleSwapRoute({ from, tokenIn, tokenOut, amountIn, config }) {
-  if (!isEurcToCirBtc(tokenIn, tokenOut)) {
-    return kit.estimateSwap({ from, tokenIn: swapTokenParam(tokenIn), tokenOut: swapTokenParam(tokenOut), amountIn, config })
-  }
-  const first = await kit.estimateSwap({ from, tokenIn: 'EURC', tokenOut: 'USDC', amountIn, config })
-  const intermediateAmount = first?.estimatedOutput?.amount
-  if (!intermediateAmount || Number(intermediateAmount) <= 0) throw new Error('Route EURC → USDC tidak menghasilkan estimasi.')
-  const second = await kit.estimateSwap({ from, tokenIn: 'USDC', tokenOut: swapTokenParam('cirBTC'), amountIn: intermediateAmount, config })
+function circleSwapClientParams({ chain, wallet, tokenIn, tokenOut, amountIn }) {
   return {
-    ...second,
-    tokenIn: 'EURC',
-    tokenOut: 'cirBTC',
+    from: { adapter: circleAdapter, chain: circleAppKitChain(chain), address: wallet.address },
+    tokenIn: tokenIn.address,
+    tokenOut: tokenOut.address,
     amountIn,
-    fees: [...(first?.fees || []), ...(second?.fees || [])],
-    route: 'EURC → USDC → cirBTC',
-    legs: [first, second],
+    config: { apiKey: arcSwapApiKey(), allowanceStrategy: 'approve' },
   }
 }
 
-async function executeCircleSwapRoute({ from, tokenIn, tokenOut, amountIn, config }) {
-  if (!isEurcToCirBtc(tokenIn, tokenOut)) {
-    return kit.swap({ from, tokenIn: swapTokenParam(tokenIn), tokenOut: swapTokenParam(tokenOut), amountIn, config })
-  }
-  const first = await kit.swap({ from, tokenIn: 'EURC', tokenOut: 'USDC', amountIn, config })
-  const intermediateAmount = first?.amountOut
-  if (!intermediateAmount || Number(intermediateAmount) <= 0) throw new Error('Swap EURC → USDC tidak menghasilkan output untuk route cirBTC.')
-  const second = await kit.swap({ from, tokenIn: 'USDC', tokenOut: swapTokenParam('cirBTC'), amountIn: intermediateAmount, config })
-  return {
-    ...second,
-    tokenIn: 'EURC',
-    tokenOut: 'cirBTC',
-    amountIn,
-    route: 'EURC → USDC → cirBTC',
-    steps: [
-      { name: 'EURC → USDC', state: 'success', txHash: first?.txHash, explorerUrl: first?.explorerUrl, amountOut: first?.amountOut },
-      { name: 'USDC → cirBTC', state: 'success', txHash: second?.txHash, explorerUrl: second?.explorerUrl, amountOut: second?.amountOut },
-    ],
-  }
+async function estimateCircleSwap({ chain, wallet, tokenIn, tokenOut, amountIn }) {
+  return kit.estimateSwap(circleSwapClientParams({ chain, wallet, tokenIn, tokenOut, amountIn }))
+}
+
+async function executeCircleSwap({ chain, wallet, tokenIn, tokenOut, amountIn }) {
+  return kit.swap(circleSwapClientParams({ chain, wallet, tokenIn, tokenOut, amountIn }))
 }
 
 function stablecoinErrorMessage(payload, fallback) {
   if (!payload || typeof payload !== 'object') return fallback
   return payload.message || payload.error || payload.detail || fallback
-}
-
-async function quotePreparedEoaRoute({ owner, tokenIn, tokenOut, amount }) {
-  const firstParams = buildStablecoinSwapParams({
-    owner,
-    tokenIn,
-    tokenOut: isEurcToCirBtc(tokenIn, tokenOut) ? 'USDC' : tokenOut,
-    amount,
-    customFeeBps: 0,
-  })
-  const first = await stablecoinRequest('/v1/stablecoinKits/quote', { query: firstParams })
-  if (!isEurcToCirBtc(tokenIn, tokenOut)) return { quote: first, legs: [{ params: firstParams, quote: first }] }
-  const intermediateUnits = String(first?.quote?.minAmount || '0')
-  if (BigInt(intermediateUnits) <= 0n) throw new Error('Route EURC → USDC tidak menghasilkan minimum output.')
-  const secondParams = buildStablecoinSwapParams({
-    owner,
-    tokenIn: 'USDC',
-    tokenOut: 'cirBTC',
-    amount: unitsToDecimal(BigInt(intermediateUnits), TOKEN_DECIMALS.USDC),
-    customFeeBps: 0,
-  })
-  const second = await stablecoinRequest('/v1/stablecoinKits/quote', { query: secondParams })
-  return { quote: second, legs: [{ params: firstParams, quote: first }, { params: secondParams, quote: second }] }
 }
 
 async function prepareEoaSwapLeg(params, tokenIn, tokenOut) {
@@ -1717,27 +1774,6 @@ async function prepareEoaSwapLeg(params, tokenIn, tokenOut) {
     executionParams: prepared.transaction.executionParams,
     signature: prepared.transaction.signature,
   }
-}
-
-async function prepareEoaSwapRoute({ owner, tokenIn, tokenOut, amount }) {
-  if (!isEurcToCirBtc(tokenIn, tokenOut)) {
-    const params = buildStablecoinSwapParams({ owner, tokenIn, tokenOut, amount })
-    const leg = await prepareEoaSwapLeg(params, tokenIn, tokenOut)
-    return { amountOut: leg.amountOut, route: `${tokenIn} → ${tokenOut}`, legs: [leg] }
-  }
-  const firstParams = buildStablecoinSwapParams({ owner, tokenIn: 'EURC', tokenOut: 'USDC', amount })
-  const first = await prepareEoaSwapLeg(firstParams, 'EURC', 'USDC')
-  const intermediateUnits = String(first.stopLimit || '0')
-  if (BigInt(intermediateUnits) <= 0n) throw new Error('Route EURC → USDC tidak menghasilkan minimum output.')
-  const secondParams = buildStablecoinSwapParams({
-    owner,
-    tokenIn: 'USDC',
-    tokenOut: 'cirBTC',
-    amount: unitsToDecimal(BigInt(intermediateUnits), TOKEN_DECIMALS.USDC),
-    customFeeBps: 0,
-  })
-  const second = await prepareEoaSwapLeg(secondParams, 'USDC', 'cirBTC')
-  return { amountOut: second.amountOut, route: 'EURC → USDC → cirBTC', legs: [first, second] }
 }
 
 async function stablecoinRequest(path, { method = 'GET', query, body } = {}) {
@@ -2280,11 +2316,20 @@ function walletLookupMiss(error) {
   return status === 404 || /not found|does not exist|no such wallet/i.test(message)
 }
 
-async function getOrCreateWallet(metamaskAddr) {
+// Kunci penyimpanan wallet: chain Arc (jaringan aktif) tetap memakai kunci
+// lama (alamat user) supaya data produksi tidak berubah; chain lain memakai
+// `alamat|BLOCKCHAIN` sehingga satu user bisa punya wallet custodial di banyak
+// chain tanpa saling menimpa.
+function walletStorageKey(addr, blockchain) {
+  return blockchain === arcCircleWalletBlockchain() ? addr : `${addr}|${blockchain}`
+}
+
+async function getOrCreateWallet(metamaskAddr, chainEntry = null) {
   const addr = metamaskAddr.toLowerCase()
-  const activeBlockchain = arcCircleWalletBlockchain()
+  const activeBlockchain = chainEntry?.circleWalletBlockchain || arcCircleWalletBlockchain()
+  const storageKey = walletStorageKey(addr, activeBlockchain)
   const db = loadWallets()
-  const record = db[addr]
+  const record = db[storageKey]
   if (record) {
     const recordBlockchain = typeof record === 'object' && record ? String(record.blockchain || '') : ''
     // Record dari jaringan lain tidak pernah dipakai ulang: alamat wallet
@@ -2295,8 +2340,8 @@ async function getOrCreateWallet(metamaskAddr) {
         const walletData = walletResponse && typeof walletResponse === 'object' ? walletResponse.data : undefined
         const wallet = walletData && typeof walletData === 'object' ? walletData.wallet : undefined
         if (wallet && wallet.id && wallet.address) {
-          if (typeof db[addr] === 'string' || db[addr].address !== wallet.address || db[addr].blockchain !== activeBlockchain) {
-            db[addr] = { id: wallet.id, address: wallet.address, blockchain: activeBlockchain }
+          if (typeof db[storageKey] === 'string' || db[storageKey].address !== wallet.address || db[storageKey].blockchain !== activeBlockchain) {
+            db[storageKey] = { id: wallet.id, address: wallet.address, blockchain: activeBlockchain }
             saveWallets(db)
           }
           return wallet
@@ -2314,7 +2359,7 @@ async function getOrCreateWallet(metamaskAddr) {
   })
   const wallet = wr && wr.data && Array.isArray(wr.data.wallets) ? wr.data.wallets[0] : undefined
   if (!wallet || !wallet.id || !wallet.address) throw new Error('Circle wallet creation response is incomplete')
-  db[addr] = { id: wallet.id, address: wallet.address, blockchain: activeBlockchain }
+  db[storageKey] = { id: wallet.id, address: wallet.address, blockchain: activeBlockchain }
   saveWallets(db)
   console.log(`[wallet] new: ${addr} → ${wallet.address} (${activeBlockchain})`)
   return wallet
@@ -2545,9 +2590,32 @@ app.post('/api/wallet', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress } = req.body
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
-    const w = await getOrCreateWallet(owner)
-    res.json({ success: true, wallet: { id: w.id, address: w.address } })
-  } catch(e) { console.error('[wallet]', e.message); res.status(500).json({ error: e.message }) }
+    const chain = req.body.chain ? resolveSwapChain(req.body.chain) : null
+    if (chain && !chain.circleWalletBlockchain) {
+      return res.status(400).json({
+        error: `Circle Wallet belum tersedia di ${chain.name}. Pilih Personal Wallet untuk chain ini.`,
+        code: 'circle_wallet_chain_unsupported',
+      })
+    }
+    const w = await getOrCreateWallet(owner, chain)
+    res.json({
+      success: true,
+      wallet: {
+        id: w.id,
+        address: w.address,
+        blockchain: w.blockchain || chain?.circleWalletBlockchain || arcCircleWalletBlockchain(),
+        chain: chain?.key || ARC_CHAIN_KEY,
+      },
+    })
+  } catch(e) { console.error('[wallet]', e.message); res.status(e.status || 500).json({ error: e.message, code: e.code }) }
+})
+
+// ── Daftar chain swap (UI: selector chain + wallet_addEthereumChain) ──
+app.get('/api/swap/chains', (_req, res) => {
+  res.json({
+    network: IS_ARC_MAINNET ? 'mainnet' : 'testnet',
+    chains: swapChainList(),
+  })
 })
 
 // ── Balance ──
@@ -2869,79 +2937,94 @@ function fixedUsdc(value) {
 app.post('/api/eoa-swap-quote', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress, amountIn } = req.body
-    const tokenIn = normalizeArcToken(req.body.tokenIn)
-    const tokenOut = normalizeArcToken(req.body.tokenOut)
     if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
-    // cirBTC swaps use on-chain AMM router — Circle API doesn't support cirBTC
-    if (isCirBtcSwap(tokenIn, tokenOut)) {
-      const ammQuote = await quoteCirBtcAmmRoute(tokenIn, tokenOut, safeAmount)
-      return res.json(ammQuote)
+    const chain = resolveSwapChain(req.body.chain)
+    const tokenIn = await describeSwapToken(req.body.tokenIn, chain)
+    const tokenOut = await describeSwapToken(req.body.tokenOut, chain)
+    if (sameSwapToken(tokenIn, tokenOut)) return res.status(400).json({ error: 'Token swap harus berbeda' })
+    // Router AMM on-chain hanya untuk cirBTC di Arc Testnet; chain lain sudah
+    // dirutekan Circle Stablecoin Service (termasuk token arbitrary/paste CA).
+    if (usesCirBtcAmmRouter(chain.key, tokenIn, tokenOut)) {
+      const ammQuote = await quoteCirBtcAmmRoute(tokenIn.symbol, tokenOut.symbol, safeAmount)
+      return res.json({ ...ammQuote, chain: chain.key, chainId: chain.chainId, tokens: { tokenIn: swapTokenPayload(tokenIn), tokenOut: swapTokenPayload(tokenOut) } })
     }
-    const platformFee = splitPlatformFee(safeAmount, tokenIn)
-    const routeQuote = await quotePreparedEoaRoute({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
-    const quote = routeQuote.quote
-    const estimatedUnits = BigInt(quote?.quote?.estimatedAmount || '0')
-    const minUnits = BigInt(quote?.quote?.minAmount || '0')
-    const amountOut = unitsToDecimal(estimatedUnits, TOKEN_DECIMALS[tokenOut])
-    const minAmountOut = unitsToDecimal(minUnits, TOKEN_DECIMALS[tokenOut])
+    const platformFee = splitPlatformFeeUnits(safeAmount, tokenIn.decimals)
+    const routeQuote = await quoteStablecoinSwapRoute({ owner, chain, tokenIn, tokenOut, amountUnits: platformFee.netUnits })
+    const amountOut = unitsToDecimal(routeQuote.estimatedUnits, tokenOut.decimals)
+    const minAmountOut = unitsToDecimal(routeQuote.minUnits, tokenOut.decimals)
     return res.json({
       available: true,
+      chain: chain.key,
+      chainId: chain.chainId,
       source: 'stablecoin-service',
-      route: routeQuote.legs.length > 1 ? 'EURC → USDC → cirBTC' : `${tokenIn} → ${tokenOut}`,
-      provider: quote?.quote?.route?.provider || 'circle',
+      route: `${swapTokenLabel(tokenIn)} → ${swapTokenLabel(tokenOut)}`,
+      provider: routeQuote.provider,
       amountOut,
       minAmountOut,
       fee: '0.000000',
       platformFee: {
         bps: platformFee.feeBps,
         amount: platformFee.feeAmount,
-        token: tokenIn,
+        token: swapTokenLabel(tokenIn),
+        tokenAddress: tokenIn.address,
+        tokenDecimals: tokenIn.decimals,
         treasury: platformTreasury(),
         swapAmountIn: platformFee.netAmount,
       },
+      tokens: { tokenIn: swapTokenPayload(tokenIn), tokenOut: swapTokenPayload(tokenOut) },
       rate: Number(amountOut || 0) / Number(safeAmount || 1),
     })
   } catch(e) {
     if (isNoSwapRouteError(e)) return noSwapRouteResponse(res, e)
     console.error('[eoa-swap-quote]', e.message)
-    res.status(e.status || 500).json({ error: e.message })
+    res.status(e.status || 500).json({ error: e.message, code: e.code })
   }
 })
 
 app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress, amountIn } = req.body
-    const tokenIn = normalizeArcToken(req.body.tokenIn)
-    const tokenOut = normalizeArcToken(req.body.tokenOut)
     if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
-    // cirBTC swaps: on-chain AMM router — Circle API doesn't support cirBTC
-    if (isCirBtcSwap(tokenIn, tokenOut)) {
-      const ammQuote = await quoteCirBtcAmmRoute(tokenIn, tokenOut, safeAmount)
+    const chain = resolveSwapChain(req.body.chain)
+    const tokenIn = await describeSwapToken(req.body.tokenIn, chain)
+    const tokenOut = await describeSwapToken(req.body.tokenOut, chain)
+    if (sameSwapToken(tokenIn, tokenOut)) return res.status(400).json({ error: 'Token swap harus berbeda' })
+    const chainMeta = {
+      chain: chain.key,
+      chainId: chain.chainId,
+      explorerUrl: chain.explorerUrl,
+      tokens: { tokenIn: swapTokenPayload(tokenIn), tokenOut: swapTokenPayload(tokenOut) },
+    }
+    // Router AMM on-chain hanya untuk cirBTC di Arc Testnet; chain lain
+    // (termasuk tantangan mainnet Arc/Ethereum) sudah dirutekan Circle.
+    if (usesCirBtcAmmRouter(chain.key, tokenIn, tokenOut)) {
+      const ammQuote = await quoteCirBtcAmmRoute(tokenIn.symbol, tokenOut.symbol, safeAmount)
       if (ammQuote?.available === false) {
         return res.json({
           success: false,
           available: false,
+          ...chainMeta,
           code: ammQuote.code || 'NO_SWAP_ROUTE',
           error: ammQuote.error || 'Route swap belum tersedia untuk pasangan token ini.',
         })
       }
+      const ammFee = { ...ammQuote.platformFee, tokenAddress: tokenIn.address, tokenDecimals: tokenIn.decimals }
       // Single-leg USDC ↔ cirBTC
-      if ((tokenIn === 'USDC' && tokenOut === 'cirBTC') || (tokenIn === 'cirBTC' && tokenOut === 'USDC')) {
+      if ((tokenIn.symbol === 'USDC' && tokenOut.symbol === 'cirBTC') || (tokenIn.symbol === 'cirBTC' && tokenOut.symbol === 'USDC')) {
         return res.json({
           success: true,
+          ...chainMeta,
           source: 'arcox-amm-router',
           route: ammQuote.route,
-          tokenIn,
-          tokenOut,
           grossAmountIn: safeAmount,
           amountIn: safeAmount,
           amountOut: ammQuote.amountOut,
           legs: [],
-          platformFee: ammQuote.platformFee,
+          platformFee: ammFee,
           ammRouter: CIRBTC_AMM_ROUTER,
           ammPool: CIRBTC_AMM_POOL,
           ammSwapAmount: ammQuote.platformFee?.swapAmountIn || safeAmount,
@@ -2949,16 +3032,15 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
         })
       }
       // Two-leg EURC → cirBTC: EURC→USDC via stablecoin adapter, USDC→cirBTC via AMM router
-      if (tokenIn === 'EURC' && tokenOut === 'cirBTC') {
+      if (tokenIn.symbol === 'EURC' && tokenOut.symbol === 'cirBTC') {
         const firstParams = buildStablecoinSwapParams({ owner, tokenIn: 'EURC', tokenOut: 'USDC', amount: ammQuote.platformFee?.swapAmountIn || safeAmount, customFeeBps: 0 })
         const first = await prepareEoaSwapLeg(firstParams, 'EURC', 'USDC')
         const secondLegAmount = ammQuote.intermediateAmount || first.amountOut
         return res.json({
           success: true,
+          ...chainMeta,
           source: 'arcox-amm-router-2leg',
           route: 'EURC → USDC → cirBTC',
-          tokenIn,
-          tokenOut,
           grossAmountIn: safeAmount,
           amountIn: safeAmount,
           amountOut: ammQuote.amountOut,
@@ -2978,44 +3060,51 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
               estimatedAmount: ammQuote.amountOut,
             },
           ],
-          platformFee: ammQuote.platformFee,
+          platformFee: ammFee,
           note: 'Leg 1 uses Circle stablecoin adapter; leg 2 uses on-chain AMM router.',
         })
       }
-      // Fallback for any other unsupported direction inside isCirBtcSwap
+      // Fallback for any other unsupported direction inside the AMM pair set
       return res.json({
         success: false,
         available: false,
+        ...chainMeta,
         code: 'NO_SWAP_ROUTE',
         error: 'Route swap belum tersedia untuk pasangan token ini.',
       })
     }
-    const platformFee = splitPlatformFee(safeAmount, tokenIn)
-    // Keep quote and preparation bound to the same net swap amount. The gross
-    // amount is displayed separately and the platform fee is not silently
-    // included in the Circle execution payload.
-    const prepared = await prepareEoaSwapRoute({ owner, tokenIn, tokenOut, amount: platformFee.netAmount })
-    const developerFee = prepared.legs.flatMap(leg => leg.fees?.developer || [])[0]
-    const developerFeeToken = developerFee ? tokenSymbolForAddress(developerFee.token) : tokenOut
+    const platformFee = splitPlatformFeeUnits(safeAmount, tokenIn.decimals)
+    // Swap input sudah dikurangi fee display; customFee di dalam swap yang
+    // benar-benar menyetor fee ke treasury, jadi user tidak ditarik dua kali.
+    const leg = await prepareStablecoinSwapLeg({
+      owner, chain, tokenIn, tokenOut,
+      amountUnits: platformFee.netUnits,
+      customFeeBps: platformFee.feeBps,
+    })
+    // Respons swap Circle tidak selalu mengirim `fees` sebagai array (skema
+    // transaksi hanya menjamin signature + executionParams), jadi baca fee
+    // developer hanya kalau bentuknya memang array — kalau tidak, pakai split
+    // lokal yang sudah dihitung dari amountIn.
+    const developerFee = Array.isArray(leg.fees) ? leg.fees.find(fee => fee?.type === 'developer') : null
     const developerFeeAmount = developerFee
-      ? unitsToDecimal(BigInt(developerFee.amount), TOKEN_DECIMALS[developerFeeToken] || 6)
+      ? unitsToDecimal(BigInt(developerFee.amount || '0'), tokenIn.decimals)
       : platformFee.feeAmount
     return res.json({
       success: true,
+      ...chainMeta,
       source: 'stablecoin-service',
-      route: 'eoa-appkit-adapter',
-      adapterContract: ARC_APPKIT_ADAPTER,
-      tokenIn,
-      tokenOut,
-      route: prepared.route,
+      route: `${swapTokenLabel(tokenIn)} → ${swapTokenLabel(tokenOut)}`,
+      adapterContract: swapAdapterAddress(),
       grossAmountIn: safeAmount,
       amountIn: platformFee.netAmount,
-      amountOut: prepared.amountOut,
-      legs: prepared.legs,
+      amountOut: leg.amountOut,
+      legs: [leg],
       platformFee: {
         bps: platformFee.feeBps,
         amount: developerFeeAmount,
-        token: developerFeeToken,
+        token: swapTokenLabel(tokenIn),
+        tokenAddress: tokenIn.address,
+        tokenDecimals: tokenIn.decimals,
         treasury: normalizeAddress(platformTreasury(), 'ARCOX_TREASURY_WALLET_ADDRESS'),
         collectedBy: 'swap-adapter',
       },
@@ -3023,53 +3112,63 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
   } catch(e) {
     if (isNoSwapRouteError(e)) return noSwapRouteResponse(res, e)
     console.error('[eoa-swap-prepare]', e.message)
-    res.status(e.status || 500).json({ error: e.message })
+    res.status(e.status || 500).json({ error: e.message, code: e.code })
   }
 })
 
 app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress, amountIn } = req.body
-    const tokenIn = normalizeArcToken(req.body.tokenIn)
-    const tokenOut = normalizeArcToken(req.body.tokenOut)
     if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
     if (!arcSwapApiKey()) return res.status(500).json({ error: IS_ARC_MAINNET ? 'CIRCLE_API_KEY_MAINNET belum dikonfigurasi' : 'KIT_KEY belum dikonfigurasi' })
-    if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
-    if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
-    // cirBTC swaps use on-chain AMM router — Circle API doesn't support cirBTC
-    if (isCirBtcSwap(tokenIn, tokenOut)) {
-      const ammQuote = await quoteCirBtcAmmRoute(tokenIn, tokenOut, safeAmount)
+    const chain = resolveSwapChain(req.body.chain)
+    const tokenIn = await describeSwapToken(req.body.tokenIn, chain)
+    const tokenOut = await describeSwapToken(req.body.tokenOut, chain)
+    if (sameSwapToken(tokenIn, tokenOut)) return res.status(400).json({ error: 'Token swap harus berbeda' })
+    // Router AMM on-chain hanya untuk cirBTC di Arc Testnet.
+    if (usesCirBtcAmmRouter(chain.key, tokenIn, tokenOut)) {
+      const ammQuote = await quoteCirBtcAmmRoute(tokenIn.symbol, tokenOut.symbol, safeAmount)
       if (ammQuote?.available === false) {
         return res.json({
           success: false,
           available: false,
+          chain: chain.key,
           code: ammQuote.code || 'NO_SWAP_ROUTE',
           error: ammQuote.error || 'Route swap belum tersedia untuk pasangan token ini.',
         })
       }
-      return res.json(ammQuote)
+      return res.json({ ...ammQuote, chain: chain.key, chainId: chain.chainId })
     }
-    const platformFee = splitPlatformFee(safeAmount, tokenIn)
-    try {
-      const wallet = await getOrCreateWallet(owner)
-      const estimate = await estimateCircleSwapRoute({
-        from: { adapter: circleAdapter, chain: arcSwapChain(), address: wallet.address },
-        tokenIn,
-        tokenOut,
-        amountIn: platformFee.netAmount,
-        config: { apiKey: arcSwapApiKey(), allowanceStrategy: 'approve' },
+    if (!chain.circleWalletBlockchain) {
+      return res.status(400).json({
+        error: `Circle Wallet belum tersedia di ${chain.name}. Pilih Personal Wallet untuk swap di chain ini.`,
+        code: 'circle_wallet_chain_unsupported',
       })
-      const fee = (estimate.fees || []).reduce((sum, f) => sum + Number(f.amount || 0), 0)
+    }
+    const platformFee = splitPlatformFeeUnits(safeAmount, tokenIn.decimals)
+    try {
+      const wallet = await getOrCreateWallet(owner, chain)
+      const estimate = await estimateCircleSwap({
+        chain, wallet, tokenIn, tokenOut,
+        amountIn: platformFee.netAmount,
+      })
+      // `fees` hanya array di jalur estimate App Kit; jaga tetap aman kalau
+      // provider mengubah bentuknya (objek) supaya quote tidak 500.
+      const fee = (Array.isArray(estimate.fees) ? estimate.fees : []).reduce((sum, f) => sum + Number(f.amount || 0), 0)
       return res.json({
         available: true,
+        chain: chain.key,
+        chainId: chain.chainId,
         amountOut: estimate.estimatedOutput?.amount || '0',
         fee: fee.toFixed(6),
         platformFee: {
           bps: platformFee.feeBps,
           amount: platformFee.feeAmount,
-          token: tokenIn,
+          token: swapTokenLabel(tokenIn),
+          tokenAddress: tokenIn.address,
+          tokenDecimals: tokenIn.decimals,
           treasury: platformTreasury(),
           swapAmountIn: platformFee.netAmount,
         },
@@ -3080,68 +3179,59 @@ app.post('/api/quote', apiLimiter, requireAuth, async (req, res) => {
       console.error('[quote]', e.message)
       return res.status(500).json({ error: e.message })
     }
-  } catch(e) { res.status(500).json({ error: e.message }) }
+  } catch(e) { res.status(e.status || 500).json({ error: e.message, code: e.code }) }
 })
 
 // ── Swap ──
 app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { metamaskAddress, amountIn } = req.body
-    const tokenIn = normalizeArcToken(req.body.tokenIn)
-    const tokenOut = normalizeArcToken(req.body.tokenOut)
     if (!metamaskAddress || !req.body.tokenIn || !req.body.tokenOut || !amountIn) return res.status(400).json({ error: 'Missing params' })
     const owner = normalizeAddress(metamaskAddress, 'metamaskAddress')
     const safeAmount = normalizeAmount(amountIn)
     if (!arcSwapApiKey()) return res.status(500).json({ error: IS_ARC_MAINNET ? 'CIRCLE_API_KEY_MAINNET belum dikonfigurasi' : 'KIT_KEY belum dikonfigurasi' })
-    if (!TOKENS[tokenIn] || !TOKENS[tokenOut]) return res.status(400).json({ error: 'Unsupported token: ' + (!TOKENS[tokenIn] ? tokenIn : tokenOut) })
-    if (tokenIn === tokenOut) return res.status(400).json({ error: 'Token swap harus berbeda' })
-    // Circle Wallet cannot execute swaps where the input is cirBTC; on-chain AMM router is required.
-    if (tokenIn === 'cirBTC') {
+    const chain = resolveSwapChain(req.body.chain)
+    const tokenIn = await describeSwapToken(req.body.tokenIn, chain)
+    const tokenOut = await describeSwapToken(req.body.tokenOut, chain)
+    if (sameSwapToken(tokenIn, tokenOut)) return res.status(400).json({ error: 'Token swap harus berbeda' })
+    // cirBTC di Arc Testnet hanya bisa lewat pool on-chain; Circle Wallet tidak
+    // bisa mengirim panggilan pool arbitrary, jadi arahkan ke Personal Wallet.
+    if (usesCirBtcAmmRouter(chain.key, tokenIn, tokenOut)) {
       return res.json({
         success: false,
         available: false,
+        chain: chain.key,
         code: 'NO_SWAP_ROUTE',
-        error: `cirBTC → ${tokenOut} tidak dapat dilakukan melalui Circle Wallet. Gunakan wallet EOA dengan AMM router.`,
+        error: `Swap cirBTC di ${chain.name} memakai AMM pool on-chain. Gunakan Personal Wallet untuk pasangan ini.`,
       })
     }
-    const platformFee = splitPlatformFee(safeAmount, tokenIn)
-    const wallet = await getOrCreateWallet(owner)
-    const params = {
-      from: { adapter: circleAdapter, chain: arcSwapChain(), address: wallet.address },
-      tokenIn: swapTokenParam(tokenIn),
-      tokenOut: swapTokenParam(tokenOut),
-      amountIn: platformFee.netAmount,
-      config: { apiKey: arcSwapApiKey(), allowanceStrategy: 'approve' },
+    if (!chain.circleWalletBlockchain) {
+      return res.status(400).json({
+        error: `Circle Wallet belum tersedia di ${chain.name}. Pilih Personal Wallet untuk swap di chain ini.`,
+        code: 'circle_wallet_chain_unsupported',
+      })
     }
+    const platformFee = splitPlatformFeeUnits(safeAmount, tokenIn.decimals)
+    const wallet = await getOrCreateWallet(owner, chain)
     try {
-      await estimateCircleSwapRoute({
-        from: params.from,
-        tokenIn,
-        tokenOut,
-        amountIn: platformFee.netAmount,
-        config: params.config,
-      })
+      await estimateCircleSwap({ chain, wallet, tokenIn, tokenOut, amountIn: platformFee.netAmount })
     } catch(e) {
       if (isNoSwapRouteError(e)) return noSwapRouteResponse(res, e)
       console.warn('[swap] estimate precheck failed, continuing:', e.message)
     }
-    const result = await executeCircleSwapRoute({
-      from: params.from,
-      tokenIn,
-      tokenOut,
-      amountIn: platformFee.netAmount,
-      config: params.config,
-    })
+    const result = await executeCircleSwap({ chain, wallet, tokenIn, tokenOut, amountIn: platformFee.netAmount })
+    // Fee platform dijalur Circle Wallet dikirim terpisah setelah swap (fee
+    // tidak bisa diambil dari payload AppKit yang dikelola adapter).
     let feeResult = null
     let feeError = ''
     const treasury = normalizeAddress(platformTreasury(), 'ARCOX_TREASURY_WALLET_ADDRESS')
     if (platformFee.feeUnits > 0n) {
       try {
         feeResult = await kit.send({
-          from: { adapter: circleAdapter, chain: arcSwapChain(), address: wallet.address },
+          from: { adapter: circleAdapter, chain: circleAppKitChain(chain), address: wallet.address },
           to: treasury,
           amount: platformFee.feeAmount,
-          token: SEND_TOKEN_MAP[tokenIn] || TOKENS[tokenIn] || tokenIn,
+          token: tokenIn.address,
         })
       } catch (error) {
         feeError = error?.message || String(error)
@@ -3152,12 +3242,16 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
       success: true,
       result: {
         ...result,
+        chain: chain.key,
+        chainId: chain.chainId,
         grossAmountIn: safeAmount,
         amountIn: platformFee.netAmount,
         platformFee: {
           bps: platformFee.feeBps,
           amount: platformFee.feeAmount,
-          token: tokenIn,
+          token: swapTokenLabel(tokenIn),
+          tokenAddress: tokenIn.address,
+          tokenDecimals: tokenIn.decimals,
           treasury,
           txHash: feeResult?.txHash,
           explorerUrl: feeResult?.explorerUrl,
@@ -3168,7 +3262,7 @@ app.post('/api/swap', apiLimiter, requireAuth, async (req, res) => {
   } catch(e) {
     if (isNoSwapRouteError(e)) return noSwapRouteResponse(res, e)
     console.error('[swap]', e.message)
-    res.status(500).json({ error: e.message })
+    res.status(e.status || 500).json({ error: e.message, code: e.code })
   }
 })
 

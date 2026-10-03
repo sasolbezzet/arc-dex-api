@@ -3001,17 +3001,15 @@ const X402_TRANSFER_ABI = [{ type: 'function', name: 'transfer', stateMutability
 const X402_APPROVE_ABI = [{ type: 'function', name: 'approve', stateMutability: 'nonpayable', inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] }]
 
 // Swap token registry mengikuti jaringan aktif (bukan konstanta testnet).
-// cirBTC belum ada di Arc mainnet, jadi entrinya hilang di mainnet dan swap
-// cirBTC gagal-tertutup. Execution menargetkan pool router yang terdaftar:
-// router's swapWithFee double-pull dari caller, pool menarik sekali dari MSCA.
-// cirBTC hanya ada di Arc Testnet (registry mengembalikan null), jadi entri
-// cirBTC dipertahankan khusus testnet dan hilang di mainnet.
-const CIRBTC_TESTNET = '0xf0C4a4CE82A5746AbAAd9425360Ab04fbBA432BF'
+// cirBTC live di Arc mainnet (0x171A4217…) dan Arc Testnet (0xf0C4a4CE…),
+// jadi alamatnya datang dari registry jaringan supaya tidak bocor antar
+// lingkungan. Execution menargetkan pool router yang terdaftar: router's
+// swapWithFee double-pull dari caller, pool menarik sekali dari MSCA.
 const SWAP_TOKEN_ADDRESS = Object.fromEntries(
   [
     ['USDC', arcTokenAddress('USDC')],
     ['EURC', arcTokenAddress('EURC')],
-    ['cirBTC', IS_ARC_MAINNET ? null : CIRBTC_TESTNET],
+    ['cirBTC', arcTokenAddress('cirBTC')],
   ].filter(([, address]) => Boolean(address)),
 )
 const SWAP_TOKEN_DECIMALS = { USDC: 6, EURC: 6, cirBTC: 8 }
@@ -3064,11 +3062,30 @@ function computeMinAmountOut(amountOutDecimal, decimals) {
   return (units * 99n) / 100n
 }
 
+// A user may reference a swap token by symbol or by pasted contract address;
+// the prepare payload carries both. Match either form so the quote → execute
+// binding holds for generic tokens too.
+function swapTokenMatches(expected, symbol, address) {
+  const value = String(expected || '').trim()
+  if (!value) return true
+  if (/^0x[0-9a-fA-F]{40}$/.test(value)) return String(address || '').toLowerCase() === value.toLowerCase()
+  return String(symbol || '').toUpperCase() === value.toUpperCase()
+}
+
 export function buildPreparedSwapCalls(prepared, expected = {}) {
   const allowedAdapter = String(arcContractAddress('ARCOX_SWAP_ADAPTER') || '').toLowerCase()
   const allowedAmmRouter = String(arcContractAddress('ARCOX_AMM_ROUTER') || '').toLowerCase()
-  if (expected.tokenIn && String(prepared?.tokenIn || '').toUpperCase() !== String(expected.tokenIn).toUpperCase()) return { calls: null, reason: 'quote_token_in_mismatch' }
-  if (expected.tokenOut && String(prepared?.tokenOut || '').toUpperCase() !== String(expected.tokenOut).toUpperCase()) return { calls: null, reason: 'quote_token_out_mismatch' }
+  // Chain-aware prepare payloads identify tokens in `tokens.{tokenIn,tokenOut}`
+  // (`{ symbol, address, decimals }`); normalize legacy top-level fields too.
+  const payloadTokens = prepared?.tokens || {}
+  const tokenInSymbol = payloadTokens.tokenIn?.symbol || prepared?.tokenIn || ''
+  const tokenOutSymbol = payloadTokens.tokenOut?.symbol || prepared?.tokenOut || ''
+  const tokenInAddr = payloadTokens.tokenIn?.address || prepared?.tokenInAddress || SWAP_TOKEN_ADDRESS[tokenInSymbol]
+  const tokenOutAddr = payloadTokens.tokenOut?.address || prepared?.tokenOutAddress || SWAP_TOKEN_ADDRESS[tokenOutSymbol]
+  const tokenInDecimals = Number.isInteger(payloadTokens.tokenIn?.decimals) ? payloadTokens.tokenIn.decimals : (SWAP_TOKEN_DECIMALS[tokenInSymbol] ?? 6)
+  const tokenOutDecimals = Number.isInteger(payloadTokens.tokenOut?.decimals) ? payloadTokens.tokenOut.decimals : (SWAP_TOKEN_DECIMALS[tokenOutSymbol] ?? 8)
+  if (!swapTokenMatches(expected.tokenIn, tokenInSymbol, tokenInAddr)) return { calls: null, reason: 'quote_token_in_mismatch' }
+  if (!swapTokenMatches(expected.tokenOut, tokenOutSymbol, tokenOutAddr)) return { calls: null, reason: 'quote_token_out_mismatch' }
 
   // ── AMM router single-leg (USDC↔cirBTC) — on-chain, no Circle routing ──
   if (prepared?.source === 'arcox-amm-router') {
@@ -3077,16 +3094,14 @@ export function buildPreparedSwapCalls(prepared, expected = {}) {
     const allowedAmmPool = String(process.env.ARCOX_AMM_POOL || ARCOX_AMM_POOL).toLowerCase()
     if (!allowedAmmPool) return { calls: null, reason: 'amm_pool_not_allowlisted' }
     if (String(prepared.ammPool || '').toLowerCase() !== allowedAmmPool) return { calls: null, reason: 'amm_pool_mismatch' }
-    const tokenInAddr = prepared.tokenInAddress || SWAP_TOKEN_ADDRESS[prepared.tokenIn]
-    const tokenOutAddr = prepared.tokenOutAddress || SWAP_TOKEN_ADDRESS[prepared.tokenOut]
     if (!tokenInAddr || !tokenOutAddr || !prepared.amountIn || !prepared.amountOut) return { calls: null, reason: 'amm_route_incomplete' }
-    const grossAmount = parseUnits(String(prepared.amountIn), SWAP_TOKEN_DECIMALS[prepared.tokenIn] ?? 6)
-    const amountIn = parseUnits(String(prepared.platformFee?.swapAmountIn || prepared.ammSwapAmount || prepared.amountIn), SWAP_TOKEN_DECIMALS[prepared.tokenIn] ?? 6)
+    const grossAmount = parseUnits(String(prepared.amountIn), tokenInDecimals)
+    const amountIn = parseUnits(String(prepared.platformFee?.swapAmountIn || prepared.ammSwapAmount || prepared.amountIn), tokenInDecimals)
     if (amountIn <= 0n || amountIn > grossAmount) return { calls: null, reason: 'amm_amount_invalid' }
-    const minAmountOut = computeMinAmountOut(prepared.amountOut, SWAP_TOKEN_DECIMALS[prepared.tokenOut] ?? 8)
+    const minAmountOut = computeMinAmountOut(prepared.amountOut, tokenOutDecimals)
     const calls = []
     const feeAmount = prepared.platformFee?.amount
-      ? parseUnits(String(prepared.platformFee.amount), SWAP_TOKEN_DECIMALS[prepared.tokenIn] ?? 6)
+      ? parseUnits(String(prepared.platformFee.amount), tokenInDecimals)
       : 0n
     if (feeAmount > 0n) {
       if (!prepared.platformFee?.treasury) return { calls: null, reason: 'amm_fee_treasury_missing' }
@@ -3109,11 +3124,12 @@ export function buildPreparedSwapCalls(prepared, expected = {}) {
     if (!Array.isArray(prepared.legs) || prepared.legs.length === 0) return { calls: null, reason: 'prepared_route_incomplete' }
     const calls = []
     const feeAmount = prepared.platformFee?.amount
-      ? parseUnits(String(prepared.platformFee.amount), SWAP_TOKEN_DECIMALS[prepared.tokenIn] ?? 6)
+      ? parseUnits(String(prepared.platformFee.amount), tokenInDecimals)
       : 0n
     if (feeAmount > 0n) {
       if (!prepared.platformFee?.treasury) return { calls: null, reason: 'amm_fee_treasury_missing' }
-      calls.push({ to: getAddress(SWAP_TOKEN_ADDRESS[prepared.tokenIn]), value: 0n, data: encodeFunctionData({ abi: X402_TRANSFER_ABI, functionName: 'transfer', args: [getAddress(prepared.platformFee.treasury), feeAmount] }) })
+      if (!tokenInAddr) return { calls: null, reason: 'amm_route_incomplete' }
+      calls.push({ to: getAddress(tokenInAddr), value: 0n, data: encodeFunctionData({ abi: X402_TRANSFER_ABI, functionName: 'transfer', args: [getAddress(prepared.platformFee.treasury), feeAmount] }) })
     }
     for (const leg of prepared.legs) {
       if (leg?.provider === 'arcox-amm') {
@@ -3474,14 +3490,16 @@ export function createMcpServer(userId, context = {}) {
     action: z.string().describe('swap, bridge, or send'),
     fromChain: z.string().optional().describe('Source chain'),
     toChain: z.string().optional().describe('Destination chain'),
+    chain: z.string().optional().describe('Swap chain (arc-mainnet, ethereum-mainnet, base-mainnet, arbitrum-mainnet)'),
     token: z.string().optional().describe('Token symbol (USDC, EURC, cirBTC)'),
-    tokenIn: z.string().optional().describe('Swap input token'),
-    tokenOut: z.string().optional().describe('Swap output token'),
+    tokenIn: z.string().optional().describe('Swap input token symbol or contract address'),
+    tokenOut: z.string().optional().describe('Swap output token symbol or contract address'),
     amountIn: z.string().optional().describe('Exact swap amount for a Circle route availability check'),
     source: z.string().optional().describe('session (MSCA)'),
   }, async (params) => {
     const action = String(params.action || '').toLowerCase()
     const source = params.source || 'session'
+    const swapChainKey = executionChainKey(params.chain) || ARC_CHAIN_KEY
     const tokens = [params.token, params.tokenIn, params.tokenOut]
       .filter(Boolean)
       .map(token => String(token).toUpperCase())
@@ -3509,6 +3527,7 @@ export function createMcpServer(userId, context = {}) {
         tokenIn: params.tokenIn,
         tokenOut: params.tokenOut,
         amountIn: params.amountIn,
+        chain: swapChainKey,
         metamaskAddress: session.walletAddress,
       }, session.walletAddress).catch(error => ({ available: false, code: 'swap_quote_unavailable', error: error?.message || 'Circle swap quote unavailable' }))
     }
@@ -3543,6 +3562,7 @@ export function createMcpServer(userId, context = {}) {
       executionEnabled: action === 'bridge' ? ENABLE_MSCA_CCTP_BRIDGE : undefined,
       action: params.action,
       source,
+      chain: action === 'swap' ? swapChainKey : undefined,
       walletAddress: session?.walletAddress || null,
       walletType: session ? 'MSCA' : null,
       chains: { ...Object.fromEntries(ARC_BALANCE_CHAIN_KEYS.map(key => [key, CHAINS[key]?.id ?? null])), [IS_ARC_MAINNET ? 'solana-mainnet' : 'solana-devnet']: 'solana' },
@@ -3564,38 +3584,40 @@ export function createMcpServer(userId, context = {}) {
   // ── SWAP TOOLS (quote → confirm → execute) ──
 
   registerTool('arcox_quote_swap', 'Get a swap quote preview. Show preview to user, wait for confirmation, then call arcox_execute_swap', {
-    tokenIn: z.string().describe('Input token symbol (USDC, EURC, cirBTC)'),
-    tokenOut: z.string().describe('Output token symbol'),
+    tokenIn: z.string().describe('Input token symbol (USDC, EURC, cirBTC) or contract address'),
+    tokenOut: z.string().describe('Output token symbol or contract address'),
     amountIn: z.string().describe('Amount in human readable (e.g. "1")'),
+    chain: z.string().optional().describe(`Swap chain (${ARC_CHAIN_KEY}, ethereum-mainnet, base-mainnet, arbitrum-mainnet). Default ${ARC_CHAIN_KEY}`),
     source: z.string().optional().describe('session (MSCA)'),
   }, async (params) => {
     const src = params.source || 'session'
+    const chainKey = executionChainKey(params.chain) || ARC_CHAIN_KEY
     if (src !== 'session') {
-      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', reason: 'msca_only', source: src, chain: ARC_CHAIN_KEY, walletType: null, message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote swap hanya untuk source=session.' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', reason: 'msca_only', source: src, chain: chainKey, walletType: null, message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Quote swap hanya untuk source=session.' }) }] }
     }
     const session = await resolveActiveMsca(userId, boundMscaWalletAddress)
     if (!session) {
       return { content: [{ type: 'text', text: jsonText(mscaRequiredResult()) }] }
     }
-    const quoteData = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: session.walletAddress }, session.walletAddress)
+    const quoteData = await apiPost('/api/eoa-swap-quote', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, chain: chainKey, metamaskAddress: session.walletAddress }, session.walletAddress)
     if (quoteData?.available !== true) {
-      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', chain: ARC_CHAIN_KEY, ...quoteData, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', chain: chainKey, ...quoteData, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
     }
     // Prepare immutable calldata at preview time. Execution must use this exact
     // payload, not re-quote later with potentially different routing/slippage.
-    const prepared = await apiPost('/api/eoa-swap-prepare', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, metamaskAddress: session.walletAddress }, session.walletAddress)
+    const prepared = await apiPost('/api/eoa-swap-prepare', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, chain: chainKey, metamaskAddress: session.walletAddress }, session.walletAddress)
     if (prepared?.success === false || prepared?.available === false || typeof prepared !== 'object' || !prepared) {
-      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', chain: ARC_CHAIN_KEY, ...prepared, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
+      return { content: [{ type: 'text', text: jsonText({ schemaVersion: 1, preview: false, rejected: true, action: 'swap', chain: chainKey, ...prepared, source: 'session', walletAddress: session.walletAddress, walletType: 'MSCA' }) }] }
     }
-    const quote = createExecutionQuote(userId, 'swap', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, walletAddress: session.walletAddress, quote: quoteData, prepared })
+    const quote = createExecutionQuote(userId, 'swap', { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, walletAddress: session.walletAddress, fromChain: chainKey, toChain: chainKey, quote: quoteData, prepared })
     return { content: [{ type: 'text', text: jsonText({
       ...quoteData,
       schemaVersion: 1,
       preview: true,
       action: 'swap',
-      chain: ARC_CHAIN_KEY,
-      fromChain: ARC_CHAIN_KEY,
-      toChain: ARC_CHAIN_KEY,
+      chain: chainKey,
+      fromChain: chainKey,
+      toChain: chainKey,
       previewId: quote.previewId,
       expiresAt: new Date(quote.expires).toISOString(),
       source: 'session',
@@ -3606,9 +3628,10 @@ export function createMcpServer(userId, context = {}) {
   })
 
   registerTool('arcox_execute_swap', 'Execute a confirmed swap via Agent Wallet (MSCA/session key). Requires previewId from arcox_quote_swap and user confirmation.', {
-    tokenIn: z.string().describe('Input token symbol'),
-    tokenOut: z.string().describe('Output token symbol'),
+    tokenIn: z.string().describe('Input token symbol or contract address'),
+    tokenOut: z.string().describe('Output token symbol or contract address'),
     amountIn: z.string().describe('Exact amount from quote'),
+    chain: z.string().optional().describe(`Swap chain (${ARC_CHAIN_KEY}, ethereum-mainnet, base-mainnet, arbitrum-mainnet). Default ${ARC_CHAIN_KEY}`),
     source: z.string().optional().describe('session (MSCA)'),
     previewId: z.string().describe('Preview ID from arcox_quote_swap'),
     confirmed: z.boolean().describe('Must be true to execute'),
@@ -3616,6 +3639,7 @@ export function createMcpServer(userId, context = {}) {
   }, async (params) => {
     if (!params.confirmed || !validConfirmationText(params.confirmationText)) return { content: [{ type: 'text', text: jsonText({ error: 'Confirmation required. Use confirmed=true and confirmationText exactly yes or ya.' }) }] }
     const source = params.source || 'session'
+    const chainKey = executionChainKey(params.chain) || ARC_CHAIN_KEY
     if (source !== 'session') {
       return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: 'msca_only', message: 'MCP server hanya memakai Agent Wallet (MSCA/session key). Parameter source harus "session".' }) }] }
     }
@@ -3625,10 +3649,12 @@ export function createMcpServer(userId, context = {}) {
       tokenIn: params.tokenIn,
       tokenOut: params.tokenOut,
       amountIn: params.amountIn,
+      fromChain: chainKey,
+      toChain: chainKey,
       walletAddress: activeSession.walletAddress,
     })
     if (!quoteCheck.ok) return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: quoteCheck.reason }) }] }
-    const gate = await canAutoExecute(userId, source, params.amountIn, ARC_CHAIN_KEY, activeSession.walletAddress, agentKey, dailyLimit)
+    const gate = await canAutoExecute(userId, source, params.amountIn, chainKey, activeSession.walletAddress, agentKey, dailyLimit)
     if (!gate.ok) {
       return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: gate.reason, message: gate.reason === 'no_session' ? 'Session key MSCA belum diaktifkan. User harus setup Agent Wallet (MSCA) + session key di Plugin page.' : gate.message }) }] }
     }
@@ -3656,7 +3682,7 @@ export function createMcpServer(userId, context = {}) {
         return { content: [{ type: 'text', text: jsonText({ status: 'rejected', executed: false, reason: preparedResult.reason || 'swap_calldata_unavailable', message }) }] }
       }
       const { swapViaSession } = await import('./sessionKeyService.mjs')
-      const result = await swapViaSession(activeSession.walletAddress, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey: ARC_CHAIN_KEY, agentKey, dailyLimit, limitsOwner: userId })
+      const result = await swapViaSession(activeSession.walletAddress, { tokenIn: params.tokenIn, tokenOut: params.tokenOut, amountIn: params.amountIn, preparedCalls: preparedResult.calls, chainKey, agentKey, dailyLimit, limitsOwner: userId })
       if (result.status === 'success') {
         await recordAutoExec(userId, {
           agent: requestAgent, agentClientId: clientId, action: 'swap', amount: params.amountIn, token: params.tokenIn,

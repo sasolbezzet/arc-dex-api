@@ -206,6 +206,29 @@ me-resolve namespace tersebut lewat `listAgentBindingsForNamespace` dan mengirim
 `allowCredentials`, sehingga dialog passkey tidak pernah berjalan discoverable
 (yang bisa memilih wallet agent lain).
 
+## Swap lintas-chain
+
+Swap retail memakai dana yang sudah ada di chain itu (tanpa bridge); chain
+dipilih lewat parameter `chain` di UI/API/MCP.
+
+| Endpoint | Pemakai | Catatan |
+|---|---|---|
+| `GET /api/swap/chains` | UI | Daftar chain + token, flag `active` (Arc aktif) & `circleWalletSupported`. |
+| `POST /api/eoa-swap-quote`, `POST /api/eoa-swap-prepare` | Personal Wallet (EOA) | Calldata adapter Circle + `customFee` platform; wallet browser yang menandatangani. |
+| `POST /api/quote`, `POST /api/swap` | Circle Wallet | `estimateSwap`/`swap` App Kit dari wallet custodial per chain. |
+
+- Chain mainnet: `arc-mainnet` (default), `ethereum-mainnet`, `base-mainnet`,
+  `arbitrum-mainnet`. Chain di luar daftar ditolak (`unsupported_swap_chain`),
+  bukan diam-diam jatuh ke Arc.
+- Token boleh simbol (`USDC`, `EURC`, `USYC`, `cirBTC`) atau contract address
+  apa pun yang ditempel; decimals CA dibaca on-chain
+  (`token_decimals_unavailable` kalau bukan ERC-20 di chain itu).
+- Wallet Circle per chain dibuat on-demand (`POST /api/wallet` + `chain`) dan
+  disimpan terpisah dari wallet Arc.
+- Ketersediaan route mengikuti provider: cirBTC hanya Arc + Ethereum, EURC
+  tidak ada di Arbitrum, dan di Arc Testnet cirBTC masih lewat AMM pool
+  on-chain (Personal Wallet).
+
 ## ARCOX Pay, x402, Intel, AI Router
 
 - **ARCOX Pay**: payment link/invoice USDC Arc Testnet, status timeline,
