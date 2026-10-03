@@ -29,7 +29,7 @@ function cfg() {
       (IS_ARC_MAINNET ? process.env.ARCOX_ROUTER_FEE_BPS_MAINNET : '') ||
       process.env.ARCOX_ROUTER_FEE_BPS ||
       process.env.ARCOX_FEE_BPS ||
-      30,
+      50,
     ), 1_000),
     maxFeeBps: 1_000,
     label: `${ARC_NETWORK_LABEL} - Unified Balance is a USDC routing layer, not a third wallet.`,

@@ -60,7 +60,7 @@ for (const [tokenIn, tokenOut, amountIn] of pairs) {
       slippageBps: 300,
       ...(withFee ? {
         customFee: {
-          percentageBps: Number(process.env.ARCOX_ROUTER_FEE_BPS || 30),
+          percentageBps: Number(process.env.ARCOX_ROUTER_FEE_BPS || 50),
           recipientAddress: process.env.ARCOX_FEE_TREASURY || owner,
         },
       } : {}),

@@ -1181,13 +1181,15 @@ function swapTokenParam(token) {
   return TOKENS[token] || token
 }
 
-// Fee router on-chain bisa punya bps berbeda per jaringan (mainnet di-deploy 500),
-// jadi nilai mainnet dibaca dari var terpisah dan tidak menimpa testnet.
+// Fee platform off-chain (swap/send/settlement) dibaca dari env per jaringan;
+// default 50 bps = 0.5%. Kontrak Fee Router on-chain punya bps immutable milik
+// sendiri (lihat docs/arc-mainnet-deploy-plan.md) dan hanya dipakai jalur
+// bridge router, jadi nilainya bisa berbeda dari env sampai kontrak di-redeploy.
 const PLATFORM_FEE_BPS = Number(
   (IS_ARC_MAINNET ? process.env.ARCOX_ROUTER_FEE_BPS_MAINNET : '') ||
   process.env.ARCOX_ROUTER_FEE_BPS ||
   process.env.ARCOX_FEE_BPS ||
-  30,
+  50,
 )
 const platformTreasury = () => requireTreasuryAddress()
 // Alamat adapter tidak boleh hardcode testnet: mainnet membaca `*_MAINNET` dan

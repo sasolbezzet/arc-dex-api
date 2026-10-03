@@ -230,7 +230,9 @@ ARC_NETWORK=mainnet
 
 # kontrak ARCOX mainnet — hanya dari *_MAINNET
 ARCOX_FEE_ROUTER_ADDRESS_MAINNET=0x9Fd14A94bDbEFf73EDB22853cc77416B65E2A0c0
-ARCOX_ROUTER_FEE_BPS_MAINNET=500
+# Fee platform off-chain (swap/send/settlement). Kontrak Fee Router on-chain
+# memakai bps immutable miliknya sendiri, jadi nilainya bisa berbeda.
+ARCOX_ROUTER_FEE_BPS_MAINNET=50
 # Router per chain (dibaca backend/frontend di luar resolver Arc)
 ARCOX_BASE_FEE_ROUTER_ADDRESS=0xD858f073FA09834b1d64C165afC2757F1DF2f019
 ARCOX_ARBITRUM_FEE_ROUTER_ADDRESS=0xaF15a9fFdDB21A42Aa6175B8130aE69ce41C78F9
@@ -283,10 +285,16 @@ RPC diambil dari `ARC_MAINNET_RPC_URL` bila diset, kalau tidak dari
 ### 5.1 Status aktivasi env (26 Sep 2026)
 
 - `.env` produksi VPS sudah mainnet: `ARC_NETWORK=mainnet`,
-  `ARCOX_FEE_ROUTER_ADDRESS_MAINNET`, `ARCOX_ROUTER_FEE_BPS_MAINNET=500`,
-  `ARCOX_SWAP_ADAPTER_MAINNET`, `CIRCLE_ENV=live`, `CIRCLE_BASE_URL=https://api.circle.com`,
+  `ARCOX_FEE_ROUTER_ADDRESS_MAINNET`, `ARCOX_SWAP_ADAPTER_MAINNET`,
+  `CIRCLE_ENV=live`, `CIRCLE_BASE_URL=https://api.circle.com`,
   `X402_MODE=arc_mainnet`, `X402_NETWORK=arc-mainnet`, `X402_CHAIN_ID=5042`,
   `CIRCLE_X402_NETWORK=arc-mainnet`. Backup: `.env.bak-20260926-112802`.
+- **3 Okt 2026 — fee platform off-chain diturunkan ke 50 bps (0,5%)**:
+  `ARCOX_ROUTER_FEE_BPS_MAINNET`, `ARCOX_ROUTER_FEE_BPS`, `ARCOX_FEE_BPS`, dan
+  `X402_PLATFORM_FEE_BPS` semua 50. Kontrak Fee Router on-chain TIDAK berubah —
+  `feeBps`-nya immutable **500** (terverifikasi `feeBps()` di Arc/Base/Arbitrum),
+  jadi jalur bridge via router masih memungut 5% sampai kontrak di-redeploy.
+  UI bridge membaca `feeBps()` on-chain supaya angka yang ditampilkan tetap benar.
 - `npm run probe:mainnet` → **22 lulus / 0 blocker**. Instance uji (`PORT=3999`) dan
   produksi (`arc-dex-api.service`) start bersih; `npm test` 340/340 hijau.
 - Bug boot mainnet ditemukan & diperbaiki: `BRIDGE_CHAIN_DEF.Arc_Testnet` memanggil

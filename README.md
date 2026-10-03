@@ -152,7 +152,7 @@ Karakteristik yang berlaku sekarang:
 
   Harga provider disimpan per chain dalam base units beserta rail-nya
   (`vanilla` / `gateway` / `permit2` / `solana`). Di mode `msca` invoice x402
-  ARCOX hanya menagih **fee platform** (`X402_PLATFORM_FEE_BPS`, default 5%):
+  ARCOX hanya menagih **fee platform** (`X402_PLATFORM_FEE_BPS`, default 50 bps = 0,5%):
   harga provider dibayar langsung oleh Agent Wallet (MSCA) pembeli ke endpoint
   provider lewat EIP-3009 yang diverifikasi ERC-1271, jadi tidak ada kunci
   platform yang bisa membelanjakan dana agent. Konsekuensinya seller yang hanya

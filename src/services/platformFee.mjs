@@ -10,9 +10,9 @@
 
 const PERCENT_DENOMINATOR = 10_000n
 
-/** Fee in basis points. 500 = 5%, matching the deployed router fee. */
+/** Fee in basis points. 50 = 0.5% (kebijakan platform ARCOX saat ini). */
 export function platformFeeBps() {
-  const raw = Number(process.env.X402_PLATFORM_FEE_BPS ?? 500)
+  const raw = Number(process.env.X402_PLATFORM_FEE_BPS ?? 50)
   if (!Number.isFinite(raw) || raw <= 0) return 0
   return Math.min(Math.floor(raw), 10_000)
 }
