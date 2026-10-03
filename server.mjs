@@ -39,6 +39,7 @@ import { handleCircleNotificationOutcome } from './src/services/circleNotificati
 import { arcRpcUrls } from './src/config/arcRpc.mjs'
 import { ARC_CCTP_DOMAIN, ARC_CHAIN_ID, ARC_CHAIN_KEY, ARC_CHAIN_NAME, ARC_EXPLORER_URL, ARC_GATEWAY_KEY, ARC_SDK_CHAIN_NAME, IS_ARC_MAINNET, arcCctpChains, arcCctpDomains, arcCircleApiKey, arcCircleClientKey, arcCircleEntitySecret, arcCircleWalletBlockchain, arcContractAddress, arcGatewayBaseUrl, arcGatewayChains, arcIrisBaseUrl, arcNetwork, arcSolanaCctp, arcTokenAddress, resolveMscaChainKey } from './src/config/arcNetwork.mjs'
 import { describeSwapToken, resolveSwapChain, swapAdapterAddress, swapChainList } from './src/services/swapChains.mjs'
+import { developerFeeBaseUnits } from './src/services/swapPreparedFees.mjs'
 import { buildCircleModularTarget, circleModularProxyHeaders, isAllowedCircleModularMethod, normalizeCircleModularResponse } from './src/services/circleModularProxy.mjs'
 import { AUTO_MINT_MAX_ATTEMPTS, autoMintJobIsActive, autoMintRetryDue, markAutoMintRetryable } from './src/services/autoMintState.mjs'
 import { startRefundWorker } from './src/services/x402RefundWorker.mjs'
@@ -3074,20 +3075,21 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
       })
     }
     const platformFee = splitPlatformFeeUnits(safeAmount, tokenIn.decimals)
-    // Swap input sudah dikurangi fee display; customFee di dalam swap yang
-    // benar-benar menyetor fee ke treasury, jadi user tidak ditarik dua kali.
+    // Swap disiapkan untuk amount PENUH dan customFee adapter memotong fee dari
+    // input (basis `inputAmount`), jadi yang benar-benar dibayar user = feeBps ×
+    // amountIn — sama dengan display dan dengan quote (quote memakai net, yang
+    // persis sama dengan sisa setelah fee). Mengirim net + customFee membuat
+    // fee terhitung dua kali dan output nyata ~5% lebih kecil dari quote.
     const leg = await prepareStablecoinSwapLeg({
       owner, chain, tokenIn, tokenOut,
-      amountUnits: platformFee.netUnits,
+      amountUnits: platformFee.amountUnits,
       customFeeBps: platformFee.feeBps,
     })
-    // Respons swap Circle tidak selalu mengirim `fees` sebagai array (skema
-    // transaksi hanya menjamin signature + executionParams), jadi baca fee
-    // developer hanya kalau bentuknya memang array — kalau tidak, pakai split
-    // lokal yang sudah dihitung dari amountIn.
-    const developerFee = Array.isArray(leg.fees) ? leg.fees.find(fee => fee?.type === 'developer') : null
-    const developerFeeAmount = developerFee
-      ? unitsToDecimal(BigInt(developerFee.amount || '0'), tokenIn.decimals)
+    // Fee developer dari Circle hanya dipakai bila bentuknya bisa dibaca; kalau
+    // tidak, split lokal yang sudah dihitung dari amountIn yang jadi acuan.
+    const developerFeeUnits = developerFeeBaseUnits(leg)
+    const developerFeeAmount = developerFeeUnits
+      ? unitsToDecimal(BigInt(developerFeeUnits), tokenIn.decimals)
       : platformFee.feeAmount
     return res.json({
       success: true,
