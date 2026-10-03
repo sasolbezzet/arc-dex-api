@@ -70,14 +70,16 @@ Script mainnet khusus ada di `arcox-mcp/packages/runtime/scripts/` (jangan pakai
 | Langkah | Perintah |
 | --- | --- |
 | Cek saldo deployer | `npm run mainnet:balances -- --key-file <file>:<VAR>` |
-| Dry-run rencana | `npm run mainnet:fee-router:deploy -- --key-file … --treasury … --fee-bps 500 --chains arc,base` |
+| Dry-run rencana | `npm run mainnet:fee-router:deploy -- --key-file … --treasury … --fee-bps 50 --chains arc,base` |
 | Kirim | tambahkan `--broadcast` |
 | Aktifkan domain tujuan | `npm run mainnet:fee-router:domains -- --key-file … --chains arc,base --broadcast` |
+| Setel feeBps (tanpa redeploy) | `npm run mainnet:fee-router:fee -- --key-file … --fee-bps 50 --chains arc,base,arbitrum --broadcast` |
 | Verifikasi state + bytecode | `npm run mainnet:fee-router:verify` |
 | Verifikasi source publik | `npm run mainnet:fee-router:verify-sources` |
 
 Hasil 25 Sep 2026 — owner/deployer `0xE34FF1D2…4569e` (key `EOA_PRIVATE_KEY` di
-`~/.arcox/agent.env`), treasury `0x5d16E8Ef…DF40F`, `feeBps` **500** (5%):
+`~/.arcox/agent.env`), treasury `0x5d16E8Ef…DF40F`; `feeBps` deploy awal **500**,
+kini **50** (0,5%) lewat `setFeeBps` 3 Okt 2026:
 
 | Chain | Alamat Fee Router | Domain aktif | Deploy tx |
 | --- | --- | --- | --- |
@@ -86,13 +88,15 @@ Hasil 25 Sep 2026 — owner/deployer `0xE34FF1D2…4569e` (key `EOA_PRIVATE_KEY`
 | Arbitrum One (42161) | `0xaF15a9fFdDB21A42Aa6175B8130aE69ce41C78F9` | 26 (Arc), 6 (Base) | `0x9ae11d17…7f5cd` |
 
 Ketiga chain memakai `treasury` = `0x5d16E8Ef186d6D0d984f9A50C7ddb16C106DF40F`
-dan `feeBps` = 500 — sudah diverifikasi on-chain, jadi **tidak perlu deploy ulang**
-hanya untuk mengganti treasury.
+dan `feeBps` = 50 — sudah diverifikasi on-chain, jadi **tidak perlu deploy ulang**
+hanya untuk mengganti treasury atau fee (keduanya setter owner: `setTreasury`,
+`setFeeBps`).
 
 Verifikasi yang sudah lulus: state on-chain (owner, treasury, feeBps, `usdc`,
 `tokenMessenger` mainnet CCTP v2, `localDomain`, `supportedTokens`,
-`quoteFee(1 USDC)` = 0.05), bytecode on-chain cocok dengan hasil kompilasi ulang
-sumber (immutable di-mask), dan **source terverifikasi Sourcify `exact_match`**
+`quoteFee(1 USDC)` sesuai bps aktif — 0.005 sejak fee 50 bps), bytecode on-chain
+cocok dengan hasil kompilasi ulang sumber (immutable di-mask), dan **source
+terverifikasi Sourcify `exact_match`**
 (creation + runtime) untuk **ketiga chain**. Explorer Arc Mainnet memblokir API
 dari server (Cloudflare), jadi Sourcify dipakai sebagai jalur verifikasi otomatis.
 
@@ -132,7 +136,7 @@ Rencana deploy siap di `arcox-mcp/packages/runtime/scripts/deploy-swap-adapter-m
 - **`Adapter` tidak punya parameter treasury maupun fee.** Yang bisa disetel saat
   init hanya `initialize(address owner_, address signer_, uint256 signerThreshold_)`.
   Jadi permintaan "swap adapter pakai alamat treasury" tidak punya padanan di
-  kontrak ini — treasury 5% sudah ditangani Fee Router.
+  kontrak ini — treasury + fee (kini 0,5%) sudah ditangani Fee Router.
 - Estimasi gas proxy tidak mungkin sebelum implementation ada (konstruktor OZ
   mendelegatecall `initialize` ke logic; delegatecall ke alamat tanpa kode selalu
   revert), jadi script memakai limit tetap 1,2 juta gas.
@@ -230,8 +234,8 @@ ARC_NETWORK=mainnet
 
 # kontrak ARCOX mainnet — hanya dari *_MAINNET
 ARCOX_FEE_ROUTER_ADDRESS_MAINNET=0x9Fd14A94bDbEFf73EDB22853cc77416B65E2A0c0
-# Fee platform off-chain (swap/send/settlement). Kontrak Fee Router on-chain
-# memakai bps immutable miliknya sendiri, jadi nilainya bisa berbeda.
+# Fee platform off-chain (swap/send/settlement). Fee Router on-chain disetel ke
+# nilai yang sama (50 bps) lewat setFeeBps, jadi jalur bridge via router ikut 0,5%.
 ARCOX_ROUTER_FEE_BPS_MAINNET=50
 # Router per chain (dibaca backend/frontend di luar resolver Arc)
 ARCOX_BASE_FEE_ROUTER_ADDRESS=0xD858f073FA09834b1d64C165afC2757F1DF2f019
@@ -289,12 +293,16 @@ RPC diambil dari `ARC_MAINNET_RPC_URL` bila diset, kalau tidak dari
   `CIRCLE_ENV=live`, `CIRCLE_BASE_URL=https://api.circle.com`,
   `X402_MODE=arc_mainnet`, `X402_NETWORK=arc-mainnet`, `X402_CHAIN_ID=5042`,
   `CIRCLE_X402_NETWORK=arc-mainnet`. Backup: `.env.bak-20260926-112802`.
-- **3 Okt 2026 — fee platform off-chain diturunkan ke 50 bps (0,5%)**:
+- **3 Okt 2026 — fee platform diturunkan ke 50 bps (0,5%)**:
   `ARCOX_ROUTER_FEE_BPS_MAINNET`, `ARCOX_ROUTER_FEE_BPS`, `ARCOX_FEE_BPS`, dan
-  `X402_PLATFORM_FEE_BPS` semua 50. Kontrak Fee Router on-chain TIDAK berubah —
-  `feeBps`-nya immutable **500** (terverifikasi `feeBps()` di Arc/Base/Arbitrum),
-  jadi jalur bridge via router masih memungut 5% sampai kontrak di-redeploy.
-  UI bridge membaca `feeBps()` on-chain supaya angka yang ditampilkan tetap benar.
+  `X402_PLATFORM_FEE_BPS` semua 50. **Fee Router on-chain juga kini 50 bps**:
+  `feeBps` ternyata storage biasa dengan setter owner-only (`setFeeBps(uint16)`),
+  bukan immutable — jadi tidak perlu redeploy. `setFeeBps(50)` dikirim ke
+  Arc/Base/Arbitrum dari key owner `0xE34FF1D2…` (`~/.arcox/agent.env:EOA_PRIVATE_KEY`)
+  lewat `npm run mainnet:fee-router:fee -- --fee-bps 50 --chains arc,base,arbitrum --broadcast`;
+  alamat, verifikasi Sourcify, dan integrasi tidak berubah. UI bridge tetap
+  membaca `feeBps()` on-chain sebagai sumber kebenaran.
+  Hanya `usdc`, `tokenMessenger`, dan `localDomain` yang immutable.
 - `npm run probe:mainnet` → **22 lulus / 0 blocker**. Instance uji (`PORT=3999`) dan
   produksi (`arc-dex-api.service`) start bersih; `npm test` 340/340 hijau.
 - Bug boot mainnet ditemukan & diperbaiki: `BRIDGE_CHAIN_DEF.Arc_Testnet` memanggil
