@@ -54,7 +54,7 @@ export function registerDocsCatalogTools(ctx) {
     { id: 'bridge-retry', title: 'Bridge Retry', tags: ['bridge', 'retry', 'cctp'], body: 'CCTP bridge has approve, burn, attestation, and mint stages. If burn succeeded but mint is pending, retry mint instead of repeating the burn.' },
     { id: 'mcp-safety', title: 'MCP Safety Rules', tags: ['mcp', 'agent', 'safety'], body: 'Agents must call quote tools first, show preview, receive explicit confirmation, then execute with previewId and confirmationText.' },
     { id: 'intel-x402', title: 'Intel x402', tags: ['intel', 'x402', 'arkham'], body: 'ARCOX Intel is x402 paid: unpaid requests return an invoice; pay via arcox_x402_pay_invoice then retry with paymentId.' },
-    { id: 'marketplace-x402', title: 'x402 Marketplace', tags: ['marketplace', 'x402', 'providers'], body: 'The ARCOX marketplace mirrors the Circle x402 discovery directory. Search and quote are free; buying settles the provider price plus the ARCOX platform fee (5% by default) on one x402 invoice.' },
+    { id: 'marketplace-x402', title: 'x402 Marketplace', tags: ['marketplace', 'x402', 'providers'], body: 'The ARCOX marketplace mirrors the Circle x402 discovery directory. Search and quote are free; buying settles the provider price plus the ARCOX platform fee (0.5% by default) on one x402 invoice.' },
   ]
 
   registerTool('arcox_search_docs', 'Search ARCOX product and MCP documentation. Use this before guessing an unfamiliar ARCOX flow.', {

@@ -1182,9 +1182,9 @@ function swapTokenParam(token) {
 }
 
 // Fee platform off-chain (swap/send/settlement) dibaca dari env per jaringan;
-// default 50 bps = 0.5%. Kontrak Fee Router on-chain punya bps immutable milik
-// sendiri (lihat docs/arc-mainnet-deploy-plan.md) dan hanya dipakai jalur
-// bridge router, jadi nilainya bisa berbeda dari env sampai kontrak di-redeploy.
+// default 50 bps = 0.5%. Kontrak Fee Router on-chain menyimpan `feeBps`-nya
+// sendiri untuk jalur bridge router (kini juga 50 bps, diubah owner lewat
+// `setFeeBps` — bukan immutable; lihat docs/arc-mainnet-deploy-plan.md).
 const PLATFORM_FEE_BPS = Number(
   (IS_ARC_MAINNET ? process.env.ARCOX_ROUTER_FEE_BPS_MAINNET : '') ||
   process.env.ARCOX_ROUTER_FEE_BPS ||
@@ -3081,7 +3081,8 @@ app.post('/api/eoa-swap-prepare', apiLimiter, requireAuth, async (req, res) => {
     // input (basis `inputAmount`), jadi yang benar-benar dibayar user = feeBps ×
     // amountIn — sama dengan display dan dengan quote (quote memakai net, yang
     // persis sama dengan sisa setelah fee). Mengirim net + customFee membuat
-    // fee terhitung dua kali dan output nyata ~5% lebih kecil dari quote.
+    // fee terhitung dua kali dan output nyata menyusut sebesar fee ekstra itu
+    // (dulu ~5% saat fee masih 500 bps).
     const leg = await prepareStablecoinSwapLeg({
       owner, chain, tokenIn, tokenOut,
       amountUnits: platformFee.amountUnits,

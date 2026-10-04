@@ -4,6 +4,10 @@ import assert from 'node:assert/strict'
 // The platform fee is charged on top of a service price and is quoted to
 // buyers, so the arithmetic has to be exact in USDC base units: a rounding
 // error is either an overcharge or a silent loss of margin.
+//
+// File ini sengaja meng-override env ke 500 bps (5%) supaya aritmetika diuji
+// pada angka yang mudah diperiksa. Default platform yang sebenarnya (50 bps)
+// dikunci di test/platformFee50Bps.test.mjs.
 process.env.X402_PLATFORM_FEE_BPS = '500'
 process.env.X402_PLATFORM_FEE_FIXED_USDC = '0'
 process.env.X402_PLATFORM_FEE_SERVICES_ENABLED = 'false'
@@ -18,7 +22,7 @@ const {
   toUsdcBaseUnits,
 } = await import('../src/services/platformFee.mjs')
 
-test('default fee is 5% charged on top of the price', () => {
+test('env override 500 bps charges 5% on top of the price', () => {
   assert.equal(platformFeeBps(), 500)
   const split = applyPlatformFee('0.05')
   assert.equal(split.netAmount, '0.050000')
